@@ -71,16 +71,20 @@ class TestPhase0Offline(unittest.TestCase):
             REPO_ROOT / "deploy/kairos/scripts/00_phase0_probe_vmm.sh",
             REPO_ROOT / "deploy/kairos/scripts/01_phase0_download_bagel.sh",
             REPO_ROOT / "deploy/kairos/scripts/02_phase0_topo_8gpu.sh",
+            REPO_ROOT / "deploy/kairos/scripts/03_phase0_motivation.sh",
         ]
         for script in scripts:
             proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, msg=f"bash -n failed for {script}: {proc.stderr}")
 
     def test_phase0_modules_import(self) -> None:
-        from morphserve.bench import topo_probe
+        from morphserve.bench import motivation_profile, topo_probe
+        from morphserve.models import bagel_adapter
         from morphserve.tools import fetch_hf, verify_model
 
         self.assertTrue(callable(topo_probe.main))
+        self.assertTrue(callable(motivation_profile.main))
+        self.assertTrue(callable(bagel_adapter.apply_vllm_omni_mm_limit))
         self.assertTrue(callable(fetch_hf.main))
         self.assertTrue(callable(verify_model.main))
 

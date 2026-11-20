@@ -1,0 +1,76 @@
+{
+  "status": "ok",
+  "compiled_with_cuda_h": true,
+  "driver_version": 13000,
+  "device_index": 0,
+  "device_name": "NVIDIA A100-PCIE-40GB",
+  "vmm_supported": true,
+  "total_memory_bytes": 42406903808,
+  "residual_memory_delta_bytes": 0,
+  "min_granularity_bytes": 2097152,
+  "recommended_granularity_bytes": 2097152,
+  "single_2mb_remap_us": {"mean":86.230,"min":81.856,"p50":84.005,"p95":101.175,"p99":108.739,"max":125.411},
+  "granularity_sweep": [
+    {
+      "handle_mib": 2,
+      "layer_handles": 256,
+      "spike_handles": 2048,
+      "pool_create_ms": 25.350,
+      "layer_512mib_remap_ms": {"mean":23.283,"min":22.974,"p50":23.105,"p95":24.639,"p99":25.016,"max":25.110},
+      "vae_4gib_acquire_ms": {"mean":193.980,"min":189.878,"p50":193.937,"p95":197.838,"p99":199.268,"max":199.625},
+      "vae_4gib_bulk_unmap_only_ms": {"mean":75.498,"min":73.446,"p50":75.416,"p95":77.800,"p99":78.719,"max":78.949},
+      "vae_4gib_release_and_restore_ms": {"mean":193.582,"min":190.689,"p50":193.790,"p95":195.655,"p99":196.305,"max":196.468},
+      "pattern_verified": true
+    },
+    {
+      "handle_mib": 32,
+      "layer_handles": 16,
+      "spike_handles": 128,
+      "pool_create_ms": 1.557,
+      "layer_512mib_remap_ms": {"mean":1.301,"min":1.280,"p50":1.299,"p95":1.322,"p99":1.323,"max":1.323},
+      "vae_4gib_acquire_ms": {"mean":10.574,"min":10.479,"p50":10.568,"p95":10.632,"p99":10.636,"max":10.637},
+      "vae_4gib_bulk_unmap_only_ms": {"mean":3.950,"min":3.919,"p50":3.948,"p95":3.993,"p99":3.999,"max":4.000},
+      "vae_4gib_release_and_restore_ms": {"mean":10.568,"min":10.482,"p50":10.567,"p95":10.645,"p99":10.649,"max":10.650},
+      "pattern_verified": true
+    },
+    {
+      "handle_mib": 64,
+      "layer_handles": 8,
+      "spike_handles": 64,
+      "pool_create_ms": 0.823,
+      "layer_512mib_remap_ms": {"mean":0.707,"min":0.643,"p50":0.668,"p95":0.960,"p99":0.988,"max":0.995},
+      "vae_4gib_acquire_ms": {"mean":5.437,"min":5.391,"p50":5.443,"p95":5.466,"p99":5.467,"max":5.468},
+      "vae_4gib_bulk_unmap_only_ms": {"mean":2.029,"min":2.013,"p50":2.030,"p95":2.042,"p99":2.043,"max":2.043},
+      "vae_4gib_release_and_restore_ms": {"mean":5.449,"min":5.416,"p50":5.451,"p95":5.491,"p99":5.493,"max":5.493},
+      "pattern_verified": true
+    },
+    {
+      "handle_mib": 128,
+      "layer_handles": 4,
+      "spike_handles": 32,
+      "pool_create_ms": 0.463,
+      "layer_512mib_remap_ms": {"mean":1.514,"min":0.334,"p50":0.358,"p95":4.236,"p99":4.236,"max":4.236},
+      "vae_4gib_acquire_ms": {"mean":2.836,"min":2.800,"p50":2.838,"p95":2.862,"p99":2.863,"max":2.863},
+      "vae_4gib_bulk_unmap_only_ms": {"mean":1.056,"min":1.039,"p50":1.057,"p95":1.070,"p99":1.072,"max":1.073},
+      "vae_4gib_release_and_restore_ms": {"mean":2.846,"min":2.831,"p50":2.845,"p95":2.870,"p99":2.879,"max":2.881},
+      "pattern_verified": true
+    },
+    {
+      "handle_mib": 256,
+      "layer_handles": 2,
+      "spike_handles": 16,
+      "pool_create_ms": 0.224,
+      "layer_512mib_remap_ms": {"mean":2.022,"min":0.201,"p50":2.118,"p95":2.119,"p99":2.119,"max":2.119},
+      "vae_4gib_acquire_ms": {"mean":1.564,"min":1.533,"p50":1.569,"p95":1.582,"p99":1.587,"max":1.588},
+      "vae_4gib_bulk_unmap_only_ms": {"mean":0.573,"min":0.554,"p50":0.574,"p95":0.589,"p99":0.591,"max":0.591},
+      "vae_4gib_release_and_restore_ms": {"mean":1.574,"min":1.543,"p50":1.569,"p95":1.611,"p99":1.612,"max":1.612},
+      "pattern_verified": true
+    }
+  ],
+  "h2d_super_handle_mib": 128,
+  "h2d_stream_mib": 512,
+  "h2d_stream_gbps": {"mean":12.334,"min":12.325,"p50":12.333,"p95":12.342,"p99":12.345,"max":12.346},
+  "h2d_super_remap_ms": {"mean":0.393,"min":0.374,"p50":0.393,"p95":0.409,"p99":0.409,"max":0.409},
+  "h2d_remap_plus_copy_ms": {"mean":43.936,"min":43.912,"p50":43.937,"p95":43.957,"p99":43.963,"max":43.964},
+  "h2d_bit_exact": true
+}

@@ -392,7 +392,6 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
             pluggable = torch.cuda.CUDAPluggableAllocator(
                 str(so_path), "tripool_alloc", "tripool_free"
             )
-            pool = torch.cuda.MemPool(pluggable.allocator())
 
             st_before = TripoolStats()
             lib.tripool_get_stats(ctypes.byref(st_before))
@@ -403,11 +402,15 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
             for _ in range(repeats + 1):  # 1 warmup + repeats measured
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
+                # Create a lightweight scoped MemPool per VAE invocation so exiting destroys
+                # ONLY this transient pool's block cache and triggers immediate bulk cuMemUnmap.
+                pool = torch.cuda.MemPool(pluggable.allocator())
                 lib.tripool_scope_begin()
                 with torch.cuda.use_mem_pool(pool):
                     out_vmm_pooled = vae_like_forward(x_in)
                 out_vmm = out_vmm_pooled.clone()
                 del out_vmm_pooled
+                del pool
                 stream_ptr = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
                 lib.tripool_scope_end(stream_ptr)
                 torch.cuda.synchronize()
@@ -420,7 +423,7 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
             vmm_cold_ms = vmm_times[0]
             vmm_steady_times = vmm_times[1:]
 
-            del pool, pluggable
+            del pluggable
             gc.collect()
             torch.cuda.synchronize()
 

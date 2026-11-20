@@ -296,11 +296,12 @@ def profile_single_gpu_bagel(model_dir: Path, steps: int = 20, width: int = 512,
     pipeline.vae.decode = wrapped_vae_decode
     pipeline.vae.encode = wrapped_vae_encode
 
-    # Instrument BAGEL transformer step/flow calls (exact per-step & per-CFG-branch latency!)
+    # Instrument BAGEL exact DiT step & per-CFG-branch methods discovered on vllm-omni 0.30.0
     step_call_ms: list[float] = []
+    branch_call_ms: list[float] = []
     bagel = pipeline.bagel
     flow_method_name = None
-    for cand in ("forward_flow", "forward_inference", "forward_step"):
+    for cand in ("predict_noise_maybe_with_cfg", "predict_noise_with_multi_branch_cfg", "predict_noise"):
         if hasattr(bagel, cand):
             flow_method_name = cand
             break
@@ -317,21 +318,20 @@ def profile_single_gpu_bagel(model_dir: Path, steps: int = 20, width: int = 512,
 
         setattr(bagel, flow_method_name, wrapped_flow)
 
-    # Also instrument language_model.forward_inference if present to time individual CFG forward passes
-    lm_forward_ms: list[float] = []
-    lm = getattr(bagel, "language_model", None)
-    if lm is not None and hasattr(lm, "forward_inference"):
-        orig_lm_fwd = lm.forward_inference
+    if hasattr(bagel, "forward_single_branch"):
+        orig_branch = bagel.forward_single_branch
 
-        def wrapped_lm_fwd(*args, **kwargs):
+        def wrapped_branch(*args, **kwargs):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            res = orig_lm_fwd(*args, **kwargs)
+            res = orig_branch(*args, **kwargs)
             torch.cuda.synchronize()
-            lm_forward_ms.append(round((time.perf_counter() - t0) * 1000.0, 3))
+            branch_call_ms.append(round((time.perf_counter() - t0) * 1000.0, 3))
             return res
 
-        lm.forward_inference = wrapped_lm_fwd
+        bagel.forward_single_branch = wrapped_branch
+
+    lm_forward_ms = branch_call_ms
 
     # Inspect BAGEL methods for AR text decode capability
     bagel_methods = sorted(m for m in dir(bagel) if not m.startswith("_"))
@@ -455,28 +455,50 @@ def profile_single_gpu_bagel(model_dir: Path, steps: int = 20, width: int = 512,
         torch.cuda.synchronize()
         prefill_ms = (time.perf_counter() - t_prefill0) * 1000.0
 
-        # Also measure AR decode TPOT if generate_text exists on bagel
+        # Measure real AR text generation TPOT on cloned NaiveCache (32 tokens)
         ar_decode_info = None
         if hasattr(bagel, "generate_text"):
             try:
-                t_ar0 = time.perf_counter()
-                # Clone shallow view so we don't mutate main_ctx for image generation
-                tmp_ctx = {
-                    "kv_lens": list(main_ctx["kv_lens"]),
-                    "ropes": list(main_ctx["ropes"]),
-                    "past_key_values": NaiveCache(bagel.config.llm_config.num_hidden_layers),
-                }
-                tmp_ctx["past_key_values"].key_cache = [
-                    None if t is None else t.clone() for t in main_ctx["past_key_values"].key_cache
-                ]
-                tmp_ctx["past_key_values"].value_cache = [
-                    None if t is None else t.clone() for t in main_ctx["past_key_values"].value_cache
-                ]
-                # Inspect signature safely
-                ar_decode_info = {"has_generate_text": True}
-                del tmp_ctx
+                import inspect as _inspect
+
+                sig = str(_inspect.signature(bagel.generate_text))
+                ar_decode_info = {"signature": sig}
+                if turn_idx in (0, 3):
+                    tmp_kv = NaiveCache(bagel.config.llm_config.num_hidden_layers)
+                    for lyr in range(tmp_kv.num_layers):
+                        k = main_ctx["past_key_values"].key_cache[lyr]
+                        v = main_ctx["past_key_values"].value_cache[lyr]
+                        tmp_kv.key_cache[lyr] = None if k is None else k.clone()
+                        tmp_kv.value_cache[lyr] = None if v is None else v.clone()
+                    ar_inputs, _, _ = bagel.prepare_start_tokens(
+                        curr_kvlens=list(main_ctx["kv_lens"]),
+                        curr_rope=list(main_ctx["ropes"]),
+                        new_token_ids=pipeline.new_token_ids,
+                    )
+                    ar_inputs = move_dev(ar_inputs)
+                    torch.cuda.synchronize()
+                    t_ar0 = time.perf_counter()
+                    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        gen_ids = bagel.generate_text(
+                            past_key_values=tmp_kv,
+                            max_length=32,
+                            do_sample=False,
+                            end_token_id=pipeline.new_token_ids["eos_token_id"],
+                            **ar_inputs,
+                        )
+                    torch.cuda.synchronize()
+                    ar_ms = (time.perf_counter() - t_ar0) * 1000.0
+                    n_tok = int(gen_ids.numel()) if torch.is_tensor(gen_ids) else len(gen_ids)
+                    ar_decode_info.update(
+                        {
+                            "tokens": n_tok,
+                            "total_ms": round(ar_ms, 2),
+                            "tpot_ms": round(ar_ms / max(1, n_tok), 2),
+                        }
+                    )
+                    del tmp_kv, ar_inputs, gen_ids
             except Exception as exc:
-                ar_decode_info = {"error": str(exc)}
+                ar_decode_info = {"error": f"{type(exc).__name__}: {exc}"}
 
         # Run DiT denoising + FLUX VAE decode
         torch.cuda.reset_peak_memory_stats(device)
@@ -516,11 +538,14 @@ def profile_single_gpu_bagel(model_dir: Path, steps: int = 20, width: int = 512,
         turn_vae = vae_events[vae_start_idx:]
         turn_lm_ms = lm_forward_ms[lm_start_idx:]
         turn_flow_ms = step_call_ms[flow_start_idx:]
-        # Analyze per-step determinism (excluding first warmup call and VAE/prefill calls)
-        denoise_lm = [x for x in turn_lm_ms if x > 20.0]
-        lm_cv = (
-            round(statistics.stdev(denoise_lm) / statistics.mean(denoise_lm), 4)
-            if len(denoise_lm) >= 4 and statistics.mean(denoise_lm) > 0
+        step_cv = (
+            round(statistics.stdev(turn_flow_ms[1:]) / statistics.mean(turn_flow_ms[1:]), 4)
+            if len(turn_flow_ms) >= 5 and statistics.mean(turn_flow_ms[1:]) > 0
+            else None
+        )
+        branch_cv = (
+            round(statistics.stdev(turn_lm_ms[3:]) / statistics.mean(turn_lm_ms[3:]), 4)
+            if len(turn_lm_ms) >= 6 and statistics.mean(turn_lm_ms[3:]) > 0
             else None
         )
 
@@ -539,12 +564,14 @@ def profile_single_gpu_bagel(model_dir: Path, steps: int = 20, width: int = 512,
                 "mem_pre_gen": mem_pre_gen,
                 "mem_post_gen": mem_post_gen,
                 "vae_events": turn_vae,
-                "lm_forward_call_count": len(turn_lm_ms),
-                "lm_forward_ms_sample": turn_lm_ms[:12],
-                "lm_denoise_calls_gt20ms_count": len(denoise_lm),
-                "lm_denoise_p50_ms": round(statistics.median(denoise_lm), 2) if denoise_lm else None,
-                "lm_denoise_cv": lm_cv,
-                "flow_calls_count": len(turn_flow_ms),
+                "dit_step_call_count": len(turn_flow_ms),
+                "dit_step_ms_all": turn_flow_ms,
+                "dit_step_p50_ms": round(statistics.median(turn_flow_ms), 2) if turn_flow_ms else None,
+                "dit_step_cv_steady": step_cv,
+                "cfg_branch_call_count": len(turn_lm_ms),
+                "cfg_branch_ms_sample": turn_lm_ms[:15],
+                "cfg_branch_p50_ms": round(statistics.median(turn_lm_ms), 2) if turn_lm_ms else None,
+                "cfg_branch_cv_steady": branch_cv,
                 "ar_decode_info": ar_decode_info,
             }
         )

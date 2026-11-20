@@ -96,6 +96,12 @@ def _probe_mirror_url(url: str, expected_size: int) -> tuple[bool, float, str]:
         return False, 0.0, f"{type(exc).__name__}: {exc}"
 
 
+MODELSCOPE_REPO_ALIASES: dict[str, list[str]] = {
+    "ByteDance-Seed/BAGEL-7B-MoT": ["bytedance-community/BAGEL-7B-MoT", "ByteDance-Seed/BAGEL-7B-MoT"],
+    "InternVL-U/InternVL-U": ["OpenGVLab/InternVL-U", "InternVL-U/InternVL-U"],
+}
+
+
 def select_best_url(
     endpoint: str,
     repo_id: str,
@@ -105,22 +111,25 @@ def select_best_url(
     extra_mirrors: list[str] | None = None,
 ) -> str:
     quoted = urllib.parse.quote(rel_path, safe="/")
-    candidates = [
-        f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}",
-        f"https://www.modelscope.cn/models/{repo_id}/resolve/master/{quoted}",
-    ]
+    ms_file = urllib.parse.quote(rel_path, safe="")
+    candidates = []
+    for ms_repo in MODELSCOPE_REPO_ALIASES.get(repo_id, [repo_id]):
+        candidates.append(
+            f"https://modelscope.cn/api/v1/models/{ms_repo}/repo?Revision=master&FilePath={ms_file}"
+        )
+    candidates.append(f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}")
     if extra_mirrors:
         for base in extra_mirrors:
             candidates.append(f"{base.rstrip('/')}/{quoted}")
 
     if expected_size < 16 * 1024 * 1024:
-        return candidates[0]
+        return f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}"
 
-    best_url = candidates[0]
+    best_url = candidates[-1]
     best_mbps = -1.0
     for url in candidates:
         ok, mbps, note = _probe_mirror_url(url, expected_size)
-        print(f"mirror probe {rel_path}: {url[:80]} -> {note}", flush=True)
+        print(f"mirror probe {rel_path}: {url[:95]} -> {note}", flush=True)
         if ok and mbps > best_mbps:
             best_mbps = mbps
             best_url = url

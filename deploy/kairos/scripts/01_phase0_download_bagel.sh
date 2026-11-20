@@ -25,13 +25,14 @@ _morphserve_job0b_cleanup() {
 }
 trap _morphserve_job0b_cleanup EXIT
 
-echo "== downloading ${MODEL_REPO}@${MODEL_REV} from ${HF_ENDPOINT} -> ${MODEL_DEST}"
+echo "== downloading ${MODEL_REPO}@${MODEL_REV} from ${HF_ENDPOINT} (parallel HTTP Range, 16 workers) -> ${MODEL_DEST}"
 python3 -m morphserve.tools.fetch_hf \
   --repo-id "$MODEL_REPO" \
   --revision "$MODEL_REV" \
   --dest "$MODEL_DEST" \
   --endpoint "$HF_ENDPOINT" \
-  --max-workers 8
+  --max-workers 16 \
+  --chunk-mib 16
 
 echo "== offline manifest re-verification"
 python3 -m morphserve.tools.verify_model \

@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
-"""Download and SHA256-verify a pinned HuggingFace model snapshot (supports HF_ENDPOINT mirrors)."""
+"""Fast parallel HTTP-Range downloader with mirror probing and strict HF LFS SHA256 verification."""
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-CHUNK_SIZE = 4 * 1024 * 1024
+HASH_CHUNK_SIZE = 4 * 1024 * 1024
+DEFAULT_RANGE_CHUNK_MIB = 16
 
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        while chunk := handle.read(CHUNK_SIZE):
+        while chunk := handle.read(HASH_CHUNK_SIZE):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def get_json(url: str) -> object:
-    req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.1"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+def get_json(url: str, timeout: int = 60) -> object:
+    req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.2"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
@@ -62,29 +66,233 @@ def fetch_tree(endpoint: str, repo_id: str, revision: str) -> tuple[str, list[di
     return resolved_rev, files
 
 
-def download_via_hub(endpoint: str, repo_id: str, revision: str, dest: Path, max_workers: int) -> None:
-    os.environ["HF_ENDPOINT"] = endpoint.rstrip("/")
-    os.environ.pop("HF_HUB_OFFLINE", None)
-    os.environ.pop("TRANSFORMERS_OFFLINE", None)
-    from huggingface_hub import snapshot_download
-
-    t0 = time.perf_counter()
-    path = snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        local_dir=str(dest),
-        max_workers=max_workers,
+def _probe_mirror_url(url: str, expected_size: int) -> tuple[bool, float, str]:
+    probe_end = min(expected_size - 1, 2 * 1024 * 1024 - 1)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "morphserve-fetch/0.2",
+            "Range": f"bytes=0-{probe_end}",
+        },
     )
-    elapsed = time.perf_counter() - t0
-    print(f"snapshot_download finished in {elapsed:.1f}s -> {path}", flush=True)
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            status = getattr(resp, "status", 200)
+            cr = resp.headers.get("Content-Range", "")
+            data = resp.read()
+            elapsed = max(1e-6, time.perf_counter() - t0)
+            if status != 206:
+                return False, 0.0, f"HTTP {status} (no range support)"
+            if "/" in cr:
+                total_str = cr.rsplit("/", 1)[-1].strip()
+                if total_str.isdigit() and int(total_str) != expected_size:
+                    return False, 0.0, f"size mismatch {total_str} != {expected_size}"
+            if len(data) != probe_end + 1:
+                return False, 0.0, f"short probe {len(data)} != {probe_end + 1}"
+            mbps = (len(data) / (1024**2)) / elapsed
+            return True, mbps, f"ok ({mbps:.2f} MiB/s)"
+    except Exception as exc:
+        return False, 0.0, f"{type(exc).__name__}: {exc}"
 
 
-def verify_and_write_manifest(
+def select_best_url(
+    endpoint: str,
+    repo_id: str,
+    revision: str,
+    rel_path: str,
+    expected_size: int,
+    extra_mirrors: list[str] | None = None,
+) -> str:
+    quoted = urllib.parse.quote(rel_path, safe="/")
+    candidates = [
+        f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}",
+        f"https://www.modelscope.cn/models/{repo_id}/resolve/master/{quoted}",
+    ]
+    if extra_mirrors:
+        for base in extra_mirrors:
+            candidates.append(f"{base.rstrip('/')}/{quoted}")
+
+    if expected_size < 16 * 1024 * 1024:
+        return candidates[0]
+
+    best_url = candidates[0]
+    best_mbps = -1.0
+    for url in candidates:
+        ok, mbps, note = _probe_mirror_url(url, expected_size)
+        print(f"mirror probe {rel_path}: {url[:80]} -> {note}", flush=True)
+        if ok and mbps > best_mbps:
+            best_mbps = mbps
+            best_url = url
+    print(f"selected mirror for {rel_path}: {best_url} ({best_mbps:.2f} MiB/s probe)", flush=True)
+    return best_url
+
+
+def _download_single_small(url: str, dest: Path, expected_size: int) -> None:
+    part = dest.with_name(dest.name + ".part")
+    for attempt in range(1, 7):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.2"})
+            with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as out:
+                shutil.copyfileobj(resp, out, length=1024 * 1024)
+            if part.stat().st_size != expected_size:
+                raise IOError(f"size mismatch {part.stat().st_size} != {expected_size}")
+            part.replace(dest)
+            return
+        except Exception as exc:
+            print(f"retry {attempt}/6 for {dest.name}: {exc}", flush=True)
+            time.sleep(min(20, 2 * attempt))
+    raise RuntimeError(f"failed to download {dest.name} after 6 attempts")
+
+
+def download_file_range_parallel(
+    url: str,
+    dest: Path,
+    expected_size: int,
+    workers: int = 16,
+    chunk_mib: int = DEFAULT_RANGE_CHUNK_MIB,
+) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if expected_size < 8 * 1024 * 1024:
+        _download_single_small(url, dest, expected_size)
+        return
+
+    chunk_bytes = chunk_mib * 1024 * 1024
+    num_chunks = (expected_size + chunk_bytes - 1) // chunk_bytes
+    part_path = dest.with_name(dest.name + ".part")
+    state_path = dest.with_name(dest.name + ".part.chunks.json")
+
+    done_chunks: set[int] = set()
+    if part_path.is_file() and part_path.stat().st_size == expected_size and state_path.is_file():
+        try:
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            if saved.get("size") == expected_size and saved.get("chunk_bytes") == chunk_bytes:
+                done_chunks = set(saved.get("done", []))
+                print(
+                    f"resuming {dest.name}: {len(done_chunks)}/{num_chunks} chunks already complete",
+                    flush=True,
+                )
+        except Exception:
+            done_chunks = set()
+
+    fd = os.open(str(part_path), os.O_CREAT | os.O_RDWR, 0o666)
+    try:
+        os.ftruncate(fd, expected_size)
+        pending = [i for i in range(num_chunks) if i not in done_chunks]
+        lock = threading.Lock()
+        bytes_done = sum(
+            min(chunk_bytes, expected_size - i * chunk_bytes) for i in done_chunks
+        )
+        t_start = time.perf_counter()
+        bytes_this_run = 0
+        last_log = t_start
+        chunks_since_save = 0
+
+        def save_state_locked() -> None:
+            tmp = state_path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "size": expected_size,
+                        "chunk_bytes": chunk_bytes,
+                        "done": sorted(done_chunks),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(state_path)
+
+        def fetch_chunk(idx: int) -> int:
+            start = idx * chunk_bytes
+            end = min(expected_size - 1, start + chunk_bytes - 1)
+            need = end - start + 1
+            last_err: Exception | None = None
+            for attempt in range(1, 9):
+                try:
+                    req = urllib.request.Request(
+                        url,
+                        headers={
+                            "User-Agent": "morphserve-fetch/0.2",
+                            "Range": f"bytes={start}-{end}",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        status = getattr(resp, "status", 200)
+                        if status != 206:
+                            raise IOError(f"expected HTTP 206, got {status}")
+                        buf = bytearray()
+                        while len(buf) < need:
+                            piece = resp.read(min(1024 * 1024, need - len(buf)))
+                            if not piece:
+                                break
+                            buf.extend(piece)
+                        if len(buf) != need:
+                            raise IOError(f"short chunk {idx}: got {len(buf)} != {need}")
+                        # Write directly at exact offset via lock-free pwrite
+                        written = 0
+                        view = memoryview(buf)
+                        while written < need:
+                            n = os.pwrite(fd, view[written:], start + written)
+                            if n <= 0:
+                                raise IOError("os.pwrite returned 0")
+                            written += n
+                        return need
+                except Exception as exc:
+                    last_err = exc
+                    time.sleep(min(25, 1.5 * attempt))
+            raise RuntimeError(f"chunk {idx} ({start}-{end}) failed after 8 attempts: {last_err}")
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(fetch_chunk, idx): idx for idx in pending}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                nbytes = fut.result()
+                now = time.perf_counter()
+                with lock:
+                    done_chunks.add(idx)
+                    bytes_done += nbytes
+                    bytes_this_run += nbytes
+                    chunks_since_save += 1
+                    if chunks_since_save >= 8 or len(done_chunks) == num_chunks:
+                        save_state_locked()
+                        chunks_since_save = 0
+                    if now - last_log >= 15.0 or len(done_chunks) == num_chunks:
+                        rate_mibs = (bytes_this_run / (1024**2)) / max(1e-6, now - t_start)
+                        pct = 100.0 * bytes_done / expected_size
+                        rem_mib = (expected_size - bytes_done) / (1024**2)
+                        eta_s = rem_mib / max(0.01, rate_mibs)
+                        print(
+                            f"[{dest.name}] {pct:5.1f}% ({bytes_done / (1024**3):.2f}/{expected_size / (1024**3):.2f} GiB) "
+                            f"rate={rate_mibs:.2f} MiB/s eta={eta_s:.0f}s chunks={len(done_chunks)}/{num_chunks}",
+                            flush=True,
+                        )
+                        last_log = now
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+    if part_path.stat().st_size != expected_size:
+        raise RuntimeError(f"assembled size mismatch: {part_path.stat().st_size} != {expected_size}")
+    part_path.replace(dest)
+    if state_path.is_file():
+        state_path.unlink()
+
+
+def sync_and_verify_repo(
     endpoint: str,
     repo_id: str,
     revision: str,
     dest: Path,
+    workers: int = 16,
+    chunk_mib: int = DEFAULT_RANGE_CHUNK_MIB,
+    verify_only: bool = False,
 ) -> dict:
+    dest.mkdir(parents=True, exist_ok=True)
+    # Remove any leftover huggingface_hub xet .cache inside local_dir to save /data space
+    stale_cache = dest / ".cache"
+    if stale_cache.is_dir():
+        shutil.rmtree(stale_cache, ignore_errors=True)
+
     resolved_rev, tree_files = fetch_tree(endpoint, repo_id, revision)
     if revision != resolved_rev and not resolved_rev.startswith(revision):
         raise RuntimeError(f"revision mismatch: requested={revision} resolved={resolved_rev}")
@@ -93,18 +301,48 @@ def verify_and_write_manifest(
     total_bytes = 0
     for item in tree_files:
         rel_path = item["path"]
-        # Skip .gitattributes / hidden repo metadata if absent
-        local_file = safe_destination(dest, rel_path)
-        if not local_file.is_file():
-            raise RuntimeError(f"missing expected model file: {local_file}")
-        actual_size = local_file.stat().st_size
         expected_size = item.get("size")
-        if expected_size is not None and actual_size != expected_size:
-            raise RuntimeError(f"size mismatch for {rel_path}: {actual_size} != {expected_size}")
-        actual_sha = sha256_file(local_file)
         lfs_sha = (item.get("lfs") or {}).get("oid") or (item.get("lfs") or {}).get("sha256")
-        if lfs_sha and actual_sha != lfs_sha:
-            raise RuntimeError(f"LFS SHA256 mismatch for {rel_path}: {actual_sha} != {lfs_sha}")
+        local_file = safe_destination(dest, rel_path)
+
+        need_download = True
+        if local_file.is_file() and (expected_size is None or local_file.stat().st_size == expected_size):
+            actual_sha = sha256_file(local_file)
+            if not lfs_sha or actual_sha == lfs_sha:
+                need_download = False
+                print(
+                    f"already verified {rel_path} ({local_file.stat().st_size / (1024**2):.2f} MiB) sha256={actual_sha[:12]}",
+                    flush=True,
+                )
+            else:
+                print(f"checksum mismatch on existing {rel_path}; re-downloading", flush=True)
+                local_file.unlink()
+
+        if need_download:
+            if verify_only:
+                raise RuntimeError(f"missing or invalid file in --verify-only mode: {local_file}")
+            if expected_size is None:
+                raise RuntimeError(f"missing expected size in tree metadata for {rel_path}")
+            url = select_best_url(endpoint, repo_id, resolved_rev, rel_path, expected_size)
+            download_file_range_parallel(
+                url,
+                local_file,
+                expected_size,
+                workers=workers,
+                chunk_mib=chunk_mib,
+            )
+            actual_sha = sha256_file(local_file)
+            if lfs_sha and actual_sha != lfs_sha:
+                local_file.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"LFS SHA256 mismatch after download for {rel_path}: {actual_sha} != {lfs_sha}"
+                )
+            print(
+                f"verified {rel_path} ({expected_size / (1024**2):.2f} MiB) sha256={actual_sha[:12]}",
+                flush=True,
+            )
+
+        actual_size = local_file.stat().st_size
         manifest_files.append(
             {
                 "path": rel_path,
@@ -114,7 +352,6 @@ def verify_and_write_manifest(
             }
         )
         total_bytes += actual_size
-        print(f"verified {rel_path} ({actual_size / (1024**2):.2f} MiB) sha256={actual_sha[:12]}", flush=True)
 
     manifest = {
         "schema": "morphserve.model-manifest.v1",
@@ -134,19 +371,25 @@ def verify_and_write_manifest(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Download and SHA256-verify HF model snapshot")
+    parser = argparse.ArgumentParser(description="Parallel HTTP-Range HF model downloader + SHA256 verifier")
     parser.add_argument("--repo-id", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--dest", type=Path, required=True)
     parser.add_argument("--endpoint", default=os.environ.get("HF_ENDPOINT", "https://hf-mirror.com"))
-    parser.add_argument("--max-workers", type=int, default=8)
+    parser.add_argument("--max-workers", type=int, default=16)
+    parser.add_argument("--chunk-mib", type=int, default=DEFAULT_RANGE_CHUNK_MIB)
     parser.add_argument("--verify-only", action="store_true")
     args = parser.parse_args(argv)
 
-    args.dest.mkdir(parents=True, exist_ok=True)
-    if not args.verify_only:
-        download_via_hub(args.endpoint, args.repo_id, args.revision, args.dest, args.max_workers)
-    manifest = verify_and_write_manifest(args.endpoint, args.repo_id, args.revision, args.dest)
+    manifest = sync_and_verify_repo(
+        args.endpoint,
+        args.repo_id,
+        args.revision,
+        args.dest,
+        workers=args.max_workers,
+        chunk_mib=args.chunk_mib,
+        verify_only=args.verify_only,
+    )
     print(
         json.dumps(
             {

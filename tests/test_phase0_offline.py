@@ -69,10 +69,20 @@ class TestPhase0Offline(unittest.TestCase):
             REPO_ROOT / "csrc/vmm_tripool/build.sh",
             REPO_ROOT / "deploy/kairos/scripts/morphserve_common.sh",
             REPO_ROOT / "deploy/kairos/scripts/00_phase0_probe_vmm.sh",
+            REPO_ROOT / "deploy/kairos/scripts/01_phase0_download_bagel.sh",
+            REPO_ROOT / "deploy/kairos/scripts/02_phase0_topo_8gpu.sh",
         ]
         for script in scripts:
             proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, msg=f"bash -n failed for {script}: {proc.stderr}")
+
+    def test_phase0_modules_import(self) -> None:
+        from morphserve.bench import topo_probe
+        from morphserve.tools import fetch_hf, verify_model
+
+        self.assertTrue(callable(topo_probe.main))
+        self.assertTrue(callable(fetch_hf.main))
+        self.assertTrue(callable(verify_model.main))
 
 
 if __name__ == "__main__":

@@ -23,17 +23,20 @@ import urllib.request
 
 class TripoolStats(ctypes.Structure):
     _fields_ = [
-        ("granularity_bytes", ctypes.c_uint64),
-        ("pool_total_pages", ctypes.c_uint64),
-        ("pool_free_pages", ctypes.c_uint64),
-        ("mapped_pages_current", ctypes.c_uint64),
-        ("mapped_pages_peak", ctypes.c_uint64),
-        ("small_slab_pages_current", ctypes.c_uint64),
+        ("min_granularity_bytes", ctypes.c_uint64),
+        ("handle_bytes", ctypes.c_uint64),
+        ("pool_total_handles", ctypes.c_uint64),
+        ("pool_free_handles", ctypes.c_uint64),
+        ("mapped_handles_current", ctypes.c_uint64),
+        ("mapped_handles_peak", ctypes.c_uint64),
+        ("live_allocs_current", ctypes.c_uint64),
         ("overflow_creates", ctypes.c_uint64),
         ("alloc_calls", ctypes.c_uint64),
         ("free_calls", ctypes.c_uint64),
+        ("scope_flushes", ctypes.c_uint64),
         ("total_map_us", ctypes.c_double),
         ("total_unmap_us", ctypes.c_double),
+        ("total_sync_us", ctypes.c_double),
     ]
 
 
@@ -312,7 +315,7 @@ def _tensor_sha256(tensor) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def run_pytorch_mempool_probe(so_path: Path) -> dict:
+def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int = 5) -> dict:
     if not so_path.is_file():
         return {"status": "missing_library", "path": str(so_path)}
     try:
@@ -328,8 +331,12 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
         return {"status": "unsupported_pytorch_api"}
 
     lib = ctypes.CDLL(str(so_path))
-    lib.tripool_init.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t]
-    lib.tripool_init.restype = ctypes.c_int
+    lib.tripool_init_ex.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+    lib.tripool_init_ex.restype = ctypes.c_int
+    lib.tripool_scope_begin.argtypes = []
+    lib.tripool_scope_begin.restype = None
+    lib.tripool_scope_end.argtypes = [ctypes.c_void_p]
+    lib.tripool_scope_end.restype = ctypes.c_int
     lib.tripool_get_stats.argtypes = [ctypes.POINTER(TripoolStats)]
     lib.tripool_get_stats.restype = None
     lib.tripool_shutdown.argtypes = []
@@ -337,11 +344,10 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
-    # Warm up cuDNN / default allocator context before initializing TriPool
     _ = torch.zeros(1, device=device)
     torch.cuda.synchronize()
 
-    rc = lib.tripool_init(0, 6144, 16)
+    rc = lib.tripool_init_ex(0, 6144, 16, handle_mib)
     if rc != 0:
         return {"status": "init_failed", "rc": rc}
 
@@ -349,7 +355,6 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
         torch.manual_seed(2026)
         torch.cuda.manual_seed_all(2026)
 
-        # Simulated FLUX VAE decode upsampling blocks (bf16, multi-GB transient activation spike)
         conv1 = nn.Conv2d(256, 256, kernel_size=3, padding=1, dtype=torch.bfloat16, device=device).eval()
         gn1 = nn.GroupNorm(32, 256, dtype=torch.bfloat16, device=device).eval()
         conv2 = nn.Conv2d(256, 128, kernel_size=3, padding=1, dtype=torch.bfloat16, device=device).eval()
@@ -363,7 +368,7 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
             h1 = conv1(h)
             h2 = h + h1
             h3 = F.silu(conv2(h2))
-            # Force a large transient buffer (2.0 GiB) matching high-res FLUX VAE conv peaks
+            # Force a 2.0 GiB transient buffer matching high-res FLUX VAE conv peaks
             scratch = torch.empty((16, 256, 512, 512), dtype=torch.bfloat16, device=device)
             scratch[:2].copy_(h2)
             out = conv3(h3) + scratch[:2, :3] * 0.0
@@ -371,18 +376,19 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
             return out
 
         with torch.inference_mode():
-            # Warmup cuDNN kernels on default allocator before timing
+            # Warmup cuDNN kernels on default allocator
             _ = vae_like_forward(x_in)
             torch.cuda.synchronize()
 
-            # Reference run on PyTorch default allocator
-            t_ref0 = time.perf_counter()
-            out_ref = vae_like_forward(x_in)
-            torch.cuda.synchronize()
-            ref_ms = (time.perf_counter() - t_ref0) * 1000.0
+            ref_times = []
+            out_ref = None
+            for _ in range(repeats):
+                t0 = time.perf_counter()
+                out_ref = vae_like_forward(x_in)
+                torch.cuda.synchronize()
+                ref_times.append((time.perf_counter() - t0) * 1000.0)
             ref_sha = _tensor_sha256(out_ref)
 
-            # TriPool-VMM scoped MemPool run
             pluggable = torch.cuda.CUDAPluggableAllocator(
                 str(so_path), "tripool_alloc", "tripool_free"
             )
@@ -391,17 +397,28 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
             st_before = TripoolStats()
             lib.tripool_get_stats(ctypes.byref(st_before))
 
-            torch.cuda.synchronize()
-            t_vmm0 = time.perf_counter()
-            with torch.cuda.use_mem_pool(pool):
-                out_vmm_pooled = vae_like_forward(x_in)
-                # Copy compact final output out to default allocator? Wait: inside scope
-                # we keep out_vmm_pooled, then clone outside scope so pool releases 100%.
-            out_vmm = out_vmm_pooled.clone()
-            del out_vmm_pooled
-            gc.collect()
-            torch.cuda.synchronize()
-            vmm_ms = (time.perf_counter() - t_vmm0) * 1000.0
+            vmm_times = []
+            out_vmm = None
+            all_reclaimed_each = []
+            for _ in range(repeats + 1):  # 1 warmup + repeats measured
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                lib.tripool_scope_begin()
+                with torch.cuda.use_mem_pool(pool):
+                    out_vmm_pooled = vae_like_forward(x_in)
+                out_vmm = out_vmm_pooled.clone()
+                del out_vmm_pooled
+                stream_ptr = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
+                lib.tripool_scope_end(stream_ptr)
+                torch.cuda.synchronize()
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                st_iter = TripoolStats()
+                lib.tripool_get_stats(ctypes.byref(st_iter))
+                all_reclaimed_each.append(st_iter.mapped_handles_current == 0)
+                vmm_times.append(dt_ms)
+
+            vmm_cold_ms = vmm_times[0]
+            vmm_steady_times = vmm_times[1:]
 
             del pool, pluggable
             gc.collect()
@@ -414,18 +431,25 @@ def run_pytorch_mempool_probe(so_path: Path) -> dict:
             bit_exact = bool(torch.equal(out_ref, out_vmm) and ref_sha == vmm_sha)
             max_abs_diff = float((out_ref.float() - out_vmm.float()).abs().max().item())
 
+        ref_p50 = sorted(ref_times)[len(ref_times) // 2]
+        vmm_p50 = sorted(vmm_steady_times)[len(vmm_steady_times) // 2]
         return {
-            "status": "ok" if (bit_exact and st_after.mapped_pages_current == 0) else "check_failed",
+            "status": "ok" if (bit_exact and st_after.mapped_handles_current == 0 and all(all_reclaimed_each)) else "check_failed",
+            "handle_mib": handle_mib,
             "bit_exact": bit_exact,
             "ref_sha256": ref_sha,
             "vmm_sha256": vmm_sha,
             "max_abs_diff": max_abs_diff,
-            "ref_ms": round(ref_ms, 3),
-            "vmm_ms": round(vmm_ms, 3),
+            "ref_p50_ms": round(ref_p50, 3),
+            "vmm_cold_ms": round(vmm_cold_ms, 3),
+            "vmm_steady_p50_ms": round(vmm_p50, 3),
+            "vmm_overhead_p50_ms": round(vmm_p50 - ref_p50, 3),
+            "ref_times_ms": [round(x, 3) for x in ref_times],
+            "vmm_steady_times_ms": [round(x, 3) for x in vmm_steady_times],
             "peak_transient_mib": round(
-                (st_after.mapped_pages_peak * st_after.granularity_bytes) / (1024**2), 2
+                (st_after.mapped_handles_peak * st_after.handle_bytes) / (1024**2), 2
             ),
-            "all_pages_reclaimed": st_after.mapped_pages_current == 0,
+            "all_pages_reclaimed": st_after.mapped_handles_current == 0 and all(all_reclaimed_each),
             "zero_hotpath_overflow": st_after.overflow_creates == 0,
             "stats_before": stats_to_dict(st_before),
             "stats_after": stats_to_dict(st_after),
@@ -479,16 +503,24 @@ def main(argv: list[str] | None = None) -> int:
     print(f"wrote {out_path}", flush=True)
 
     # Print concise executive summary to stdout for job logs
+    sweep = report.get("cpp_vmm_probe", {}).get("granularity_sweep") or []
+    sweep_by_mib = {item.get("handle_mib"): item for item in sweep}
     summary = {
         "vmm_compiled": None if vmm_build_status is None else vmm_build_status.get("compiled"),
         "vmm_cpp_status": report.get("cpp_vmm_probe", {}).get("status"),
         "single_2mb_remap_p50_us": report.get("cpp_vmm_probe", {}).get("single_2mb_remap_us", {}).get("p50"),
-        "vae_4gib_acquire_p50_ms": report.get("cpp_vmm_probe", {}).get("vae_spike_acquire_ms", {}).get("p50"),
-        "vae_4gib_release_p50_ms": report.get("cpp_vmm_probe", {}).get("vae_spike_release_ms", {}).get("p50"),
+        "vae_4gib_2mib_p50_ms": sweep_by_mib.get(2, {}).get("vae_4gib_acquire_ms", {}).get("p50"),
+        "vae_4gib_64mib_p50_ms": sweep_by_mib.get(64, {}).get("vae_4gib_acquire_ms", {}).get("p50"),
+        "vae_4gib_128mib_p50_ms": sweep_by_mib.get(128, {}).get("vae_4gib_acquire_ms", {}).get("p50"),
+        "vae_4gib_128mib_unmap_p50_ms": sweep_by_mib.get(128, {}).get("vae_4gib_bulk_unmap_only_ms", {}).get("p50"),
+        "h2d_128mib_remap_p50_ms": report.get("cpp_vmm_probe", {}).get("h2d_super_remap_ms", {}).get("p50"),
         "h2d_stream_p50_gbps": report.get("cpp_vmm_probe", {}).get("h2d_stream_gbps", {}).get("p50"),
         "mempool_status": report.get("pytorch_mempool_probe", {}).get("status"),
         "mempool_bit_exact": report.get("pytorch_mempool_probe", {}).get("bit_exact"),
         "mempool_all_reclaimed": report.get("pytorch_mempool_probe", {}).get("all_pages_reclaimed"),
+        "mempool_ref_p50_ms": report.get("pytorch_mempool_probe", {}).get("ref_p50_ms"),
+        "mempool_vmm_steady_p50_ms": report.get("pytorch_mempool_probe", {}).get("vmm_steady_p50_ms"),
+        "mempool_overhead_p50_ms": report.get("pytorch_mempool_probe", {}).get("vmm_overhead_p50_ms"),
         "mempool_peak_mib": report.get("pytorch_mempool_probe", {}).get("peak_transient_mib"),
     }
     print("PHASE0_SUMMARY=" + json.dumps(summary, ensure_ascii=False), flush=True)

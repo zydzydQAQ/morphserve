@@ -1,0 +1,530 @@
+{
+  "schema": "morphserve.phase0.motivation.v1",
+  "timestamp_utc": "2026-11-20T14:58:58Z",
+  "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+  "weights_and_configs": {
+    "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+    "files_scanned": [
+      {
+        "file": "ae.safetensors",
+        "tensor_mib": 319.75
+      },
+      {
+        "file": "ema.safetensors",
+        "tensor_mib": 27861.14
+      }
+    ],
+    "total_gib": 27.52,
+    "understanding_expert_gib": 14.185,
+    "generation_expert_gib": 12.208,
+    "vit_and_connector_gib": 0.814,
+    "vae_gib": 0.313,
+    "category_mib": {
+      "generation_attn": 1568.26,
+      "generation_io_embed": 28.44,
+      "generation_mlp": 10904.26,
+      "generation_norm_other": 0.38,
+      "understanding_attn": 1568.26,
+      "understanding_io_embed": 2079.01,
+      "understanding_mlp": 10878.0,
+      "understanding_norm_other": 0.38,
+      "vae": 320.19,
+      "vit_and_connector": 833.69
+    },
+    "category_params_m": {
+      "generation_attn": 822.22,
+      "generation_io_embed": 14.91,
+      "generation_mlp": 5716.97,
+      "generation_norm_other": 0.2,
+      "understanding_attn": 822.22,
+      "understanding_io_embed": 1090.0,
+      "understanding_mlp": 5703.2,
+      "understanding_norm_other": 0.2,
+      "vae": 84.05,
+      "vit_and_connector": 437.1
+    },
+    "dtype_gib": {
+      "BF16": 27.208,
+      "F32": 0.312
+    },
+    "num_layers": 28,
+    "per_layer_generation_mib_summary": {
+      "min": 444.52,
+      "median": 444.52,
+      "max": 444.52
+    },
+    "per_layer_understanding_mib_summary": {
+      "min": 444.52,
+      "median": 444.52,
+      "max": 444.52
+    },
+    "sample_names": {
+      "vae": [
+        "ae.safetensors:decoder.conv_in.bias [512] F32",
+        "ae.safetensors:decoder.conv_in.weight [512, 16, 3, 3] F32",
+        "ae.safetensors:decoder.conv_out.bias [3] F32",
+        "ae.safetensors:decoder.conv_out.weight [3, 128, 3, 3] F32",
+        "ae.safetensors:decoder.mid.attn_1.k.bias [512] F32",
+        "ae.safetensors:decoder.mid.attn_1.k.weight [512, 512, 1, 1] F32"
+      ],
+      "vit_and_connector": [
+        "ema.safetensors:connector.fc1.bias [3584] BF16",
+        "ema.safetensors:connector.fc1.weight [3584, 1152] BF16",
+        "ema.safetensors:connector.fc2.bias [3584] BF16",
+        "ema.safetensors:connector.fc2.weight [3584, 3584] BF16",
+        "ema.safetensors:vit_model.vision_model.embeddings.patch_embedding.bias [1152] BF16",
+        "ema.safetensors:vit_model.vision_model.embeddings.patch_embedding.weight [1152, 588] BF16"
+      ],
+      "understanding_io_embed": [
+        "ema.safetensors:language_model.lm_head.weight [152064, 3584] BF16",
+        "ema.safetensors:language_model.model.embed_tokens.weight [152064, 3584] BF16",
+        "ema.safetensors:language_model.model.norm.weight [3584] BF16"
+      ],
+      "understanding_norm_other": [
+        "ema.safetensors:language_model.model.layers.0.input_layernorm.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.post_attention_layernorm.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.input_layernorm.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.post_attention_layernorm.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.10.input_layernorm.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.10.post_attention_layernorm.weight [3584] BF16"
+      ],
+      "generation_norm_other": [
+        "ema.safetensors:language_model.model.layers.0.input_layernorm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.post_attention_layernorm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.input_layernorm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.post_attention_layernorm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.10.input_layernorm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:language_model.model.layers.10.post_attention_layernorm_moe_gen.weight [3584] BF16"
+      ],
+      "understanding_mlp": [
+        "ema.safetensors:language_model.model.layers.0.mlp.down_proj.weight [3584, 18944] BF16",
+        "ema.safetensors:language_model.model.layers.0.mlp.gate_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.mlp.up_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp.down_proj.weight [3584, 18944] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp.gate_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp.up_proj.weight [18944, 3584] BF16"
+      ],
+      "generation_mlp": [
+        "ema.safetensors:language_model.model.layers.0.mlp_moe_gen.down_proj.weight [3584, 18944] BF16",
+        "ema.safetensors:language_model.model.layers.0.mlp_moe_gen.gate_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.mlp_moe_gen.up_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp_moe_gen.down_proj.weight [3584, 18944] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp_moe_gen.gate_proj.weight [18944, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.1.mlp_moe_gen.up_proj.weight [18944, 3584] BF16"
+      ],
+      "understanding_attn": [
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_norm.weight [128] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_proj.bias [512] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_proj.weight [512, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.o_proj.weight [3584, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.q_norm.weight [128] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.q_proj.bias [3584] BF16"
+      ],
+      "generation_attn": [
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_norm_moe_gen.weight [128] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_proj_moe_gen.bias [512] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.k_proj_moe_gen.weight [512, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.o_proj_moe_gen.weight [3584, 3584] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.q_norm_moe_gen.weight [128] BF16",
+        "ema.safetensors:language_model.model.layers.0.self_attn.q_proj_moe_gen.bias [3584] BF16"
+      ],
+      "generation_io_embed": [
+        "ema.safetensors:language_model.model.norm_moe_gen.weight [3584] BF16",
+        "ema.safetensors:latent_pos_embed.pos_embed [4096, 3584] BF16",
+        "ema.safetensors:llm2vae.bias [64] BF16",
+        "ema.safetensors:llm2vae.weight [64, 3584] BF16"
+      ]
+    },
+    "vllm_omni_builtin_bagel_yamls": {
+      "deploy/bagel.yaml": "# BAGEL-7B-MoT deploy: CUDA defaults, verified on NVIDIA A100 (80GB).\n#\n# Stage 0 (Thinker) and Stage 1 (DiT) share a single GPU by default.\n# For dual-GPU setups, set stage 1 devices to \"1\".\n#\n# Fields omitted from a stage fall back to StageDeployConfig dataclass\n# defaults (see vllm_omni/config/stage_config.py).\n\nasync_chunk: false\n\nstages:\n  - stage_id: 0\n    max_num_batched_tokens: 32768\n    max_num_seqs: 3\n    gpu_memory_utilization: 0.45\n    trust_remote_code: true\n    enable_prefix_caching: false\n    devices: \"0\"\n    default_sampling_params:\n      temperature: 0.4\n      top_p: 0.9\n      top_k: 1\n      max_tokens: 2048\n      seed: 52\n      detokenize: true\n      repetition_penalty: 1.05\n\n  - stage_id: 1\n    max_num_batched_tokens: 32768\n    max_num_seqs: 1\n    enforce_eager: true\n    trust_remote_code: true\n    enable_prefix_caching: false\n    devices: \"0\"\n    input_connectors:\n      from_stage_0: shared_memory_connector\n    default_sampling_params:\n      seed: 52\n\nconnectors:\n  shared_memory_connector:\n    name: SharedMemoryConnector\n\n  rdma_connector:\n    name: MooncakeTransferEngineConnector\n    extra:\n      host: \"auto\"\n      zmq_port: 50051\n      protocol: \"rdma\"\n      device_name: \"\"\n      memory_pool_size: 4294967296\n      memory_pool_device: \"cpu\"\n",
+      "deploy/bagel_single_stage.yaml": "# BAGEL-7B-MoT single-stage deploy: all modalities handled by the DiT stage.\n#\n# The DiT stage contains a full LLM (Qwen2-MoT), ViT, VAE, and tokenizer,\n# so it supports text2img, img2img, img2text, text2text, and think mode\n# without a separate Thinker (AR) stage.\n#\n# Select this topology via:\n#   vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \\\n#       --deploy-config vllm_omni/deploy/bagel_single_stage.yaml\n#\n# Or programmatically:\n#   Omni(model=\"...\", deploy_config=\"vllm_omni/deploy/bagel_single_stage.yaml\")\n\npipeline: bagel_single_stage\nasync_chunk: false\n\nstages:\n  - stage_id: 0\n    max_num_batched_tokens: 32768\n    max_num_seqs: 1\n    enforce_eager: true\n    trust_remote_code: true\n    enable_prefix_caching: false\n    devices: \"0\"\n    default_sampling_params:\n      seed: 52\n",
+      "deploy/bagel_think.yaml": "# BAGEL-7B-MoT think-mode deploy.\n#\n# Inherits all settings from bagel.yaml; only overrides the pipeline to\n# bagel_think which uses expand_cfg_prompts_think and omits\n# kv_transfer_criteria so the Thinker decodes <think> tokens before\n# transferring KV to DiT.\n#\n# Select this topology via:\n#   python end2end.py --model ByteDance-Seed/BAGEL-7B-MoT --think\n#\n# Or explicitly:\n#   vllm serve ByteDance-Seed/BAGEL-7B-MoT --omni \\\n#       --deploy-config vllm_omni/deploy/bagel_think.yaml\n\nbase_config: bagel.yaml\npipeline: bagel_think\n"
+    }
+  },
+  "single_gpu": {
+    "status": "ok",
+    "load_seconds": 12.12,
+    "mem_after_load": {
+      "allocated_mib": 28149.21,
+      "reserved_mib": 28276.0,
+      "peak_allocated_mib": 28156.21,
+      "peak_reserved_mib": 28276.0
+    },
+    "flow_method_hooked": "predict_noise_maybe_with_cfg",
+    "bagel_methods_head": [
+      "T_destination",
+      "add_module",
+      "apply",
+      "base_model_prefix",
+      "bfloat16",
+      "buffers",
+      "call_super_init",
+      "cfg_normalize_function",
+      "check_cfg_parallel_validity",
+      "children",
+      "combine_cfg_noise",
+      "combine_multi_branch_cfg_noise",
+      "compile",
+      "config",
+      "config_class",
+      "connector",
+      "cpu",
+      "cuda",
+      "diffuse",
+      "double",
+      "dump_patches",
+      "eval",
+      "extra_repr",
+      "float",
+      "forward",
+      "forward_cache_update_text",
+      "forward_cache_update_vae",
+      "forward_cache_update_vit",
+      "forward_single_branch",
+      "forward_single_branch",
+      "generate_image",
+      "generate_text",
+      "get_buffer",
+      "get_extra_state",
+      "get_flattened_position_ids",
+      "get_parameter",
+      "get_submodule",
+      "half",
+      "hidden_size",
+      "ipu",
+      "language_model",
+      "latent_channel",
+      "latent_downsample",
+      "latent_patch_size",
+      "latent_pos_embed",
+      "llm2vae",
+      "load_state_dict",
+      "max_latent_size",
+      "modules",
+      "mtia",
+      "named_buffers",
+      "named_children",
+      "named_modules",
+      "named_parameters",
+      "num_heads",
+      "parallel_config",
+      "parameters",
+      "patch_latent_dim",
+      "predict_noise",
+      "predict_noise_maybe_with_cfg"
+    ],
+    "turns": [
+      {
+        "turn": 0,
+        "main_seq_len": 18,
+        "cfg_img_seq_len": 18,
+        "cfg_text_seq_len": 0,
+        "main_kv_mib": 4.92,
+        "cfg_img_kv_mib": 4.92,
+        "png_cpu_loopback_ms": 0.0,
+        "prefill_ms": 4592.72,
+        "gen_total_ms": 6534.1,
+        "turn_total_ms": 11129.42,
+        "mem_pre_gen": {
+          "allocated_mib": 28168.16,
+          "reserved_mib": 28326.0,
+          "peak_allocated_mib": 28168.16,
+          "peak_reserved_mib": 28326.0
+        },
+        "mem_post_gen": {
+          "allocated_mib": 28168.16,
+          "reserved_mib": 29322.0,
+          "peak_allocated_mib": 28714.95,
+          "peak_reserved_mib": 29322.0
+        },
+        "vae_events": [
+          {
+            "op": "vae_decode",
+            "elapsed_ms": 380.58,
+            "before_alloc_mib": 28168.83,
+            "peak_alloc_mib": 28714.95,
+            "spike_delta_mib": 546.12,
+            "after_alloc_mib": 28170.33,
+            "reserved_mib": 29322.0,
+            "input_shape": [
+              1,
+              16,
+              64,
+              64
+            ]
+          }
+        ],
+        "dit_step_call_count": 0,
+        "dit_step_ms_all": [],
+        "dit_step_p50_ms": null,
+        "dit_step_cv_steady": null,
+        "cfg_branch_call_count": 0,
+        "cfg_branch_ms_sample": [],
+        "cfg_branch_p50_ms": null,
+        "cfg_branch_cv_steady": null,
+        "ar_decode_info": {
+          "error": "ValueError: not enough values to unpack (expected 3, got 2)"
+        }
+      },
+      {
+        "turn": 1,
+        "main_seq_len": 5963,
+        "cfg_img_seq_len": 35,
+        "cfg_text_seq_len": 5946,
+        "main_kv_mib": 326.1,
+        "cfg_img_kv_mib": 1.91,
+        "png_cpu_loopback_ms": 140.72,
+        "prefill_ms": 1032.46,
+        "gen_total_ms": 5604.54,
+        "turn_total_ms": 6638.77,
+        "mem_pre_gen": {
+          "allocated_mib": 28814.26,
+          "reserved_mib": 29678.0,
+          "peak_allocated_mib": 28814.26,
+          "peak_reserved_mib": 29678.0
+        },
+        "mem_post_gen": {
+          "allocated_mib": 28814.26,
+          "reserved_mib": 30452.0,
+          "peak_allocated_mib": 29360.18,
+          "peak_reserved_mib": 30452.0
+        },
+        "vae_events": [
+          {
+            "op": "vae_encode",
+            "elapsed_ms": 32.5,
+            "before_alloc_mib": 28172.19,
+            "peak_alloc_mib": 28684.47,
+            "spike_delta_mib": 512.28,
+            "after_alloc_mib": 28172.44,
+            "reserved_mib": 29322.0,
+            "input_shape": [
+              1,
+              3,
+              512,
+              512
+            ]
+          },
+          {
+            "op": "vae_decode",
+            "elapsed_ms": 44.19,
+            "before_alloc_mib": 28814.93,
+            "peak_alloc_mib": 29360.18,
+            "spike_delta_mib": 545.25,
+            "after_alloc_mib": 28816.43,
+            "reserved_mib": 30452.0,
+            "input_shape": [
+              1,
+              16,
+              64,
+              64
+            ]
+          }
+        ],
+        "dit_step_call_count": 0,
+        "dit_step_ms_all": [],
+        "dit_step_p50_ms": null,
+        "dit_step_cv_steady": null,
+        "cfg_branch_call_count": 0,
+        "cfg_branch_ms_sample": [],
+        "cfg_branch_p50_ms": null,
+        "cfg_branch_cv_steady": null,
+        "ar_decode_info": {
+          "signature": "(past_key_values: vllm_omni.diffusion.models.bagel.bagel_transformer.NaiveCache, packed_start_tokens: torch.LongTensor, packed_query_position_ids: torch.LongTensor, max_length: int, do_sample: bool = False, temperature: float = 1.0, end_token_id: int | None = None)"
+        }
+      },
+      {
+        "turn": 2,
+        "main_seq_len": 11908,
+        "cfg_img_seq_len": 52,
+        "cfg_text_seq_len": 11891,
+        "main_kv_mib": 651.22,
+        "cfg_img_kv_mib": 2.84,
+        "png_cpu_loopback_ms": 87.44,
+        "prefill_ms": 1082.91,
+        "gen_total_ms": 6267.78,
+        "turn_total_ms": 7357.26,
+        "mem_pre_gen": {
+          "allocated_mib": 29794.48,
+          "reserved_mib": 30958.0,
+          "peak_allocated_mib": 29794.48,
+          "peak_reserved_mib": 30958.0
+        },
+        "mem_post_gen": {
+          "allocated_mib": 29466.73,
+          "reserved_mib": 31994.0,
+          "peak_allocated_mib": 30012.65,
+          "peak_reserved_mib": 31994.0
+        },
+        "vae_events": [
+          {
+            "op": "vae_encode",
+            "elapsed_ms": 27.1,
+            "before_alloc_mib": 28818.05,
+            "peak_alloc_mib": 29330.34,
+            "spike_delta_mib": 512.29,
+            "after_alloc_mib": 28818.3,
+            "reserved_mib": 30452.0,
+            "input_shape": [
+              1,
+              3,
+              512,
+              512
+            ]
+          },
+          {
+            "op": "vae_decode",
+            "elapsed_ms": 43.79,
+            "before_alloc_mib": 29467.4,
+            "peak_alloc_mib": 30012.65,
+            "spike_delta_mib": 545.25,
+            "after_alloc_mib": 29468.9,
+            "reserved_mib": 31994.0,
+            "input_shape": [
+              1,
+              16,
+              64,
+              64
+            ]
+          }
+        ],
+        "dit_step_call_count": 0,
+        "dit_step_ms_all": [],
+        "dit_step_p50_ms": null,
+        "dit_step_cv_steady": null,
+        "cfg_branch_call_count": 0,
+        "cfg_branch_ms_sample": [],
+        "cfg_branch_p50_ms": null,
+        "cfg_branch_cv_steady": null,
+        "ar_decode_info": {
+          "signature": "(past_key_values: vllm_omni.diffusion.models.bagel.bagel_transformer.NaiveCache, packed_start_tokens: torch.LongTensor, packed_query_position_ids: torch.LongTensor, max_length: int, do_sample: bool = False, temperature: float = 1.0, end_token_id: int | None = None)"
+        }
+      },
+      {
+        "turn": 3,
+        "main_seq_len": 17854,
+        "cfg_img_seq_len": 70,
+        "cfg_text_seq_len": 17836,
+        "main_kv_mib": 976.39,
+        "cfg_img_kv_mib": 3.83,
+        "png_cpu_loopback_ms": 68.73,
+        "prefill_ms": 1204.37,
+        "gen_total_ms": 6873.31,
+        "turn_total_ms": 8080.72,
+        "mem_pre_gen": {
+          "allocated_mib": 31744.55,
+          "reserved_mib": 32486.0,
+          "peak_allocated_mib": 31744.55,
+          "peak_reserved_mib": 32486.0
+        },
+        "mem_post_gen": {
+          "allocated_mib": 31091.22,
+          "reserved_mib": 35204.0,
+          "peak_allocated_mib": 31638.02,
+          "peak_reserved_mib": 35204.0
+        },
+        "vae_events": [
+          {
+            "op": "vae_encode",
+            "elapsed_ms": 27.09,
+            "before_alloc_mib": 29470.33,
+            "peak_alloc_mib": 29982.61,
+            "spike_delta_mib": 512.28,
+            "after_alloc_mib": 29470.58,
+            "reserved_mib": 31994.0,
+            "input_shape": [
+              1,
+              3,
+              512,
+              512
+            ]
+          },
+          {
+            "op": "vae_decode",
+            "elapsed_ms": 43.73,
+            "before_alloc_mib": 31091.89,
+            "peak_alloc_mib": 31638.02,
+            "spike_delta_mib": 546.13,
+            "after_alloc_mib": 31093.39,
+            "reserved_mib": 35204.0,
+            "input_shape": [
+              1,
+              16,
+              64,
+              64
+            ]
+          }
+        ],
+        "dit_step_call_count": 0,
+        "dit_step_ms_all": [],
+        "dit_step_p50_ms": null,
+        "dit_step_cv_steady": null,
+        "cfg_branch_call_count": 0,
+        "cfg_branch_ms_sample": [],
+        "cfg_branch_p50_ms": null,
+        "cfg_branch_cv_steady": null,
+        "ar_decode_info": {
+          "error": "ValueError: not enough values to unpack (expected 3, got 2)"
+        }
+      }
+    ],
+    "vae_batch_and_res_stress": {
+      "512_b1": {
+        "oom": false,
+        "elapsed_ms": 52.6,
+        "before_alloc_mib": 31091.22,
+        "peak_alloc_mib": 31987.47,
+        "spike_delta_mib": 896.25,
+        "peak_reserved_mib": 33114.0,
+        "out_shape": [
+          1,
+          3,
+          512,
+          512
+        ]
+      },
+      "512_b2": {
+        "oom": false,
+        "elapsed_ms": 94.46,
+        "before_alloc_mib": 31091.22,
+        "peak_alloc_mib": 32883.72,
+        "spike_delta_mib": 1792.5,
+        "peak_reserved_mib": 34522.0,
+        "out_shape": [
+          2,
+          3,
+          512,
+          512
+        ]
+      },
+      "1024_b1": {
+        "oom": false,
+        "elapsed_ms": 212.32,
+        "before_alloc_mib": 31091.22,
+        "peak_alloc_mib": 34676.22,
+        "spike_delta_mib": 3585.0,
+        "peak_reserved_mib": 37600.0,
+        "out_shape": [
+          1,
+          3,
+          1024,
+          1024
+        ]
+      },
+      "1024_b2": {
+        "oom": false,
+        "elapsed_ms": 488.05,
+        "before_alloc_mib": 31091.22,
+        "peak_alloc_mib": 38261.22,
+        "spike_delta_mib": 7170.0,
+        "peak_reserved_mib": 39654.0,
+        "out_shape": [
+          2,
+          3,
+          1024,
+          1024
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,285 @@
+{
+  "schema": "morphserve.phase0.motivation.v1",
+  "timestamp_utc": "2026-11-20T15:00:34Z",
+  "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+  "two_stage": {
+    "status": "ok",
+    "deploy_config": "/shared/code/MORPHSERVE/builds/3d0f60c/configs/bagel_2gpu_baseline.yaml",
+    "turns": [
+      {
+        "turn": 0,
+        "e2e_seconds": 21.44,
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "kv_transfer": {
+          "transfer_count": 1,
+          "total_transfer_mib": 0.99,
+          "total_transfer_seconds": 0.001,
+          "total_serialize_seconds": 0.0042,
+          "transfers": [
+            {
+              "request_id": "chatcmpl-affd98003a4b7c7b-a4a70e08",
+              "bytes": 1036773,
+              "seconds": 0.001
+            }
+          ],
+          "serializes": [
+            {
+              "request_id": "chatcmpl-affd98003a4b7c7b-a4a70e08",
+              "ms": 4.2
+            }
+          ]
+        }
+      },
+      {
+        "turn": 1,
+        "e2e_seconds": 28.403,
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "kv_transfer": {
+          "transfer_count": 3,
+          "total_transfer_mib": 652.44,
+          "total_transfer_seconds": 1.173,
+          "total_serialize_seconds": 1.6926,
+          "transfers": [
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02",
+              "bytes": 342063368,
+              "seconds": 0.624
+            },
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_text",
+              "bytes": 339999091,
+              "seconds": 0.546
+            },
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_img",
+              "bytes": 2069023,
+              "seconds": 0.003
+            }
+          ],
+          "serializes": [
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02",
+              "ms": 927.7
+            },
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_text",
+              "ms": 759.8
+            },
+            {
+              "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_img",
+              "ms": 5.1
+            }
+          ]
+        }
+      },
+      {
+        "turn": 2,
+        "e2e_seconds": 11.384,
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "kv_transfer": {
+          "transfer_count": 3,
+          "total_transfer_mib": 654.41,
+          "total_transfer_seconds": 1.141,
+          "total_serialize_seconds": 1.6578,
+          "transfers": [
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb",
+              "bytes": 343095789,
+              "seconds": 0.586
+            },
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_text",
+              "bytes": 339999026,
+              "seconds": 0.552
+            },
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_img",
+              "bytes": 3101218,
+              "seconds": 0.003
+            }
+          ],
+          "serializes": [
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb",
+              "ms": 763.4
+            },
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_text",
+              "ms": 885.4
+            },
+            {
+              "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_img",
+              "ms": 9.0
+            }
+          ]
+        }
+      },
+      {
+        "turn": 3,
+        "e2e_seconds": 11.214,
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0,
+          "prompt_tokens_details": null,
+          "completion_tokens_details": null
+        },
+        "kv_transfer": {
+          "transfer_count": 3,
+          "total_transfer_mib": 656.49,
+          "total_transfer_seconds": 1.088,
+          "total_serialize_seconds": 1.5251,
+          "transfers": [
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93",
+              "bytes": 344185590,
+              "seconds": 0.546
+            },
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_text",
+              "bytes": 339999026,
+              "seconds": 0.538
+            },
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_img",
+              "bytes": 4190764,
+              "seconds": 0.004
+            }
+          ],
+          "serializes": [
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93",
+              "ms": 771.5
+            },
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_text",
+              "ms": 748.5
+            },
+            {
+              "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_img",
+              "ms": 5.1
+            }
+          ]
+        }
+      }
+    ],
+    "aggregate_kv_transfer": {
+      "transfer_count": 10,
+      "total_transfer_mib": 1964.32,
+      "total_transfer_seconds": 3.403,
+      "total_serialize_seconds": 4.8797,
+      "transfers": [
+        {
+          "request_id": "chatcmpl-affd98003a4b7c7b-a4a70e08",
+          "bytes": 1036773,
+          "seconds": 0.001
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02",
+          "bytes": 342063368,
+          "seconds": 0.624
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_text",
+          "bytes": 339999091,
+          "seconds": 0.546
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_img",
+          "bytes": 2069023,
+          "seconds": 0.003
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb",
+          "bytes": 343095789,
+          "seconds": 0.586
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_text",
+          "bytes": 339999026,
+          "seconds": 0.552
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_img",
+          "bytes": 3101218,
+          "seconds": 0.003
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93",
+          "bytes": 344185590,
+          "seconds": 0.546
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_text",
+          "bytes": 339999026,
+          "seconds": 0.538
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_img",
+          "bytes": 4190764,
+          "seconds": 0.004
+        }
+      ],
+      "serializes": [
+        {
+          "request_id": "chatcmpl-affd98003a4b7c7b-a4a70e08",
+          "ms": 4.2
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02",
+          "ms": 927.7
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_text",
+          "ms": 759.8
+        },
+        {
+          "request_id": "chatcmpl-931bc395f6f896ce-85609a02__cfg_img",
+          "ms": 5.1
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb",
+          "ms": 763.4
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_text",
+          "ms": 885.4
+        },
+        {
+          "request_id": "chatcmpl-bdad88b1d5c0e6bf-862e59bb__cfg_img",
+          "ms": 9.0
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93",
+          "ms": 771.5
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_text",
+          "ms": 748.5
+        },
+        {
+          "request_id": "chatcmpl-afad5b806eb5704c-a9631e93__cfg_img",
+          "ms": 5.1
+        }
+      ]
+    }
+  }
+}

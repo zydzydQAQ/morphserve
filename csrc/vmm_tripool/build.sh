@@ -67,12 +67,12 @@ echo "== installing Python package and configs into $INSTALL_TMP"
 for subdir in src configs docs csrc; do
   if [ -d "$SRC_DIR/$subdir" ]; then
     rm -rf "$INSTALL_TMP/$subdir"
-    cp -a "$SRC_DIR/$subdir" "$INSTALL_TMP/$subdir"
+    cp -R "$SRC_DIR/$subdir" "$INSTALL_TMP/$subdir"
   fi
 done
 for topfile in README.md pyproject.toml; do
   if [ -f "$SRC_DIR/$topfile" ]; then
-    cp -a "$SRC_DIR/$topfile" "$INSTALL_TMP/$topfile"
+    cp "$SRC_DIR/$topfile" "$INSTALL_TMP/$topfile"
   fi
 done
 

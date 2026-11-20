@@ -1,0 +1,18 @@
+{
+  "0->1": {
+    "gbps_p50": 10.542,
+    "verified": true
+  },
+  "0->2": {
+    "gbps_p50": 10.581,
+    "verified": true
+  },
+  "0->4": {
+    "gbps_p50": 11.271,
+    "verified": true
+  },
+  "4->5": {
+    "gbps_p50": 10.467,
+    "verified": true
+  }
+}

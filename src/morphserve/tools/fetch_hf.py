@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast parallel HTTP-Range downloader with mirror probing and strict HF LFS SHA256 verification."""
+"""Fast parallel HTTP-Range downloader with mirror probing, safe cancellation, and strict HF LFS SHA256 verification."""
 
 from __future__ import annotations
 
@@ -19,6 +19,11 @@ import urllib.request
 HASH_CHUNK_SIZE = 4 * 1024 * 1024
 DEFAULT_RANGE_CHUNK_MIB = 16
 
+MODELSCOPE_REPO_ALIASES: dict[str, list[str]] = {
+    "ByteDance-Seed/BAGEL-7B-MoT": ["bytedance-community/BAGEL-7B-MoT", "ByteDance-Seed/BAGEL-7B-MoT"],
+    "InternVL-U/InternVL-U": ["OpenGVLab/InternVL-U", "InternVL-U/InternVL-U"],
+}
+
 
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -29,7 +34,7 @@ def sha256_file(path: Path) -> str:
 
 
 def get_json(url: str, timeout: int = 60) -> object:
-    req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.2"})
+    req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.3"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
@@ -71,7 +76,7 @@ def _probe_mirror_url(url: str, expected_size: int) -> tuple[bool, float, str]:
     req = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "morphserve-fetch/0.2",
+            "User-Agent": "morphserve-fetch/0.3",
             "Range": f"bytes=0-{probe_end}",
         },
     )
@@ -96,20 +101,14 @@ def _probe_mirror_url(url: str, expected_size: int) -> tuple[bool, float, str]:
         return False, 0.0, f"{type(exc).__name__}: {exc}"
 
 
-MODELSCOPE_REPO_ALIASES: dict[str, list[str]] = {
-    "ByteDance-Seed/BAGEL-7B-MoT": ["bytedance-community/BAGEL-7B-MoT", "ByteDance-Seed/BAGEL-7B-MoT"],
-    "InternVL-U/InternVL-U": ["OpenGVLab/InternVL-U", "InternVL-U/InternVL-U"],
-}
-
-
-def select_best_url(
+def rank_mirror_urls(
     endpoint: str,
     repo_id: str,
     revision: str,
     rel_path: str,
     expected_size: int,
     extra_mirrors: list[str] | None = None,
-) -> str:
+) -> list[str]:
     quoted = urllib.parse.quote(rel_path, safe="/")
     ms_file = urllib.parse.quote(rel_path, safe="")
     candidates = []
@@ -117,31 +116,36 @@ def select_best_url(
         candidates.append(
             f"https://modelscope.cn/api/v1/models/{ms_repo}/repo?Revision=master&FilePath={ms_file}"
         )
-    candidates.append(f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}")
+    hf_primary = f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}"
+    candidates.append(hf_primary)
+    if "huggingface.co" not in endpoint:
+        candidates.append(f"https://huggingface.co/{repo_id}/resolve/{revision}/{quoted}")
     if extra_mirrors:
         for base in extra_mirrors:
             candidates.append(f"{base.rstrip('/')}/{quoted}")
 
     if expected_size < 16 * 1024 * 1024:
-        return f"{endpoint.rstrip('/')}/{repo_id}/resolve/{revision}/{quoted}"
+        return [hf_primary]
 
-    best_url = candidates[-1]
-    best_mbps = -1.0
+    ranked: list[tuple[float, str]] = []
     for url in candidates:
         ok, mbps, note = _probe_mirror_url(url, expected_size)
         print(f"mirror probe {rel_path}: {url[:95]} -> {note}", flush=True)
-        if ok and mbps > best_mbps:
-            best_mbps = mbps
-            best_url = url
-    print(f"selected mirror for {rel_path}: {best_url} ({best_mbps:.2f} MiB/s probe)", flush=True)
-    return best_url
+        if ok:
+            ranked.append((mbps, url))
+    if not ranked:
+        return [hf_primary]
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    ordered = [u for _, u in ranked]
+    print(f"selected mirror for {rel_path}: {ordered[0]} ({ranked[0][0]:.2f} MiB/s probe)", flush=True)
+    return ordered
 
 
 def _download_single_small(url: str, dest: Path, expected_size: int) -> None:
     part = dest.with_name(dest.name + ".part")
     for attempt in range(1, 7):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.2"})
+            req = urllib.request.Request(url, headers={"User-Agent": "morphserve-fetch/0.3"})
             with urllib.request.urlopen(req, timeout=60) as resp, part.open("wb") as out:
                 shutil.copyfileobj(resp, out, length=1024 * 1024)
             if part.stat().st_size != expected_size:
@@ -155,15 +159,16 @@ def _download_single_small(url: str, dest: Path, expected_size: int) -> None:
 
 
 def download_file_range_parallel(
-    url: str,
+    urls: list[str],
     dest: Path,
     expected_size: int,
     workers: int = 16,
     chunk_mib: int = DEFAULT_RANGE_CHUNK_MIB,
+    max_retries: int = 24,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if expected_size < 8 * 1024 * 1024:
-        _download_single_small(url, dest, expected_size)
+        _download_single_small(urls[0], dest, expected_size)
         return
 
     chunk_bytes = chunk_mib * 1024 * 1024
@@ -185,6 +190,7 @@ def download_file_range_parallel(
             done_chunks = set()
 
     fd = os.open(str(part_path), os.O_CREAT | os.O_RDWR, 0o666)
+    stop_event = threading.Event()
     try:
         os.ftruncate(fd, expected_size)
         pending = [i for i in range(num_chunks) if i not in done_chunks]
@@ -216,28 +222,33 @@ def download_file_range_parallel(
             end = min(expected_size - 1, start + chunk_bytes - 1)
             need = end - start + 1
             last_err: Exception | None = None
-            for attempt in range(1, 9):
+            for attempt in range(1, max_retries + 1):
+                if stop_event.is_set():
+                    raise RuntimeError("cancelled")
+                # Primary fast mirror for first attempts, rotate fallbacks on repeated failures
+                url = urls[0] if (attempt <= 4 or len(urls) == 1) else urls[(attempt - 4) % len(urls)]
                 try:
                     req = urllib.request.Request(
                         url,
                         headers={
-                            "User-Agent": "morphserve-fetch/0.2",
+                            "User-Agent": "morphserve-fetch/0.3",
                             "Range": f"bytes={start}-{end}",
                         },
                     )
-                    with urllib.request.urlopen(req, timeout=45) as resp:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
                         status = getattr(resp, "status", 200)
                         if status != 206:
                             raise IOError(f"expected HTTP 206, got {status}")
                         buf = bytearray()
                         while len(buf) < need:
+                            if stop_event.is_set():
+                                raise RuntimeError("cancelled")
                             piece = resp.read(min(1024 * 1024, need - len(buf)))
                             if not piece:
                                 break
                             buf.extend(piece)
                         if len(buf) != need:
                             raise IOError(f"short chunk {idx}: got {len(buf)} != {need}")
-                        # Write directly at exact offset via lock-free pwrite
                         written = 0
                         view = memoryview(buf)
                         while written < need:
@@ -248,10 +259,13 @@ def download_file_range_parallel(
                         return need
                 except Exception as exc:
                     last_err = exc
-                    time.sleep(min(25, 1.5 * attempt))
-            raise RuntimeError(f"chunk {idx} ({start}-{end}) failed after 8 attempts: {last_err}")
+                    if stop_event.is_set():
+                        raise
+                    time.sleep(min(20.0, 1.0 * attempt))
+            raise RuntimeError(f"chunk {idx} ({start}-{end}) failed after {max_retries} attempts: {last_err}")
 
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {pool.submit(fetch_chunk, idx): idx for idx in pending}
             for fut in as_completed(futures):
                 idx = futures[fut]
@@ -276,6 +290,14 @@ def download_file_range_parallel(
                             flush=True,
                         )
                         last_log = now
+        except Exception:
+            stop_event.set()
+            with lock:
+                save_state_locked()
+            pool.shutdown(wait=False, cancel_futures=True)
+            raise
+        else:
+            pool.shutdown(wait=True)
         os.fsync(fd)
     finally:
         os.close(fd)
@@ -295,9 +317,9 @@ def sync_and_verify_repo(
     workers: int = 16,
     chunk_mib: int = DEFAULT_RANGE_CHUNK_MIB,
     verify_only: bool = False,
+    only_files: set[str] | None = None,
 ) -> dict:
     dest.mkdir(parents=True, exist_ok=True)
-    # Remove any leftover huggingface_hub xet .cache inside local_dir to save /data space
     stale_cache = dest / ".cache"
     if stale_cache.is_dir():
         shutil.rmtree(stale_cache, ignore_errors=True)
@@ -306,9 +328,15 @@ def sync_and_verify_repo(
     if revision != resolved_rev and not resolved_rev.startswith(revision):
         raise RuntimeError(f"revision mismatch: requested={revision} resolved={resolved_rev}")
 
+    selected_files = [
+        item for item in tree_files if (only_files is None or item["path"] in only_files)
+    ]
+    if only_files is not None and not selected_files:
+        raise RuntimeError(f"no files matched --only-file {sorted(only_files)}")
+
     manifest_files = []
     total_bytes = 0
-    for item in tree_files:
+    for item in selected_files:
         rel_path = item["path"]
         expected_size = item.get("size")
         lfs_sha = (item.get("lfs") or {}).get("oid") or (item.get("lfs") or {}).get("sha256")
@@ -332,9 +360,9 @@ def sync_and_verify_repo(
                 raise RuntimeError(f"missing or invalid file in --verify-only mode: {local_file}")
             if expected_size is None:
                 raise RuntimeError(f"missing expected size in tree metadata for {rel_path}")
-            url = select_best_url(endpoint, repo_id, resolved_rev, rel_path, expected_size)
+            urls = rank_mirror_urls(endpoint, repo_id, resolved_rev, rel_path, expected_size)
             download_file_range_parallel(
-                url,
+                urls,
                 local_file,
                 expected_size,
                 workers=workers,
@@ -369,12 +397,14 @@ def sync_and_verify_repo(
         "revision": revision,
         "resolved_revision": resolved_rev,
         "verified_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "partial_selection": sorted(only_files) if only_files is not None else None,
         "file_count": len(manifest_files),
         "total_bytes": total_bytes,
         "total_gib": round(total_bytes / (1024**3), 3),
         "files": manifest_files,
     }
-    manifest_path = dest / "MODEL_MANIFEST.json"
+    manifest_name = "MODEL_MANIFEST.json" if only_files is None else "PARTIAL_MANIFEST.json"
+    manifest_path = dest / manifest_name
     manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return manifest
 
@@ -388,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-workers", type=int, default=16)
     parser.add_argument("--chunk-mib", type=int, default=DEFAULT_RANGE_CHUNK_MIB)
     parser.add_argument("--verify-only", action="store_true")
+    parser.add_argument("--only-file", action="append", default=None)
     args = parser.parse_args(argv)
 
     manifest = sync_and_verify_repo(
@@ -398,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
         workers=args.max_workers,
         chunk_mib=args.chunk_mib,
         verify_only=args.verify_only,
+        only_files=set(args.only_file) if args.only_file else None,
     )
     print(
         json.dumps(

@@ -116,7 +116,7 @@ def run_overnight_deep(
                     full_suite,
                     target_qps=qps,
                     burstgpt_deltas=burst_deltas,
-                    gentd_deltas=gentd_deltas,
+                    gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
                 d["per_quadrant"] = _quadrant_breakdown(rep.sessions)
@@ -155,7 +155,7 @@ def run_overnight_deep(
                     sk_suite,
                     target_qps=1.0,
                     burstgpt_deltas=burst_deltas,
-                    gentd_deltas=gentd_deltas,
+                    gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
                 d.pop("sessions", None)

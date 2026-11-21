@@ -159,7 +159,7 @@ def run_suite_a_qps_and_ablations(
                     suite,
                     target_qps=qps,
                     burstgpt_deltas=burst_deltas,
-                    gentd_deltas=gentd_deltas,
+                    gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
                 d.pop("sessions", None)
@@ -189,7 +189,7 @@ def run_suite_a_qps_and_ablations(
                 suite,
                 target_qps=ablation_qps,
                 burstgpt_deltas=burst_deltas,
-                gentd_deltas=gentd_deltas,
+                gentd26_deltas=gentd_deltas,
             )
             d = rep.to_dict()
             d.pop("sessions", None)
@@ -263,7 +263,7 @@ def run_suite_b_skews_and_parity(
                     sk_suite,
                     target_qps=skew_qps,
                     burstgpt_deltas=burst_deltas,
-                    gentd_deltas=gentd_deltas,
+                    gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
                 d.pop("sessions", None)

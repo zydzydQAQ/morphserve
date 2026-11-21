@@ -329,14 +329,6 @@ def run_worker_process(
                 loopback.update_context_from_u8_gpu(ctx, img_or_u8, update_vae=update_vae, update_vit=update_vit)
                 return
             pil_img = img_or_u8
-            if policy.use_module3_cow_loopback and loopback is not None:
-                u8 = (
-                    torch.from_numpy(np.asarray(pil_img.convert("RGB"), dtype=np.uint8, copy=True))
-                    .permute(2, 0, 1)
-                    .to(device)
-                )
-                loopback.update_context_from_u8_gpu(ctx, u8, update_vae=update_vae, update_vit=update_vit)
-                return
 
             def vae_tf(v):
                 arr = torch.from_numpy(np.array(v.convert("RGB"), copy=True)).float() / 127.5 - 1.0

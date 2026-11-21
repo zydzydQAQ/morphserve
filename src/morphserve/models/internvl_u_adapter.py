@@ -144,6 +144,7 @@ class InternVLUDecoderPager:
 
         self._orig_vae_decode = None
         self._orig_vae_encode = None
+        self._is_pinned = False
         self._va_views: list[Any] = []
         self.mirror: SharedNumaMemfdMirror | None = None
         self._owns_mirror = False
@@ -192,10 +193,41 @@ class InternVLUDecoderPager:
                 p.data = u8_va[off : off + nbytes].view(dtype).view(shape)
 
         if self.wrap_vae:
-            self._orig_vae_decode = self.vae.decode
-            self._orig_vae_encode = self.vae.encode
-            self.vae.decode = lambda *a, **kw: vmm.run_in_transient_scope(self._orig_vae_decode, *a, **kw)
-            self.vae.encode = lambda *a, **kw: vmm.run_in_transient_scope(self._orig_vae_encode, *a, **kw)
+            orig_dec = self.vae.decode
+            orig_enc = self.vae.encode
+            self._orig_vae_decode = orig_dec
+            self._orig_vae_encode = orig_enc
+
+            def _wrapped_decode(*a, **kw):
+                was_pinned = self._is_pinned
+                prev_res = vmm.expert_resident_count(self.expert_id)
+                self._is_pinned = False
+                vmm.set_expert_pinned(self.expert_id, False)
+                try:
+                    return vmm.run_in_transient_scope(orig_dec, *a, **kw)
+                finally:
+                    if vmm.expert_resident_count(self.expert_id) < prev_res:
+                        vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                    self._is_pinned = was_pinned
+                    if was_pinned:
+                        vmm.set_expert_pinned(self.expert_id, True)
+
+            def _wrapped_encode(*a, **kw):
+                was_pinned = self._is_pinned
+                prev_res = vmm.expert_resident_count(self.expert_id)
+                self._is_pinned = False
+                vmm.set_expert_pinned(self.expert_id, False)
+                try:
+                    return vmm.run_in_transient_scope(orig_enc, *a, **kw)
+                finally:
+                    if vmm.expert_resident_count(self.expert_id) < prev_res:
+                        vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                    self._is_pinned = was_pinned
+                    if was_pinned:
+                        vmm.set_expert_pinned(self.expert_id, True)
+
+            self.vae.decode = _wrapped_decode
+            self.vae.encode = _wrapped_encode
 
         self.set_residency_alpha(initial_alpha)
 
@@ -205,6 +237,7 @@ class InternVLUDecoderPager:
         assert self.vmm is not None
         target = max(0, min(self.num_layers, int(round(float(alpha) * self.num_layers))))
         s_ptr = int(torch.cuda.current_stream(self._device).cuda_stream)
+        self._is_pinned = False
         self.vmm.set_expert_pinned(self.expert_id, False)
         if target < self.num_layers:
             self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
@@ -218,6 +251,7 @@ class InternVLUDecoderPager:
         import torch
 
         assert self.vmm is not None
+        self._is_pinned = True
         self.vmm.set_expert_pinned(self.expert_id, True)
         if self.vmm.expert_resident_count(self.expert_id) < self.num_layers:
             self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
@@ -225,9 +259,23 @@ class InternVLUDecoderPager:
         try:
             yield
         finally:
+            self._is_pinned = False
             self.vmm.set_expert_pinned(self.expert_id, False)
 
     def close(self) -> None:
+        import torch
+
+        if self._orig_vae_decode is not None:
+            self.vae.decode = self._orig_vae_decode
+            self._orig_vae_decode = None
+        if self._orig_vae_encode is not None:
+            self.vae.encode = self._orig_vae_encode
+            self._orig_vae_encode = None
+        for lid in range(self.num_layers):
+            for _, p, _, dtype, _, _ in self._layer_params[lid]:
+                p.data = torch.empty((0,), dtype=dtype, device=self._device)
+        self._va_views.clear()
+        self.vmm = None
         if self.mirror is not None and self._owns_mirror:
             self.mirror.close()
         self.mirror = None

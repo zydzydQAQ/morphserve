@@ -1,5 +1,5 @@
 {
-  "name": "morphserve-p2-m22smoke-20261121-r2",
+  "name": "morphserve-p2-m22smoke-20261121-r3",
   "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "workers": 1,
   "gpus_per_worker": 8,
@@ -12,11 +12,11 @@
     },
     {
       "name": "KAIROS_RUN_ID",
-      "value": "morphserve-p2-m22smoke-20261121-r2"
+      "value": "morphserve-p2-m22smoke-20261121-r3"
     },
     {
       "name": "KAIROS_BUILD",
-      "value": "346339d"
+      "value": "a2ba11e"
     },
     {
       "name": "KAIROS_REQUIRE_BUILD",

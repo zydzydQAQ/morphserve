@@ -56,11 +56,44 @@ def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
         sys.modules.setdefault("timm.layers", layers_mod)
 
     import transformers.image_utils as iu
+    import transformers.processing_utils as pu
+    import transformers.utils as tu
 
     if not hasattr(iu, "concatenate_list"):
         iu.concatenate_list = lambda items: [x for sub in items for x in (sub if isinstance(sub, list) else [sub])]
     if not hasattr(iu, "make_list_of_images"):
         iu.make_list_of_images = iu.make_flat_list_of_images
+    if not hasattr(iu, "is_valid_image"):
+        iu.is_valid_image = lambda img: img is not None
+    if not hasattr(iu, "valid_images"):
+        iu.valid_images = lambda imgs: True
+    if not hasattr(iu, "validate_preprocess_arguments"):
+        iu.validate_preprocess_arguments = lambda *a, **kw: None
+    if not hasattr(tu, "is_flash_attn_greater_or_equal_2_10"):
+        tu.is_flash_attn_greater_or_equal_2_10 = lambda: False
+
+    try:
+        import transformers.models.internvl.processing_internvl as pi
+
+        if not hasattr(pi, "InternVLImagesKwargs"):
+            pi.InternVLImagesKwargs = getattr(pu, "ImagesKwargs", dict)
+        if not hasattr(pi, "InternVLProcessorKwargs"):
+            pi.InternVLProcessorKwargs = getattr(pu, "ProcessingKwargs", dict)
+    except ImportError:
+        pi_mod = types.ModuleType("transformers.models.internvl.processing_internvl")
+        pi_mod.InternVLImagesKwargs = getattr(pu, "ImagesKwargs", dict)
+        pi_mod.InternVLProcessorKwargs = getattr(pu, "ProcessingKwargs", dict)
+        sys.modules["transformers.models.internvl.processing_internvl"] = pi_mod
+
+    try:
+        import transformers.models.internvl.video_processing_internvl as vpi
+
+        if not hasattr(vpi, "InternVLVideoProcessor"):
+            vpi.InternVLVideoProcessor = type("InternVLVideoProcessor", (), {})
+    except ImportError:
+        vpi_mod = types.ModuleType("transformers.models.internvl.video_processing_internvl")
+        vpi_mod.InternVLVideoProcessor = type("InternVLVideoProcessor", (), {})
+        sys.modules["transformers.models.internvl.video_processing_internvl"] = vpi_mod
 
 
 def load_internvlu_pipeline(
@@ -69,17 +102,64 @@ def load_internvlu_pipeline(
     device_index: int = 0,
 ) -> Any:
     """Load `InternVLUPipeline` from verified local safetensors in `bfloat16` on `cuda:{device_index}`."""
+    import inspect
     import torch
 
     _install_runtime_compat_shims(vendor_dir=vendor_dir)
+    from diffusers.models import AutoencoderKLQwenImage
+    from diffusers.schedulers import DPMSolverMultistepScheduler
     from internvlu import InternVLUPipeline
+    from internvlu.diffusion import InternVLUGenerationDecoder
+    from internvlu.processing_internvlu import InternVLUProcessor
+    from internvlu.vlm import InternVLUChatModel
 
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")
-    pipe = InternVLUPipeline.from_pretrained(
-        str(model_dir),
+
+    # Load each verified sub-directory directly to bypass diffusers>=0.40 custom module_path restrictions
+    vlm = InternVLUChatModel.from_pretrained(
+        str(model_dir / "vlm"),
         torch_dtype=torch.bfloat16,
         local_files_only=True,
+    )
+    generation_decoder = InternVLUGenerationDecoder.from_pretrained(
+        str(model_dir / "generation_decoder"),
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+    )
+    vae = AutoencoderKLQwenImage.from_pretrained(
+        str(model_dir / "vae"),
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+    )
+    scheduler = DPMSolverMultistepScheduler.from_pretrained(
+        str(model_dir / "scheduler"),
+        local_files_only=True,
+    )
+    processor = InternVLUProcessor.from_pretrained(
+        str(model_dir / "processor"),
+        local_files_only=True,
+    )
+
+    # Guard Qwen3ForCausalLM.forward against custom `padding_type` kwarg in transformers>=5
+    lm = getattr(vlm, "language_model", None)
+    if lm is not None and hasattr(lm, "forward"):
+        orig_lm_fwd = lm.forward
+        sig_params = inspect.signature(orig_lm_fwd).parameters
+        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+        if "padding_type" not in sig_params and not has_var_kw:
+            def _safe_lm_fwd(*a, **kw):
+                kw.pop("padding_type", None)
+                return orig_lm_fwd(*a, **kw)
+
+            lm.forward = _safe_lm_fwd
+
+    pipe = InternVLUPipeline(
+        vlm=vlm,
+        generation_decoder=generation_decoder,
+        vae=vae,
+        scheduler=scheduler,
+        processor=processor,
     )
     pipe = pipe.to(dev)
     pipe.vlm.eval()

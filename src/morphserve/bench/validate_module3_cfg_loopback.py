@@ -286,10 +286,12 @@ def _run_bagel_generate_3branch(
     )
     sampling.past_key_values = main_ctx["past_key_values"]
     sampling.kv_metadata = {"ropes": main_ctx["ropes"], "image_shape": [height, width]}
-    sampling.cfg_text_past_key_values = cfg_text_ctx["past_key_values"]
-    sampling.cfg_text_kv_metadata = {"ropes": cfg_text_ctx["ropes"], "image_shape": [height, width]}
-    sampling.cfg_img_past_key_values = cfg_img_ctx["past_key_values"]
-    sampling.cfg_img_kv_metadata = {"ropes": cfg_img_ctx["ropes"], "image_shape": [height, width]}
+    if cfg_text_ctx is not None and cfg_text_ctx["past_key_values"].key_cache[0] is not None:
+        sampling.cfg_text_past_key_values = cfg_text_ctx["past_key_values"]
+        sampling.cfg_text_kv_metadata = {"ropes": cfg_text_ctx["ropes"], "image_shape": [height, width]}
+    if cfg_img_ctx is not None and cfg_img_ctx["past_key_values"].key_cache[0] is not None:
+        sampling.cfg_img_past_key_values = cfg_img_ctx["past_key_values"]
+        sampling.cfg_img_kv_metadata = {"ropes": cfg_img_ctx["ropes"], "image_shape": [height, width]}
 
     torch.cuda.synchronize()
     t0 = time.perf_counter()

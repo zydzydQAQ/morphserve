@@ -1,5 +1,5 @@
 {
-  "name": "morphserve-p2-m21gate-20261121-r2",
+  "name": "morphserve-p2-m21gate-20261121-r3",
   "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "workers": 1,
   "gpus_per_worker": 1,
@@ -12,11 +12,11 @@
     },
     {
       "name": "KAIROS_RUN_ID",
-      "value": "morphserve-p2-m21gate-20261121-r2"
+      "value": "morphserve-p2-m21gate-20261121-r3"
     },
     {
       "name": "KAIROS_BUILD",
-      "value": "c2eb5b2"
+      "value": "12ec342"
     },
     {
       "name": "KAIROS_REQUIRE_BUILD",

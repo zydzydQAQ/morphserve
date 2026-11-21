@@ -408,8 +408,8 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
             with pager.generation_mode(prefetch_all=True):
                 _ = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=2, seed=52, hw=512)
 
-            # Turn-0 Path B (alpha=0.75 -> ~3.11 GiB H2D)
-            pager.set_residency_alpha(0.75)
+            # Turn-0 Path B (Und-role initial residency alpha=0.50 -> ~6.22 GiB H2D)
+            pager.set_residency_alpha(0.50)
             torch.cuda.synchronize(device)
             with pager.generation_mode(prefetch_all=True):
                 img_b_t0, gen_b_t0_ms = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=steps, seed=52, hw=512)
@@ -475,7 +475,11 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
             # Evaluate router decisions on live ClusterTopologyProfile
             topo = ClusterTopologyProfile.a100_pcie_8gpu_default()
             router = DualPathMorphRouter(topo)
-            workers = {
+            workers_t0 = {
+                0: WorkerState(gpu_id=0, role="und", expert_alpha=0.50, kv_free_bytes=16 * GIB),
+                1: WorkerState(gpu_id=1, role="gen", expert_alpha=1.00, kv_free_bytes=16 * GIB),
+            }
+            workers_t3 = {
                 0: WorkerState(gpu_id=0, role="hybrid", expert_alpha=0.75, kv_free_bytes=16 * GIB),
                 1: WorkerState(gpu_id=1, role="gen", expert_alpha=1.00, kv_free_bytes=16 * GIB),
             }
@@ -488,7 +492,7 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                     dit_step1_ms=340.0,
                     interleaved_roundtrip_gamma=1,
                 ),
-                workers,
+                workers_t0,
             )
             dec_long = router.decide(
                 CPTGRequestSpec(
@@ -499,7 +503,7 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                     dit_step1_ms=340.0,
                     interleaved_roundtrip_gamma=2,
                 ),
-                workers,
+                workers_t3,
             )
             payload = {
                 "t0_short_kv": {

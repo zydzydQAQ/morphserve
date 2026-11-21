@@ -2,6 +2,7 @@
 
 from .cfg_prefix_attn import (
     BagelSharedPrefixPatch,
+    _should_use_flash_prefix_split,
     get_fa2_backend_status,
     install_shared_prefix_bagel_hooks,
     shared_prefix_cfg_attention,
@@ -26,6 +27,7 @@ __all__ = [
     "CoWBranchSpec",
     "GpuInPlaceLoopback",
     "SharedPrefixCache",
+    "_should_use_flash_prefix_split",
     "cow_fork_context",
     "decode_latent_to_u8_gpu",
     "detect_lecp_prefix_len",

@@ -8,6 +8,7 @@ from .cost_router import (
     WorkerState,
 )
 from .nccl_state_shipper import (
+    DirectNcclMesh,
     DirectNcclP2PChannel,
     NcclStateShipper,
     SharedNumaMemfdMirror,
@@ -23,6 +24,7 @@ from .topology import (
 __all__ = [
     "CPTGRequestSpec",
     "ClusterTopologyProfile",
+    "DirectNcclMesh",
     "DirectNcclP2PChannel",
     "DualPathMorphRouter",
     "HalfNodeH2DPacer",

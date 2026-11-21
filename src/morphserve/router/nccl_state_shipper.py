@@ -88,6 +88,7 @@ class SharedNumaMemfdMirror:
         self._buf_keepalive = (ctypes.c_uint8 * self.nbytes).from_buffer(self.mm)
         self.ptr = int(ctypes.addressof(self._buf_keepalive))
         self._pin_api: _HostCudaPin | None = None
+        self._pinned_vmm_lib: Any = None
         self.pinned = False
 
     @classmethod
@@ -136,8 +137,15 @@ class SharedNumaMemfdMirror:
             raise
         return cls(fd=fd, mm=mm, nbytes=int(nbytes), numa_node=numa_node, is_owner=False)
 
-    def pin_cuda(self) -> None:
+    def pin_cuda(self, vmm: Any = None) -> None:
         if self.pinned:
+            return
+        if vmm is not None:
+            rc = int(vmm.lib.tripool_host_register(ctypes.c_void_p(self.ptr), ctypes.c_size_t(self.nbytes)))
+            if rc != 0:
+                raise RuntimeError(f"tripool_host_register failed (rc={rc}) for {self.nbytes} bytes")
+            self._pinned_vmm_lib = vmm.lib
+            self.pinned = True
             return
         if self._pin_api is None:
             self._pin_api = _HostCudaPin()
@@ -179,11 +187,18 @@ class SharedNumaMemfdMirror:
         return (total / 1e9) / dt_s
 
     def close(self) -> None:
-        if self.pinned and self._pin_api is not None:
-            try:
-                self._pin_api.unregister(self.ptr)
-            except Exception:
-                pass
+        if self.pinned:
+            if self._pinned_vmm_lib is not None:
+                try:
+                    self._pinned_vmm_lib.tripool_host_unregister(ctypes.c_void_p(self.ptr))
+                except Exception:
+                    pass
+                self._pinned_vmm_lib = None
+            elif self._pin_api is not None:
+                try:
+                    self._pin_api.unregister(self.ptr)
+                except Exception:
+                    pass
             self.pinned = False
         self._buf_keepalive = None
         if getattr(self, "mm", None) is not None:
@@ -561,7 +576,161 @@ class NcclStateShipper:
         )
 
 
+class DirectNcclMesh:
+    """Multi-rank NCCL P2P communicator with dedicated transfer stream (bypasses `torch.distributed`)."""
+
+    def __init__(self, rank: int, world_size: int, uid_bytes: bytes, device_index: int) -> None:
+        import torch
+
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.device_index = int(device_index)
+        self.device = torch.device(f"cuda:{self.device_index}")
+        torch.cuda.set_device(self.device)
+        self._nccl = _load_libnccl()
+        self._bind_nccl_symbols()
+        self.comm = ctypes.c_void_p(0)
+        uid = _NcclUniqueId.from_buffer_copy(uid_bytes)
+        self._check(
+            self._nccl.ncclCommInitRank(ctypes.byref(self.comm), ctypes.c_int(self.world_size), uid, ctypes.c_int(self.rank)),
+            "ncclCommInitRank",
+        )
+        self.transfer_stream = torch.cuda.Stream(device=self.device)
+
+    @staticmethod
+    def generate_unique_id_bytes() -> bytes:
+        nccl = _load_libnccl()
+        nccl.ncclGetUniqueId.argtypes = [ctypes.POINTER(_NcclUniqueId)]
+        nccl.ncclGetUniqueId.restype = ctypes.c_int
+        uid = _NcclUniqueId()
+        rc = int(nccl.ncclGetUniqueId(ctypes.byref(uid)))
+        if rc != 0:
+            raise RuntimeError(f"ncclGetUniqueId failed with ncclResult_t={rc}")
+        return bytes(uid)
+
+    def _bind_nccl_symbols(self) -> None:
+        self._nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _NcclUniqueId, ctypes.c_int]
+        self._nccl.ncclCommInitRank.restype = ctypes.c_int
+        self._nccl.ncclCommDestroy.argtypes = [ctypes.c_void_p]
+        self._nccl.ncclCommDestroy.restype = ctypes.c_int
+        self._nccl.ncclSend.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+        self._nccl.ncclSend.restype = ctypes.c_int
+        self._nccl.ncclRecv.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+        self._nccl.ncclRecv.restype = ctypes.c_int
+
+    def _check(self, rc: int, op: str) -> None:
+        if int(rc) != 0:
+            raise RuntimeError(f"{op} failed with ncclResult_t={rc}")
+
+    @staticmethod
+    def pack_bagel_context(ctx: dict[str, Any], device: Any = None) -> tuple[dict[str, Any], Any]:
+        import torch
+
+        pkv = ctx["past_key_values"]
+        num_layers = int(pkv.num_layers)
+        get_k = pkv.key_cache.get if isinstance(pkv.key_cache, dict) else (lambda i: pkv.key_cache[i])
+        get_v = pkv.value_cache.get if isinstance(pkv.value_cache, dict) else (lambda i: pkv.value_cache[i])
+        sample_k = next((get_k(l) for l in range(num_layers) if get_k(l) is not None), None)
+        if device is None:
+            device = sample_k.device if sample_k is not None else torch.device(f"cuda:{torch.cuda.current_device()}")
+
+        layer_specs: list[list[Any] | None] = []
+        chunks: list[Any] = []
+        for l in range(num_layers):
+            k = get_k(l)
+            v = get_v(l)
+            if k is None or v is None:
+                layer_specs.append(None)
+                continue
+            layer_specs.append([list(k.shape), list(v.shape), str(k.dtype).replace("torch.", "")])
+            chunks.append(k.contiguous().view(torch.uint8).reshape(-1))
+            chunks.append(v.contiguous().view(torch.uint8).reshape(-1))
+        flat = torch.cat(chunks, dim=0) if chunks else torch.empty((0,), dtype=torch.uint8, device=device)
+        meta = {
+            "num_layers": num_layers,
+            "kv_lens": list(ctx["kv_lens"]),
+            "ropes": list(ctx["ropes"]),
+            "total_bytes": int(flat.numel()),
+            "layers": layer_specs,
+        }
+        return meta, flat
+
+    @staticmethod
+    def unpack_bagel_context(meta: dict[str, Any], flat_u8: Any, naive_cache_cls: Any) -> dict[str, Any]:
+        import torch
+
+        num_layers = int(meta["num_layers"])
+        pkv = naive_cache_cls(num_layers)
+        off = 0
+        for l, spec in enumerate(meta["layers"]):
+            if spec is None:
+                continue
+            k_shape, v_shape, dt_name = spec
+            dtype = getattr(torch, dt_name)
+            elem_sz = int(torch.empty((), dtype=dtype).element_size())
+            k_bytes = int(torch.Size(k_shape).numel() * elem_sz)
+            v_bytes = int(torch.Size(v_shape).numel() * elem_sz)
+            pkv.key_cache[l] = flat_u8[off : off + k_bytes].view(dtype).reshape(k_shape).clone()
+            off += k_bytes
+            pkv.value_cache[l] = flat_u8[off : off + v_bytes].view(dtype).reshape(v_shape).clone()
+            off += v_bytes
+        return {"kv_lens": list(meta["kv_lens"]), "ropes": list(meta["ropes"]), "past_key_values": pkv}
+
+    def send_u8(self, tensor_u8: Any, dst_rank: int, sync_stream: bool = True) -> float:
+        import torch
+
+        nbytes = int(tensor_u8.numel())
+        t0 = time.perf_counter()
+        if nbytes > 0:
+            ev = torch.cuda.current_stream(self.device).record_event()
+            self.transfer_stream.wait_event(ev)
+            self._check(
+                self._nccl.ncclSend(
+                    ctypes.c_void_p(int(tensor_u8.data_ptr())),
+                    ctypes.c_size_t(nbytes),
+                    ctypes.c_int(0),
+                    ctypes.c_int(int(dst_rank)),
+                    self.comm,
+                    ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
+                ),
+                "ncclSend",
+            )
+            if sync_stream:
+                self.transfer_stream.synchronize()
+        return round((time.perf_counter() - t0) * 1000.0, 3)
+
+    def recv_u8(self, nbytes: int, src_rank: int, sync_stream: bool = True) -> tuple[Any, float]:
+        import torch
+
+        t0 = time.perf_counter()
+        flat = torch.empty((int(nbytes),), dtype=torch.uint8, device=self.device)
+        if nbytes > 0:
+            self._check(
+                self._nccl.ncclRecv(
+                    ctypes.c_void_p(int(flat.data_ptr())),
+                    ctypes.c_size_t(int(nbytes)),
+                    ctypes.c_int(0),
+                    ctypes.c_int(int(src_rank)),
+                    self.comm,
+                    ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
+                ),
+                "ncclRecv",
+            )
+            if sync_stream:
+                self.transfer_stream.synchronize()
+        return flat, round((time.perf_counter() - t0) * 1000.0, 3)
+
+    def close(self) -> None:
+        if getattr(self, "comm", None) and self.comm.value:
+            try:
+                self._nccl.ncclCommDestroy(self.comm)
+            except Exception:
+                pass
+            self.comm = ctypes.c_void_p(0)
+
+
 __all__ = [
+    "DirectNcclMesh",
     "DirectNcclP2PChannel",
     "NcclStateShipper",
     "SharedNumaMemfdMirror",

@@ -741,7 +741,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     all_pass = (
         bool(fa2_status.get("has_active_fa2"))
         and all(
-            x["exact_pass"] and (x["speedup"] >= 1.0 or not str(x["case"]).startswith("512px"))
+            x["exact_pass"] and x["speedup"] >= 1.0
             for x in micro_res
         )
         and report["test2_gpu_inplace_loopback"]["u8_decode_bit_exact"]

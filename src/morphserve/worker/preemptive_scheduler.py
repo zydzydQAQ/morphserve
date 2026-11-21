@@ -66,6 +66,7 @@ class UnifiedPreemptiveScheduler:
         init_ar_step_ms: float = 20.0,
         max_ar_tokens_per_yield: int = 1,
         pager: Any | None = None,
+        external_arrival_poll: Callable[[float], list[ArDecodeTask]] | None = None,
     ) -> None:
         if mode not in ("non_preemptive", "step_preemptive", "layer_chunk"):
             raise ValueError(f"unsupported scheduler mode: {mode}")
@@ -80,6 +81,7 @@ class UnifiedPreemptiveScheduler:
         self.ema_ar_step_ms = float(init_ar_step_ms)
         self.max_ar_tokens_per_yield = int(max_ar_tokens_per_yield)
         self.pager = pager
+        self.external_arrival_poll = external_arrival_poll
 
         self.active_ar_tasks: deque[ArDecodeTask] = deque()
         self.completed_ar_tasks: list[ArDecodeTask] = []
@@ -120,6 +122,13 @@ class UnifiedPreemptiveScheduler:
             task.arrival_time_s = self._run_t0_s + rel_s
             task.last_step_time_s = task.arrival_time_s
             self.active_ar_tasks.append(task)
+        if self.external_arrival_poll is not None and not self._in_ar_yield:
+            for task in self.external_arrival_poll(now_s):
+                if task.arrival_time_s <= 0.0:
+                    task.arrival_time_s = now_s
+                if task.last_step_time_s <= 0.0:
+                    task.last_step_time_s = task.arrival_time_s
+                self.active_ar_tasks.append(task)
 
     def _earliest_deadline_s(self) -> float | None:
         if not self.active_ar_tasks:

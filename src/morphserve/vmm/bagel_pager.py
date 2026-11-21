@@ -113,7 +113,8 @@ class BagelExpertPager:
         self.layer_stride_mib = self.layer_stride_bytes // MIB
         self.total_mirror_bytes = self.num_layers * self.layer_stride_bytes
 
-        self.mirror: NumaMemfdMirror | None = None
+        self.mirror: Any = None
+        self._owns_mirror: bool = True
         self.expert_id: int = -1
         self._va_views: list[Any] = []
         self._hook_handles: list[Any] = []
@@ -126,16 +127,10 @@ class BagelExpertPager:
         self._packed_params_count = 0
         self._packed_data_bytes = 0
 
-    def offload_to_host_mirror(self) -> dict[str, Any]:
-        """Step 1: Copy all 28 expert layers into NUMA memfd mirror and release PyTorch GPU weight memory."""
+    def _populate_and_drop_gpu_weights(self, mirror: Any, populate: bool) -> dict[str, Any]:
         import torch
 
-        self.mirror = NumaMemfdMirror(
-            self.total_mirror_bytes,
-            numa_node=self.numa_node,
-            name=f"morphserve_bagel_{self.role}",
-        )
-        host_u8 = self.mirror.as_uint8_tensor()
+        host_u8 = mirror.as_uint8_tensor() if populate else None
         packed_params_count = 0
         packed_data_bytes = 0
 
@@ -145,8 +140,9 @@ class BagelExpertPager:
             base_off = plan.layer_idx * self.layer_stride_bytes
             for ps in plan.params:
                 p = param_map[ps.name]
-                raw_cpu = p.detach().contiguous().cpu().view(torch.uint8).reshape(-1)
-                host_u8[base_off + ps.offset : base_off + ps.offset + ps.nbytes].copy_(raw_cpu)
+                if populate and host_u8 is not None:
+                    raw_cpu = p.detach().contiguous().cpu().view(torch.uint8).reshape(-1)
+                    host_u8[base_off + ps.offset : base_off + ps.offset + ps.nbytes].copy_(raw_cpu)
                 # Drop GPU storage immediately so HBM shrinks before TriPoolVMM preallocates physical pages
                 p.data = torch.empty(0, dtype=p.dtype, device=p.device)
                 packed_params_count += 1
@@ -154,7 +150,8 @@ class BagelExpertPager:
 
         self._packed_params_count = packed_params_count
         self._packed_data_bytes = packed_data_bytes
-        del host_u8
+        if host_u8 is not None:
+            del host_u8
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -167,8 +164,25 @@ class BagelExpertPager:
             "packed_data_mib": round(packed_data_bytes / MIB, 2),
             "mirror_total_mib": round(self.total_mirror_bytes / MIB, 2),
             "packing_efficiency_pct": round(100.0 * packed_data_bytes / self.total_mirror_bytes, 2),
-            "numa_bound": self.mirror.numa_bound,
+            "populated": populate,
+            "numa_bound": bool(getattr(mirror, "numa_bound", True)),
         }
+
+    def offload_to_host_mirror(self) -> dict[str, Any]:
+        """Step 1: Copy all 28 expert layers into NUMA memfd mirror and release PyTorch GPU weight memory."""
+        self.mirror = NumaMemfdMirror(
+            self.total_mirror_bytes,
+            numa_node=self.numa_node,
+            name=f"morphserve_bagel_{self.role}",
+        )
+        self._owns_mirror = True
+        return self._populate_and_drop_gpu_weights(self.mirror, populate=True)
+
+    def offload_to_shared_mirror(self, shared_mirror: Any, populate: bool = False) -> dict[str, Any]:
+        """Step 1 (8-GPU Shared Mode): Bind to a per-NUMA-socket shared memfd mirror without duplicating host RAM."""
+        self.mirror = shared_mirror
+        self._owns_mirror = False
+        return self._populate_and_drop_gpu_weights(shared_mirror, populate=populate)
 
     def bind_vmm(self, vmm: TriPoolVMM, initial_alpha: float = 1.0) -> dict[str, Any]:
         """Step 2: Pin mirror, reserve Expert VA, permanently bind Parameter.data views, load initial alpha."""
@@ -338,6 +352,6 @@ class BagelExpertPager:
 
     def close(self) -> None:
         self.unbind_vmm_keep_mirror()
-        if self.mirror is not None:
+        if self.mirror is not None and self._owns_mirror:
             self.mirror.close()
-            self.mirror = None
+        self.mirror = None

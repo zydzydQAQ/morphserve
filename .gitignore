@@ -3,12 +3,14 @@ __pycache__/
 *.so
 *.o
 *.a
+/build/
 build/
 dist/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
 .cache/
+/data/
 results/raw/
 *.log
 *.nsys-rep

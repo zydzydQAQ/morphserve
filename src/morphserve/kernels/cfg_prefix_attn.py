@@ -767,6 +767,95 @@ def _run_flash_prefix_cfg(
     return outputs
 
 
+def _should_use_flash_prefix_split(q_len: int, l_shared: int, num_shared_branches: int) -> bool:
+    """Gate two-pass FlashPrefix-CFG + LSE merge on compute-to-LSE-merge payoff."""
+    if num_shared_branches < 2 or l_shared < 256:
+        return False
+    if q_len <= 2048:
+        return l_shared >= max(256, int(1.5 * q_len))
+    return l_shared >= 4 * q_len
+
+
+def _run_unpadded_varlen_cfg(
+    q_list: list[Any],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+    k_prefix: Any | None,
+    v_prefix: Any | None,
+    shared_branch_ids: list[int],
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    sm_scale: float,
+    attn_noncausal: Any | None = None,
+) -> list[Any] | None:
+    """Single-pass unpadded varlen FA2 across all CFG branches without left-padding or LSE merge."""
+    import torch
+
+    num_branches = len(q_list)
+    q_len, h_q, head_dim = q_list[0].shape
+    h_kv = k_loc_list[0].shape[1]
+    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
+    kind, _, fn, _ = backend
+    shared_set = set(shared_branch_ids)
+    l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
+
+    all_k_parts: list[Any] = []
+    all_v_parts: list[Any] = []
+    k_lens: list[int] = []
+    for b in range(num_branches):
+        b_len = 0
+        if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
+            all_k_parts.append(k_prefix)
+            all_v_parts.append(v_prefix)
+            b_len += l_shared
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and vs is not None and ks.shape[0] > 0:
+            all_k_parts.append(ks)
+            all_v_parts.append(vs)
+            b_len += int(ks.shape[0])
+        all_k_parts.append(k_loc_list[b])
+        all_v_parts.append(v_loc_list[b])
+        b_len += int(k_loc_list[b].shape[0])
+        k_lens.append(b_len)
+
+    if kind == "vllm_varlen":
+        q_cat = torch.cat(q_list, dim=0).contiguous()
+        k_cat = torch.cat(all_k_parts, dim=0).contiguous()
+        v_cat = torch.cat(all_v_parts, dim=0).contiguous()
+        cu_q = _get_cu_seqlens([q_len] * num_branches, q_cat.device)
+        cu_k = _get_cu_seqlens(k_lens, q_cat.device)
+        res = fn(
+            q_cat,
+            k_cat,
+            v_cat,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=q_len,
+            max_seqlen_k=max(k_lens),
+            softmax_scale=sm_scale,
+            causal=False,
+            return_softmax_lse=False,
+        )
+        out_cat = res[0] if isinstance(res, tuple) else res
+        return list(out_cat.split(q_len, dim=0))
+
+    if kind == "flashinfer" or attn_noncausal is not None:
+        outs: list[Any] = []
+        for b in range(num_branches):
+            ks, vs = k_suffix_list[b], v_suffix_list[b]
+            if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
+                ks = torch.cat([k_prefix, ks], dim=0) if (ks is not None and ks.shape[0] > 0) else k_prefix
+                vs = torch.cat([v_prefix, vs], dim=0) if (vs is not None and vs.shape[0] > 0) else v_prefix
+            outs.append(
+                _run_unshared_single_branch(
+                    q_list[b], ks, vs, k_loc_list[b], v_loc_list[b], sm_scale, attn_noncausal=attn_noncausal
+                )
+            )
+        return outs
+
+    return None
+
+
 def shared_prefix_cfg_attention(
     q_list: list[Any],
     k_loc_list: list[Any],
@@ -792,9 +881,23 @@ def shared_prefix_cfg_attention(
     gqa_group = h_q // h_kv
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
-    # Preferred default: FlashPrefix-CFG (native FA2 Tensor Core 250 TFLOPS + zero-copy prefix + Triton LSE merge!)
-    if backend == "flash_prefix" and q_list[0].is_cuda and l_shared >= 256 and len(shared_branch_ids) >= 2:
-        fp_out = _run_flash_prefix_cfg(
+    # Preferred default: FlashPrefix-CFG when shared prefix compute outweighs LSE merge, else unpadded FA2 varlen.
+    if backend == "flash_prefix" and q_list[0].is_cuda:
+        if _should_use_flash_prefix_split(q_len, l_shared, len(shared_branch_ids)):
+            fp_out = _run_flash_prefix_cfg(
+                q_list=q_list,
+                k_loc_list=k_loc_list,
+                v_loc_list=v_loc_list,
+                k_prefix=k_prefix,
+                v_prefix=v_prefix,
+                shared_branch_ids=shared_branch_ids,
+                k_suffix_list=k_suffix_list,
+                v_suffix_list=v_suffix_list,
+                sm_scale=sm_scale,
+            )
+            if fp_out is not None:
+                return fp_out
+        unpadded_out = _run_unpadded_varlen_cfg(
             q_list=q_list,
             k_loc_list=k_loc_list,
             v_loc_list=v_loc_list,
@@ -804,9 +907,10 @@ def shared_prefix_cfg_attention(
             k_suffix_list=k_suffix_list,
             v_suffix_list=v_suffix_list,
             sm_scale=sm_scale,
+            attn_noncausal=attn_noncausal,
         )
-        if fp_out is not None:
-            return fp_out
+        if unpadded_out is not None:
+            return unpadded_out
 
     outputs: list[Any] = [None] * num_branches
     handled: set[int] = set()

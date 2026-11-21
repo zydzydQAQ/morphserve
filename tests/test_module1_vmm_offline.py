@@ -37,24 +37,26 @@ class _MockParam:
 
 class _MockBagelLayer:
     def __init__(self) -> None:
-        # Exact BAGEL-7B-MoT per-layer dimensions (444.52 MiB per expert!)
+        # Exact vllm_omni Qwen2MoTDecoderLayer parameter names & dimensions (444.52 MiB per expert!)
         self._params = [
-            ("self_attn.q_proj.weight", _MockParam((3584, 3584))),
-            ("self_attn.k_proj.weight", _MockParam((512, 3584))),
-            ("self_attn.v_proj.weight", _MockParam((512, 3584))),
+            ("self_attn.qkv_proj.weight", _MockParam((4608, 3584))),
+            ("self_attn.qkv_proj.bias", _MockParam((4608,))),
+            ("self_attn.qkv_proj.gen_exp.weight", _MockParam((4608, 3584))),
+            ("self_attn.qkv_proj.gen_exp.bias", _MockParam((4608,))),
             ("self_attn.o_proj.weight", _MockParam((3584, 3584))),
-            ("mlp.gate_proj.weight", _MockParam((18944, 3584))),
-            ("mlp.up_proj.weight", _MockParam((18944, 3584))),
-            ("mlp.down_proj.weight", _MockParam((3584, 18944))),
+            ("self_attn.o_proj.gen_exp.weight", _MockParam((3584, 3584))),
+            ("self_attn.q_norm.weight", _MockParam((128,))),
+            ("self_attn.q_norm.gen_weight", _MockParam((128,))),
+            ("self_attn.k_norm.weight", _MockParam((128,))),
+            ("self_attn.k_norm.gen_weight", _MockParam((128,))),
             ("input_layernorm.weight", _MockParam((3584,))),
-            ("self_attn.q_proj_moe_gen.weight", _MockParam((3584, 3584))),
-            ("self_attn.k_proj_moe_gen.weight", _MockParam((512, 3584))),
-            ("self_attn.v_proj_moe_gen.weight", _MockParam((512, 3584))),
-            ("self_attn.o_proj_moe_gen.weight", _MockParam((3584, 3584))),
-            ("mlp_moe_gen.gate_proj.weight", _MockParam((18944, 3584))),
-            ("mlp_moe_gen.up_proj.weight", _MockParam((18944, 3584))),
+            ("input_layernorm.gen_weight", _MockParam((3584,))),
+            ("mlp.gate_up_proj.weight", _MockParam((37888, 3584))),
+            ("mlp.down_proj.weight", _MockParam((3584, 18944))),
+            ("mlp_moe_gen.gate_up_proj.weight", _MockParam((37888, 3584))),
             ("mlp_moe_gen.down_proj.weight", _MockParam((3584, 18944))),
-            ("input_layernorm_moe_gen.weight", _MockParam((3584,))),
+            ("post_attention_layernorm.weight", _MockParam((3584,))),
+            ("post_attention_layernorm.gen_weight", _MockParam((3584,))),
         ]
 
     def named_parameters(self):
@@ -111,10 +113,11 @@ class TestModule1VmmOffline(unittest.TestCase):
         # 444.5 MiB aligns cleanly into 7 x 64 MiB = 448 MiB (>99% efficiency!)
         self.assertEqual(stride_bytes, 448 * 1024 * 1024)
         for plan in plans:
-            self.assertEqual(len(plan.params), 8)
+            self.assertEqual(len(plan.params), 9)
             for ps in plan.params:
                 self.assertEqual(ps.offset % ALIGN_BYTES, 0)
             self.assertLessEqual(plan.used_bytes, stride_bytes)
+            self.assertGreater(plan.used_bytes / stride_bytes, 0.99)
 
     def test_memfd_mirror_read_write(self) -> None:
         mirror = NumaMemfdMirror(4 * 1024 * 1024, numa_node=0, name="test_mirror")

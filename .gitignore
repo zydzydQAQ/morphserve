@@ -13,3 +13,4 @@ results/raw/
 *.log
 *.nsys-rep
 *.sqlite
+vllm_omni_ref/

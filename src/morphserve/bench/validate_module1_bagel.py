@@ -342,6 +342,13 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     report["test1_alpha_sweep"] = alpha_results
 
     # Also measure high-res 1024x1024 Step-1 overlap (10 steps: ~4x larger DiT compute horizon!)
+    # Warm up 1024x1024 Triton/cuDNN kernels once at alpha=1.0 so the sweep is jitter-free.
+    pager.set_residency_alpha(1.0)
+    with pager.generation_mode(prefetch_all=False):
+        _h_warm, _ = _run_bagel_generate(
+            pipeline, main_ctx, cfg_img_ctx, prompt, steps=2, seed=52, height=1024, width=1024, sync_before=True
+        )
+    del _h_warm
     hires_results = []
     hires_ref_sha = None
     for alpha in (1.0, 0.75, 0.50, 0.0):

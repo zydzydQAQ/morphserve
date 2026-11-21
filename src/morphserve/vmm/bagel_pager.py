@@ -35,7 +35,12 @@ def align_up(n: int, align: int = ALIGN_BYTES) -> int:
 
 
 def is_generation_param_name(name: str) -> bool:
-    return ("moe_gen" in name) or ("_gen." in name) or name.endswith("_gen") or ("gen_proj" in name)
+    return (
+        ("moe_gen" in name)
+        or (".gen_exp." in name)
+        or name.endswith(".gen_weight")
+        or (name == "gen_weight")
+    )
 
 
 def build_layer_pack_plans(

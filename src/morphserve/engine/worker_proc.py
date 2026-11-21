@@ -181,15 +181,17 @@ def run_worker_process(
     ack_q: Any,
 ) -> None:
     """Main entry point for each persistent GPU worker process."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
     import numpy as np
     from PIL import Image
     import torch
+
+    torch.cuda.set_device(rank)
     from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     bench_root = Path(bench_root_str)
     model_dir = Path(model_dir_str)

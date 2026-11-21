@@ -108,7 +108,8 @@ def simulate_cluster_point(
     """Discrete-event simulation of N-GPU serving under dual-stream arrivals & fabric contention."""
     if policy_name not in VALID_POLICIES:
         raise ValueError(f"unknown policy: {policy_name}")
-    rng = random.Random(seed + hash((policy_name, num_gpus, hw.name)) % 10007)
+    # Identical deterministic arrival trace across all policies at a given (num_gpus, hw) point
+    rng = random.Random(int(seed) + int(num_gpus) * 97 + int(round(hw.compute_speedup_x * 100.0)))
     bp = base_params or {}
     ar_tok_ms = bp.get("ar_tok_ms", 23.5) / hw.compute_speedup_x
     ar_prefill_ms = bp.get("ar_prefill_ms", 62.0) / hw.compute_speedup_x

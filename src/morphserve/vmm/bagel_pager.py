@@ -273,22 +273,28 @@ class BagelExpertPager:
 
         def _wrapped_decode(*args, **kwargs):
             was_active = self._active_guard
+            prev_res = vmm.expert_resident_count(self.expert_id)
             self._active_guard = False
             vmm.set_expert_pinned(self.expert_id, False)
             try:
                 return vmm.run_in_transient_scope(self._orig_vae_decode, *args, **kwargs)
             finally:
+                if vmm.expert_resident_count(self.expert_id) < prev_res:
+                    vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
                 self._active_guard = was_active
                 if was_active:
                     vmm.set_expert_pinned(self.expert_id, True)
 
         def _wrapped_encode(*args, **kwargs):
             was_active = self._active_guard
+            prev_res = vmm.expert_resident_count(self.expert_id)
             self._active_guard = False
             vmm.set_expert_pinned(self.expert_id, False)
             try:
                 return vmm.run_in_transient_scope(self._orig_vae_encode, *args, **kwargs)
             finally:
+                if vmm.expert_resident_count(self.expert_id) < prev_res:
+                    vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
                 self._active_guard = was_active
                 if was_active:
                     vmm.set_expert_pinned(self.expert_id, True)

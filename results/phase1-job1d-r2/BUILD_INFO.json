@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "9d1411b10db40243fd20253d2ee7fdc7b802c8d7",
+  "short_commit": "9d1411b",
+  "subject": "fix(m2): iterate NaiveCache by layer index and archive M3/M4 reports",
+  "built_utc": "2026-11-21T06:47:40+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 47,
+  "bytes": 759790
+}

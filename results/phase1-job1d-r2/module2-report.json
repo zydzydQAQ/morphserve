@@ -1,0 +1,330 @@
+{
+  "schema": "morphserve.phase1.module2.v1",
+  "timestamp_utc": "2026-11-21T06:50:35Z",
+  "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+  "steps": 20,
+  "live_topology": {
+    "num_gpus": 8,
+    "gpu_names": [
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB"
+    ],
+    "half_groups": [
+      {
+        "group_id": 0,
+        "numa_node": 0,
+        "gpu_ids": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "aggregate_h2d_gbps": 10.35,
+        "solo_h2d_gbps": 8.75
+      }
+    ],
+    "intra_half_p2p_cap_gbps": 19.67,
+    "cross_half_p2p_cap_gbps": 9.98,
+    "p2p_bw_gbps": [
+      [
+        0.0,
+        9.11,
+        9.84,
+        9.1,
+        9.97,
+        9.11,
+        9.99,
+        9.1
+      ],
+      [
+        9.84,
+        0.0,
+        9.84,
+        9.11,
+        9.99,
+        9.1,
+        9.98,
+        9.1
+      ],
+      [
+        9.84,
+        9.11,
+        0.0,
+        9.11,
+        9.97,
+        9.1,
+        9.98,
+        9.1
+      ],
+      [
+        9.84,
+        9.11,
+        9.84,
+        0.0,
+        9.99,
+        9.11,
+        9.99,
+        9.11
+      ],
+      [
+        9.98,
+        9.1,
+        9.98,
+        9.11,
+        0.0,
+        9.11,
+        9.85,
+        9.11
+      ],
+      [
+        9.98,
+        9.09,
+        9.98,
+        9.11,
+        9.85,
+        0.0,
+        9.85,
+        9.11
+      ],
+      [
+        9.97,
+        9.1,
+        9.98,
+        9.11,
+        9.85,
+        9.11,
+        0.0,
+        9.11
+      ],
+      [
+        9.97,
+        9.1,
+        9.97,
+        9.11,
+        9.85,
+        9.11,
+        9.85,
+        0.0
+      ]
+    ]
+  },
+  "test1_shared_numa_memfd_and_h2d_pacer": {
+    "world_size": 8,
+    "payload_per_mirror_gib": 12.25,
+    "naive_8gpu_host_ram_gib": 98.0,
+    "shared_2socket_host_ram_gib": 24.5,
+    "observed_shmem_delta_gib": 24.5,
+    "host_ram_savings_x": 4.0,
+    "all_inodes_matched": true,
+    "all_sentinels_matched": true,
+    "unpaced_4gpu_half0_agg_gbps": 12.4,
+    "unpaced_4gpu_half0_per_gpu_gbps": 3.1,
+    "unpaced_4gpu_half0_wall_ms": 1517.45,
+    "paced_dual_half_per_gpu_gbps": 12.34,
+    "paced_dual_half_4req_wall_ms": 763.61,
+    "h2d_per_gpu_speedup_x": 3.98,
+    "ranks": [
+      {
+        "rank": 0,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.37,
+        "paced_bw_gbps": 12.34,
+        "paced_dma_ms": 381.34,
+        "paced_wait_plus_dma_ms": 762.93
+      },
+      {
+        "rank": 1,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.39,
+        "paced_bw_gbps": 12.35,
+        "paced_dma_ms": 380.85,
+        "paced_wait_plus_dma_ms": 381.53
+      },
+      {
+        "rank": 2,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.45,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 3,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.3,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 4,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 12.33,
+        "paced_dma_ms": 381.44,
+        "paced_wait_plus_dma_ms": 763.61
+      },
+      {
+        "rank": 5,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 12.33,
+        "paced_dma_ms": 381.42,
+        "paced_wait_plus_dma_ms": 382.04
+      },
+      {
+        "rank": 6,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 7,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      }
+    ]
+  },
+  "test2_bagel_dualpath_crossover": {
+    "t0_short_kv": {
+      "kv_mib": 0.98,
+      "router_decision": "state_ship",
+      "router_dst_gpu": 1,
+      "path_a_ship_ms": 0.336,
+      "path_a_bw_gbps": 3.068,
+      "path_b_morph_overhead_ms": 256.16,
+      "path_a_bit_exact": true,
+      "path_b_bit_exact": true
+    },
+    "t3_long_interleaved_kv": {
+      "seq_len": 23822,
+      "kv_mib": 1302.77,
+      "router_decision": "in_place_morph",
+      "router_dst_gpu": 0,
+      "path_a_gamma2_ship_ms": 7454.12,
+      "path_a_bw_gbps": 10.423,
+      "path_b_morph_overhead_ms": 216.77,
+      "path_a_bit_exact": true,
+      "path_b_bit_exact": true
+    }
+  },
+  "test3_mixed_cptg_8req_burst": {
+    "decisions": [
+      {
+        "req_id": "req0_bagel_t0_short",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 1,
+        "t_ship_ms": 3.46,
+        "t_morph_ms": 622.597,
+        "reason": "tight_mot: same_half state_ship(4.0MiB) 3.5ms < morph 622.6ms"
+      },
+      {
+        "req_id": "req1_internvl_u_bridge",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 5,
+        "t_ship_ms": 8.525,
+        "t_morph_ms": 612.247,
+        "reason": "bridge_mllm_dit: same_half state_ship(24.0MiB) 8.5ms < morph 612.2ms"
+      },
+      {
+        "req_id": "req2_bagel_t4_long",
+        "path": "in_place_morph",
+        "src_gpu": 2,
+        "dst_gpu": 2,
+        "t_ship_ms": 451.896,
+        "t_morph_ms": 146.374,
+        "reason": "tight_mot: in_place_morph(alpha=0.75) 146.4ms <= ship 451.9ms"
+      },
+      {
+        "req_id": "req3_bagel_1024px",
+        "path": "state_ship",
+        "src_gpu": 4,
+        "dst_gpu": 3,
+        "t_ship_ms": 279.244,
+        "t_morph_ms": 382.121,
+        "reason": "tight_mot: same_half state_ship(1200.0MiB) 279.2ms < morph 382.1ms"
+      },
+      {
+        "req_id": "req4_internvl_u_h1",
+        "path": "state_ship",
+        "src_gpu": 4,
+        "dst_gpu": 7,
+        "t_ship_ms": 10.367,
+        "t_morph_ms": 985.121,
+        "reason": "bridge_mllm_dit: same_half state_ship(32.0MiB) 10.4ms < morph 985.1ms"
+      },
+      {
+        "req_id": "req5_bagel_t3_long_h1",
+        "path": "in_place_morph",
+        "src_gpu": 6,
+        "dst_gpu": 6,
+        "t_ship_ms": 1416.348,
+        "t_morph_ms": 519.247,
+        "reason": "tight_mot: in_place_morph(alpha=0.75) 519.2ms <= ship 1416.3ms"
+      },
+      {
+        "req_id": "req6_bagel_t0_spill",
+        "path": "in_place_morph",
+        "src_gpu": 0,
+        "dst_gpu": 0,
+        "t_ship_ms": 1371.976,
+        "t_morph_ms": 1368.345,
+        "reason": "tight_mot: in_place_morph(alpha=0.50) 1368.3ms <= ship 1372.0ms"
+      },
+      {
+        "req_id": "req7_bagel_1024_h0",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 4,
+        "t_ship_ms": 1819.261,
+        "t_morph_ms": 4879.0,
+        "reason": "tight_mot: same_half state_ship(1500.0MiB) 1819.3ms < morph 4879.0ms"
+      }
+    ],
+    "bridge_all_shipped": true,
+    "short_all_shipped": false,
+    "long_and_1024_all_in_place": false
+  },
+  "status": "check_failed"
+}

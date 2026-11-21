@@ -168,7 +168,7 @@ def _read_gpu_numa_node_sysfs(bus_id: str) -> int:
     sys_path = Path(f"/sys/bus/pci/devices/{norm}/numa_node")
     try:
         val = int(sys_path.read_text(encoding="utf-8").strip())
-        return val if val >= 0 else 0
+        return val if val >= 0 else -1
     except Exception:
         return -1
 
@@ -215,13 +215,16 @@ def probe_live_topology(
         else ClusterTopologyProfile.a100_pcie_8gpu_default()
     )
     half_groups: list[PcieHalfGroup] = []
-    for gid, node in enumerate(sorted(numa_map.keys())):
-        gpus = tuple(sorted(numa_map[node]))
-        solo_bw = base.half_groups[gid % len(base.half_groups)].solo_h2d_gbps
-        agg_bw = base.half_groups[gid % len(base.half_groups)].aggregate_h2d_gbps
-        half_groups.append(
-            PcieHalfGroup(group_id=gid, numa_node=node, gpu_ids=gpus, aggregate_h2d_gbps=agg_bw, solo_h2d_gbps=solo_bw)
-        )
+    if len(numa_map) < 2:
+        half_groups = list(base.half_groups)
+    else:
+        for gid, node in enumerate(sorted(numa_map.keys())):
+            gpus = tuple(sorted(numa_map[node]))
+            solo_bw = base.half_groups[gid % len(base.half_groups)].solo_h2d_gbps
+            agg_bw = base.half_groups[gid % len(base.half_groups)].aggregate_h2d_gbps
+            half_groups.append(
+                PcieHalfGroup(group_id=gid, numa_node=node, gpu_ids=gpus, aggregate_h2d_gbps=agg_bw, solo_h2d_gbps=solo_bw)
+            )
 
     p2p_bw = [list(row) for row in base.p2p_bw_gbps]
     if quick_p2p_mib > 0:

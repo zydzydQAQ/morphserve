@@ -370,7 +370,7 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
         channel.barrier()
         if rank == 0:
             m_long_fwd = shipper.send_bagel_context(ctx_long_main, dst_rank=1)
-            # Also ship back updated KV state after DiT roundtrip (gamma=2 interleaved!)
+            channel.barrier()  # Exclude Rank 1 DiT compute time from return-trip NCCL wire measurement
             recv_back, m_long_back = shipper.recv_bagel_context(src_rank=1, naive_cache_cls=NaiveCache, device=device)
             del recv_back
             channel.barrier()
@@ -380,11 +380,13 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 pipeline, recv_long, ctx_long_text, ctx_long_img, f"{edit_p} (turn 3)", steps=steps, seed=61, hw=512
             )
             sha_a_t3 = _pil_sha256(img_a_t3)
+            del img_a_t3
+            channel.barrier()
             m_long_back = shipper.send_bagel_context(recv_long, dst_rank=0)
-            del recv_long, img_a_t3
+            del recv_long
             channel.barrier()
 
-        # ---- Path B Execution on Rank 0 using TriPool-VMM (`alpha = 0.75` and `1024px alpha = 0.50`) ----
+        # ---- Path B Execution on Rank 0 using TriPool-VMM (`alpha = 0.75`) ----
         r0_results: dict[str, Any] = {}
         if rank == 0:
             # Attach TriPool-VMM on Rank 0
@@ -400,6 +402,11 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 allow_overflow=False,
             )
             pager.bind_vmm(vmm, initial_alpha=0.75)
+
+            # Warmup TriPool CUDAPluggableAllocator MemPool once at alpha=1.0 before timed Path B
+            pager.set_residency_alpha(1.0)
+            with pager.generation_mode(prefetch_all=True):
+                _ = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=2, seed=52, hw=512)
 
             # Turn-0 Path B (alpha=0.75 -> ~3.11 GiB H2D)
             pager.set_residency_alpha(0.75)
@@ -549,8 +556,8 @@ def _test3_mixed_cptg_burst(topo: ClusterTopologyProfile) -> dict[str, Any]:
         CPTGRequestSpec(req_id="req2_bagel_t4_long", src_gpu=2, architecture="tight_mot", kv_bytes=1950 * MIB, dit_step1_ms=340.0, interleaved_roundtrip_gamma=2),
         CPTGRequestSpec(req_id="req3_bagel_1024px", src_gpu=4, architecture="tight_mot", kv_bytes=1200 * MIB, dit_step1_ms=1650.0, resolution=1024, interleaved_roundtrip_gamma=2),
         CPTGRequestSpec(req_id="req4_internvl_u_h1", src_gpu=4, architecture="bridge_mllm_dit", bridge_bytes=32 * MIB, kv_bytes=3 * GIB, dit_step1_ms=310.0, interleaved_roundtrip_gamma=2),
-        CPTGRequestSpec(req_id="req5_bagel_t3_long_h1", src_gpu=6, architecture="tight_mot", kv_bytes=2100 * MIB, dit_step1_ms=340.0, interleaved_roundtrip_gamma=2),
         CPTGRequestSpec(req_id="req6_bagel_t0_spill", src_gpu=0, architecture="tight_mot", kv_bytes=6 * MIB, dit_step1_ms=287.0),
+        CPTGRequestSpec(req_id="req5_bagel_t3_long_h1", src_gpu=6, architecture="tight_mot", kv_bytes=2100 * MIB, dit_step1_ms=340.0, interleaved_roundtrip_gamma=2),
         CPTGRequestSpec(req_id="req7_bagel_1024_h0", src_gpu=0, architecture="tight_mot", kv_bytes=1500 * MIB, dit_step1_ms=1650.0, resolution=1024, interleaved_roundtrip_gamma=2),
     ]
     decs = router.route_batch(burst, workers)
@@ -602,7 +609,17 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict[s
     test2_json.unlink(missing_ok=True)
 
     # Probe live 8-GPU topology AFTER child workers exit so parent CUDA context stays idle during Tests 1 & 2
+    from dataclasses import replace
+
     topo = probe_live_topology(quick_p2p_mib=128)
+    topo.half_groups = [
+        replace(
+            grp,
+            aggregate_h2d_gbps=float(test1_res["unpaced_4gpu_half0_agg_gbps"]),
+            solo_h2d_gbps=float(test1_res["paced_dual_half_per_gpu_gbps"]),
+        )
+        for grp in topo.half_groups
+    ]
     test3_res = _test3_mixed_cptg_burst(topo)
 
     all_pass = (

@@ -364,13 +364,15 @@ def shared_prefix_cfg_attention_ref(
         vb = torch.cat(parts_v, dim=0)
         qb = q_list[b]
         if fp32_accum:
+            g = h_q // h_kv
+            kb_f = kb.float().repeat_interleave(g, dim=1) if g > 1 else kb.float()
+            vb_f = vb.float().repeat_interleave(g, dim=1) if g > 1 else vb.float()
             ob = F.scaled_dot_product_attention(
                 qb.float().unsqueeze(0).permute(0, 2, 1, 3),
-                kb.float().unsqueeze(0).permute(0, 2, 1, 3),
-                vb.float().unsqueeze(0).permute(0, 2, 1, 3),
+                kb_f.unsqueeze(0).permute(0, 2, 1, 3),
+                vb_f.unsqueeze(0).permute(0, 2, 1, 3),
                 is_causal=False,
                 scale=sm_scale,
-                enable_gqa=(h_q != h_kv),
             )
             outs.append(ob.permute(0, 2, 1, 3).squeeze(0).to(qb.dtype))
         else:

@@ -77,10 +77,11 @@ def _left_pad_stack_stock(tensors):
     return out, mask
 
 
-def bench_triton_cfg_attention_micro(device) -> list[dict]:
-    """Microbenchmark + exactness check of Triton Single-HBM-Read CFG Attention vs stock left_pad_stack SDPA."""
+def bench_triton_cfg_attention_micro(device, attn_noncausal=None) -> list[dict]:
+    """Microbenchmark + exactness check of Triton Single-HBM-Read CFG Attention vs real vLLM-Omni FlashAttn left_pad_stack."""
     import torch
     import torch.nn.functional as F
+    from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
 
     torch.manual_seed(2026)
     torch.cuda.manual_seed_all(2026)
@@ -89,9 +90,9 @@ def bench_triton_cfg_attention_micro(device) -> list[dict]:
 
     results = []
     # Sweep realistic BAGEL-7B-MoT multi-turn shapes:
-    #   Branch 0 (main): L_shared + 24 text suffix + Q local
+    #   Branch 0 (main): L_shared + suffix + Q local
     #   Branch 1 (cfg_text): L_shared + 0 suffix + Q local
-    #   Branch 2 (cfg_img): 24 text-only + Q local
+    #   Branch 2 (cfg_img): text-only + Q local
     configs = [
         ("512px_turn1_2k", 1026, 2048, 24, 0, 24),
         ("512px_turn2_4k", 1026, 4096, 24, 0, 24),
@@ -100,131 +101,157 @@ def bench_triton_cfg_attention_micro(device) -> list[dict]:
         ("1024px_turn2_8k", 4098, 8192, 32, 0, 32),
     ]
 
-    for label, q_len, l_shared, l_suf0, l_suf1, l_img in configs:
-        q_list = [torch.randn((q_len, h_q, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
-        k_loc = [torch.randn((q_len, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
-        v_loc = [torch.randn((q_len, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
+    with torch.inference_mode():
+        for label, q_len, l_shared, l_suf0, l_suf1, l_img in configs:
+            q_list = [torch.randn((q_len, h_q, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
+            k_loc = [torch.randn((q_len, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
+            v_loc = [torch.randn((q_len, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5 for _ in range(3)]
 
-        k_pre = torch.randn((l_shared, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        v_pre = torch.randn((l_shared, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        k_suf0 = torch.randn((l_suf0, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        v_suf0 = torch.randn((l_suf0, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        k_suf1 = None if l_suf1 == 0 else torch.randn((l_suf1, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        v_suf1 = None if l_suf1 == 0 else torch.randn((l_suf1, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        k_img = torch.randn((l_img, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
-        v_img = torch.randn((l_img, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            k_pre = torch.randn((l_shared, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            v_pre = torch.randn((l_shared, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            k_suf0 = torch.randn((l_suf0, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            v_suf0 = torch.randn((l_suf0, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            k_suf1 = None if l_suf1 == 0 else torch.randn((l_suf1, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            v_suf1 = None if l_suf1 == 0 else torch.randn((l_suf1, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            k_img = torch.randn((l_img, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
+            v_img = torch.randn((l_img, h_kv, d), dtype=torch.bfloat16, device=device) * 0.5
 
-        k_suf_list = [k_suf0, k_suf1, k_img]
-        v_suf_list = [v_suf0, v_suf1, v_img]
+            k_suf_list = [k_suf0, k_suf1, k_img]
+            v_suf_list = [v_suf0, v_suf1, v_img]
 
-        # Pre-built stock branch caches (simulating NaiveCache copies held by main, cfg_text, cfg_img)
-        ck0 = torch.cat([k_pre, k_suf0], dim=0)
-        cv0 = torch.cat([v_pre, v_suf0], dim=0)
-        ck1 = k_pre.clone() if k_suf1 is None else torch.cat([k_pre, k_suf1], dim=0)
-        cv1 = v_pre.clone() if v_suf1 is None else torch.cat([v_pre, v_suf1], dim=0)
-        ck2, cv2 = k_img, v_img
+            # Pre-built stock branch caches (simulating NaiveCache copies held by main, cfg_text, cfg_img)
+            ck0 = torch.cat([k_pre, k_suf0], dim=0)
+            cv0 = torch.cat([v_pre, v_suf0], dim=0)
+            ck1 = k_pre.clone() if k_suf1 is None else torch.cat([k_pre, k_suf1], dim=0)
+            cv1 = v_pre.clone() if v_suf1 is None else torch.cat([v_pre, v_suf1], dim=0)
+            ck2, cv2 = k_img, v_img
 
-        def run_stock_layer():
-            q_4d = torch.stack(q_list, dim=0)  # (3, Q, H_q, D)
-            kb = [
-                torch.cat([ck0, k_loc[0]], dim=0),
-                torch.cat([ck1, k_loc[1]], dim=0),
-                torch.cat([ck2, k_loc[2]], dim=0),
-            ]
-            vb = [
-                torch.cat([cv0, v_loc[0]], dim=0),
-                torch.cat([cv1, v_loc[1]], dim=0),
-                torch.cat([cv2, v_loc[2]], dim=0),
-            ]
-            k_4d, mask = _left_pad_stack_stock(kb)
-            v_4d, _ = _left_pad_stack_stock(vb)
-            attn_mask = None
-            if mask is not None:
-                # Match Flash/SDPA bool mask (B, 1, 1, K)
-                attn_mask = mask[:, None, None, :]
-            out = F.scaled_dot_product_attention(
-                q_4d.permute(0, 2, 1, 3),
-                k_4d.permute(0, 2, 1, 3),
-                v_4d.permute(0, 2, 1, 3),
-                attn_mask=attn_mask,
-                is_causal=False,
-                scale=sm_scale,
-                enable_gqa=True,
+            def run_stock_layer():
+                q_4d = torch.stack(q_list, dim=0)  # (3, Q, H_q, D)
+                kb = [
+                    torch.cat([ck0, k_loc[0]], dim=0),
+                    torch.cat([ck1, k_loc[1]], dim=0),
+                    torch.cat([ck2, k_loc[2]], dim=0),
+                ]
+                vb = [
+                    torch.cat([cv0, v_loc[0]], dim=0),
+                    torch.cat([cv1, v_loc[1]], dim=0),
+                    torch.cat([cv2, v_loc[2]], dim=0),
+                ]
+                k_4d, mask = _left_pad_stack_stock(kb)
+                v_4d, _ = _left_pad_stack_stock(vb)
+                if attn_noncausal is not None:
+                    meta = DiffusionAttentionMetadata(attn_mask=mask) if mask is not None else None
+                    return attn_noncausal(q_4d, k_4d, v_4d, meta)
+                # Fallback if attn_noncausal not supplied: run unmasked per-branch FlashAttn/SDPA
+                outs = []
+                for i in range(3):
+                    ob = F.scaled_dot_product_attention(
+                        q_list[i].unsqueeze(0).permute(0, 2, 1, 3),
+                        kb[i].unsqueeze(0).permute(0, 2, 1, 3),
+                        vb[i].unsqueeze(0).permute(0, 2, 1, 3),
+                        is_causal=False,
+                        scale=sm_scale,
+                        enable_gqa=True,
+                    )
+                    outs.append(ob.permute(0, 2, 1, 3).squeeze(0))
+                return torch.stack(outs, dim=0)
+
+            def run_morphserve_layer():
+                return shared_prefix_cfg_attention(
+                    q_list=q_list,
+                    k_loc_list=k_loc,
+                    v_loc_list=v_loc,
+                    k_prefix=k_pre,
+                    v_prefix=v_pre,
+                    shared_branch_ids=[0, 1],
+                    k_suffix_list=k_suf_list,
+                    v_suffix_list=v_suf_list,
+                    sm_scale=sm_scale,
+                    attn_noncausal=attn_noncausal,
+                )
+
+            # Exactness vs FP32 reference
+            ref_fp32 = shared_prefix_cfg_attention_ref(
+                q_list, k_loc, v_loc, k_pre, v_pre, [0, 1], k_suf_list, v_suf_list, sm_scale=sm_scale, fp32_accum=True
             )
-            return out.permute(0, 2, 1, 3)
+            out_ms = run_morphserve_layer()
+            out_stock = run_stock_layer()
 
-        def run_morphserve_layer():
-            return shared_prefix_cfg_attention(
-                q_list=q_list,
-                k_loc_list=k_loc,
-                v_loc_list=v_loc,
-                k_prefix=k_pre,
-                v_prefix=v_pre,
-                shared_branch_ids=[0, 1],
-                k_suffix_list=k_suf_list,
-                v_suffix_list=v_suf_list,
-                sm_scale=sm_scale,
+            max_err = 0.0
+            mean_err = 0.0
+            min_cos = 1.0
+            stock_max_err = 0.0
+            for b in range(3):
+                diff = (out_ms[b].float() - ref_fp32[b].float()).abs()
+                max_err = max(max_err, float(diff.max().item()))
+                mean_err += float(diff.mean().item()) / 3.0
+                cos = float(
+                    F.cosine_similarity(out_ms[b].float().reshape(-1), ref_fp32[b].float().reshape(-1), dim=0).item()
+                )
+                min_cos = min(min_cos, cos)
+                sdiff = (out_stock[b].float() - ref_fp32[b].float()).abs()
+                stock_max_err = max(stock_max_err, float(sdiff.max().item()))
+
+            # Warmup (triggers Triton autotune on first call!)
+            for _ in range(5):
+                _ = run_stock_layer()
+                _ = run_morphserve_layer()
+            torch.cuda.synchronize()
+
+            iters = 20
+            ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            ev0.record()
+            for _ in range(iters):
+                _ = run_stock_layer()
+            ev1.record()
+            torch.cuda.synchronize()
+            stock_ms = ev0.elapsed_time(ev1) / iters
+
+            ev0.record()
+            for _ in range(iters):
+                _ = run_morphserve_layer()
+            ev1.record()
+            torch.cuda.synchronize()
+            ms_ms = ev0.elapsed_time(ev1) / iters
+
+            stock_kv_tokens_read = 3 * (l_shared + l_suf0 + q_len)
+            ms_kv_tokens_read = l_shared + l_suf0 + l_suf1 + l_img + 3 * q_len
+            results.append(
+                {
+                    "case": label,
+                    "q_len": q_len,
+                    "l_shared": l_shared,
+                    "stock_ms": round(stock_ms, 3),
+                    "morphserve_ms": round(ms_ms, 3),
+                    "speedup": round(stock_ms / max(ms_ms, 1e-6), 2),
+                    "kv_hbm_read_reduction_x": round(stock_kv_tokens_read / ms_kv_tokens_read, 2),
+                    "max_abs_err_vs_fp32": round(max_err, 5),
+                    "stock_max_abs_err_vs_fp32": round(stock_max_err, 5),
+                    "mean_abs_err_vs_fp32": round(mean_err, 6),
+                    "min_cosine_sim": round(min_cos, 7),
+                    "exact_pass": max_err <= 0.02 and mean_err <= 0.002 and min_cos >= 0.9999,
+                }
             )
-
-        # Exactness vs FP32 reference
-        ref_fp32 = shared_prefix_cfg_attention_ref(
-            q_list, k_loc, v_loc, k_pre, v_pre, [0, 1], k_suf_list, v_suf_list, sm_scale=sm_scale, fp32_accum=True
-        )
-        out_ms = run_morphserve_layer()
-        out_stock = run_stock_layer()
-
-        max_err = 0.0
-        mean_err = 0.0
-        min_cos = 1.0
-        for b in range(3):
-            diff = (out_ms[b].float() - ref_fp32[b].float()).abs()
-            max_err = max(max_err, float(diff.max().item()))
-            mean_err += float(diff.mean().item()) / 3.0
-            cos = float(F.cosine_similarity(out_ms[b].float().reshape(-1), ref_fp32[b].float().reshape(-1), dim=0).item())
-            min_cos = min(min_cos, cos)
-
-        # Warmup (triggers Triton autotune on first call!)
-        for _ in range(5):
-            _ = run_stock_layer()
-            _ = run_morphserve_layer()
-        torch.cuda.synchronize()
-
-        iters = 20
-        ev0, ev1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        ev0.record()
-        for _ in range(iters):
-            _ = run_stock_layer()
-        ev1.record()
-        torch.cuda.synchronize()
-        stock_ms = ev0.elapsed_time(ev1) / iters
-
-        ev0.record()
-        for _ in range(iters):
-            _ = run_morphserve_layer()
-        ev1.record()
-        torch.cuda.synchronize()
-        ms_ms = ev0.elapsed_time(ev1) / iters
-
-        # Theoretical HBM bytes read for KV (bf16 = 2 bytes, K+V = 2 tensors)
-        stock_kv_tokens_read = 3 * (l_shared + l_suf0 + q_len)
-        ms_kv_tokens_read = l_shared + l_suf0 + l_suf1 + l_img + 3 * q_len
-        results.append(
-            {
-                "case": label,
-                "q_len": q_len,
-                "l_shared": l_shared,
-                "stock_ms": round(stock_ms, 3),
-                "morphserve_ms": round(ms_ms, 3),
-                "speedup": round(stock_ms / max(ms_ms, 1e-6), 2),
-                "kv_hbm_read_reduction_x": round(stock_kv_tokens_read / ms_kv_tokens_read, 2),
-                "max_abs_err_vs_fp32": round(max_err, 5),
-                "mean_abs_err_vs_fp32": round(mean_err, 6),
-                "min_cosine_sim": round(min_cos, 7),
-                "exact_pass": max_err <= 0.02 and mean_err <= 0.002 and min_cos >= 0.9999,
-            }
-        )
-        del q_list, k_loc, v_loc, k_pre, v_pre, k_suf0, v_suf0, k_img, v_img, ck0, cv0, ck1, cv1, ref_fp32, out_ms, out_stock
-        torch.cuda.empty_cache()
+            del (
+                q_list,
+                k_loc,
+                v_loc,
+                k_pre,
+                v_pre,
+                k_suf0,
+                v_suf0,
+                k_img,
+                v_img,
+                ck0,
+                cv0,
+                ck1,
+                cv1,
+                ref_fp32,
+                out_ms,
+                out_stock,
+            )
+            torch.cuda.empty_cache()
 
     return results
 
@@ -388,12 +415,6 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "steps": steps,
     }
 
-    # ==================== Test 1: Triton Shared-Prefix CFG Attention Microbenchmark ====================
-    micro_res = bench_triton_cfg_attention_micro(device)
-    report["test1_triton_cfg_microbench"] = micro_res
-    gc.collect()
-    torch.cuda.empty_cache()
-
     # ==================== Load Real BAGEL-7B-MoT ====================
     t_load0 = time.perf_counter()
     pipeline = load_bagel_pipeline(model_dir, device_index=0)
@@ -401,6 +422,14 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     num_layers = pipeline.bagel.config.llm_config.num_hidden_layers
     loopback = GpuInPlaceLoopback(pipeline)
     cfg_patch = install_shared_prefix_bagel_hooks(pipeline, min_shared_tokens=32)
+
+    # ==================== Test 1: Triton Shared-Prefix CFG Attention Microbenchmark ====================
+    # Benchmark directly against BAGEL's real FlashAttention-2 DiffusionAttention (`attn_noncausal`)!
+    attn_noncausal = pipeline.bagel.language_model.model.layers[0].self_attn.attn_noncausal
+    micro_res = bench_triton_cfg_attention_micro(device, attn_noncausal=attn_noncausal)
+    report["test1_triton_cfg_microbench"] = micro_res
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # ==================== Test 2: GPU In-Place Loopback vs CPU PIL/PNG Loopback ====================
     torch.manual_seed(2026)

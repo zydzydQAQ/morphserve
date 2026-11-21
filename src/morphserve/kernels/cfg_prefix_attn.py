@@ -19,6 +19,63 @@ except ImportError:
 
 if HAS_TRITON:
 
+    @triton.jit
+    def _lse_merge_2stage_fwd(
+        O_pre,
+        LSE_pre,
+        O_tail,
+        LSE_tail,
+        Out,
+        sop_m,
+        sop_h,
+        sop_d,
+        slp_h,
+        slp_m,
+        sot_m,
+        sot_h,
+        sot_d,
+        slt_h,
+        slt_m,
+        so_m,
+        so_h,
+        so_d,
+        TOTAL_M,
+        HEAD_DIM: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+    ):
+        """Exact FP32 online-softmax LSE merge combining shared-prefix FA2 output with private-tail FA2 output."""
+        pid_m = tl.program_id(0)
+        pid_h = tl.program_id(1)
+        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        offs_d = tl.arange(0, HEAD_DIM)
+        m_mask = offs_m < TOTAL_M
+
+        lse_p = tl.load(LSE_pre + pid_h * slp_h + offs_m * slp_m, mask=m_mask, other=float("-inf")).to(tl.float32)
+        lse_t = tl.load(LSE_tail + pid_h * slt_h + offs_m * slt_m, mask=m_mask, other=float("-inf")).to(tl.float32)
+        m = tl.maximum(lse_p, lse_t)
+        wp = tl.exp(lse_p - m)
+        wt = tl.exp(lse_t - m)
+        inv = 1.0 / (wp + wt)
+        alpha_p = wp * inv
+        alpha_t = wt * inv
+
+        op = tl.load(
+            O_pre + offs_m[:, None] * sop_m + pid_h * sop_h + offs_d[None, :] * sop_d,
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        ot = tl.load(
+            O_tail + offs_m[:, None] * sot_m + pid_h * sot_h + offs_d[None, :] * sot_d,
+            mask=m_mask[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        merged = op * alpha_p[:, None] + ot * alpha_t[:, None]
+        tl.store(
+            Out + offs_m[:, None] * so_m + pid_h * so_h + offs_d[None, :] * so_d,
+            merged.to(Out.dtype.element_ty),
+            mask=m_mask[:, None],
+        )
+
     @triton.autotune(
         configs=[
             triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
@@ -424,6 +481,183 @@ def _run_unshared_single_branch(
     return out.permute(0, 2, 1, 3).squeeze(0)
 
 
+_FA2_FUNCS: tuple[Any, Any, str, str] | None = None
+_FA2_RESOLVED: bool = False
+
+
+def _resolve_fa2() -> tuple[Any, Any, str, str] | None:
+    """Resolve native FlashAttention-2 (flash_attn or vllm_flash_attn) + LSE kwarg names once."""
+    global _FA2_FUNCS, _FA2_RESOLVED
+    if _FA2_RESOLVED:
+        return _FA2_FUNCS
+    import inspect
+
+    _FA2_RESOLVED = True
+    for mod_name in ("flash_attn", "vllm.vllm_flash_attn"):
+        try:
+            mod = __import__(mod_name, fromlist=["flash_attn_func", "flash_attn_varlen_func"])
+            fa_fn = getattr(mod, "flash_attn_func", None)
+            fa_varlen = getattr(mod, "flash_attn_varlen_func", None)
+            if fa_fn is None or fa_varlen is None:
+                continue
+            p_fn = inspect.signature(fa_fn).parameters
+            p_vl = inspect.signature(fa_varlen).parameters
+            kw_fn = "return_softmax_lse" if "return_softmax_lse" in p_fn else (
+                "return_attn_probs" if "return_attn_probs" in p_fn else ""
+            )
+            kw_vl = "return_softmax_lse" if "return_softmax_lse" in p_vl else (
+                "return_attn_probs" if "return_attn_probs" in p_vl else ""
+            )
+            if kw_fn and kw_vl:
+                _FA2_FUNCS = (fa_fn, fa_varlen, kw_fn, kw_vl)
+                return _FA2_FUNCS
+        except Exception:
+            continue
+    return None
+
+
+def _run_flash_prefix_cfg(
+    q_list: list[Any],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+    k_prefix: Any,
+    v_prefix: Any,
+    shared_branch_ids: list[int],
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    sm_scale: float,
+) -> list[Any] | None:
+    """FlashPrefix-CFG: zero-copy single-read FA2 on shared prefix + varlen FA2 on private tails + Triton LSE merge."""
+    fa2 = _resolve_fa2()
+    if fa2 is None:
+        return None
+    import torch
+
+    fa_fn, fa_varlen, kw_fn, kw_vl = fa2
+    num_branches = len(q_list)
+    q_len, h_q, head_dim = q_list[0].shape
+    device = q_list[0].device
+    n_shared = len(shared_branch_ids)
+    shared_set = set(shared_branch_ids)
+    unshared_ids = [b for b in range(num_branches) if b not in shared_set]
+    ordered_ids = list(shared_branch_ids) + unshared_ids
+
+    # ---- Stage 1: Single-HBM-Read native FA2 over shared prefix (ZERO copy of k_prefix/v_prefix!) ----
+    # Packing Q_shared = [Q_b0; Q_b1; ...] into [1, n_shared * Q, H_q, D] doubles/triples SM wave
+    # occupancy while reading k_prefix/v_prefix ONCE at full 250 TFLOPS Tensor Core speed!
+    q_shared = torch.cat([q_list[b] for b in shared_branch_ids], dim=0).contiguous()  # [M_s, H_q, D]
+    res_pre = fa_fn(
+        q_shared.unsqueeze(0),
+        k_prefix.unsqueeze(0),
+        v_prefix.unsqueeze(0),
+        softmax_scale=sm_scale,
+        causal=False,
+        **{kw_fn: True},
+    )
+    o_pre = res_pre[0].squeeze(0)  # [M_s, H_q, D]
+    lse_p_raw = res_pre[1]
+    lse_pre = (
+        lse_p_raw[0, :, : n_shared * q_len].contiguous()
+        if lse_p_raw.ndim == 3
+        else lse_p_raw[:, : n_shared * q_len].contiguous()
+    )  # [H_q, M_s] FP32
+
+    # ---- Stage 2: One varlen FA2 call over ONLY tiny private tails [suffix_b, local_b] (ZERO padding!) ----
+    q_all = torch.cat([q_shared] + [q_list[b] for b in unshared_ids], dim=0).contiguous() if unshared_ids else q_shared
+    k_parts = []
+    v_parts = []
+    k_lens = []
+    for b in ordered_ids:
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and ks.shape[0] > 0:
+            k_parts.append(ks)
+            v_parts.append(vs)
+            k_parts.append(k_loc_list[b])
+            v_parts.append(v_loc_list[b])
+            k_lens.append(int(ks.shape[0]) + q_len)
+        else:
+            k_parts.append(k_loc_list[b])
+            v_parts.append(v_loc_list[b])
+            k_lens.append(q_len)
+    k_packed = torch.cat(k_parts, dim=0).contiguous()
+    v_packed = torch.cat(v_parts, dim=0).contiguous()
+
+    cu_q = torch.arange(0, (num_branches + 1) * q_len, q_len, dtype=torch.int32, device=device)
+    cu_k_list = [0]
+    for ln in k_lens:
+        cu_k_list.append(cu_k_list[-1] + ln)
+    cu_k = torch.tensor(cu_k_list, dtype=torch.int32, device=device)
+    max_k = max(k_lens)
+
+    res_tail = fa_varlen(
+        q_all,
+        k_packed,
+        v_packed,
+        cu_q,
+        cu_k,
+        q_len,
+        max_k,
+        softmax_scale=sm_scale,
+        causal=False,
+        **{kw_vl: True},
+    )
+    o_tail_all = res_tail[0]  # [num_branches * Q, H_q, D]
+    lse_raw = res_tail[1]
+    if lse_raw.ndim == 3:
+        # [num_branches, H_q, Q_or_padded] -> [H_q, n_shared * Q]
+        lse_tail_shared = lse_raw[:n_shared, :, :q_len].permute(1, 0, 2).reshape(h_q, n_shared * q_len).contiguous()
+    else:
+        # [H_q, num_branches * Q] -> [H_q, n_shared * Q]
+        lse_tail_shared = lse_raw[:, : n_shared * q_len].contiguous()
+
+    # ---- Stage 3: Exact FP32 online-softmax LSE merge for shared branches (zero-autotune Triton, ~0.03ms) ----
+    o_tail_shared = o_tail_all[: n_shared * q_len].contiguous()
+    total_m = n_shared * q_len
+    if HAS_TRITON and head_dim in (64, 128):
+        o_merged = torch.empty_like(o_pre)
+        grid = (triton.cdiv(total_m, 16), h_q)
+        _lse_merge_2stage_fwd[grid](
+            o_pre,
+            lse_pre,
+            o_tail_shared,
+            lse_tail_shared,
+            o_merged,
+            o_pre.stride(0),
+            o_pre.stride(1),
+            o_pre.stride(2),
+            lse_pre.stride(0),
+            lse_pre.stride(1),
+            o_tail_shared.stride(0),
+            o_tail_shared.stride(1),
+            o_tail_shared.stride(2),
+            lse_tail_shared.stride(0),
+            lse_tail_shared.stride(1),
+            o_merged.stride(0),
+            o_merged.stride(1),
+            o_merged.stride(2),
+            total_m,
+            HEAD_DIM=head_dim,
+            BLOCK_M=16,
+            num_warps=4,
+        )
+    else:
+        lp = lse_pre.transpose(0, 1).unsqueeze(-1)  # [M_s, H_q, 1]
+        lt = lse_tail_shared.transpose(0, 1).unsqueeze(-1)
+        m = torch.maximum(lp, lt)
+        wp = torch.exp(lp - m)
+        wt = torch.exp(lt - m)
+        inv = 1.0 / (wp + wt)
+        o_merged = (o_pre.float() * (wp * inv) + o_tail_shared.float() * (wt * inv)).to(o_pre.dtype)
+
+    outputs: list[Any] = [None] * num_branches
+    for idx, b in enumerate(shared_branch_ids):
+        outputs[b] = o_merged[idx * q_len : (idx + 1) * q_len]
+    for idx, b in enumerate(unshared_ids):
+        off = (n_shared + idx) * q_len
+        outputs[b] = o_tail_all[off : off + q_len]
+    return outputs
+
+
 def shared_prefix_cfg_attention(
     q_list: list[Any],
     k_loc_list: list[Any],
@@ -435,8 +669,9 @@ def shared_prefix_cfg_attention(
     v_suffix_list: list[Any | None],
     sm_scale: float | None = None,
     attn_noncausal: Any | None = None,
+    backend: str = "flash_prefix",
 ) -> list[Any]:
-    """Dispatch multi-branch CFG attention through our Single-HBM-Read Triton kernel."""
+    """Dispatch multi-branch CFG attention via FlashPrefix-CFG (default) or single-pass Triton kernel."""
     import torch
 
     num_branches = len(q_list)
@@ -447,6 +682,22 @@ def shared_prefix_cfg_attention(
     sm_scale_log2 = sm_scale * 1.4426950408889634
     gqa_group = h_q // h_kv
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
+
+    # Preferred default: FlashPrefix-CFG (native FA2 Tensor Core 250 TFLOPS + zero-copy prefix + Triton LSE merge!)
+    if backend == "flash_prefix" and q_list[0].is_cuda and l_shared > 0 and len(shared_branch_ids) >= 2:
+        fp_out = _run_flash_prefix_cfg(
+            q_list=q_list,
+            k_loc_list=k_loc_list,
+            v_loc_list=v_loc_list,
+            k_prefix=k_prefix,
+            v_prefix=v_prefix,
+            shared_branch_ids=shared_branch_ids,
+            k_suffix_list=k_suffix_list,
+            v_suffix_list=v_suffix_list,
+            sm_scale=sm_scale,
+        )
+        if fp_out is not None:
+            return fp_out
 
     outputs: list[Any] = [None] * num_branches
     handled: set[int] = set()

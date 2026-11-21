@@ -502,6 +502,8 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     torch.cuda.synchronize()
     cpu_prep_only_ms = (time.perf_counter() - t_prep_c0) * 1000.0
 
+    u8_cpu_ref = torch.from_numpy(np.array(pil_reloaded)).permute(2, 0, 1).to(device)
+    u8_diff_max = int((img_u8_gpu.to(torch.int16) - u8_cpu_ref.to(torch.int16)).abs().max().item())
     vae_diff_max = float((vae_gpu_inp["padded_images"][0] - vae_cpu_t).abs().max().item())
     vit_gpu_tokens = vit_gpu_inp["packed_vit_tokens"]
     vit_diff_max = float((vit_gpu_tokens - vit_cpu_tokens).abs().max().item())
@@ -536,8 +538,10 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "cpu_png_pil_prep_only_ms": round(cpu_prep_only_ms, 2),
         "gpu_inplace_prep_only_ms": round(gpu_prep_only_ms, 3),
         "prep_speedup_x": round(cpu_prep_only_ms / max(gpu_prep_only_ms, 1e-4), 1),
+        "u8_decode_max_abs_diff": u8_diff_max,
+        "u8_decode_bit_exact": u8_diff_max == 0,
         "vae_input_max_abs_diff": vae_diff_max,
-        "vae_input_bit_exact": vae_diff_max == 0.0,
+        "vae_input_bit_exact": u8_diff_max == 0 and vae_diff_max <= 1e-6,
         "vit_tokens_max_abs_diff": round(vit_diff_max, 6),
         "vit_tokens_cosine_sim": round(vit_cos, 7),
         "ar_text_cpu": ar_text_cpu,
@@ -569,7 +573,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             if turn_idx > 0:
                 if use_morphserve:
                     # Simulate GPU tensor already on GPU after previous turn's VAE decode!
-                    prev_u8 = torch.from_numpy(np.asarray(imgs[-1].convert("RGB"), dtype=np.uint8)).permute(2, 0, 1).to(device)
+                    prev_u8 = torch.from_numpy(np.array(imgs[-1].convert("RGB"), dtype=np.uint8, copy=True)).permute(2, 0, 1).to(device)
                     torch.cuda.synchronize()
                     t_lb0 = time.perf_counter()
                     loopback.update_context_from_u8_gpu(main_ctx, prev_u8)

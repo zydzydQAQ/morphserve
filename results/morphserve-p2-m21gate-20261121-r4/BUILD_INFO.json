@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "b1aaa84f19ca023d8f930fa5ba77907e755dc572",
+  "short_commit": "b1aaa84",
+  "subject": "feat(phase2): direct-workspace 1024px CFG, M2.3 BAGEL main/skew/ablation/parity, M2.4 InternVL-U adapter, and M2.5 2x8+64GPU scaling",
+  "built_utc": "2026-11-21T12:06:45+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 62,
+  "bytes": 1026277
+}

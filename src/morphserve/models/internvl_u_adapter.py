@@ -131,34 +131,20 @@ class InternVLUDecoderPager:
         layer_offsets = [0 for _ in range(self.num_layers)]
         for lid, pname, p in raw_params:
             nbytes = int(p.numel() * p.element_size())
-            off = _align_up(layer_offsets[lid])
+            off = _align_up(layer_offsets[lid], 512)
             self._layer_params[lid].append((pname, p, tuple(p.shape), p.dtype, off, nbytes))
             layer_offsets[lid] = off + nbytes
 
-        self.layer_bytes = [_align_up(max(x, 4096), self.super_handle_bytes) for x in layer_offsets]
-        self.layer_mirror_offsets: list[int] = []
-        cur = 0
-        for lb in self.layer_bytes:
-            self.layer_mirror_offsets.append(cur)
-            cur += lb
-        self.total_mirror_bytes = cur
+        self.layer_used_bytes = [max(x, 4096) for x in layer_offsets]
+        max_used = max(self.layer_used_bytes)
+        self.layer_stride_bytes = _align_up(max_used, self.super_handle_bytes)
+        self.layer_stride_mib = self.layer_stride_bytes // MIB
+        self.layer_mirror_offsets = [lid * self.layer_stride_bytes for lid in range(self.num_layers)]
+        self.total_mirror_bytes = self.num_layers * self.layer_stride_bytes
 
-        # Optional VAE CPU mirror for Scoped Bulk-Unmap Transient Pool
-        self._vae_entries: list[tuple[Any, Any, int, int]] = []
-        vae_cur = 0
-        if self.wrap_vae:
-            for _, p in self.vae.named_parameters():
-                nb = int(p.numel() * p.element_size())
-                off = _align_up(vae_cur)
-                self._vae_entries.append((p, p.detach().contiguous().cpu(), off, nb))
-                vae_cur = off + nb
-            for _, b in self.vae.named_buffers():
-                nb = int(b.numel() * b.element_size())
-                off = _align_up(vae_cur)
-                self._vae_entries.append((b, b.detach().contiguous().cpu(), off, nb))
-                vae_cur = off + nb
-        self.vae_total_bytes = _align_up(max(vae_cur, 4096), 2 * MIB) if self.wrap_vae else 0
-
+        self._orig_vae_decode = None
+        self._orig_vae_encode = None
+        self._va_views: list[Any] = []
         self.mirror: SharedNumaMemfdMirror | None = None
         self._owns_mirror = False
         self.vmm: TriPoolVMM | None = None
@@ -169,7 +155,7 @@ class InternVLUDecoderPager:
 
         self.mirror = shared_mirror
         self._owns_mirror = False
-        base_addr = shared_mirror.host_ptr
+        base_addr = shared_mirror.ptr
         for lid in range(self.num_layers):
             l_base = base_addr + self.layer_mirror_offsets[lid]
             for _, p, _, dtype, off, nbytes in self._layer_params[lid]:
@@ -177,9 +163,6 @@ class InternVLUDecoderPager:
                     cpu_t = p.detach().contiguous().cpu()
                     ctypes.memmove(l_base + off, cpu_t.data_ptr(), nbytes)
                 p.data = torch.empty((0,), dtype=dtype, device=self._device)
-        if self.wrap_vae:
-            for tensor_ref, _, _, _ in self._vae_entries:
-                tensor_ref.data = torch.empty((0,), dtype=tensor_ref.dtype, device=self._device)
         torch.cuda.empty_cache()
 
     def offload_to_host_mirror(self) -> SharedNumaMemfdMirror:
@@ -195,68 +178,54 @@ class InternVLUDecoderPager:
     def bind_vmm(self, vmm: TriPoolVMM, initial_alpha: float = 1.0) -> None:
         assert self.mirror is not None
         self.vmm = vmm
-        self.mirror.pin_cuda(vmm)
-        vmm.register_expert(self.expert_id, self.layer_bytes)
+        self.expert_id = vmm.register_expert(
+            num_layers=self.num_layers,
+            layer_stride_mib=self.layer_stride_mib,
+            mirror=self.mirror,
+        )
+        self._va_views = []
+        for lid in range(self.num_layers):
+            vmm.set_expert_layer_used_bytes(self.expert_id, lid, self.layer_used_bytes[lid])
+            u8_va = vmm.expert_layer_uint8_view(self.expert_id, lid)
+            self._va_views.append(u8_va)
+            for _, p, shape, dtype, off, nbytes in self._layer_params[lid]:
+                p.data = u8_va[off : off + nbytes].view(dtype).view(shape)
+
+        if self.wrap_vae:
+            self._orig_vae_decode = self.vae.decode
+            self._orig_vae_encode = self.vae.encode
+            self.vae.decode = lambda *a, **kw: vmm.run_in_transient_scope(self._orig_vae_decode, *a, **kw)
+            self.vae.encode = lambda *a, **kw: vmm.run_in_transient_scope(self._orig_vae_encode, *a, **kw)
+
         self.set_residency_alpha(initial_alpha)
-
-    def _rebind_layer_views(self, lid: int) -> None:
-        import torch
-
-        assert self.vmm is not None
-        dev_ptr = self.vmm.expert_layer_ptr(self.expert_id, lid)
-        total_b = self.layer_bytes[lid]
-        raw_u8 = self.vmm.wrap_device_ptr_as_tensor(dev_ptr, (total_b,), torch.uint8)
-        for _, p, shape, dtype, off, nbytes in self._layer_params[lid]:
-            p.data = raw_u8[off : off + nbytes].view(dtype).reshape(shape)
 
     def set_residency_alpha(self, alpha: float) -> int:
         import torch
 
-        assert self.vmm is not None and self.mirror is not None
+        assert self.vmm is not None
         target = max(0, min(self.num_layers, int(round(float(alpha) * self.num_layers))))
         s_ptr = int(torch.cuda.current_stream(self._device).cuda_stream)
-        for lid in range(self.num_layers):
-            res = self.vmm.expert_is_resident(self.expert_id, lid)
-            if lid < target and not res:
-                h_ptr = self.mirror.host_ptr + self.layer_mirror_offsets[lid]
-                self.vmm.expert_map_and_prefetch(self.expert_id, lid, h_ptr, self.layer_bytes[lid], stream_ptr=s_ptr)
-                self._rebind_layer_views(lid)
-            elif lid >= target and res:
-                for _, p, _, dtype, _, _ in self._layer_params[lid]:
-                    p.data = torch.empty((0,), dtype=dtype, device=self._device)
-                self.vmm.expert_drop_clean(self.expert_id, lid, stream_ptr=s_ptr)
+        self.vmm.set_expert_pinned(self.expert_id, False)
+        if target < self.num_layers:
+            self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
+        if target > 0:
+            self.vmm.load_expert_layers_sync(self.expert_id, 0, target)
         torch.cuda.synchronize(self._device)
-        return target
+        return self.vmm.expert_resident_count(self.expert_id)
 
     @contextmanager
     def generation_mode(self):
         import torch
 
-        assert self.vmm is not None and self.mirror is not None
-        s_ptr = int(torch.cuda.current_stream(self._device).cuda_stream)
-        for lid in range(self.num_layers):
-            if not self.vmm.expert_is_resident(self.expert_id, lid):
-                h_ptr = self.mirror.host_ptr + self.layer_mirror_offsets[lid]
-                self.vmm.expert_map_and_prefetch(self.expert_id, lid, h_ptr, self.layer_bytes[lid], stream_ptr=s_ptr)
-                self._rebind_layer_views(lid)
-        vae_mounted = False
-        if self.wrap_vae and self.vae_total_bytes > 0:
-            v_ptr = self.vmm.transient_alloc(self.vae_total_bytes)
-            vae_u8 = self.vmm.wrap_device_ptr_as_tensor(v_ptr, (self.vae_total_bytes,), torch.uint8)
-            for tensor_ref, cpu_src, off, nb in self._vae_entries:
-                dst_view = vae_u8[off : off + nb].view(tensor_ref.dtype).reshape(cpu_src.shape)
-                dst_view.copy_(cpu_src, non_blocking=True)
-                tensor_ref.data = dst_view
-            vae_mounted = True
+        assert self.vmm is not None
+        self.vmm.set_expert_pinned(self.expert_id, True)
+        if self.vmm.expert_resident_count(self.expert_id) < self.num_layers:
+            self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
         torch.cuda.synchronize(self._device)
         try:
             yield
         finally:
-            if vae_mounted:
-                torch.cuda.synchronize(self._device)
-                for tensor_ref, _, _, _ in self._vae_entries:
-                    tensor_ref.data = torch.empty((0,), dtype=tensor_ref.dtype, device=self._device)
-                self.vmm.transient_reset(stream_ptr=s_ptr)
+            self.vmm.set_expert_pinned(self.expert_id, False)
 
     def close(self) -> None:
         if self.mirror is not None and self._owns_mirror:

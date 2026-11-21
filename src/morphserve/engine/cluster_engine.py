@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import shutil
 import threading
 import time
 from typing import Any

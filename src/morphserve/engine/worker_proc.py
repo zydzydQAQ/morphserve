@@ -94,6 +94,7 @@ def _pack_multi_ctx(
     cfg_text_prefix_len: int,
     include_cfg_text_dup: bool,
     device: Any,
+    pending_vae_paths: list[str] | None = None,
 ) -> tuple[dict[str, Any], Any]:
     import torch
 
@@ -119,6 +120,7 @@ def _pack_multi_ctx(
         "total_bytes": int(flat.numel()),
         "cfg_text_prefix_len": int(cfg_text_prefix_len),
         "include_cfg_text_dup": bool(include_cfg_text_dup),
+        "pending_vae_paths": list(pending_vae_paths or []),
         "sections": sections,
     }
     return meta, flat
@@ -164,6 +166,7 @@ def _unpack_multi_ctx(
         "cfg_text_ctx": cfg_text_ctx,
         "cfg_img_ctx": cfg_img_ctx,
         "cfg_text_prefix_len": int(meta.get("cfg_text_prefix_len", 0)),
+        "pending_vae_paths": list(meta.get("pending_vae_paths") or []),
         "last_img_u8": None,
         "last_img_pil": None,
     }
@@ -289,53 +292,88 @@ def run_worker_process(
             ctx["past_key_values"] = pipeline.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
         ctx["kv_lens"], ctx["ropes"] = nl, nr
 
-    def _update_image_ctx(ctx: dict[str, Any], img_or_u8: Any) -> None:
-        if torch.is_tensor(img_or_u8) and loopback is not None:
-            loopback.update_context_from_u8_gpu(ctx, img_or_u8)
-            return
-        pil_img = img_or_u8
-        if policy.use_module3_cow_loopback and loopback is not None:
-            u8 = (
-                torch.from_numpy(np.asarray(pil_img.convert("RGB"), dtype=np.uint8, copy=True))
-                .permute(2, 0, 1)
-                .to(device)
-            )
-            loopback.update_context_from_u8_gpu(ctx, u8)
-            return
+    def _ensure_gen_weights_for_vae() -> bool:
+        if pager is not None and vmm is not None:
+            if vmm.expert_resident_count(pager.expert_id) < pager.num_layers:
+                vmm.load_expert_layers_sync(pager.expert_id, 0, pager.num_layers)
+            return False
+        if policy.use_naive_offload and cpu_naive_weights:
+            for layer in pipeline.bagel.language_model.model.layers:
+                for pname, p in layer.named_parameters():
+                    key = f"{id(layer)}.{pname}"
+                    if key in cpu_naive_weights and p.numel() == 0:
+                        p.data = cpu_naive_weights[key].to(device)
+            torch.cuda.synchronize(device)
+            return True
+        return False
 
-        # Stock CPU PIL path (matches vLLM-Omni pipeline_bagel.py)
-        def vae_tf(v):
-            arr = torch.from_numpy(np.array(v.convert("RGB"), copy=True)).float() / 127.5 - 1.0
-            return arr.permute(2, 0, 1)
+    def _drop_naive_gen_weights() -> None:
+        if policy.use_naive_offload and cpu_naive_weights:
+            for layer in pipeline.bagel.language_model.model.layers:
+                for pname, p in layer.named_parameters():
+                    key = f"{id(layer)}.{pname}"
+                    if key in cpu_naive_weights:
+                        p.data = torch.empty(0, dtype=p.dtype, device=device)
+            torch.cuda.empty_cache()
 
-        def vit_tf(v):
-            return pipeline.image_processor(images=v, return_tensors="pt").pixel_values[0]
+    def _update_image_ctx(
+        ctx: dict[str, Any],
+        img_or_u8: Any,
+        update_vae: bool = True,
+        update_vit: bool = True,
+    ) -> None:
+        swapped = _ensure_gen_weights_for_vae() if update_vae else False
+        try:
+            if torch.is_tensor(img_or_u8) and loopback is not None:
+                loopback.update_context_from_u8_gpu(ctx, img_or_u8, update_vae=update_vae, update_vit=update_vit)
+                return
+            pil_img = img_or_u8
+            if policy.use_module3_cow_loopback and loopback is not None:
+                u8 = (
+                    torch.from_numpy(np.asarray(pil_img.convert("RGB"), dtype=np.uint8, copy=True))
+                    .permute(2, 0, 1)
+                    .to(device)
+                )
+                loopback.update_context_from_u8_gpu(ctx, u8, update_vae=update_vae, update_vit=update_vit)
+                return
 
-        vi, nl, nr = pipeline.bagel.prepare_vae_images(
-            curr_kvlens=ctx["kv_lens"],
-            curr_rope=ctx["ropes"],
-            images=[pil_img],
-            transforms=vae_tf,
-            new_token_ids=pipeline.new_token_ids,
-        )
-        vi = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vi.items()}
-        vti, nlv, nrv = pipeline.bagel.prepare_vit_images(
-            curr_kvlens=nl,
-            curr_rope=nr,
-            images=[pil_img],
-            transforms=vit_tf,
-            new_token_ids=pipeline.new_token_ids,
-        )
-        vti = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vti.items()}
-        for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
-            vti.pop(k, None)
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vae(
-                pipeline.vae, ctx["past_key_values"], **vi
-            )
-            ctx["kv_lens"], ctx["ropes"] = nl, nr
-            ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vit(ctx["past_key_values"], **vti)
-            ctx["kv_lens"], ctx["ropes"] = nlv, nrv
+            def vae_tf(v):
+                arr = torch.from_numpy(np.array(v.convert("RGB"), copy=True)).float() / 127.5 - 1.0
+                return arr.permute(2, 0, 1)
+
+            def vit_tf(v):
+                return pipeline.image_processor(images=v, return_tensors="pt").pixel_values[0]
+
+            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                if update_vae:
+                    vi, nl, nr = pipeline.bagel.prepare_vae_images(
+                        curr_kvlens=ctx["kv_lens"],
+                        curr_rope=ctx["ropes"],
+                        images=[pil_img],
+                        transforms=vae_tf,
+                        new_token_ids=pipeline.new_token_ids,
+                    )
+                    vi = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vi.items()}
+                    ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vae(
+                        pipeline.vae, ctx["past_key_values"], **vi
+                    )
+                    ctx["kv_lens"], ctx["ropes"] = nl, nr
+                if update_vit:
+                    vti, nlv, nrv = pipeline.bagel.prepare_vit_images(
+                        curr_kvlens=ctx["kv_lens"],
+                        curr_rope=ctx["ropes"],
+                        images=[pil_img],
+                        transforms=vit_tf,
+                        new_token_ids=pipeline.new_token_ids,
+                    )
+                    vti = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in vti.items()}
+                    for k in ("packed_indexes", "packed_key_value_indexes", "key_values_lens"):
+                        vti.pop(k, None)
+                    ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vit(ctx["past_key_values"], **vti)
+                    ctx["kv_lens"], ctx["ropes"] = nlv, nrv
+        finally:
+            if swapped:
+                _drop_naive_gen_weights()
 
     def _run_ar_direct(ctx: dict[str, Any], max_tokens: int) -> dict[str, Any]:
         start_inp = pipeline.bagel.prepare_start_tokens(ctx["kv_lens"], ctx["ropes"], pipeline.new_token_ids)
@@ -406,28 +444,36 @@ def run_worker_process(
             }
             ctx_store[ctx_id] = entry
 
+        entry.setdefault("pending_vae_paths", [])
         main_ctx = entry["main_ctx"]
-        # Loopback previous turn's generated image if this is a follow-up editing turn
+        prep_dit = bool(cmd.get("prepare_for_dit", False))
+        # Pure VQA (`prep_dit=False`) only needs ViT (`mode='und'`).
+        # On static `und` ranks (which dropped `gen` weights), defer VAE latent encode to the `gen` rank!
+        can_run_vae_here = prep_dit and not (policy.routing_mode == "static_nccl_fission" and role == "und")
+
         if cmd.get("use_prev_image"):
             if cmd.get("prev_image_path"):
-                _update_image_ctx(main_ctx, _load_pil(cmd["prev_image_path"]))
+                p_prev = str(cmd["prev_image_path"])
+                _update_image_ctx(main_ctx, _load_pil(p_prev), update_vae=can_run_vae_here, update_vit=True)
+                if prep_dit and not can_run_vae_here:
+                    entry["pending_vae_paths"].append(p_prev)
             elif policy.use_module3_cow_loopback and entry.get("last_img_u8") is not None:
-                _update_image_ctx(main_ctx, entry["last_img_u8"])
+                _update_image_ctx(main_ctx, entry["last_img_u8"], update_vae=can_run_vae_here, update_vit=True)
             elif entry.get("last_img_pil") is not None:
                 prev_pil = entry["last_img_pil"]
                 if not policy.use_module3_cow_loopback:
-                    # Faithfully replicate stock vLLM-Omni CPU PNG save/reload roundtrip
                     buf = io.BytesIO()
                     prev_pil.save(buf, format="PNG")
                     buf.seek(0)
                     prev_pil = Image.open(buf).convert("RGB")
                     prev_pil.load()
-                _update_image_ctx(main_ctx, prev_pil)
+                _update_image_ctx(main_ctx, prev_pil, update_vae=can_run_vae_here, update_vit=True)
 
         for rel_img in cmd.get("image_paths", []):
-            _update_image_ctx(main_ctx, _load_pil(rel_img))
+            _update_image_ctx(main_ctx, _load_pil(rel_img), update_vae=can_run_vae_here, update_vit=True)
+            if prep_dit and not can_run_vae_here:
+                entry["pending_vae_paths"].append(str(rel_img))
 
-        prep_dit = bool(cmd.get("prepare_for_dit", False))
         prompt = cmd["prompt"]
         if prep_dit:
             has_hist = main_ctx["past_key_values"].key_cache[0] is not None
@@ -462,6 +508,11 @@ def run_worker_process(
         main_ctx = entry["main_ctx"]
         cfg_text_ctx = entry.get("cfg_text_ctx")
         cfg_img_ctx = entry.get("cfg_img_ctx")
+        for pend_img in entry.pop("pending_vae_paths", []) or []:
+            pil_v = _load_pil(pend_img)
+            _update_image_ctx(main_ctx, pil_v, update_vae=True, update_vit=False)
+            if cfg_text_ctx is not None:
+                _update_image_ctx(cfg_text_ctx, pil_v, update_vae=True, update_vit=False)
         height = int(cmd.get("height", 512))
         width = int(cmd.get("width", 512))
         steps = int(cmd.get("dit_steps", 20))
@@ -943,6 +994,7 @@ def run_worker_process(
                         entry.get("cfg_text_prefix_len", 0),
                         include_cfg_text_dup=bool(cmd.get("include_cfg_text_dup", False)),
                         device=device,
+                        pending_vae_paths=entry.get("pending_vae_paths"),
                     )
                     packed_id = f"{ctx_id}__{cmd_id}"
                     packed_store[packed_id] = flat
@@ -985,6 +1037,7 @@ def run_worker_process(
                         entry.get("cfg_text_prefix_len", 0),
                         include_cfg_text_dup=True,
                         device=device,
+                        pending_vae_paths=entry.get("pending_vae_paths"),
                     )
                     cpu_bytes = flat.cpu().numpy().tobytes()
                     del flat
@@ -1104,5 +1157,12 @@ def run_worker_process(
         packed_store.clear()
         cpu_naive_weights.clear()
         gc.collect()
+        try:
+            import torch.distributed as dist
+
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

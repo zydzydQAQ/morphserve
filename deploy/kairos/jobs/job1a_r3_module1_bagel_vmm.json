@@ -1,0 +1,30 @@
+{
+  "name": "morphserve-p1-m1vmm-20261121-r3",
+  "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "workers": 1,
+  "gpus_per_worker": 1,
+  "mount_shared": true,
+  "command": "bash /shared/data/MORPHSERVE/scripts/04_phase1_module1_validate.sh",
+  "env": [
+    {
+      "name": "KAIROS_PROJECT",
+      "value": "MORPHSERVE"
+    },
+    {
+      "name": "KAIROS_RUN_ID",
+      "value": "morphserve-p1-m1vmm-20261121-r3"
+    },
+    {
+      "name": "KAIROS_BUILD",
+      "value": "d5b854a"
+    },
+    {
+      "name": "KAIROS_REQUIRE_BUILD",
+      "value": "1"
+    },
+    {
+      "name": "KAIROS_EXECUTION_IMAGE",
+      "value": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2"
+    }
+  ]
+}

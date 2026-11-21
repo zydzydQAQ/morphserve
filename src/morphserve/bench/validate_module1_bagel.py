@@ -127,13 +127,23 @@ def _build_turn0_context(pipeline, prompt: str, device):
     return make_ctx(), make_ctx()
 
 
-def _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt: str, steps: int = 20, seed: int = 52):
+def _run_bagel_generate(
+    pipeline,
+    main_ctx,
+    cfg_img_ctx,
+    prompt: str,
+    steps: int = 20,
+    seed: int = 52,
+    height: int = 512,
+    width: int = 512,
+    sync_before: bool = True,
+):
     import torch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
     sampling = OmniDiffusionSamplingParams(
-        height=512,
-        width=512,
+        height=height,
+        width=width,
         num_inference_steps=steps,
         seed=seed,
         extra_args={
@@ -146,11 +156,12 @@ def _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt: str, steps: int
         },
     )
     sampling.past_key_values = main_ctx["past_key_values"]
-    sampling.kv_metadata = {"ropes": main_ctx["ropes"], "image_shape": [512, 512]}
+    sampling.kv_metadata = {"ropes": main_ctx["ropes"], "image_shape": [height, width]}
     sampling.cfg_img_past_key_values = cfg_img_ctx["past_key_values"]
-    sampling.cfg_img_kv_metadata = {"ropes": cfg_img_ctx["ropes"], "image_shape": [512, 512]}
+    sampling.cfg_img_kv_metadata = {"ropes": cfg_img_ctx["ropes"], "image_shape": [height, width]}
 
-    torch.cuda.synchronize()
+    if sync_before:
+        torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.inference_mode():
         out = pipeline._forward_single({"prompt": prompt, "modalities": ["image"]}, sampling)
@@ -180,12 +191,31 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     report["load_seconds"] = round(time.perf_counter() - t_load0, 2)
     report["mem_monolithic_loaded"] = _mem_info_mib(0)
     try:
+        import shutil
+
         layer0 = pipeline.bagel.language_model.model.layers[0]
+        pipe_file = inspect.getsourcefile(type(pipeline))
+        bagel_file = inspect.getsourcefile(type(pipeline.bagel))
+        llm_file = inspect.getsourcefile(type(pipeline.bagel.language_model.model))
+        ref_dir = output_dir / "vllm_omni_ref"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        for src_p in {pipe_file, bagel_file, llm_file}:
+            if src_p and Path(src_p).is_file():
+                shutil.copy2(src_p, ref_dir / Path(src_p).name)
         report["bagel_introspection"] = {
-            "pipeline_file": inspect.getsourcefile(type(pipeline)),
-            "bagel_file": inspect.getsourcefile(type(pipeline.bagel)),
-            "llm_file": inspect.getsourcefile(type(pipeline.bagel.language_model.model)),
+            "pipeline_file": pipe_file,
+            "bagel_file": bagel_file,
+            "llm_file": llm_file,
             "layer0_class": type(layer0).__name__,
+            "layer0_params": [
+                {
+                    "name": n,
+                    "shape": list(p.shape),
+                    "dtype": str(p.dtype),
+                    "mib": round(p.numel() * p.element_size() / MIB, 2),
+                }
+                for n, p in layer0.named_parameters()
+            ],
             "layer0_forward_methods": [m for m in dir(layer0) if "forward" in m],
             "pipeline_forward_methods": [m for m in dir(pipeline) if "forward" in m or "diffuse" in m or "step" in m],
         }
@@ -258,13 +288,19 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     }
 
     alpha_results = []
-    # Measure Step-1 vs total latency across alpha = 1.0, 0.75, 0.50, 0.25, 0.0
+    # Measure Step-1 overlap across alpha = 1.0, 0.75, 0.50, 0.25, 0.0 (512x512, 20 steps)
     for alpha in (1.0, 0.75, 0.50, 0.25, 0.0):
         res_before = pager.set_residency_alpha(alpha)
         st_before = vmm.stats_dict()
 
+        # Sync BEFORE generation_mode so prefetch_expert_async overlaps with Step-1 compute cleanly!
+        torch.cuda.synchronize()
+        t_wall0 = time.perf_counter()
         with pager.generation_mode(prefetch_all=True):
-            img, gen_ms = _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52)
+            img, _ = _run_bagel_generate(
+                pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52, sync_before=False
+            )
+        gen_ms = (time.perf_counter() - t_wall0) * 1000.0
 
         st_after = vmm.stats_dict()
         sha = _pil_sha256(img)
@@ -304,6 +340,53 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         item["hidden_by_overlap_ms"] = round(max(0.0, raw_h2d_ms - max(0.0, item["morph_stall_vs_alpha1_ms"])), 2)
 
     report["test1_alpha_sweep"] = alpha_results
+
+    # Also measure high-res 1024x1024 Step-1 overlap (10 steps: ~4x larger DiT compute horizon!)
+    hires_results = []
+    hires_ref_sha = None
+    for alpha in (1.0, 0.75, 0.50, 0.0):
+        res_before = pager.set_residency_alpha(alpha)
+        st_before = vmm.stats_dict()
+        torch.cuda.synchronize()
+        t_wall0 = time.perf_counter()
+        with pager.generation_mode(prefetch_all=True):
+            h_img, _ = _run_bagel_generate(
+                pipeline,
+                main_ctx,
+                cfg_img_ctx,
+                prompt,
+                steps=10,
+                seed=52,
+                height=1024,
+                width=1024,
+                sync_before=False,
+            )
+        h_ms = (time.perf_counter() - t_wall0) * 1000.0
+        st_after = vmm.stats_dict()
+        h_sha = _pil_sha256(h_img)
+        if hires_ref_sha is None:
+            hires_ref_sha = h_sha
+        streamed_mib = round((st_after["expert_h2d_bytes_total"] - st_before["expert_h2d_bytes_total"]) / MIB, 2)
+        hires_results.append(
+            {
+                "alpha": alpha,
+                "resident_layers_before": res_before,
+                "streamed_h2d_mib": streamed_mib,
+                "gen_total_ms": round(h_ms, 2),
+                "bit_exact_vs_alpha1": h_sha == hires_ref_sha,
+                "expert_map_delta_ms": round((st_after["expert_map_us"] - st_before["expert_map_us"]) / 1000.0, 3),
+                "transient_reclaimed": st_after["transient_mapped_handles_current"] == 0,
+                "overflow_creates": st_after["overflow_creates"],
+            }
+        )
+        del h_img
+    t_hires1 = hires_results[0]["gen_total_ms"]
+    for item in hires_results:
+        item["morph_stall_vs_alpha1_ms"] = round(item["gen_total_ms"] - t_hires1, 2)
+        raw_h2d_ms = (item["streamed_h2d_mib"] * MIB / 1e9) / 12.33 * 1000.0
+        item["theoretical_unoverlapped_h2d_ms"] = round(raw_h2d_ms, 2)
+        item["hidden_by_overlap_ms"] = round(max(0.0, raw_h2d_ms - max(0.0, item["morph_stall_vs_alpha1_ms"])), 2)
+    report["test1b_1024_overlap_sweep"] = hires_results
     report["layer_hook_telemetry"] = {
         "layer_hook_calls": pager.layer_hook_calls,
         "hook_methods_triggered": sorted(pager.hook_methods_triggered),
@@ -370,8 +453,13 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     res_after_vae = vmm_tight.expert_resident_count(pager.expert_id)
 
     # Now verify instant recovery: DiT generation immediately after auto-eviction streams back ONLY dropped tail layers!
+    torch.cuda.synchronize()
+    t_rec0 = time.perf_counter()
     with pager.generation_mode(prefetch_all=True):
-        post_img, post_gen_ms = _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52)
+        post_img, _ = _run_bagel_generate(
+            pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52, sync_before=False
+        )
+    post_gen_ms = (time.perf_counter() - t_rec0) * 1000.0
     post_sha = _pil_sha256(post_img)
     del post_img
 
@@ -406,6 +494,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         report["ar_isolation_check"]["zero_gen_faults_in_ar_mode"]
         and report["layer_hook_telemetry"]["layer_hook_calls"] > 0
         and all(x["bit_exact"] and x["transient_reclaimed"] and x["overflow_creates"] == 0 for x in alpha_results)
+        and all(x["bit_exact_vs_alpha1"] and x["transient_reclaimed"] and x["overflow_creates"] == 0 for x in hires_results)
         and report["test4_kv_arena_and_carve"]["kv_readback_verified"]
         and report["test4_kv_arena_and_carve"]["kv_pages_reclaimed"]
         and report["test4_kv_arena_and_carve"]["super_to_fine_carves_triggered"] >= 1

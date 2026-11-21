@@ -30,6 +30,7 @@ enum class LayerState : int {
 struct ExpertLayer {
     LayerState state = LayerState::EVICTED;
     bool needs_stream_wait = false;
+    size_t used_bytes = 0;  // 0 means copy full layer_stride_bytes
     std::vector<CUmemGenericAllocationHandle> handles;
     CUevent ready_event = nullptr;
 };
@@ -499,6 +500,16 @@ public:
         return 0;
     }
 
+    int expert_set_layer_used_bytes(int expert_id, int layer_idx, size_t used_bytes) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
+        auto& bank = experts_[expert_id];
+        if (layer_idx < 0 || layer_idx >= bank.num_layers) return -2;
+        if (used_bytes > bank.layer_stride_bytes) return -3;
+        bank.layers[layer_idx].used_bytes = used_bytes;
+        return 0;
+    }
+
     int expert_load_layers_sync(int expert_id, int start_layer, int end_layer_exclusive) {
         std::lock_guard<std::mutex> lock(mu_);
         if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
@@ -508,14 +519,18 @@ public:
         try {
             ensure_ctx_locked();
             auto& drv = CudaDriver::instance();
-            for (int l = start_layer; l < end_layer_exclusive; ++l) {
-                if (bank.layers[l].state == LayerState::EVICTED) {
-                    map_and_submit_h2d_locked(bank, l);
+            int l = start_layer;
+            while (l < end_layer_exclusive) {
+                while (l < end_layer_exclusive && bank.layers[l].state != LayerState::EVICTED) ++l;
+                int run_start = l;
+                while (l < end_layer_exclusive && bank.layers[l].state == LayerState::EVICTED) ++l;
+                if (l > run_start) {
+                    map_and_submit_contiguous_locked(bank, run_start, l);
                 }
             }
             drv.check(drv.cuStreamSynchronize(h2d_stream_), "load_layers_sync wait h2d");
-            for (int l = start_layer; l < end_layer_exclusive; ++l) {
-                bank.layers[l].needs_stream_wait = false;
+            for (int i = start_layer; i < end_layer_exclusive; ++i) {
+                bank.layers[i].needs_stream_wait = false;
             }
             return 0;
         } catch (const std::exception& e) {
@@ -818,43 +833,75 @@ private:
         return h;
     }
 
-    void map_and_submit_h2d_locked(ExpertBank& bank, int layer_idx) {
+    // Batch-map a contiguous range [start_layer, end_layer) with ONE single cuMemSetAccess
+    // (avoids per-layer GPU MMU TLB shootdown while DMA is active!), then submit per-layer
+    // H2D DMA + ready_event so compute_stream can pipeline layer-by-layer with zero mid-DMA stall.
+    void map_and_submit_contiguous_locked(ExpertBank& bank, int start_layer, int end_layer) {
+        if (start_layer >= end_layer) return;
         auto& drv = CudaDriver::instance();
-        auto& lyr = bank.layers[layer_idx];
-        std::vector<CUmemGenericAllocationHandle> handles;
-        handles.reserve(bank.handles_per_layer);
-        for (size_t i = 0; i < bank.handles_per_layer; ++i) {
-            handles.push_back(pop_super_handle_locked(nullptr, /*for_kv=*/false, bank.id));
+        const int count = end_layer - start_layer;
+        const size_t total_handles = static_cast<size_t>(count) * bank.handles_per_layer;
+
+        std::vector<CUmemGenericAllocationHandle> all_handles;
+        all_handles.reserve(total_handles);
+        size_t mapped_count = 0;
+        const CUdeviceptr batch_va =
+            bank.va_base + static_cast<size_t>(start_layer) * bank.layer_stride_bytes;
+        const size_t batch_bytes = static_cast<size_t>(count) * bank.layer_stride_bytes;
+
+        try {
+            for (size_t i = 0; i < total_handles; ++i) {
+                all_handles.push_back(pop_super_handle_locked(nullptr, /*for_kv=*/false, bank.id));
+            }
+
+            auto tm0 = std::chrono::steady_clock::now();
+            for (size_t i = 0; i < total_handles; ++i) {
+                drv.check(drv.cuMemMap(batch_va + i * super_bytes_, super_bytes_, 0, all_handles[i], 0),
+                          "expert batch cuMemMap");
+                ++mapped_count;
+            }
+            drv.check(drv.cuMemSetAccess(batch_va, batch_bytes, &access_, 1),
+                      "expert batch cuMemSetAccess");
+            auto tm1 = std::chrono::steady_clock::now();
+            expert_map_us_ += std::chrono::duration<double, std::micro>(tm1 - tm0).count();
+
+            auto th0 = std::chrono::steady_clock::now();
+            for (int idx = 0; idx < count; ++idx) {
+                const int l = start_layer + idx;
+                auto& lyr = bank.layers[l];
+                const size_t byte_off = static_cast<size_t>(l) * bank.layer_stride_bytes;
+                const CUdeviceptr dst_va = bank.va_base + byte_off;
+                const uint8_t* src_host = bank.host_pinned_base + byte_off;
+                const size_t copy_bytes =
+                    (lyr.used_bytes > 0 && lyr.used_bytes <= bank.layer_stride_bytes)
+                        ? lyr.used_bytes
+                        : bank.layer_stride_bytes;
+
+                drv.check(drv.cuMemcpyHtoDAsync(dst_va, src_host, copy_bytes, h2d_stream_),
+                          "expert cuMemcpyHtoDAsync");
+                drv.check(drv.cuEventRecord(lyr.ready_event, h2d_stream_), "expert cuEventRecord");
+
+                lyr.handles.assign(
+                    all_handles.begin() + static_cast<std::ptrdiff_t>(idx * bank.handles_per_layer),
+                    all_handles.begin() + static_cast<std::ptrdiff_t>((idx + 1) * bank.handles_per_layer));
+                lyr.state = LayerState::RESIDENT;
+                lyr.needs_stream_wait = true;
+                expert_mapped_handles_ += bank.handles_per_layer;
+                ++expert_resident_layers_;
+                ++expert_prefetch_layers_completed_;
+                expert_h2d_bytes_total_ += copy_bytes;
+            }
+            auto th1 = std::chrono::steady_clock::now();
+            expert_h2d_submit_us_ += std::chrono::duration<double, std::micro>(th1 - th0).count();
+        } catch (...) {
+            if (mapped_count > 0) {
+                drv.cuMemUnmap(batch_va, mapped_count * super_bytes_);
+            }
+            for (auto h : all_handles) {
+                free_super_handles_.push_back(h);
+            }
+            throw;
         }
-
-        const size_t byte_off = static_cast<size_t>(layer_idx) * bank.layer_stride_bytes;
-        const CUdeviceptr dst_va = bank.va_base + byte_off;
-        const uint8_t* src_host = bank.host_pinned_base + byte_off;
-
-        auto tm0 = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < handles.size(); ++i) {
-            drv.check(drv.cuMemMap(dst_va + i * super_bytes_, super_bytes_, 0, handles[i], 0),
-                      "expert cuMemMap");
-        }
-        drv.check(drv.cuMemSetAccess(dst_va, bank.layer_stride_bytes, &access_, 1),
-                  "expert cuMemSetAccess");
-        auto tm1 = std::chrono::steady_clock::now();
-        expert_map_us_ += std::chrono::duration<double, std::micro>(tm1 - tm0).count();
-
-        auto th0 = std::chrono::steady_clock::now();
-        drv.check(drv.cuMemcpyHtoDAsync(dst_va, src_host, bank.layer_stride_bytes, h2d_stream_),
-                  "expert cuMemcpyHtoDAsync");
-        drv.check(drv.cuEventRecord(lyr.ready_event, h2d_stream_), "expert cuEventRecord");
-        auto th1 = std::chrono::steady_clock::now();
-        expert_h2d_submit_us_ += std::chrono::duration<double, std::micro>(th1 - th0).count();
-
-        lyr.handles = std::move(handles);
-        lyr.state = LayerState::RESIDENT;
-        lyr.needs_stream_wait = true;
-        expert_mapped_handles_ += bank.handles_per_layer;
-        ++expert_resident_layers_;
-        ++expert_prefetch_layers_completed_;
-        expert_h2d_bytes_total_ += bank.layer_stride_bytes;
     }
 
     void streamer_loop() {
@@ -872,29 +919,50 @@ private:
         }
 
         while (true) {
-            PrefetchJob job;
-            {
-                std::unique_lock<std::mutex> lock(mu_);
-                cv_req_.wait(lock, [&] { return stop_streamer_ || !prefetch_queue_.empty(); });
-                if (stop_streamer_) return;
-                job = prefetch_queue_.front();
-                prefetch_queue_.pop_front();
-                if (job.expert_id < 0 || static_cast<size_t>(job.expert_id) >= experts_.size()) continue;
-                auto& bank = experts_[job.expert_id];
-                if (job.layer_idx < 0 || job.layer_idx >= bank.num_layers) continue;
-                if (bank.layers[job.layer_idx].state != LayerState::QUEUED) continue;
-                bank.layers[job.layer_idx].state = LayerState::STREAMING;
-                try {
-                    ensure_ctx_locked();
-                    map_and_submit_h2d_locked(bank, job.layer_idx);
-                } catch (const std::exception& e) {
-                    std::fprintf(stderr, "[tripool_vmm] streamer layer %d error: %s\n", job.layer_idx, e.what());
-                    bank.layers[job.layer_idx].state = LayerState::EVICTED;
-                    streamer_error_ = true;
+            std::unique_lock<std::mutex> lock(mu_);
+            cv_req_.wait(lock, [&] { return stop_streamer_ || !prefetch_queue_.empty(); });
+            if (stop_streamer_) return;
+
+            PrefetchJob first = prefetch_queue_.front();
+            prefetch_queue_.pop_front();
+            if (first.expert_id < 0 || static_cast<size_t>(first.expert_id) >= experts_.size()) continue;
+            auto& bank = experts_[first.expert_id];
+            if (first.layer_idx < 0 || first.layer_idx >= bank.num_layers) continue;
+            if (bank.layers[first.layer_idx].state != LayerState::QUEUED) continue;
+
+            // Coalesce contiguous queued layers of the same expert into one TLB-friendly batch map!
+            int start_l = first.layer_idx;
+            int end_l = start_l + 1;
+            while (!prefetch_queue_.empty()) {
+                const auto& nxt = prefetch_queue_.front();
+                if (nxt.expert_id == first.expert_id &&
+                    nxt.layer_idx == end_l &&
+                    end_l < bank.num_layers &&
+                    bank.layers[end_l].state == LayerState::QUEUED) {
+                    prefetch_queue_.pop_front();
+                    ++end_l;
+                } else {
+                    break;
                 }
-                lock.unlock();
-                cv_ready_.notify_all();
             }
+            for (int l = start_l; l < end_l; ++l) {
+                bank.layers[l].state = LayerState::STREAMING;
+            }
+            try {
+                ensure_ctx_locked();
+                map_and_submit_contiguous_locked(bank, start_l, end_l);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[tripool_vmm] streamer layers [%d,%d) error: %s\n",
+                             start_l, end_l, e.what());
+                for (int l = start_l; l < end_l; ++l) {
+                    if (bank.layers[l].state != LayerState::RESIDENT) {
+                        bank.layers[l].state = LayerState::EVICTED;
+                    }
+                }
+                streamer_error_ = true;
+            }
+            lock.unlock();
+            cv_ready_.notify_all();
         }
     }
 
@@ -1104,6 +1172,10 @@ size_t tripool_expert_layer_stride_bytes(int expert_id) {
 
 int tripool_expert_set_pinned(int expert_id, int pinned) {
     return UnifiedTriPoolVMM::instance().expert_set_pinned(expert_id, pinned);
+}
+
+int tripool_expert_set_layer_used_bytes(int expert_id, int layer_idx, size_t used_bytes) {
+    return UnifiedTriPoolVMM::instance().expert_set_layer_used_bytes(expert_id, layer_idx, used_bytes);
 }
 
 int tripool_expert_load_layers_sync(int expert_id, int start_layer, int end_layer_exclusive) {

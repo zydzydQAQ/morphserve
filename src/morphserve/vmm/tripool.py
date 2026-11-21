@@ -247,6 +247,8 @@ class TriPoolVMM:
 
         L.tripool_expert_set_pinned.argtypes = [ctypes.c_int, ctypes.c_int]
         L.tripool_expert_set_pinned.restype = ctypes.c_int
+        L.tripool_expert_set_layer_used_bytes.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_size_t]
+        L.tripool_expert_set_layer_used_bytes.restype = ctypes.c_int
         L.tripool_expert_load_layers_sync.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
         L.tripool_expert_load_layers_sync.restype = ctypes.c_int
         L.tripool_expert_prefetch_async.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
@@ -364,6 +366,15 @@ class TriPoolVMM:
         rc = int(self.lib.tripool_expert_set_pinned(int(expert_id), 1 if pinned else 0))
         if rc != 0:
             raise RuntimeError(f"tripool_expert_set_pinned failed (rc={rc})")
+
+    def set_expert_layer_used_bytes(self, expert_id: int, layer_idx: int, used_bytes: int) -> None:
+        rc = int(
+            self.lib.tripool_expert_set_layer_used_bytes(
+                int(expert_id), int(layer_idx), ctypes.c_size_t(int(used_bytes))
+            )
+        )
+        if rc != 0:
+            raise RuntimeError(f"tripool_expert_set_layer_used_bytes failed (rc={rc})")
 
     def load_expert_layers_sync(self, expert_id: int, start_layer: int, end_layer: int) -> None:
         rc = int(self.lib.tripool_expert_load_layers_sync(int(expert_id), int(start_layer), int(end_layer)))

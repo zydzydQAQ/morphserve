@@ -97,6 +97,7 @@ class TestModule1VmmOffline(unittest.TestCase):
                 "tripool_kv_alloc_page",
                 "tripool_kv_free_page",
                 "tripool_expert_register",
+                "tripool_expert_set_layer_used_bytes",
                 "tripool_expert_prefetch_async",
                 "tripool_expert_wait_layer",
                 "tripool_expert_evict_range",

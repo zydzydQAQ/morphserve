@@ -94,6 +94,7 @@ uint64_t tripool_expert_layer_va(int expert_id, int layer_idx);
 size_t tripool_expert_layer_stride_bytes(int expert_id);
 
 int tripool_expert_set_pinned(int expert_id, int pinned);
+int tripool_expert_set_layer_used_bytes(int expert_id, int layer_idx, size_t used_bytes);
 int tripool_expert_load_layers_sync(int expert_id, int start_layer, int end_layer_exclusive);
 int tripool_expert_prefetch_async(int expert_id, int start_layer, int end_layer_exclusive);
 int tripool_expert_wait_layer(int expert_id, int layer_idx, void* compute_stream);

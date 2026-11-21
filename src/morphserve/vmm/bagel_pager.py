@@ -35,7 +35,7 @@ def align_up(n: int, align: int = ALIGN_BYTES) -> int:
 
 
 def is_generation_param_name(name: str) -> bool:
-    return "moe_gen" in name
+    return ("moe_gen" in name) or ("_gen." in name) or name.endswith("_gen") or ("gen_proj" in name)
 
 
 def build_layer_pack_plans(
@@ -181,6 +181,7 @@ class BagelExpertPager:
 
         self._va_views = []
         for plan in self.plans:
+            vmm.set_expert_layer_used_bytes(self.expert_id, plan.layer_idx, plan.used_bytes)
             layer = self.layers[plan.layer_idx]
             param_map = dict(layer.named_parameters())
             layer_u8_va = vmm.expert_layer_uint8_view(self.expert_id, plan.layer_idx)

@@ -1,0 +1,394 @@
+"""Phase-2 Milestone M2.3: 8xA100 BAGEL-7B-MoT 5-Baseline Evaluation, Skew, Ablations & Lossless Parity."""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from dataclasses import replace
+import gc
+import hashlib
+import json
+import math
+from pathlib import Path
+import shutil
+import time
+from typing import Any
+
+from morphserve.bench.interleaved_bench import (
+    InterleavedSession,
+    WorkloadSuite,
+    load_burstgpt_interarrivals,
+    load_gentd26_interarrivals,
+)
+from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine, VALID_POLICIES
+
+
+def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
+    """Select a deterministic, quadrant-balanced slice of `suite` preserving arrival ordering."""
+    if max_sessions <= 0 or len(suite.sessions) <= max_sessions:
+        return suite
+    by_quad: dict[str, list[InterleavedSession]] = defaultdict(list)
+    for s in suite.sessions:
+        by_quad[s.quadrant].append(s)
+
+    n_tot = len(suite.sessions)
+    picked: list[InterleavedSession] = []
+    quotas: list[tuple[str, int, float]] = []
+    used = 0
+    for q, items in sorted(by_quad.items()):
+        exact = max_sessions * (len(items) / float(n_tot))
+        cnt = min(len(items), int(math.floor(exact)))
+        quotas.append((q, cnt, exact - cnt))
+        used += cnt
+
+    quotas.sort(key=lambda x: (-x[2], x[0]))
+    counts = {q: c for q, c, _ in quotas}
+    rem = max_sessions - used
+    for q, _, _ in quotas:
+        if rem <= 0:
+            break
+        if counts[q] < len(by_quad[q]):
+            counts[q] += 1
+            rem -= 1
+
+    for q, items in sorted(by_quad.items()):
+        picked.extend(items[: counts[q]])
+    picked.sort(key=lambda s: (s.arrival_offset_s, s.session_id))
+    return WorkloadSuite(
+        name=f"{suite.name}_n{len(picked)}",
+        trace_source=suite.trace_source,
+        base_qps=suite.base_qps,
+        sessions=picked,
+    )
+
+
+def _compute_image_pair_metrics(path_a: Path, path_b: Path) -> dict[str, Any]:
+    import numpy as np
+    from PIL import Image
+
+    sha_a = hashlib.sha256(path_a.read_bytes()).hexdigest()
+    sha_b = hashlib.sha256(path_b.read_bytes()).hexdigest()
+    with Image.open(path_a) as ia, Image.open(path_b) as ib:
+        arr_a = np.asarray(ia.convert("RGB"), dtype=np.float64)
+        arr_b = np.asarray(ib.convert("RGB"), dtype=np.float64)
+    if arr_a.shape != arr_b.shape:
+        return {
+            "sha256_equal": False,
+            "ssim": 0.0,
+            "psnr_db": 0.0,
+            "mae_u8": 255.0,
+            "sha256_a": sha_a[:16],
+            "sha256_b": sha_b[:16],
+        }
+    diff = np.abs(arr_a - arr_b)
+    mae = float(diff.mean())
+    mse = float(((arr_a - arr_b) ** 2).mean())
+    psnr = 99.0 if mse < 1e-10 else float(10.0 * math.log10((255.0**2) / mse))
+
+    h, w, c = arr_a.shape
+    bh = (h // 8) * 8
+    bw = (w // 8) * 8
+    ab = arr_a[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
+    bb = arr_b[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    mu_a = ab.mean(axis=1)
+    mu_b = bb.mean(axis=1)
+    var_a = ab.var(axis=1)
+    var_b = bb.var(axis=1)
+    cov = ((ab - mu_a[:, None]) * (bb - mu_b[:, None])).mean(axis=1)
+    ssim = float((((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2))).mean())
+    return {
+        "sha256_equal": sha_a == sha_b,
+        "ssim": round(ssim, 6),
+        "psnr_db": round(psnr, 2),
+        "mae_u8": round(mae, 4),
+        "sha256_a": sha_a[:16],
+        "sha256_b": sha_b[:16],
+    }
+
+
+def build_ablation_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolicyConfig]]:
+    """Construct the 5-step M1-M4 ablation ladder on BAGEL-7B-MoT."""
+    base_ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=num_gpus)
+    base_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=num_gpus)
+    return [
+        ("full_morphserve", base_ms),
+        ("no_m4_layer_chunk", replace(base_ms, policy_name="no_m4_layer_chunk", preemption_mode="non_preemptive")),
+        ("no_m3_cow_loopback", replace(base_ms, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)),
+        (
+            "no_m2_dual_path",
+            replace(base_ms, policy_name="no_m2_dual_path", routing_mode="sticky_least_loaded", adaptive_alpha_rebalance=False),
+        ),
+        ("no_m1_tripool_vmm", replace(base_mono, policy_name="no_m1_tripool_vmm")),
+    ]
+
+
+def run_suite_a_qps_and_ablations(
+    model_dir: Path,
+    bench_root: Path,
+    output_dir: Path,
+    num_gpus: int = 8,
+    max_sessions: int = 28,
+    qps_points: tuple[float, ...] = (0.4, 0.8, 1.3),
+    ablation_qps: float = 1.1,
+    policies: tuple[str, ...] = VALID_POLICIES,
+) -> dict[str, Any]:
+    """Suite A (1x8 GPUs): Main 4-quadrant QPS sweep across 6 policies + M1-M4 ablation ladder."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    raw_main = WorkloadSuite.load_json(bench_root / "suites/main_mix_80.json")
+    suite = stratify_suite(raw_main, max_sessions=max_sessions)
+
+    sources_dir = bench_root / "sources"
+    burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
+    gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
+
+    qps_sweep_results: list[dict[str, Any]] = []
+    for preset in policies:
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus)
+        engine = MorphServeClusterEngine(
+            policy=policy,
+            model_dir=model_dir,
+            bench_root=bench_root,
+            tmp_root=Path(f"/tmp/ms_m23a_{preset}"),
+        )
+        try:
+            init_info = engine.start()
+            for qps in qps_points:
+                rep = engine.run_suite(
+                    suite,
+                    target_qps=qps,
+                    burstgpt_deltas=burst_deltas,
+                    gentd_deltas=gentd_deltas,
+                )
+                d = rep.to_dict()
+                d.pop("sessions", None)
+                d["host_shmem_delta_gib"] = init_info.get("host_shmem_delta_gib", rep.host_shmem_delta_gib)
+                qps_sweep_results.append(d)
+                print(
+                    f"[M2.3-QPS] policy={preset} qps={qps} goodput={rep.joint_slo_goodput_rps:.3f} "
+                    f"joint_slo={rep.joint_slo_attainment_pct}% ar_tpot_p95={rep.ar_tpot_p95_ms}ms "
+                    f"dit_p95={rep.dit_turn_p95_ms}ms oom={rep.oom_sessions}",
+                    flush=True,
+                )
+        finally:
+            engine.shutdown()
+            gc.collect()
+
+    ablation_results: list[dict[str, Any]] = []
+    for ab_name, ab_cfg in build_ablation_configs(num_gpus=num_gpus):
+        engine = MorphServeClusterEngine(
+            policy=ab_cfg,
+            model_dir=model_dir,
+            bench_root=bench_root,
+            tmp_root=Path(f"/tmp/ms_m23ab_{ab_name}"),
+        )
+        try:
+            engine.start()
+            rep = engine.run_suite(
+                suite,
+                target_qps=ablation_qps,
+                burstgpt_deltas=burst_deltas,
+                gentd_deltas=gentd_deltas,
+            )
+            d = rep.to_dict()
+            d.pop("sessions", None)
+            d["ablation_name"] = ab_name
+            ablation_results.append(d)
+            print(
+                f"[M2.3-ABLATION] {ab_name} qps={ablation_qps} goodput={rep.joint_slo_goodput_rps:.3f} "
+                f"joint_slo={rep.joint_slo_attainment_pct}% ar_tpot_p95={rep.ar_tpot_p95_ms}ms "
+                f"peak_mib={rep.peak_gpu_reserved_mib} oom={rep.oom_sessions}",
+                flush=True,
+            )
+        finally:
+            engine.shutdown()
+            gc.collect()
+
+    report = {
+        "schema": "morphserve.phase2.m23_suite_a.v1",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "num_gpus": num_gpus,
+        "sessions_per_point": len(suite.sessions),
+        "qps_points": list(qps_points),
+        "ablation_qps": ablation_qps,
+        "qps_sweep": qps_sweep_results,
+        "ablations": ablation_results,
+        "status": "ok" if all(r["error_sessions"] == 0 for r in qps_sweep_results + ablation_results) else "check_failed",
+    }
+    out_path = output_dir / "m23-suite-a-report.json"
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"wrote {out_path}", flush=True)
+    return report
+
+
+def run_suite_b_skews_and_parity(
+    model_dir: Path,
+    bench_root: Path,
+    output_dir: Path,
+    num_gpus: int = 8,
+    skew_sessions: int = 24,
+    skew_qps: float = 1.0,
+    policies: tuple[str, ...] = VALID_POLICIES,
+) -> dict[str, Any]:
+    """Suite B (1x8 GPUs): Modality-skew sweep (80:20 / 50:50 / 20:80) + GenEval/MMVet lossless parity."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    skew_files = (
+        ("ar80_dit20", "suites/skew_ar80_dit20.json"),
+        ("ar50_dit50", "suites/skew_ar50_dit50.json"),
+        ("ar20_dit80", "suites/skew_ar20_dit80.json"),
+    )
+    skew_suites = [
+        (tag, stratify_suite(WorkloadSuite.load_json(bench_root / rel), max_sessions=skew_sessions))
+        for tag, rel in skew_files
+    ]
+
+    sources_dir = bench_root / "sources"
+    burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
+    gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
+
+    skew_results: list[dict[str, Any]] = []
+    for preset in policies:
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus)
+        engine = MorphServeClusterEngine(
+            policy=policy,
+            model_dir=model_dir,
+            bench_root=bench_root,
+            tmp_root=Path(f"/tmp/ms_m23b_{preset}"),
+        )
+        try:
+            engine.start()
+            for skew_tag, sk_suite in skew_suites:
+                rep = engine.run_suite(
+                    sk_suite,
+                    target_qps=skew_qps,
+                    burstgpt_deltas=burst_deltas,
+                    gentd_deltas=gentd_deltas,
+                )
+                d = rep.to_dict()
+                d.pop("sessions", None)
+                d["skew_tag"] = skew_tag
+                skew_results.append(d)
+                print(
+                    f"[M2.3-SKEW] policy={preset} skew={skew_tag} goodput={rep.joint_slo_goodput_rps:.3f} "
+                    f"joint_slo={rep.joint_slo_attainment_pct}% ship={rep.path_a_ships} morph={rep.path_b_morphs}",
+                    flush=True,
+                )
+        finally:
+            engine.shutdown()
+            gc.collect()
+
+    acc_suite = WorkloadSuite.load_json(bench_root / "suites/accuracy_geneval_mmvet.json")
+    tmp_acc_root = Path("/tmp/ms_m23_parity_outputs")
+    shutil.rmtree(tmp_acc_root, ignore_errors=True)
+    parity_runs: dict[str, dict[str, dict[str, Any]]] = {}
+
+    try:
+        for preset in ("monolithic_dp", "morphserve"):
+            pol = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus)
+            eng = MorphServeClusterEngine(
+                policy=pol,
+                model_dir=model_dir,
+                bench_root=bench_root,
+                tmp_root=Path(f"/tmp/ms_m23_acc_{preset}"),
+            )
+            try:
+                eng.start()
+                rep = eng.run_suite(
+                    acc_suite,
+                    target_qps=0.4,
+                    save_outputs_dir=tmp_acc_root / preset,
+                )
+                parity_runs[preset] = {s["session_id"]: s for s in rep.sessions}
+            finally:
+                eng.shutdown()
+                gc.collect()
+
+        mmvet_total = 0
+        mmvet_exact = 0
+        geneval_metrics: list[dict[str, Any]] = []
+        for s in acc_suite.sessions:
+            sid = s.session_id
+            ref_s = parity_runs["monolithic_dp"][sid]
+            ms_s = parity_runs["morphserve"][sid]
+            if s.quadrant == "multi_image_vqa":
+                mmvet_total += 1
+                if ref_s.get("ar_texts") == ms_s.get("ar_texts"):
+                    mmvet_exact += 1
+            elif s.quadrant == "highres_t2i":
+                ref_imgs = ref_s.get("image_paths_out") or []
+                ms_imgs = ms_s.get("image_paths_out") or []
+                if ref_imgs and ms_imgs and Path(ref_imgs[0]).is_file() and Path(ms_imgs[0]).is_file():
+                    m = _compute_image_pair_metrics(Path(ref_imgs[0]), Path(ms_imgs[0]))
+                    m["session_id"] = sid
+                    geneval_metrics.append(m)
+
+        mmvet_exact_pct = round(100.0 * mmvet_exact / max(1, len(geneval_metrics) and mmvet_total or mmvet_total), 2) if mmvet_total else 0.0
+        mean_ssim = round(sum(m["ssim"] for m in geneval_metrics) / max(1, len(geneval_metrics)), 6)
+        min_ssim = round(min((m["ssim"] for m in geneval_metrics), default=0.0), 6)
+        sha_exact_cnt = sum(1 for m in geneval_metrics if m["sha256_equal"])
+        parity_summary = {
+            "mmvet_sessions": mmvet_total,
+            "mmvet_greedy_exact_matches": mmvet_exact,
+            "mmvet_greedy_exact_match_pct": mmvet_exact_pct,
+            "geneval_sessions": len(geneval_metrics),
+            "geneval_sha256_exact_count": sha_exact_cnt,
+            "geneval_mean_ssim": mean_ssim,
+            "geneval_min_ssim": min_ssim,
+            "geneval_pairs": geneval_metrics,
+            "lossless_pass": mmvet_exact_pct == 100.0 and min_ssim >= 0.99,
+        }
+    finally:
+        shutil.rmtree(tmp_acc_root, ignore_errors=True)
+
+    report = {
+        "schema": "morphserve.phase2.m23_suite_b.v1",
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "num_gpus": num_gpus,
+        "skew_qps": skew_qps,
+        "skew_sessions_per_point": skew_sessions,
+        "skew_sweep": skew_results,
+        "lossless_parity": parity_summary,
+        "status": (
+            "ok"
+            if all(r["error_sessions"] == 0 for r in skew_results) and parity_summary["lossless_pass"]
+            else "check_failed"
+        ),
+    }
+    out_path = output_dir / "m23-suite-b-report.json"
+    out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"wrote {out_path}", flush=True)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="MorphServe Phase-2 M2.3 BAGEL-7B-MoT Main Evaluation")
+    parser.add_argument("--mode", choices=("suite_a", "suite_b"), required=True)
+    parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument("--bench-root", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--max-sessions", type=int, default=28)
+    args = parser.parse_args(argv)
+
+    if args.mode == "suite_a":
+        rep = run_suite_a_qps_and_ablations(
+            model_dir=args.model_dir,
+            bench_root=args.bench_root,
+            output_dir=args.output_dir,
+            num_gpus=args.num_gpus,
+            max_sessions=args.max_sessions,
+        )
+    else:
+        rep = run_suite_b_skews_and_parity(
+            model_dir=args.model_dir,
+            bench_root=args.bench_root,
+            output_dir=args.output_dir,
+            num_gpus=args.num_gpus,
+            skew_sessions=min(24, args.max_sessions),
+        )
+    return 0 if rep.get("status") == "ok" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

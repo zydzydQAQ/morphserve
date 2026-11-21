@@ -465,7 +465,7 @@ _FA2_BACKEND_CACHE: dict[tuple[str, int, int, int], tuple[str, float, Any, bool]
 _FA2_BACKEND_ERRORS: list[str] = []
 _CU_SEQLENS_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 _ATTN_META_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
-_HIGHRES_STRATEGY_CACHE: dict[tuple[str, int, int, int], str] = {}
+_DIRECT_WS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def _get_cu_seqlens(lens: list[int], device: Any) -> Any:
@@ -907,6 +907,94 @@ def _run_fast_batched_noncausal_cfg(
     return [o_4d[b] for b in range(len(q_list))]
 
 
+def _run_direct_workspace_noncausal_cfg(
+    q_list: list[Any],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+    k_prefix: Any | None,
+    v_prefix: Any | None,
+    shared_branch_ids: list[int],
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    attn_noncausal: Any,
+) -> list[Any]:
+    """Single-copy direct write into 1 reusable layer workspace + cached mask metadata."""
+    import torch
+
+    num_branches = len(q_list)
+    q0 = q_list[0]
+    q_len, h_q, head_dim = q0.shape
+    h_kv = k_loc_list[0].shape[1]
+    shared_set = set(shared_branch_ids)
+    l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
+
+    lens_list: list[int] = []
+    for b in range(num_branches):
+        ln = int(k_loc_list[b].shape[0])
+        if b in shared_set and l_shared > 0 and k_prefix is not None:
+            ln += l_shared
+        ks = k_suffix_list[b]
+        if ks is not None and ks.shape[0] > 0:
+            ln += int(ks.shape[0])
+        lens_list.append(ln)
+    lens = tuple(lens_list)
+    max_len = max(lens)
+
+    wkey = (str(q0.device), str(q0.dtype))
+    ws = _DIRECT_WS_CACHE.get(wkey)
+    q_shape = (num_branches, q_len, h_q, head_dim)
+    kv_shape = (num_branches, max_len, h_kv, head_dim)
+    if (
+        ws is None
+        or ws["q"].shape != q_shape
+        or ws["k"].shape[0] != num_branches
+        or ws["k"].shape[1] < max_len
+        or ws["k"].shape[2:] != (h_kv, head_dim)
+    ):
+        ws = {
+            "q": torch.empty(q_shape, dtype=q0.dtype, device=q0.device),
+            "k": torch.zeros(kv_shape, dtype=k_loc_list[0].dtype, device=q0.device),
+            "v": torch.zeros(kv_shape, dtype=v_loc_list[0].dtype, device=q0.device),
+            "last_lens": lens,
+            "last_max": max_len,
+        }
+        _DIRECT_WS_CACHE[wkey] = ws
+
+    q_buf = ws["q"]
+    k_buf = ws["k"][:, :max_len]
+    v_buf = ws["v"][:, :max_len]
+    need_zero_pad = (ws["last_lens"] != lens) or (ws["last_max"] != max_len)
+    if need_zero_pad:
+        ws["last_lens"] = lens
+        ws["last_max"] = max_len
+
+    for b in range(num_branches):
+        q_buf[b].copy_(q_list[b])
+        pad = max_len - lens[b]
+        if need_zero_pad and pad > 0:
+            k_buf[b, :pad].zero_()
+            v_buf[b, :pad].zero_()
+        pos = pad
+        if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
+            k_buf[b, pos : pos + l_shared].copy_(k_prefix)
+            v_buf[b, pos : pos + l_shared].copy_(v_prefix)
+            pos += l_shared
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and vs is not None and ks.shape[0] > 0:
+            ls = int(ks.shape[0])
+            k_buf[b, pos : pos + ls].copy_(ks)
+            v_buf[b, pos : pos + ls].copy_(vs)
+            pos += ls
+        kl, vl = k_loc_list[b], v_loc_list[b]
+        ll = int(kl.shape[0])
+        k_buf[b, pos : pos + ll].copy_(kl)
+        v_buf[b, pos : pos + ll].copy_(vl)
+
+    meta = _get_cached_left_pad_meta(lens, q0.device)
+    o_4d = attn_noncausal(q_buf, k_buf, v_buf, meta)
+    return [o_4d[b] for b in range(num_branches)]
+
+
 def _run_unpadded_varlen_cfg(
     q_list: list[Any],
     k_loc_list: list[Any],
@@ -929,66 +1017,17 @@ def _run_unpadded_varlen_cfg(
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
     if attn_noncausal is not None:
-        skey = (str(q_list[0].device), q_len, l_shared // 1024, len(shared_branch_ids))
-        strat = _HIGHRES_STRATEGY_CACHE.get(skey)
-        if strat is None and q_list[0].is_cuda:
-            # One-time <15ms micro-calibration per shape bucket during warmup
-            cands: dict[str, Any] = {
-                "clustered": lambda: _run_clustered_noncausal_cfg(
-                    q_list,
-                    *_assemble_branch_kv(
-                        num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
-                    ),
-                    shared_branch_ids,
-                    attn_noncausal,
-                ),
-                "fast_batched": lambda: _run_fast_batched_noncausal_cfg(
-                    q_list,
-                    *_assemble_branch_kv(
-                        num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
-                    ),
-                    attn_noncausal,
-                ),
-            }
-            if l_shared >= 256 and len(shared_branch_ids) >= 2:
-                cands["flash_prefix"] = lambda: _run_flash_prefix_cfg(
-                    q_list, k_loc_list, v_loc_list, k_prefix, v_prefix, shared_branch_ids, k_suffix_list, v_suffix_list, sm_scale
-                )
-            best_name = "clustered"
-            best_ms = float("inf")
-            for name, fn_cand in cands.items():
-                out_c = fn_cand()
-                if out_c is None:
-                    continue
-                ev0 = torch.cuda.Event(enable_timing=True)
-                ev1 = torch.cuda.Event(enable_timing=True)
-                ev0.record()
-                for _ in range(3):
-                    _ = fn_cand()
-                ev1.record()
-                torch.cuda.synchronize(q_list[0].device)
-                ms = ev0.elapsed_time(ev1) / 3.0
-                if ms < best_ms:
-                    best_ms = ms
-                    best_name = name
-            strat = best_name
-            if len(_HIGHRES_STRATEGY_CACHE) < 128:
-                _HIGHRES_STRATEGY_CACHE[skey] = strat
-        elif strat is None:
-            strat = "clustered"
-
-        if strat == "flash_prefix":
-            fp_out = _run_flash_prefix_cfg(
-                q_list, k_loc_list, v_loc_list, k_prefix, v_prefix, shared_branch_ids, k_suffix_list, v_suffix_list, sm_scale
-            )
-            if fp_out is not None:
-                return fp_out
-        kb_list, vb_list = _assemble_branch_kv(
-            num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
+        return _run_direct_workspace_noncausal_cfg(
+            q_list=q_list,
+            k_loc_list=k_loc_list,
+            v_loc_list=v_loc_list,
+            k_prefix=k_prefix,
+            v_prefix=v_prefix,
+            shared_branch_ids=shared_branch_ids,
+            k_suffix_list=k_suffix_list,
+            v_suffix_list=v_suffix_list,
+            attn_noncausal=attn_noncausal,
         )
-        if strat == "fast_batched":
-            return _run_fast_batched_noncausal_cfg(q_list, kb_list, vb_list, attn_noncausal)
-        return _run_clustered_noncausal_cfg(q_list, kb_list, vb_list, shared_branch_ids, attn_noncausal)
 
     backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
     kind, _, fn, _ = backend

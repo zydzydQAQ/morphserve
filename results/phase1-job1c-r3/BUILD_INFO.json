@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "bb92fec78c42962d57ddabb865ecfc4139eec334",
+  "short_commit": "bb92fec",
+  "subject": "feat(m2,m3,m4): implement 8-GPU dual-path router & DirectNcclP2PChannel, finalize M3/M4 gates",
+  "built_utc": "2026-11-21T06:27:24+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 45,
+  "bytes": 749776
+}

@@ -163,6 +163,7 @@ class TestModule2Offline(unittest.TestCase):
             "src/morphserve/router/topology.py",
             "src/morphserve/router/cost_router.py",
             "src/morphserve/router/nccl_state_shipper.py",
+            "src/morphserve/bench/validate_module2_dualpath.py",
         ):
             p = REPO_ROOT / rel
             res = subprocess.run([sys.executable, "-m", "py_compile", str(p)], capture_output=True, text=True)

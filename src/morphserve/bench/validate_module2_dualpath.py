@@ -277,8 +277,13 @@ def _run_bagel_dit(pipeline, main_ctx, cfg_text_ctx, cfg_img_ctx, prompt: str, s
 
 def _ctx_nbytes(ctx: dict[str, Any]) -> int:
     pkv = ctx["past_key_values"]
+    num_layers = int(pkv.num_layers)
+    get_k = pkv.key_cache.get if isinstance(pkv.key_cache, dict) else (lambda i: pkv.key_cache[i])
+    get_v = pkv.value_cache.get if isinstance(pkv.value_cache, dict) else (lambda i: pkv.value_cache[i])
     total = 0
-    for k, v in zip(pkv.key_cache, pkv.value_cache):
+    for l in range(num_layers):
+        k = get_k(l)
+        v = get_v(l)
         if k is not None:
             total += int(k.numel() * k.element_size())
         if v is not None:

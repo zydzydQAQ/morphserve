@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import asdict, dataclass, field
 import math
+import os
 from pathlib import Path
 import queue
-import shutil
 import threading
 import time
 from typing import Any
@@ -75,6 +75,8 @@ class SessionOutcome:
     path_b_morphs: int = 0
     preempted_ar_turns: int = 0
     total_yields: int = 0
+    ar_texts: list[str] = field(default_factory=list)
+    image_paths_out: list[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -151,6 +153,7 @@ class MorphServeClusterEngine:
         self._gpu_locks: list[asyncio.Lock] = []
         self._active_dit_ranks: dict[int, int] = {}
         self._active_preemptions: dict[int, int] = {}
+        self._active_ar_count: int = 0
         self._rr_cursor = 0
         self._started = False
         self._shmem_before_kib = 0
@@ -392,7 +395,12 @@ class MorphServeClusterEngine:
             )
             return r_res
 
-    async def _run_session_coro(self, sess: InterleavedSession, suite_t0: float) -> SessionOutcome:
+    async def _run_session_coro(
+        self,
+        sess: InterleavedSession,
+        suite_t0: float,
+        save_outputs_dir: Path | None = None,
+    ) -> SessionOutcome:
         delay = (suite_t0 + sess.arrival_offset_s) - time.perf_counter()
         if delay > 0.0:
             await asyncio.sleep(delay)
@@ -402,10 +410,13 @@ class MorphServeClusterEngine:
         ctx_id = f"ctx_{sess.session_id}"
         kv_bytes = 0
         prev_tmp_img: str | None = None
+        prev_tmp_owned = False
 
         ar_ttfts: list[float] = []
         ar_tpots: list[float] = []
         dit_turns: list[float] = []
+        ar_texts: list[str] = []
+        image_paths_out: list[str] = []
         path_a_ships = 0
         path_b_morphs = 0
         preempted_ar_turns = 0
@@ -422,45 +433,56 @@ class MorphServeClusterEngine:
 
                 # ---- Branch 1: Pure AR turn (VQA) ----
                 if plan == "ar_only":
-                    can_preempt = (
-                        self.policy.preemption_mode != "non_preemptive"
-                        and self._active_dit_ranks.get(resident_gpu, 0) > 0
-                    )
-                    if can_preempt:
-                        self._active_preemptions[resident_gpu] += 1
-                        try:
-                            ar_res = await self._rpc(
-                                resident_gpu,
-                                {
-                                    "op": "EXEC_AR_PREEMPT",
-                                    "ctx_id": ctx_id,
-                                    "prompt": turn.prompt,
-                                    "image_paths": turn.image_paths,
-                                    "max_ar_tokens": turn.max_ar_tokens,
-                                    "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
-                                    "enqueue_time_s": time.perf_counter(),
-                                    "prepare_for_dit": False,
-                                },
-                            )
-                        finally:
-                            self._active_preemptions[resident_gpu] -= 1
-                        preempted_ar_turns += 1
-                    else:
-                        async with self._gpu_locks[resident_gpu]:
-                            t_wait0 = time.perf_counter()
-                            ar_res = await self._rpc(
-                                resident_gpu,
-                                {
-                                    "op": "EXEC_AR",
-                                    "ctx_id": ctx_id,
-                                    "prompt": turn.prompt,
-                                    "image_paths": turn.image_paths,
-                                    "max_ar_tokens": turn.max_ar_tokens,
-                                    "prepare_for_dit": False,
-                                },
-                            )
-                            queue_wait = (time.perf_counter() - t_wait0) * 1000.0
-                            ar_res["ttft_ms"] = max(float(ar_res.get("ttft_ms", 0.0)), queue_wait * 0.0 + float(ar_res.get("ttft_ms", 0.0)))
+                    self._active_ar_count += 1
+                    try:
+                        can_preempt = (
+                            self.policy.preemption_mode != "non_preemptive"
+                            and self._active_dit_ranks.get(resident_gpu, 0) > 0
+                        )
+                        if can_preempt:
+                            self._active_preemptions[resident_gpu] += 1
+                            try:
+                                ar_res = await self._rpc(
+                                    resident_gpu,
+                                    {
+                                        "op": "EXEC_AR_PREEMPT",
+                                        "ctx_id": ctx_id,
+                                        "prompt": turn.prompt,
+                                        "image_paths": turn.image_paths,
+                                        "max_ar_tokens": turn.max_ar_tokens,
+                                        "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
+                                        "enqueue_time_s": time.perf_counter(),
+                                        "prepare_for_dit": False,
+                                    },
+                                )
+                            finally:
+                                self._active_preemptions[resident_gpu] -= 1
+                            preempted_ar_turns += 1
+                        else:
+                            t_enq = time.perf_counter()
+                            est_ar_ms = 22.0 * max(1, turn.max_ar_tokens)
+                            self.worker_states[resident_gpu].queue_wait_ms += est_ar_ms
+                            try:
+                                async with self._gpu_locks[resident_gpu]:
+                                    q_wait_ms = (time.perf_counter() - t_enq) * 1000.0
+                                    ar_res = await self._rpc(
+                                        resident_gpu,
+                                        {
+                                            "op": "EXEC_AR",
+                                            "ctx_id": ctx_id,
+                                            "prompt": turn.prompt,
+                                            "image_paths": turn.image_paths,
+                                            "max_ar_tokens": turn.max_ar_tokens,
+                                            "prepare_for_dit": False,
+                                        },
+                                    )
+                                    ar_res["ttft_ms"] = round(q_wait_ms + float(ar_res.get("ttft_ms", 0.0)), 2)
+                            finally:
+                                self.worker_states[resident_gpu].queue_wait_ms = max(
+                                    0.0, self.worker_states[resident_gpu].queue_wait_ms - est_ar_ms
+                                )
+                    finally:
+                        self._active_ar_count = max(0, self._active_ar_count - 1)
 
                     if ar_res["status"] == "oom":
                         return SessionOutcome(
@@ -476,47 +498,62 @@ class MorphServeClusterEngine:
                     kv_bytes = int(ar_res.get("kv_bytes", kv_bytes))
                     ar_ttfts.append(float(ar_res.get("ttft_ms", 0.0)))
                     ar_tpots.extend(float(x) for x in ar_res.get("tpots_ms", []))
+                    ar_texts.append(str(ar_res.get("text", "")))
                     continue
 
                 # ---- Branch 2: Visual-CoT / DiT Edit / High-Res T2I ----
                 t_turn0 = time.perf_counter()
                 if plan == "cot_then_dit":
-                    can_preempt = (
-                        self.policy.preemption_mode != "non_preemptive"
-                        and self._active_dit_ranks.get(resident_gpu, 0) > 0
-                    )
-                    if can_preempt:
-                        self._active_preemptions[resident_gpu] += 1
-                        try:
-                            cot_res = await self._rpc(
-                                resident_gpu,
-                                {
-                                    "op": "EXEC_AR_PREEMPT",
-                                    "ctx_id": ctx_id,
-                                    "prompt": turn.prompt,
-                                    "image_paths": turn.image_paths,
-                                    "max_ar_tokens": turn.max_ar_tokens,
-                                    "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
-                                    "enqueue_time_s": time.perf_counter(),
-                                    "prepare_for_dit": True,
-                                },
-                            )
-                        finally:
-                            self._active_preemptions[resident_gpu] -= 1
-                        preempted_ar_turns += 1
-                    else:
-                        async with self._gpu_locks[resident_gpu]:
-                            cot_res = await self._rpc(
-                                resident_gpu,
-                                {
-                                    "op": "EXEC_AR",
-                                    "ctx_id": ctx_id,
-                                    "prompt": turn.prompt,
-                                    "image_paths": turn.image_paths,
-                                    "max_ar_tokens": turn.max_ar_tokens,
-                                    "prepare_for_dit": True,
-                                },
-                            )
+                    self._active_ar_count += 1
+                    try:
+                        can_preempt = (
+                            self.policy.preemption_mode != "non_preemptive"
+                            and self._active_dit_ranks.get(resident_gpu, 0) > 0
+                        )
+                        if can_preempt:
+                            self._active_preemptions[resident_gpu] += 1
+                            try:
+                                cot_res = await self._rpc(
+                                    resident_gpu,
+                                    {
+                                        "op": "EXEC_AR_PREEMPT",
+                                        "ctx_id": ctx_id,
+                                        "prompt": turn.prompt,
+                                        "image_paths": turn.image_paths,
+                                        "max_ar_tokens": turn.max_ar_tokens,
+                                        "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
+                                        "enqueue_time_s": time.perf_counter(),
+                                        "prepare_for_dit": True,
+                                    },
+                                )
+                            finally:
+                                self._active_preemptions[resident_gpu] -= 1
+                            preempted_ar_turns += 1
+                        else:
+                            t_enq = time.perf_counter()
+                            est_ar_ms = 22.0 * max(1, turn.max_ar_tokens)
+                            self.worker_states[resident_gpu].queue_wait_ms += est_ar_ms
+                            try:
+                                async with self._gpu_locks[resident_gpu]:
+                                    q_wait_ms = (time.perf_counter() - t_enq) * 1000.0
+                                    cot_res = await self._rpc(
+                                        resident_gpu,
+                                        {
+                                            "op": "EXEC_AR",
+                                            "ctx_id": ctx_id,
+                                            "prompt": turn.prompt,
+                                            "image_paths": turn.image_paths,
+                                            "max_ar_tokens": turn.max_ar_tokens,
+                                            "prepare_for_dit": True,
+                                        },
+                                    )
+                                    cot_res["ttft_ms"] = round(q_wait_ms + float(cot_res.get("ttft_ms", 0.0)), 2)
+                            finally:
+                                self.worker_states[resident_gpu].queue_wait_ms = max(
+                                    0.0, self.worker_states[resident_gpu].queue_wait_ms - est_ar_ms
+                                )
+                    finally:
+                        self._active_ar_count = max(0, self._active_ar_count - 1)
                     if cot_res["status"] == "oom":
                         return SessionOutcome(
                             session_id=sess.session_id,
@@ -528,6 +565,7 @@ class MorphServeClusterEngine:
                     kv_bytes = int(cot_res.get("kv_bytes", kv_bytes))
                     ar_ttfts.append(float(cot_res.get("ttft_ms", 0.0)))
                     ar_tpots.extend(float(x) for x in cot_res.get("tpots_ms", []))
+                    ar_texts.append(str(cot_res.get("text", "")))
                 else:
                     # dit_edit or dit_t2i prefill
                     async with self._gpu_locks[resident_gpu]:
@@ -614,8 +652,12 @@ class MorphServeClusterEngine:
                     path_a_ships += 1
 
                 save_tmp = None
-                if has_more_edits and self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
+                if save_outputs_dir is not None:
+                    save_tmp = str(save_outputs_dir / f"{sess.session_id}_t{ti}.png")
+                    prev_tmp_owned = False
+                elif has_more_edits and self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
                     save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
+                    prev_tmp_owned = True
 
                 est_dit_ms = (1500.0 if turn.height >= 1024 else 285.0) * turn.dit_steps
                 self.worker_states[dst_gpu].queue_wait_ms += est_dit_ms
@@ -636,6 +678,20 @@ class MorphServeClusterEngine:
                                     "save_tmp_image_path": save_tmp,
                                 },
                             )
+                            # Elastic soft-biased alpha rebalance on hybrid ranks (even GPUs)
+                            if (
+                                dit_res.get("status") == "ok"
+                                and self.policy.adaptive_alpha_rebalance
+                                and self.policy.use_expert_pager
+                                and self.policy.num_gpus >= 2
+                                and (dst_gpu % 2 == 0)
+                            ):
+                                active_dit_tot = sum(self._active_dit_ranks.values()) - 1
+                                target_alpha = 0.25 if self._active_ar_count > active_dit_tot else 0.50
+                                alpha_res = await self._rpc(dst_gpu, {"op": "SET_ALPHA", "alpha": target_alpha})
+                                dit_res["resident_alpha"] = round(
+                                    float(alpha_res.get("resident_layers", 14)) / 28.0, 3
+                                )
                         finally:
                             self._active_dit_ranks[dst_gpu] -= 1
                 finally:
@@ -658,6 +714,8 @@ class MorphServeClusterEngine:
                 total_yields += int(dit_res.get("yield_count", 0))
                 if save_tmp is not None:
                     prev_tmp_img = save_tmp
+                    if save_outputs_dir is not None:
+                        image_paths_out.append(save_tmp)
                 # If static fission sent context away from und_gpu, next turn starts back on an und_gpu with prev_tmp_img
                 if self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
                     await self._rpc(dst_gpu, {"op": "RELEASE_CTX", "ctx_id": ctx_id})
@@ -685,6 +743,8 @@ class MorphServeClusterEngine:
                 path_b_morphs=path_b_morphs,
                 preempted_ar_turns=preempted_ar_turns,
                 total_yields=total_yields,
+                ar_texts=ar_texts,
+                image_paths_out=image_paths_out,
             )
         finally:
             if resident_gpu is not None:
@@ -692,11 +752,8 @@ class MorphServeClusterEngine:
                     await self._rpc(resident_gpu, {"op": "RELEASE_CTX", "ctx_id": ctx_id})
                 except Exception:
                     pass
-            if prev_tmp_img and os.path.exists(prev_tmp_img):
-                try:
-                    os.remove(prev_tmp_img)
-                except OSError:
-                    pass
+            if prev_tmp_img and prev_tmp_owned:
+                Path(prev_tmp_img).unlink(missing_ok=True)
 
     async def _run_suite_async(
         self,
@@ -704,8 +761,11 @@ class MorphServeClusterEngine:
         target_qps: float | None,
         burstgpt_deltas: list[float] | None,
         gentd26_deltas: list[float] | None,
+        save_outputs_dir: Path | None = None,
     ) -> ClusterRunReport:
         self._gpu_locks = [asyncio.Lock() for _ in range(self.policy.num_gpus)]
+        if save_outputs_dir is not None:
+            save_outputs_dir.mkdir(parents=True, exist_ok=True)
         sessions = [
             InterleavedSession(
                 session_id=s.session_id,
@@ -721,7 +781,9 @@ class MorphServeClusterEngine:
             assign_dual_trace_arrivals(sessions, burstgpt_deltas, gentd26_deltas, target_qps=eff_qps)
 
         t0 = time.perf_counter()
-        outcomes = await asyncio.gather(*(self._run_session_coro(s, t0) for s in sessions))
+        outcomes = await asyncio.gather(
+            *(self._run_session_coro(s, t0, save_outputs_dir=save_outputs_dir) for s in sessions)
+        )
         wall_s = max(time.perf_counter() - t0, 1e-6)
 
         stat_res = await asyncio.gather(*(self._rpc(g, {"op": "GET_STATS"}) for g in range(self.policy.num_gpus)))
@@ -782,11 +844,18 @@ class MorphServeClusterEngine:
         target_qps: float | None = None,
         burstgpt_deltas: list[float] | None = None,
         gentd26_deltas: list[float] | None = None,
+        save_outputs_dir: Path | None = None,
     ) -> ClusterRunReport:
         if not self._started:
             self.start()
         return asyncio.run(
-            self._run_suite_async(suite, target_qps, burstgpt_deltas, gentd26_deltas)
+            self._run_suite_async(
+                suite,
+                target_qps,
+                burstgpt_deltas,
+                gentd26_deltas,
+                save_outputs_dir=save_outputs_dir,
+            )
         )
 
     def shutdown(self) -> None:

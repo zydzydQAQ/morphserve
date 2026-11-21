@@ -464,6 +464,8 @@ def _run_unshared_single_branch(
 _FA2_BACKEND_CACHE: dict[tuple[str, int, int, int], tuple[str, float, Any, bool]] = {}
 _FA2_BACKEND_ERRORS: list[str] = []
 _CU_SEQLENS_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+_ATTN_META_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+_HIGHRES_STRATEGY_CACHE: dict[tuple[str, int, int, int], str] = {}
 
 
 def _get_cu_seqlens(lens: list[int], device: Any) -> Any:
@@ -491,7 +493,7 @@ def get_fa2_backend_status() -> dict[str, Any]:
     }
 
 
-def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
+def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any | None = None) -> Any:
     """Exact log-sum-exp online-softmax merge for `[M, H_q, D]` outputs and `[M, H_q]` ln-LSEs."""
     import torch
 
@@ -503,7 +505,7 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
     lb_1d = lse_b.reshape(n_rows).contiguous()
 
     if HAS_TRITON and oa_2d.is_cuda and d in (64, 128):
-        out_2d = torch.empty_like(oa_2d)
+        out_2d = ob_2d if (out is o_b and ob_2d.is_contiguous()) else torch.empty_like(oa_2d)
         block_r = 64 if n_rows >= 256 else 16
         grid = (triton.cdiv(n_rows, block_r),)
         _merge_two_lse_fwd[grid](
@@ -529,7 +531,11 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
     wa = torch.exp(lse_a - m)
     wb = torch.exp(lse_b - m)
     inv = 1.0 / (wa + wb)
-    return (o_a.float() * (wa * inv).unsqueeze(-1) + o_b.float() * (wb * inv).unsqueeze(-1)).to(o_a.dtype)
+    merged = (o_a.float() * (wa * inv).unsqueeze(-1) + o_b.float() * (wb * inv).unsqueeze(-1)).to(o_a.dtype)
+    if out is not None:
+        out.copy_(merged)
+        return out
+    return merged
 
 
 def _normalize_lse_shape(
@@ -721,21 +727,20 @@ def _run_flash_prefix_cfg(
     b_sh = list(shared_branch_ids)
     shared_set = set(b_sh)
     unshared_ids = [b for b in range(num_branches) if b not in shared_set]
+    ordered_ids = b_sh + unshared_ids
+    n_sh_rows = len(b_sh) * q_len
+
+    # Allocate packed Q once; shared-prefix pass slices a zero-copy view `q_all[:n_sh_rows]`!
+    q_all = torch.cat([q_list[b] for b in ordered_ids], dim=0).contiguous()
+    q_shared_cat = q_all[:n_sh_rows]
 
     # Stage 1: Single HBM read of (k_prefix, v_prefix) for all shared branches packed along Q!
-    q_shared_cat = torch.cat([q_list[b] for b in b_sh], dim=0).contiguous()
     kp, vp = k_prefix.contiguous(), v_prefix.contiguous()
     o_pre_cat, lse_pre_cat = _run_varlen_fa2_with_lse(
-        backend, q_shared_cat, kp, vp, [len(b_sh) * q_len], [int(kp.shape[0])], sm_scale
+        backend, q_shared_cat, kp, vp, [n_sh_rows], [int(kp.shape[0])], sm_scale
     )
 
     # Stage 2: Compact batched unpadded tail pass for ALL shared + unshared branches
-    ordered_ids = b_sh + unshared_ids
-    q_all = (
-        torch.cat([q_shared_cat] + [q_list[b] for b in unshared_ids], dim=0).contiguous()
-        if unshared_ids
-        else q_shared_cat
-    )
     tail_ks, tail_vs, tail_lens = [], [], []
     for b in ordered_ids:
         ks, vs = k_suffix_list[b], v_suffix_list[b]
@@ -753,10 +758,10 @@ def _run_flash_prefix_cfg(
         backend, q_all, k_tail_cat, v_tail_cat, [q_len] * len(ordered_ids), tail_lens, sm_scale
     )
 
-    # Stage 3: Exact FP32 online-softmax LSE merge for shared branches
-    n_sh_rows = len(b_sh) * q_len
+    # Stage 3: In-place exact FP32 online-softmax LSE merge directly into `o_tail_all[:n_sh_rows]`
+    o_tail_sh = o_tail_all[:n_sh_rows]
     o_merged = _merge_two_lse_states(
-        o_pre_cat, lse_pre_cat, o_tail_all[:n_sh_rows], lse_tail_all[:n_sh_rows]
+        o_pre_cat, lse_pre_cat, o_tail_sh, lse_tail_all[:n_sh_rows], out=o_tail_sh
     )
     outputs: list[Any] = [None] * num_branches
     for idx_b, b in enumerate(b_sh):
@@ -776,6 +781,132 @@ def _should_use_flash_prefix_split(q_len: int, l_shared: int, num_shared_branche
     return l_shared >= 4 * q_len
 
 
+def _get_cached_left_pad_meta(lens: tuple[int, ...], device: Any) -> Any:
+    """Return cached DiffusionAttentionMetadata(attn_mask) without per-layer mask alloc/fill."""
+    import torch
+
+    max_len = max(lens)
+    if all(ln == max_len for ln in lens):
+        return None
+    key = (str(device), lens)
+    cached = _ATTN_META_CACHE.get(key)
+    if cached is not None:
+        return cached
+    mask = torch.zeros((len(lens), max_len), dtype=torch.bool, device=device)
+    for i, ln in enumerate(lens):
+        mask[i, max_len - ln :] = True
+    try:
+        from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
+
+        meta = DiffusionAttentionMetadata(attn_mask=mask)
+    except Exception:
+        meta = None
+    if meta is not None and len(_ATTN_META_CACHE) < 256:
+        _ATTN_META_CACHE[key] = meta
+    return meta
+
+
+def _fast_left_pad_kv_pair(k_tensors: list[Any], v_tensors: list[Any]) -> tuple[Any, Any, Any]:
+    """Pack K/V branch tensors without redundant full-buffer cudaMemsetAsync or mask allocations."""
+    import torch
+
+    lens = tuple(int(t.shape[0]) for t in k_tensors)
+    max_len = max(lens)
+    if all(ln == max_len for ln in lens):
+        return torch.stack(k_tensors, dim=0), torch.stack(v_tensors, dim=0), None
+    bsz = len(k_tensors)
+    shape = (bsz, max_len, *k_tensors[0].shape[1:])
+    k_out = torch.empty(shape, dtype=k_tensors[0].dtype, device=k_tensors[0].device)
+    v_out = torch.empty(shape, dtype=v_tensors[0].dtype, device=v_tensors[0].device)
+    for i, (kt, vt, ln) in enumerate(zip(k_tensors, v_tensors, lens)):
+        pad = max_len - ln
+        if pad > 0:
+            k_out[i, :pad].zero_()
+            v_out[i, :pad].zero_()
+        k_out[i, pad:] = kt
+        v_out[i, pad:] = vt
+    meta = _get_cached_left_pad_meta(lens, k_tensors[0].device)
+    return k_out, v_out, meta
+
+
+def _assemble_branch_kv(
+    num_branches: int,
+    shared_set: set[int],
+    l_shared: int,
+    k_prefix: Any | None,
+    v_prefix: Any | None,
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+) -> tuple[list[Any], list[Any]]:
+    import torch
+
+    kb_list: list[Any] = []
+    vb_list: list[Any] = []
+    for b in range(num_branches):
+        k_parts: list[Any] = []
+        v_parts: list[Any] = []
+        if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
+            k_parts.append(k_prefix)
+            v_parts.append(v_prefix)
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and vs is not None and ks.shape[0] > 0:
+            k_parts.append(ks)
+            v_parts.append(vs)
+        k_parts.append(k_loc_list[b])
+        v_parts.append(v_loc_list[b])
+        kb_list.append(k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=0))
+        vb_list.append(v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=0))
+    return kb_list, vb_list
+
+
+def _run_clustered_noncausal_cfg(
+    q_list: list[Any],
+    kb_list: list[Any],
+    vb_list: list[Any],
+    shared_branch_ids: list[int],
+    attn_noncausal: Any,
+) -> list[Any]:
+    """Batch equal/near-equal shared branches (B=2) while running short unshared `cfg_img` unpadded (B=1)."""
+    import torch
+
+    num_branches = len(q_list)
+    b_sh = list(shared_branch_ids)
+    shared_set = set(b_sh)
+    unshared_ids = [b for b in range(num_branches) if b not in shared_set]
+    outs: list[Any] = [None] * num_branches
+
+    if len(b_sh) >= 2:
+        q_sh = torch.stack([q_list[b] for b in b_sh], dim=0)
+        k_sh, v_sh, meta_sh = _fast_left_pad_kv_pair([kb_list[b] for b in b_sh], [vb_list[b] for b in b_sh])
+        o_sh = attn_noncausal(q_sh, k_sh, v_sh, meta_sh)
+        for idx_b, b in enumerate(b_sh):
+            outs[b] = o_sh[idx_b]
+    elif len(b_sh) == 1:
+        b = b_sh[0]
+        outs[b] = attn_noncausal(q_list[b].unsqueeze(0), kb_list[b].unsqueeze(0), vb_list[b].unsqueeze(0), None).squeeze(0)
+
+    for b in unshared_ids:
+        outs[b] = attn_noncausal(q_list[b].unsqueeze(0), kb_list[b].unsqueeze(0), vb_list[b].unsqueeze(0), None).squeeze(0)
+    return outs
+
+
+def _run_fast_batched_noncausal_cfg(
+    q_list: list[Any],
+    kb_list: list[Any],
+    vb_list: list[Any],
+    attn_noncausal: Any,
+) -> list[Any]:
+    """Single-launch batched `attn_noncausal` using cached mask metadata and zero-memset empty buffers."""
+    import torch
+
+    q_4d = torch.stack(q_list, dim=0)
+    k_4d, v_4d, meta = _fast_left_pad_kv_pair(kb_list, vb_list)
+    o_4d = attn_noncausal(q_4d, k_4d, v_4d, meta)
+    return [o_4d[b] for b in range(len(q_list))]
+
+
 def _run_unpadded_varlen_cfg(
     q_list: list[Any],
     k_loc_list: list[Any],
@@ -788,7 +919,7 @@ def _run_unpadded_varlen_cfg(
     sm_scale: float,
     attn_noncausal: Any | None = None,
 ) -> list[Any] | None:
-    """Unpadded single-pass CFG attention without left-padding, Q-stacking, or LSE merge."""
+    """High-res / short-prefix lossless CFG attention without LSE-merge bottleneck."""
     import torch
 
     num_branches = len(q_list)
@@ -797,27 +928,67 @@ def _run_unpadded_varlen_cfg(
     shared_set = set(shared_branch_ids)
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
-    # Fast path when native vLLM-Omni non-causal attention operator is available:
-    # avoids 3D->4D Q stack copy, avoids left-pad + mask unpadding, and evaluates each
-    # branch on its exact unpadded KV length in a single K/V cat per branch.
     if attn_noncausal is not None:
-        outs: list[Any] = []
-        for b in range(num_branches):
-            k_parts: list[Any] = []
-            v_parts: list[Any] = []
-            if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
-                k_parts.append(k_prefix)
-                v_parts.append(v_prefix)
-            ks, vs = k_suffix_list[b], v_suffix_list[b]
-            if ks is not None and vs is not None and ks.shape[0] > 0:
-                k_parts.append(ks)
-                v_parts.append(vs)
-            k_parts.append(k_loc_list[b])
-            v_parts.append(v_loc_list[b])
-            kb = k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=0)
-            vb = v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=0)
-            outs.append(attn_noncausal(q_list[b].unsqueeze(0), kb.unsqueeze(0), vb.unsqueeze(0), None).squeeze(0))
-        return outs
+        skey = (str(q_list[0].device), q_len, l_shared // 1024, len(shared_branch_ids))
+        strat = _HIGHRES_STRATEGY_CACHE.get(skey)
+        if strat is None and q_list[0].is_cuda:
+            # One-time <15ms micro-calibration per shape bucket during warmup
+            cands: dict[str, Any] = {
+                "clustered": lambda: _run_clustered_noncausal_cfg(
+                    q_list,
+                    *_assemble_branch_kv(
+                        num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
+                    ),
+                    shared_branch_ids,
+                    attn_noncausal,
+                ),
+                "fast_batched": lambda: _run_fast_batched_noncausal_cfg(
+                    q_list,
+                    *_assemble_branch_kv(
+                        num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
+                    ),
+                    attn_noncausal,
+                ),
+            }
+            if l_shared >= 256 and len(shared_branch_ids) >= 2:
+                cands["flash_prefix"] = lambda: _run_flash_prefix_cfg(
+                    q_list, k_loc_list, v_loc_list, k_prefix, v_prefix, shared_branch_ids, k_suffix_list, v_suffix_list, sm_scale
+                )
+            best_name = "clustered"
+            best_ms = float("inf")
+            for name, fn_cand in cands.items():
+                out_c = fn_cand()
+                if out_c is None:
+                    continue
+                ev0 = torch.cuda.Event(enable_timing=True)
+                ev1 = torch.cuda.Event(enable_timing=True)
+                ev0.record()
+                for _ in range(3):
+                    _ = fn_cand()
+                ev1.record()
+                torch.cuda.synchronize(q_list[0].device)
+                ms = ev0.elapsed_time(ev1) / 3.0
+                if ms < best_ms:
+                    best_ms = ms
+                    best_name = name
+            strat = best_name
+            if len(_HIGHRES_STRATEGY_CACHE) < 128:
+                _HIGHRES_STRATEGY_CACHE[skey] = strat
+        elif strat is None:
+            strat = "clustered"
+
+        if strat == "flash_prefix":
+            fp_out = _run_flash_prefix_cfg(
+                q_list, k_loc_list, v_loc_list, k_prefix, v_prefix, shared_branch_ids, k_suffix_list, v_suffix_list, sm_scale
+            )
+            if fp_out is not None:
+                return fp_out
+        kb_list, vb_list = _assemble_branch_kv(
+            num_branches, shared_set, l_shared, k_prefix, v_prefix, k_suffix_list, v_suffix_list, k_loc_list, v_loc_list
+        )
+        if strat == "fast_batched":
+            return _run_fast_batched_noncausal_cfg(q_list, kb_list, vb_list, attn_noncausal)
+        return _run_clustered_noncausal_cfg(q_list, kb_list, vb_list, shared_branch_ids, attn_noncausal)
 
     backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
     kind, _, fn, _ = backend

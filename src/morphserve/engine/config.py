@@ -39,8 +39,8 @@ class EnginePolicyConfig:
     ar_tpot_slo_ms: float = 125.6  # 2.0x unloaded 62.82ms A100 baseline
     ar_ttft_slo_ms: float = 1500.0
     dit_turn_slo_ms: float = 15000.0
-    super_pool_mib: int = 18432
-    fine_kv_pool_mib: int = 1024
+    super_pool_mib: int = 12800
+    fine_kv_pool_mib: int = 128
     super_handle_mib: int = 64
     transient_va_gib: int = 16
     kv_va_gib: int = 8
@@ -89,8 +89,8 @@ class EnginePolicyConfig:
                 kv_vmm_only=False,
                 preemption_mode="layer_chunk",
                 initial_alphas=alphas,
-                super_pool_mib=18432,
-                fine_kv_pool_mib=1024,
+                super_pool_mib=12800,
+                fine_kv_pool_mib=128,
                 adaptive_alpha_rebalance=True,
             )
         elif policy_name == "monolithic_dp":

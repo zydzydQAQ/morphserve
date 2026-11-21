@@ -425,6 +425,8 @@ class MorphServeClusterEngine:
 
         try:
             for ti, turn in enumerate(sess.turns):
+                if ti > 0:
+                    await asyncio.sleep(0.25)
                 plan = turn.modality_plan
                 is_edit_followup = (plan == "dit_edit") and (ti > 0)
                 has_more_edits = any(t.modality_plan == "dit_edit" for t in sess.turns[ti + 1 :])

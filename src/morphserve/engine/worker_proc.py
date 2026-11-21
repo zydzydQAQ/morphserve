@@ -189,7 +189,6 @@ def run_worker_process(
 
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")
     bench_root = Path(bench_root_str)

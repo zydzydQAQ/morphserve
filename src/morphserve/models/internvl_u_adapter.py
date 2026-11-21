@@ -56,9 +56,12 @@ def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
         sys.modules.setdefault("timm.layers", layers_mod)
 
     import transformers.image_utils as iu
+    from transformers.modeling_utils import PreTrainedModel
     import transformers.processing_utils as pu
     import transformers.utils as tu
 
+    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
+        PreTrainedModel.all_tied_weights_keys = {}
     if not hasattr(iu, "concatenate_list"):
         iu.concatenate_list = lambda items: [x for sub in items for x in (sub if isinstance(sub, list) else [sub])]
     if not hasattr(iu, "make_list_of_images"):
@@ -112,6 +115,22 @@ def load_internvlu_pipeline(
     from internvlu.diffusion import InternVLUGenerationDecoder
     from internvlu.processing_internvlu import InternVLUProcessor
     from internvlu.vlm import InternVLUChatModel
+    from internvlu.vlm.modeling_intern_vit import InternVisionModel
+
+    for cls_m in (InternVLUChatModel, InternVisionModel, InternVLUGenerationDecoder):
+        if not getattr(cls_m, "_ms_post_init_patched", False):
+            orig_init = cls_m.__init__
+
+            def _make_patched_init(fn):
+                def _patched_init(self, *a, **kw):
+                    fn(self, *a, **kw)
+                    if not hasattr(self, "all_tied_weights_keys") or "all_tied_weights_keys" not in self.__dict__:
+                        self.all_tied_weights_keys = {}
+
+                return _patched_init
+
+            cls_m.__init__ = _make_patched_init(orig_init)
+            cls_m._ms_post_init_patched = True
 
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")

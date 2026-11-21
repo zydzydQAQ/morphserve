@@ -1,0 +1,104 @@
+{
+  "schema": "morphserve.phase2.m25_multinode_2x8.v1",
+  "timestamp_utc": "2026-11-21T17:14:00Z",
+  "num_nodes": 2,
+  "gpus_per_node": 8,
+  "world_size": 16,
+  "fabric_measurements": [
+    {
+      "tier": "intra_half_pcie",
+      "src_global_rank": 0,
+      "dst_global_rank": 1,
+      "payload_mib": 24,
+      "ship_median_ms": 3.09,
+      "effective_gbps": 8.14
+    },
+    {
+      "tier": "intra_half_pcie",
+      "src_global_rank": 0,
+      "dst_global_rank": 1,
+      "payload_mib": 192,
+      "ship_median_ms": 24.24,
+      "effective_gbps": 8.31
+    },
+    {
+      "tier": "intra_half_pcie",
+      "src_global_rank": 0,
+      "dst_global_rank": 1,
+      "payload_mib": 1024,
+      "ship_median_ms": 128.32,
+      "effective_gbps": 8.37
+    },
+    {
+      "tier": "intra_node_cross_socket",
+      "src_global_rank": 0,
+      "dst_global_rank": 4,
+      "payload_mib": 24,
+      "ship_median_ms": 3.63,
+      "effective_gbps": 6.93
+    },
+    {
+      "tier": "intra_node_cross_socket",
+      "src_global_rank": 0,
+      "dst_global_rank": 4,
+      "payload_mib": 192,
+      "ship_median_ms": 27.86,
+      "effective_gbps": 7.23
+    },
+    {
+      "tier": "intra_node_cross_socket",
+      "src_global_rank": 0,
+      "dst_global_rank": 4,
+      "payload_mib": 1024,
+      "ship_median_ms": 124.93,
+      "effective_gbps": 8.59
+    },
+    {
+      "tier": "inter_node_fabric",
+      "src_global_rank": 0,
+      "dst_global_rank": 8,
+      "payload_mib": 24,
+      "ship_median_ms": 23.97,
+      "effective_gbps": 1.05
+    },
+    {
+      "tier": "inter_node_fabric",
+      "src_global_rank": 0,
+      "dst_global_rank": 8,
+      "payload_mib": 192,
+      "ship_median_ms": 188.17,
+      "effective_gbps": 1.07
+    },
+    {
+      "tier": "inter_node_fabric",
+      "src_global_rank": 0,
+      "dst_global_rank": 8,
+      "payload_mib": 1024,
+      "ship_median_ms": 963.23,
+      "effective_gbps": 1.11
+    }
+  ],
+  "calibrated_gbps": {
+    "intra_half_pcie": 8.37,
+    "intra_node_cross_socket": 8.59,
+    "inter_node_fabric": 1.11
+  },
+  "cross_node_routing_verification": {
+    "bridge_24mib_decision": {
+      "path": "state_ship",
+      "dst_gpu": 8,
+      "ship_cost_ms": 25.67,
+      "morph_cost_ms": 205.45
+    },
+    "tight_mot_1536mib_decision": {
+      "path": "in_place_morph",
+      "dst_gpu": 0,
+      "ship_cost_ms": 2905.01,
+      "morph_cost_ms": 161.8
+    },
+    "suppressed_cross_node_1gib_kv_ship": true,
+    "routing_pass": true
+  },
+  "ranks_verified": 16,
+  "status": "ok"
+}

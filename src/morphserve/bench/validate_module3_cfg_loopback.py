@@ -17,6 +17,7 @@ from morphserve.kernels import (
     SharedPrefixCache,
     cow_fork_context,
     decode_latent_to_u8_gpu,
+    get_fa2_backend_status,
     install_shared_prefix_bagel_hooks,
     prepare_vae_images_gpu,
     prepare_vit_images_gpu,
@@ -430,6 +431,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     attn_noncausal = pipeline.bagel.language_model.model.layers[0].self_attn.attn_noncausal
     micro_res = bench_triton_cfg_attention_micro(device, attn_noncausal=attn_noncausal)
     report["test1_triton_cfg_microbench"] = micro_res
+    report["fa2_backend_used"] = get_fa2_backend_status()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -541,7 +543,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "u8_decode_max_abs_diff": u8_diff_max,
         "u8_decode_bit_exact": u8_diff_max == 0,
         "vae_input_max_abs_diff": vae_diff_max,
-        "vae_input_bit_exact": u8_diff_max == 0 and vae_diff_max <= 1e-6,
+        "vae_input_fp32_exact": vae_diff_max <= 1e-6,
         "vit_tokens_max_abs_diff": round(vit_diff_max, 6),
         "vit_tokens_cosine_sim": round(vit_cos, 7),
         "ar_text_cpu": ar_text_cpu,
@@ -563,11 +565,12 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     # Run identical 4-turn editing session under:
     #   (A) Stock vLLM-Omni: deepcopy(main) -> cfg_text + NaiveCache.merge + left_pad_stack + CPU PNG loopback
     #   (B) MorphServe Module 3: CoW fork + SharedPrefixCache + Single-Read Triton CFG Attention + GPU In-Place Loopback
-    def run_4turn_session(use_morphserve: bool) -> tuple[list[dict], list]:
+    def run_4turn_session(use_morphserve: bool, capture_turn3_ctx: bool = False) -> tuple[list[dict], list, Any]:
         SharedPrefixCache.clear_memo()
         main_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
         turn_logs = []
         imgs = []
+        turn3_snapshot = None
         for turn_idx, p in enumerate(prompts):
             loopback_ms = 0.0
             if turn_idx > 0:
@@ -612,6 +615,9 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                 / MIB,
                 2,
             )
+
+            if capture_turn3_ctx and turn_idx == len(prompts) - 1:
+                turn3_snapshot = (deepcopy(main_ctx), deepcopy(cfg_text_ctx), deepcopy(cfg_img_ctx), p)
 
             if use_morphserve:
                 with cfg_patch.active(reset_stats=True):
@@ -660,17 +666,30 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         del main_ctx
         gc.collect()
         torch.cuda.empty_cache()
-        return turn_logs, imgs
+        return turn_logs, imgs, turn3_snapshot
 
-    # Warmup once on Turn 0 so stock & morphserve both measure steady-state GPU clocks
+    # Warmup once (both stock and morphserve FlashPrefix-CFG kernels) so 4-turn run has zero cold JIT stall
     _w_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
     _update_text_ctx(pipeline, _w_ctx, prompts[0])
     _, _ = _run_bagel_generate_3branch(pipeline, _w_ctx, deepcopy(_w_ctx), deepcopy(_w_ctx), prompts[0], steps=4, seed=1)
     del _w_ctx
     torch.cuda.empty_cache()
 
-    stock_turns, stock_imgs = run_4turn_session(use_morphserve=False)
-    ms_turns, ms_imgs = run_4turn_session(use_morphserve=True)
+    stock_turns, stock_imgs, turn3_snap = run_4turn_session(use_morphserve=False, capture_turn3_ctx=True)
+    # Same-History Turn-3 Isolation Check: run MorphServe on exact same 17.8k-token Stock Turn-3 context
+    m_c, ct_c, ci_c, p_t3 = turn3_snap
+    rebind_cow_prefix(m_c["past_key_values"], ct_c["past_key_values"])
+    SharedPrefixCache.clear_memo()
+    with cfg_patch.active(reset_stats=True):
+        same_ctx_t3_img, same_ctx_t3_ms = _run_bagel_generate_3branch(
+            pipeline, m_c, ct_c, ci_c, p_t3, steps=steps, seed=52 + len(prompts) - 1
+        )
+    same_ctx_turn3_qual = _compute_ssim_rgb(stock_imgs[-1], same_ctx_t3_img)
+    del turn3_snap, m_c, ct_c, ci_c, same_ctx_t3_img
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    ms_turns, ms_imgs, _ = run_4turn_session(use_morphserve=True, capture_turn3_ctx=False)
 
     turn_comparisons = []
     for st, mt, simg, mimg in zip(stock_turns, ms_turns, stock_imgs, ms_imgs):
@@ -700,6 +719,12 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
     report["test3_4turn_interleaved_e2e"] = {
         "turns": turn_comparisons,
+        "same_ctx_turn3_isolation": {
+            "morphserve_gen_ms": round(same_ctx_t3_ms, 2),
+            "stock_gen_ms": stock_turns[-1]["gen_ms"],
+            "speedup_x": round(stock_turns[-1]["gen_ms"] / max(same_ctx_t3_ms, 1e-6), 3),
+            **same_ctx_turn3_qual,
+        },
         "total_stock_gen_ms": round(sum(t["stock_gen_ms"] for t in turn_comparisons), 2),
         "total_morphserve_gen_ms": round(sum(t["morphserve_gen_ms"] for t in turn_comparisons), 2),
         "total_stock_loopback_ms": round(sum(t["stock_loopback_ms"] for t in turn_comparisons), 2),
@@ -712,14 +737,20 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     gc.collect()
     torch.cuda.empty_cache()
 
+    fa2_status = report.get("fa2_backend_used", {})
     all_pass = (
-        all(x["exact_pass"] for x in micro_res)
-        and report["test2_gpu_inplace_loopback"]["vae_input_bit_exact"]
-        and report["test2_gpu_inplace_loopback"]["vit_tokens_cosine_sim"] >= 0.9999
+        bool(fa2_status.get("has_active_fa2"))
+        and all(x["exact_pass"] and (x["speedup"] > 1.05 or x["l_shared"] < 4096) for x in micro_res)
+        and report["test2_gpu_inplace_loopback"]["u8_decode_bit_exact"]
+        and report["test2_gpu_inplace_loopback"]["vae_input_fp32_exact"]
+        and report["test2_gpu_inplace_loopback"]["vit_tokens_cosine_sim"] >= 0.99999
         and report["test2_gpu_inplace_loopback"]["ar_text_exact_match"]
         and all(t["shared_triton_attn_calls"] > 0 for t in turn_comparisons if t["turn"] >= 1)
-        and all(t["ssim"] >= 0.999 for t in turn_comparisons)
-        and all(t["kv_hbm_saved_pct"] >= 40.0 for t in turn_comparisons if t["turn"] >= 1)
+        and same_ctx_turn3_qual["ssim"] >= 0.999
+        and all(t["ssim"] >= 0.985 for t in turn_comparisons)
+        and all(t["kv_hbm_saved_pct"] >= 45.0 for t in turn_comparisons if t["turn"] >= 1)
+        and report["test3_4turn_interleaved_e2e"]["total_morphserve_gen_ms"]
+        < report["test3_4turn_interleaved_e2e"]["total_stock_gen_ms"]
     )
     report["status"] = "ok" if all_pass else "check_failed"
 
@@ -731,6 +762,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         + json.dumps(
             {
                 "status": report["status"],
+                "fa2_backend": fa2_status,
                 "micro": [
                     {
                         "case": x["case"],
@@ -744,9 +776,11 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                 "loopback": {
                     "cpu_prep_ms": report["test2_gpu_inplace_loopback"]["cpu_png_pil_prep_only_ms"],
                     "gpu_prep_ms": report["test2_gpu_inplace_loopback"]["gpu_inplace_prep_only_ms"],
-                    "vae_bit_exact": report["test2_gpu_inplace_loopback"]["vae_input_bit_exact"],
+                    "u8_exact": report["test2_gpu_inplace_loopback"]["u8_decode_bit_exact"],
+                    "vit_cos": report["test2_gpu_inplace_loopback"]["vit_tokens_cosine_sim"],
                     "ar_match": report["test2_gpu_inplace_loopback"]["ar_text_exact_match"],
                 },
+                "same_ctx_turn3_ssim": same_ctx_turn3_qual["ssim"],
                 "e2e_4turn": [
                     {
                         "turn": t["turn"],

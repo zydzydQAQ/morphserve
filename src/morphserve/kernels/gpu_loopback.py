@@ -48,9 +48,8 @@ def decode_latent_to_u8_gpu(
 
 
 def _stride_align_u8_gpu(img_u8: Any, stride: int, max_img_size: int) -> Any:
-    """GPU equivalent of `pipeline_bagel.py:_resize_to_stride`. Zero-op when already stride-aligned."""
+    """Exact GPU equivalent of `pipeline_bagel.py:_resize_to_stride`. Zero-op when already stride-aligned."""
     import torch
-    import torch.nn.functional as F
 
     _, h, w = img_u8.shape
     scale = min(max_img_size / max(w, h), 1.0)
@@ -62,14 +61,8 @@ def _stride_align_u8_gpu(img_u8: Any, stride: int, max_img_size: int) -> Any:
     new_h = min(new_h, max_img_size)
     if new_w == w and new_h == h:
         return img_u8
-    resized = F.interpolate(
-        img_u8.unsqueeze(0).to(torch.float32),
-        size=(new_h, new_w),
-        mode="bicubic",
-        align_corners=False,
-        antialias=True,
-    )[0]
-    return resized.round().clamp(0.0, 255.0).to(torch.uint8)
+    resized = pil_bicubic_resize_gpu(img_u8.to(torch.float32), new_h, new_w)
+    return resized.to(torch.uint8)
 
 
 def prepare_vae_images_gpu(

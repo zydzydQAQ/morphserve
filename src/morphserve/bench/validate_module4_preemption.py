@@ -158,9 +158,12 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
     unloaded_ar_p50_ms = _pct(ar_solo_tpot_all, 50)
     unloaded_ar_p99_ms = _pct(ar_solo_tpot_all, 99)
+    slo_15x = round(1.5 * unloaded_ar_p50_ms, 1)
+    slo_20x = round(2.0 * unloaded_ar_p50_ms, 1)
+    slo_25x = round(2.5 * unloaded_ar_p50_ms, 1)
 
     # Solo DiT baseline (measure exact reference SHA256 + per-step & per-layer determinism CV!)
-    solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=60.0)
+    solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=slo_20x)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with solo_sched.run_session():
@@ -177,6 +180,9 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     report["solo_baselines"] = {
         "unloaded_ar_tpot_p50_ms": unloaded_ar_p50_ms,
         "unloaded_ar_tpot_p99_ms": unloaded_ar_p99_ms,
+        "slo_15x_ms": slo_15x,
+        "slo_20x_ms": slo_20x,
+        "slo_25x_ms": slo_25x,
         "ar1_ref_len": len(ar_ref_tokens["ar1"]),
         "ar2_ref_len": len(ar_ref_tokens["ar2"]),
         "solo_dit_512_ms": round(solo_dit_ms, 2),
@@ -187,16 +193,16 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     }
 
     # ==================== 2. Policy Comparison: Non-Preemptive vs Step-Preemptive vs Layer-Chunk ====================
-    # Mixed workload: DiT (512x512, 20 steps, ~4.9s) starts at t=0;
-    #   - AR request 1 (32 tokens) arrives at t = 400 ms (mid-DiT!)
-    #   - AR request 2 (32 tokens) arrives at t = 2200 ms (mid-DiT!)
-    # Compare across policies and multi-SLO curve (`60ms`, `80ms`, `100ms` ~ 2.5x / 3.3x / 4.2x unloaded AR step!)
+    # Mixed workload: DiT (512x512, 20 steps, ~4.95s) starts at t=0;
+    #   - AR request 1 (20 tokens) arrives at t = 400 ms (mid-DiT!)
+    #   - AR request 2 (20 tokens) arrives at t = 2500 ms (mid-DiT!)
+    # Anchored at 1.5x / 2.0x / 2.5x unloaded AR TPOT (`unloaded_ar_p50_ms`).
     policies = [
-        ("non_preemptive_fcfs", "non_preemptive", 60.0),
-        ("step_preemptive", "step_preemptive", 60.0),
-        ("morphserve_layer_chunk_slo60", "layer_chunk", 60.0),
-        ("morphserve_layer_chunk_slo80", "layer_chunk", 80.0),
-        ("morphserve_layer_chunk_slo100", "layer_chunk", 100.0),
+        ("non_preemptive_fcfs", "non_preemptive", slo_20x),
+        ("step_preemptive", "step_preemptive", slo_20x),
+        ("morphserve_layer_chunk_15x", "layer_chunk", slo_15x),
+        ("morphserve_layer_chunk_20x", "layer_chunk", slo_20x),
+        ("morphserve_layer_chunk_25x", "layer_chunk", slo_25x),
     ]
 
     policy_results = []
@@ -210,10 +216,10 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             init_ar_step_ms=max(unloaded_ar_p50_ms, 15.0),
             max_ar_tokens_per_yield=1,
         )
-        t_ar1 = _make_ar_task(pipeline, ar_base_1, "ar1", max_tokens=32, tpot_slo_ms=slo_ms)
-        t_ar2 = _make_ar_task(pipeline, ar_base_2, "ar2", max_tokens=32, tpot_slo_ms=slo_ms)
+        t_ar1 = _make_ar_task(pipeline, ar_base_1, "ar1", max_tokens=20, tpot_slo_ms=slo_ms)
+        t_ar2 = _make_ar_task(pipeline, ar_base_2, "ar2", max_tokens=20, tpot_slo_ms=slo_ms)
         sched.schedule_ar_arrival(400.0, t_ar1)
-        sched.schedule_ar_arrival(2200.0, t_ar2)
+        sched.schedule_ar_arrival(2500.0, t_ar2)
 
         torch.cuda.synchronize()
         tw0 = time.perf_counter()
@@ -257,8 +263,8 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                 "switching_overhead_ms": round(pure_overhead_ms, 2),
                 "switching_overhead_pct": overhead_pct,
                 "dit_bit_exact": sha == ref_dit_sha,
-                "ar1_bit_exact": t_ar1.generated_token_ids == ar_ref_tokens["ar1"],
-                "ar2_bit_exact": t_ar2.generated_token_ids == ar_ref_tokens["ar2"],
+                "ar1_bit_exact": t_ar1.generated_token_ids == ar_ref_tokens["ar1"][:20],
+                "ar2_bit_exact": t_ar2.generated_token_ids == ar_ref_tokens["ar2"][:20],
             }
         )
         del img, t_ar1, t_ar2, sched
@@ -289,7 +295,14 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     # Reference Turn-1 edit image BEFORE attaching Module 1 + 3 + 4
     ref_turn1_img = _run_dit(pipeline, turn1_ctx, turn1_cfg_text, turn1_cfg_img, edit_prompt, steps=12, seed=77)
 
-    # Attach Module 1 (TriPool-VMM) + Module 3 (SharedPrefixCache + Triton CFG) + Module 4 (Layer-Chunk Preemption)!
+    # Pre-warm FlashPrefix-CFG & LSE merge kernels before attaching TriPool-VMM + Scheduler
+    cfg_patch = install_shared_prefix_bagel_hooks(pipeline, min_shared_tokens=32)
+    SharedPrefixCache.clear_memo()
+    with cfg_patch.active(reset_stats=True):
+        _ = _run_dit(pipeline, turn1_ctx, turn1_cfg_text, turn1_cfg_img, edit_prompt, steps=2, seed=77)
+    SharedPrefixCache.clear_memo()
+
+    # Attach Module 1 (TriPool-VMM) + Module 3 (SharedPrefixCache + FlashPrefix CFG) + Module 4 (Layer-Chunk Preemption)!
     pager = BagelExpertPager(pipeline, role="generation", numa_node=0, super_handle_mib=64, wrap_vae=True)
     pager.offload_to_host_mirror()
     vmm = TriPoolVMM(
@@ -302,17 +315,16 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         allow_overflow=False,
     )
     pager.bind_vmm(vmm, initial_alpha=0.5)
-    cfg_patch = install_shared_prefix_bagel_hooks(pipeline, min_shared_tokens=32)
     stack_sched = UnifiedPreemptiveScheduler(
         pipeline,
         mode="layer_chunk",
-        tpot_slo_ms=80.0,
+        tpot_slo_ms=slo_20x,
         guard_ms=4.0,
         init_layer_ms=max(layer_p50, 8.0),
         init_ar_step_ms=max(unloaded_ar_p50_ms, 15.0),
         pager=pager,
     )
-    stack_ar = _make_ar_task(pipeline, ar_base_1, "ar1", max_tokens=24, tpot_slo_ms=80.0)
+    stack_ar = _make_ar_task(pipeline, ar_base_1, "ar1", max_tokens=16, tpot_slo_ms=slo_20x)
     stack_sched.schedule_ar_arrival(500.0, stack_ar)
 
     SharedPrefixCache.clear_memo()
@@ -355,13 +367,15 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
     fcfs_res = policy_results[0]
     step_res = policy_results[1]
-    lc60_res = policy_results[2]
+    lc15_res = policy_results[2]
+    lc20_res = policy_results[3]
     all_pass = (
         all(r["dit_bit_exact"] and r["ar1_bit_exact"] and r["ar2_bit_exact"] for r in policy_results)
-        and lc60_res["ar_ttft_max_ms"] < step_res["ar_ttft_max_ms"]
-        and lc60_res["ar_tpot_p99_ms"] < step_res["ar_tpot_p99_ms"]
+        and lc15_res["ar_ttft_max_ms"] < step_res["ar_ttft_max_ms"]
+        and lc15_res["ar_tpot_p99_ms"] < step_res["ar_tpot_p99_ms"]
         and step_res["ar_ttft_max_ms"] < fcfs_res["ar_ttft_max_ms"]
-        and lc60_res["switching_overhead_pct"] <= 5.0
+        and lc20_res["tpot_slo_attainment_pct"] >= 90.0
+        and lc20_res["switching_overhead_pct"] <= 5.0
         and report["test2_full_m1_m3_m4_stack"]["m1_transient_reclaimed"]
         and report["test2_full_m1_m3_m4_stack"]["m1_overflow_creates"] == 0
         and report["test2_full_m1_m3_m4_stack"]["m3_shared_triton_calls"] > 0

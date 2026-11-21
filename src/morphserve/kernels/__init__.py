@@ -2,6 +2,7 @@
 
 from .cfg_prefix_attn import (
     BagelSharedPrefixPatch,
+    get_fa2_backend_status,
     install_shared_prefix_bagel_hooks,
     shared_prefix_cfg_attention,
     shared_prefix_cfg_attention_ref,
@@ -28,6 +29,7 @@ __all__ = [
     "cow_fork_context",
     "decode_latent_to_u8_gpu",
     "detect_lecp_prefix_len",
+    "get_fa2_backend_status",
     "install_shared_prefix_bagel_hooks",
     "prepare_vae_images_gpu",
     "prepare_vit_images_gpu",

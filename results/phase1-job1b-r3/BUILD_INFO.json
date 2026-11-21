@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "d2575797513608d517b7242642de1f4c6e24ee45",
+  "short_commit": "d257579",
+  "subject": "fix(loopback): support transformers 5.x SizeDict (980x980) and PIL uint8 resize rounding in GPU loopback",
+  "built_utc": "2026-11-21T04:11:25+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 39,
+  "bytes": 615649
+}

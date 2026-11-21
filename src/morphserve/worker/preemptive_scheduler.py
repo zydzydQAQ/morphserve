@@ -195,12 +195,32 @@ class UnifiedPreemptiveScheduler:
             if self.pager is not None and prev_guard is not None:
                 self.pager._active_guard = prev_guard
 
+    def service_one_step_round(self) -> int:
+        """Serve at most one AR decode token per active task at a DiT step boundary."""
+        batch_len = len(self.active_ar_tasks)
+        if batch_len == 0:
+            return 0
+        served = 0
+        for _ in range(batch_len):
+            if not self.active_ar_tasks:
+                break
+            task = self.active_ar_tasks.popleft()
+            self._run_one_ar_step(task)
+            served += 1
+            if task.finished:
+                self.completed_ar_tasks.append(task)
+            else:
+                self.active_ar_tasks.append(task)
+            self._admit_due_arrivals(time.perf_counter())
+        if served > 0:
+            self.yield_count += 1
+        return served
+
     def service_due_ar_tasks(self, force_all_urgent: bool = False) -> int:
         """Execute urgent AR decode steps (EDF order) during a DiT preemption boundary."""
-        import torch
-
         served = 0
-        while self.active_ar_tasks and (force_all_urgent or served < self.max_ar_tokens_per_yield):
+        max_serve = max(self.max_ar_tokens_per_yield, len(self.active_ar_tasks))
+        while self.active_ar_tasks and (force_all_urgent or served < max_serve):
             # Pick EDF (earliest deadline first) active AR task
             best_idx = min(range(len(self.active_ar_tasks)), key=lambda i: self.active_ar_tasks[i].next_deadline_s())
             task = self.active_ar_tasks[best_idx]
@@ -218,6 +238,7 @@ class UnifiedPreemptiveScheduler:
             else:
                 self.active_ar_tasks.append(task)
             self._admit_due_arrivals(time.perf_counter())
+            max_serve = max(max_serve, len(self.active_ar_tasks))
         if served > 0:
             self.yield_count += 1
         return served
@@ -359,7 +380,7 @@ class UnifiedPreemptiveScheduler:
                 sched._admit_due_arrivals(now_s)
                 if sched.active_ar_tasks:
                     if sched.mode == "step_preemptive":
-                        sched.service_due_ar_tasks(force_all_urgent=True)
+                        sched.service_one_step_round()
                         sched._last_sync_s = time.perf_counter()
                         sched._queued_gpu_ms = 0.0
                     elif sched._should_yield_now(now_s, next_unit_ms=sched.ema_layer_ms):

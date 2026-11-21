@@ -68,6 +68,32 @@ class TestModule4Offline(unittest.TestCase):
         # Approaching deadline (t=100.530s, remaining=30ms <= 32.5ms): YIELD NOW!
         self.assertTrue(sched._should_yield_now(100.530, next_unit_ms=8.5))
 
+    def test_step_preemptive_serves_at_most_one_token_per_active_task(self) -> None:
+        pipe = _MockPipeline()
+        sched = UnifiedPreemptiveScheduler(pipe, mode="step_preemptive", tpot_slo_ms=130.0)
+        for rid in ("a1", "a2"):
+            sched.active_ar_tasks.append(
+                ArDecodeTask(
+                    req_id=rid,
+                    kv_cache=None,
+                    curr_tokens=None,
+                    pos_ids=None,
+                    max_tokens=5,
+                    end_token_id=None,
+                    tpot_slo_ms=130.0,
+                )
+            )
+        ran: list[str] = []
+
+        def fake_step(task: ArDecodeTask) -> None:
+            ran.append(task.req_id)
+
+        sched._run_one_ar_step = fake_step  # type: ignore[method-assign]
+        served = sched.service_one_step_round()
+        self.assertEqual(served, 2)
+        self.assertEqual(ran, ["a1", "a2"])
+        self.assertEqual(sched.yield_count, 1)
+
     def test_module4_script_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/06_phase1_module4_validate.sh"
         proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)

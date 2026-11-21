@@ -12,7 +12,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from morphserve.kernels.gpu_loopback import _extract_target_hw  # noqa: E402
+from morphserve.kernels.gpu_loopback import _extract_target_hw, pil_bicubic_resize_gpu  # noqa: E402
 from morphserve.kernels.lecp_cache import SharedPrefixCache, cow_fork_context  # noqa: E402
 
 
@@ -93,6 +93,22 @@ class TestModule3Offline(unittest.TestCase):
 
         self.assertEqual(_extract_target_hw({"height": 980, "width": 980}, 512, 512), (980, 980))
         self.assertEqual(_extract_target_hw(_SizeDict(), 512, 512), (980, 980))
+
+    def test_pil_bicubic_resize_matches_pillow_catmull_rom(self) -> None:
+        try:
+            import numpy as np
+            from PIL import Image
+            import torch
+        except ImportError:
+            self.skipTest("torch/PIL not available in offline WSL environment")
+
+        rng = np.random.default_rng(2026)
+        arr = rng.integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
+        pil_out = np.asarray(Image.fromarray(arr).resize((122, 122), Image.BICUBIC), dtype=np.int16)
+        gpu_in = torch.from_numpy(arr.transpose(2, 0, 1).copy()).float()
+        gpu_out = pil_bicubic_resize_gpu(gpu_in, 122, 122).cpu().numpy().astype(np.int16).transpose(1, 2, 0)
+        max_diff = int(np.abs(gpu_out - pil_out).max())
+        self.assertLessEqual(max_diff, 1)
 
     def test_module3_script_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/05_phase1_module3_validate.sh"

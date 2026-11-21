@@ -19,63 +19,6 @@ except ImportError:
 
 if HAS_TRITON:
 
-    @triton.jit
-    def _lse_merge_2stage_fwd(
-        O_pre,
-        LSE_pre,
-        O_tail,
-        LSE_tail,
-        Out,
-        sop_m,
-        sop_h,
-        sop_d,
-        slp_h,
-        slp_m,
-        sot_m,
-        sot_h,
-        sot_d,
-        slt_h,
-        slt_m,
-        so_m,
-        so_h,
-        so_d,
-        TOTAL_M,
-        HEAD_DIM: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-    ):
-        """Exact FP32 online-softmax LSE merge combining shared-prefix FA2 output with private-tail FA2 output."""
-        pid_m = tl.program_id(0)
-        pid_h = tl.program_id(1)
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
-        m_mask = offs_m < TOTAL_M
-
-        lse_p = tl.load(LSE_pre + pid_h * slp_h + offs_m * slp_m, mask=m_mask, other=float("-inf")).to(tl.float32)
-        lse_t = tl.load(LSE_tail + pid_h * slt_h + offs_m * slt_m, mask=m_mask, other=float("-inf")).to(tl.float32)
-        m = tl.maximum(lse_p, lse_t)
-        wp = tl.exp(lse_p - m)
-        wt = tl.exp(lse_t - m)
-        inv = 1.0 / (wp + wt)
-        alpha_p = wp * inv
-        alpha_t = wt * inv
-
-        op = tl.load(
-            O_pre + offs_m[:, None] * sop_m + pid_h * sop_h + offs_d[None, :] * sop_d,
-            mask=m_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        ot = tl.load(
-            O_tail + offs_m[:, None] * sot_m + pid_h * sot_h + offs_d[None, :] * sot_d,
-            mask=m_mask[:, None],
-            other=0.0,
-        ).to(tl.float32)
-        merged = op * alpha_p[:, None] + ot * alpha_t[:, None]
-        tl.store(
-            Out + offs_m[:, None] * so_m + pid_h * so_h + offs_d[None, :] * so_d,
-            merged.to(Out.dtype.element_ty),
-            mask=m_mask[:, None],
-        )
-
     @triton.autotune(
         configs=[
             triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
@@ -381,6 +324,43 @@ if HAS_TRITON:
         tl.store(Out1 + offs_m[:, None] * so1_m + pid_h * so1_h + offs_d[None, :] * so1_d, (acc1 / l1[:, None]).to(Out1.dtype.element_ty), mask=m_mask[:, None])
         tl.store(Out2 + offs_m[:, None] * so2_m + pid_h * so2_h + offs_d[None, :] * so2_d, (acc2 / l2[:, None]).to(Out2.dtype.element_ty), mask=m_mask[:, None])
 
+    @triton.jit
+    def _merge_two_lse_fwd(
+        Oa,
+        Lse_a,
+        Ob,
+        Lse_b,
+        Out,
+        soa_r,
+        soa_d,
+        sob_r,
+        sob_d,
+        sout_r,
+        sout_d,
+        N_ROWS,
+        BLOCK_R: tl.constexpr,
+        HEAD_DIM: tl.constexpr,
+    ):
+        """Fused exact online-softmax LSE merge for FlashPrefix-CFG (zero autotune stall)."""
+        pid_r = tl.program_id(0)
+        offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+        offs_d = tl.arange(0, HEAD_DIM)
+        mask_r = offs_r < N_ROWS
+
+        la = tl.load(Lse_a + offs_r, mask=mask_r, other=-1.0e20)
+        lb = tl.load(Lse_b + offs_r, mask=mask_r, other=-1.0e20)
+        m = tl.maximum(la, lb)
+        wa = tl.exp(la - m)
+        wb = tl.exp(lb - m)
+        inv = 1.0 / (wa + wb)
+        ca = (wa * inv)[:, None]
+        cb = (wb * inv)[:, None]
+
+        oa = tl.load(Oa + offs_r[:, None] * soa_r + offs_d[None, :] * soa_d, mask=mask_r[:, None], other=0.0).to(tl.float32)
+        ob = tl.load(Ob + offs_r[:, None] * sob_r + offs_d[None, :] * sob_d, mask=mask_r[:, None], other=0.0).to(tl.float32)
+        merged = (oa * ca + ob * cb).to(Out.dtype.element_ty)
+        tl.store(Out + offs_r[:, None] * sout_r + offs_d[None, :] * sout_d, merged, mask=mask_r[:, None])
+
 
 def shared_prefix_cfg_attention_ref(
     q_list: list[Any],
@@ -481,39 +461,228 @@ def _run_unshared_single_branch(
     return out.permute(0, 2, 1, 3).squeeze(0)
 
 
-_FA2_FUNCS: tuple[Any, Any, str, str] | None = None
-_FA2_RESOLVED: bool = False
+_FA2_BACKEND_CACHE: dict[tuple[str, int, int, int], tuple[str, float, Any, bool]] = {}
+_FA2_BACKEND_ERRORS: list[str] = []
 
 
-def _resolve_fa2() -> tuple[Any, Any, str, str] | None:
-    """Resolve native FlashAttention-2 (flash_attn or vllm_flash_attn) + LSE kwarg names once."""
-    global _FA2_FUNCS, _FA2_RESOLVED
-    if _FA2_RESOLVED:
-        return _FA2_FUNCS
+def get_fa2_backend_status() -> dict[str, Any]:
+    """Return active FlashPrefix-CFG attention backend info and any probe diagnostics."""
+    return {
+        "backends": {f"{dev}_hq{hq}_hkv{hkv}_d{d}": kind for (dev, hq, hkv, d), (kind, _, _, _) in _FA2_BACKEND_CACHE.items()},
+        "has_active_fa2": any(kind in ("vllm_varlen", "flashinfer") for kind, _, _, _ in _FA2_BACKEND_CACHE.values()),
+        "probe_errors": list(_FA2_BACKEND_ERRORS[-8:]),
+    }
+
+
+def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
+    """Exact log-sum-exp online-softmax merge for `[M, H_q, D]` outputs and `[M, H_q]` ln-LSEs."""
+    import torch
+
+    m_tot, h_q, d = o_a.shape
+    n_rows = m_tot * h_q
+    oa_2d = o_a.reshape(n_rows, d).contiguous()
+    ob_2d = o_b.reshape(n_rows, d).contiguous()
+    la_1d = lse_a.reshape(n_rows).contiguous()
+    lb_1d = lse_b.reshape(n_rows).contiguous()
+
+    if HAS_TRITON and oa_2d.is_cuda and d in (64, 128):
+        out_2d = torch.empty_like(oa_2d)
+        block_r = 16
+        grid = (triton.cdiv(n_rows, block_r),)
+        _merge_two_lse_fwd[grid](
+            oa_2d,
+            la_1d,
+            ob_2d,
+            lb_1d,
+            out_2d,
+            oa_2d.stride(0),
+            oa_2d.stride(1),
+            ob_2d.stride(0),
+            ob_2d.stride(1),
+            out_2d.stride(0),
+            out_2d.stride(1),
+            n_rows,
+            BLOCK_R=block_r,
+            HEAD_DIM=d,
+        )
+        return out_2d.reshape(m_tot, h_q, d)
+
+    m = torch.maximum(lse_a, lse_b)
+    wa = torch.exp(lse_a - m)
+    wb = torch.exp(lse_b - m)
+    inv = 1.0 / (wa + wb)
+    return (o_a.float() * (wa * inv).unsqueeze(-1) + o_b.float() * (wb * inv).unsqueeze(-1)).to(o_a.dtype)
+
+
+def _normalize_lse_shape(
+    lse: Any,
+    total_q: int,
+    h_q: int,
+    lse_scale: float = 1.0,
+    lse_transposed: bool | None = None,
+) -> Any:
+    if lse.ndim == 3 and lse.shape[0] == 1:
+        lse = lse.squeeze(0)
+    if lse.ndim == 2:
+        if lse_transposed is True:
+            lse = lse.transpose(0, 1).contiguous()
+        elif lse_transposed is None and lse.shape == (h_q, total_q) and h_q != total_q:
+            lse = lse.transpose(0, 1).contiguous()
+    out = lse.float()
+    if lse_scale != 1.0:
+        out = out * lse_scale
+    return out
+
+
+def _probe_fa2_backend(device: Any, dtype: Any, h_q: int, h_kv: int, head_dim: int) -> tuple[str, float, Any, bool]:
+    """Probe and self-verify vllm_flash_attn / flashinfer LSE backends against FP32 ground truth."""
+    key = (str(device), h_q, h_kv, head_dim)
+    cached = _FA2_BACKEND_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     import inspect
+    import torch
+    import torch.nn.functional as F
 
-    _FA2_RESOLVED = True
+    ln2 = 0.6931471805599453
+    m_test, n_test = 8, 12
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.randn((m_test, h_q, head_dim), dtype=dtype, device=device) * 0.5
+    k = torch.randn((n_test, h_kv, head_dim), dtype=dtype, device=device) * 0.5
+    v = torch.randn((n_test, h_kv, head_dim), dtype=dtype, device=device) * 0.5
+
+    g = h_q // h_kv
+    kf = k.float().repeat_interleave(g, dim=1) if g > 1 else k.float()
+    vf = v.float().repeat_interleave(g, dim=1) if g > 1 else v.float()
+    scores = torch.einsum("qhd,khd->hqk", q.float(), kf) * sm_scale
+    lse_ref_ln = torch.logsumexp(scores, dim=-1).transpose(0, 1).contiguous()
+    out_ref = torch.einsum("hqk,khd->qhd", F.softmax(scores, dim=-1), vf).contiguous()
+
     for mod_name in ("flash_attn", "vllm.vllm_flash_attn"):
         try:
-            mod = __import__(mod_name, fromlist=["flash_attn_func", "flash_attn_varlen_func"])
-            fa_fn = getattr(mod, "flash_attn_func", None)
-            fa_varlen = getattr(mod, "flash_attn_varlen_func", None)
-            if fa_fn is None or fa_varlen is None:
+            mod = __import__(mod_name, fromlist=["flash_attn_varlen_func"])
+            fn = getattr(mod, "flash_attn_varlen_func", None)
+            if fn is None:
                 continue
-            p_fn = inspect.signature(fa_fn).parameters
-            p_vl = inspect.signature(fa_varlen).parameters
-            kw_fn = "return_softmax_lse" if "return_softmax_lse" in p_fn else (
-                "return_attn_probs" if "return_attn_probs" in p_fn else ""
+            sig = inspect.signature(fn).parameters
+            if "return_softmax_lse" not in sig:
+                _FA2_BACKEND_ERRORS.append(f"{mod_name}: no return_softmax_lse in signature {list(sig)}")
+                continue
+            cu_q = torch.tensor([0, m_test], dtype=torch.int32, device=device)
+            cu_k = torch.tensor([0, n_test], dtype=torch.int32, device=device)
+            # vllm.vllm_flash_attn reverses (max_seqlen, cu_seqlens) order vs flash_attn; pass via keywords!
+            res = fn(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=m_test,
+                max_seqlen_k=n_test,
+                softmax_scale=sm_scale,
+                causal=False,
+                return_softmax_lse=True,
             )
-            kw_vl = "return_softmax_lse" if "return_softmax_lse" in p_vl else (
-                "return_attn_probs" if "return_attn_probs" in p_vl else ""
-            )
-            if kw_fn and kw_vl:
-                _FA2_FUNCS = (fa_fn, fa_varlen, kw_fn, kw_vl)
-                return _FA2_FUNCS
-        except Exception:
+            if isinstance(res, tuple) and len(res) >= 2:
+                out_c, lse_c = res[0], res[1]
+                out_err = float((out_c.float() - out_ref).abs().max().item())
+                lse_transposed = bool(lse_c.ndim >= 2 and lse_c.shape[-2] == h_q and lse_c.shape[-1] == m_test)
+                for scale in (1.0, ln2):
+                    lse_n = _normalize_lse_shape(lse_c, m_test, h_q, scale, lse_transposed=lse_transposed)
+                    lse_err = float((lse_n - lse_ref_ln).abs().max().item()) if lse_n.shape == lse_ref_ln.shape else 999.0
+                    if out_err < 0.05 and lse_err < 0.05:
+                        entry = ("vllm_varlen", scale, fn, lse_transposed)
+                        _FA2_BACKEND_CACHE[key] = entry
+                        return entry
+                _FA2_BACKEND_ERRORS.append(f"{mod_name}: mismatch out_err={out_err:.4f} lse_shape={tuple(lse_c.shape)}")
+            else:
+                _FA2_BACKEND_ERRORS.append(f"{mod_name}: expected tuple>=2, got {type(res).__name__}")
+        except Exception as exc:
+            _FA2_BACKEND_ERRORS.append(f"{mod_name}: {type(exc).__name__}: {exc}")
             continue
-    return None
+
+    try:
+        from flashinfer import single_prefill_with_kv_cache
+
+        res = single_prefill_with_kv_cache(q, k, v, causal=False, sm_scale=sm_scale, return_lse=True)
+        if isinstance(res, tuple) and len(res) >= 2:
+            out_c, lse_c = res[0], res[1]
+            out_err = float((out_c.float() - out_ref).abs().max().item())
+            lse_transposed = bool(lse_c.ndim >= 2 and lse_c.shape[-2] == h_q and lse_c.shape[-1] == m_test)
+            for scale in (ln2, 1.0):
+                lse_n = _normalize_lse_shape(lse_c, m_test, h_q, scale, lse_transposed=lse_transposed)
+                lse_err = float((lse_n - lse_ref_ln).abs().max().item()) if lse_n.shape == lse_ref_ln.shape else 999.0
+                if out_err < 0.05 and lse_err < 0.05:
+                    entry = ("flashinfer", scale, single_prefill_with_kv_cache, lse_transposed)
+                    _FA2_BACKEND_CACHE[key] = entry
+                    return entry
+            _FA2_BACKEND_ERRORS.append(f"flashinfer: mismatch out_err={out_err:.4f} lse_shape={tuple(lse_c.shape)}")
+    except Exception as exc:
+        _FA2_BACKEND_ERRORS.append(f"flashinfer: {type(exc).__name__}: {exc}")
+
+    entry = ("none", 1.0, None, False)
+    _FA2_BACKEND_CACHE[key] = entry
+    return entry
+
+
+def _run_varlen_fa2_with_lse(
+    backend: tuple[str, float, Any, bool],
+    q_cat: Any,
+    k_cat: Any,
+    v_cat: Any,
+    q_lens: list[int],
+    k_lens: list[int],
+    sm_scale: float,
+) -> tuple[Any, Any]:
+    import torch
+
+    kind, lse_scale, fn, lse_transposed = backend
+    h_q = int(q_cat.shape[1])
+    total_q = int(q_cat.shape[0])
+
+    if kind == "vllm_varlen":
+        cu_q_vals = [0]
+        for x in q_lens:
+            cu_q_vals.append(cu_q_vals[-1] + int(x))
+        cu_k_vals = [0]
+        for x in k_lens:
+            cu_k_vals.append(cu_k_vals[-1] + int(x))
+        cu_q = torch.tensor(cu_q_vals, dtype=torch.int32, device=q_cat.device)
+        cu_k = torch.tensor(cu_k_vals, dtype=torch.int32, device=q_cat.device)
+        out, lse = fn(
+            q_cat,
+            k_cat,
+            v_cat,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max(q_lens),
+            max_seqlen_k=max(k_lens),
+            softmax_scale=sm_scale,
+            causal=False,
+            return_softmax_lse=True,
+        )
+        return out, _normalize_lse_shape(lse, total_q, h_q, lse_scale, lse_transposed=lse_transposed)
+
+    if len(q_lens) == 1:
+        out, lse = fn(q_cat, k_cat, v_cat, causal=False, sm_scale=sm_scale, return_lse=True)
+        return out, _normalize_lse_shape(lse, total_q, h_q, lse_scale, lse_transposed=lse_transposed)
+
+    outs, lses = [], []
+    q_off = 0
+    k_off = 0
+    for ql, kl in zip(q_lens, k_lens):
+        oi, li = fn(
+            q_cat[q_off : q_off + ql],
+            k_cat[k_off : k_off + kl],
+            v_cat[k_off : k_off + kl],
+            causal=False, sm_scale=sm_scale, return_lse=True,
+        )
+        outs.append(oi)
+        lses.append(_normalize_lse_shape(li, ql, h_q, lse_scale, lse_transposed=lse_transposed))
+        q_off += ql
+        k_off += kl
+    return torch.cat(outs, dim=0), torch.cat(lses, dim=0)
 
 
 def _run_flash_prefix_cfg(
@@ -526,134 +695,62 @@ def _run_flash_prefix_cfg(
     k_suffix_list: list[Any | None],
     v_suffix_list: list[Any | None],
     sm_scale: float,
+    attn_noncausal: Any | None = None,
 ) -> list[Any] | None:
-    """FlashPrefix-CFG: zero-copy single-read FA2 on shared prefix + varlen FA2 on private tails + Triton LSE merge."""
-    fa2 = _resolve_fa2()
-    if fa2 is None:
+    """FlashPrefix-CFG: Single-read FA2 on shared prefix + compact varlen tail + fused Triton LSE merge."""
+    q_len, h_q, head_dim = q_list[0].shape
+    h_kv = k_loc_list[0].shape[1]
+    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
+    if backend[0] == "none":
         return None
     import torch
 
-    fa_fn, fa_varlen, kw_fn, kw_vl = fa2
     num_branches = len(q_list)
-    q_len, h_q, head_dim = q_list[0].shape
-    device = q_list[0].device
-    n_shared = len(shared_branch_ids)
-    shared_set = set(shared_branch_ids)
+    b_sh = list(shared_branch_ids)
+    shared_set = set(b_sh)
     unshared_ids = [b for b in range(num_branches) if b not in shared_set]
-    ordered_ids = list(shared_branch_ids) + unshared_ids
 
-    # ---- Stage 1: Single-HBM-Read native FA2 over shared prefix (ZERO copy of k_prefix/v_prefix!) ----
-    # Packing Q_shared = [Q_b0; Q_b1; ...] into [1, n_shared * Q, H_q, D] doubles/triples SM wave
-    # occupancy while reading k_prefix/v_prefix ONCE at full 250 TFLOPS Tensor Core speed!
-    q_shared = torch.cat([q_list[b] for b in shared_branch_ids], dim=0).contiguous()  # [M_s, H_q, D]
-    res_pre = fa_fn(
-        q_shared.unsqueeze(0),
-        k_prefix.unsqueeze(0),
-        v_prefix.unsqueeze(0),
-        softmax_scale=sm_scale,
-        causal=False,
-        **{kw_fn: True},
+    # Stage 1: Single HBM read of (k_prefix, v_prefix) for all shared branches packed along Q!
+    q_shared_cat = torch.cat([q_list[b] for b in b_sh], dim=0).contiguous()
+    kp, vp = k_prefix.contiguous(), v_prefix.contiguous()
+    o_pre_cat, lse_pre_cat = _run_varlen_fa2_with_lse(
+        backend, q_shared_cat, kp, vp, [len(b_sh) * q_len], [int(kp.shape[0])], sm_scale
     )
-    o_pre = res_pre[0].squeeze(0)  # [M_s, H_q, D]
-    lse_p_raw = res_pre[1]
-    lse_pre = (
-        lse_p_raw[0, :, : n_shared * q_len].contiguous()
-        if lse_p_raw.ndim == 3
-        else lse_p_raw[:, : n_shared * q_len].contiguous()
-    )  # [H_q, M_s] FP32
 
-    # ---- Stage 2: One varlen FA2 call over ONLY tiny private tails [suffix_b, local_b] (ZERO padding!) ----
-    q_all = torch.cat([q_shared] + [q_list[b] for b in unshared_ids], dim=0).contiguous() if unshared_ids else q_shared
-    k_parts = []
-    v_parts = []
-    k_lens = []
+    # Stage 2: Compact batched unpadded tail pass for ALL shared + unshared branches
+    ordered_ids = b_sh + unshared_ids
+    q_all = (
+        torch.cat([q_shared_cat] + [q_list[b] for b in unshared_ids], dim=0).contiguous()
+        if unshared_ids
+        else q_shared_cat
+    )
+    tail_ks, tail_vs, tail_lens = [], [], []
     for b in ordered_ids:
         ks, vs = k_suffix_list[b], v_suffix_list[b]
         if ks is not None and ks.shape[0] > 0:
-            k_parts.append(ks)
-            v_parts.append(vs)
-            k_parts.append(k_loc_list[b])
-            v_parts.append(v_loc_list[b])
-            k_lens.append(int(ks.shape[0]) + q_len)
+            kb = torch.cat([ks, k_loc_list[b]], dim=0)
+            vb = torch.cat([vs, v_loc_list[b]], dim=0)
         else:
-            k_parts.append(k_loc_list[b])
-            v_parts.append(v_loc_list[b])
-            k_lens.append(q_len)
-    k_packed = torch.cat(k_parts, dim=0).contiguous()
-    v_packed = torch.cat(v_parts, dim=0).contiguous()
-
-    cu_q = torch.arange(0, (num_branches + 1) * q_len, q_len, dtype=torch.int32, device=device)
-    cu_k_list = [0]
-    for ln in k_lens:
-        cu_k_list.append(cu_k_list[-1] + ln)
-    cu_k = torch.tensor(cu_k_list, dtype=torch.int32, device=device)
-    max_k = max(k_lens)
-
-    res_tail = fa_varlen(
-        q_all,
-        k_packed,
-        v_packed,
-        cu_q,
-        cu_k,
-        q_len,
-        max_k,
-        softmax_scale=sm_scale,
-        causal=False,
-        **{kw_vl: True},
+            kb, vb = k_loc_list[b], v_loc_list[b]
+        tail_ks.append(kb)
+        tail_vs.append(vb)
+        tail_lens.append(int(kb.shape[0]))
+    k_tail_cat = torch.cat(tail_ks, dim=0).contiguous()
+    v_tail_cat = torch.cat(tail_vs, dim=0).contiguous()
+    o_tail_all, lse_tail_all = _run_varlen_fa2_with_lse(
+        backend, q_all, k_tail_cat, v_tail_cat, [q_len] * len(ordered_ids), tail_lens, sm_scale
     )
-    o_tail_all = res_tail[0]  # [num_branches * Q, H_q, D]
-    lse_raw = res_tail[1]
-    if lse_raw.ndim == 3:
-        # [num_branches, H_q, Q_or_padded] -> [H_q, n_shared * Q]
-        lse_tail_shared = lse_raw[:n_shared, :, :q_len].permute(1, 0, 2).reshape(h_q, n_shared * q_len).contiguous()
-    else:
-        # [H_q, num_branches * Q] -> [H_q, n_shared * Q]
-        lse_tail_shared = lse_raw[:, : n_shared * q_len].contiguous()
 
-    # ---- Stage 3: Exact FP32 online-softmax LSE merge for shared branches (zero-autotune Triton, ~0.03ms) ----
-    o_tail_shared = o_tail_all[: n_shared * q_len].contiguous()
-    total_m = n_shared * q_len
-    if HAS_TRITON and head_dim in (64, 128):
-        o_merged = torch.empty_like(o_pre)
-        grid = (triton.cdiv(total_m, 16), h_q)
-        _lse_merge_2stage_fwd[grid](
-            o_pre,
-            lse_pre,
-            o_tail_shared,
-            lse_tail_shared,
-            o_merged,
-            o_pre.stride(0),
-            o_pre.stride(1),
-            o_pre.stride(2),
-            lse_pre.stride(0),
-            lse_pre.stride(1),
-            o_tail_shared.stride(0),
-            o_tail_shared.stride(1),
-            o_tail_shared.stride(2),
-            lse_tail_shared.stride(0),
-            lse_tail_shared.stride(1),
-            o_merged.stride(0),
-            o_merged.stride(1),
-            o_merged.stride(2),
-            total_m,
-            HEAD_DIM=head_dim,
-            BLOCK_M=16,
-            num_warps=4,
-        )
-    else:
-        lp = lse_pre.transpose(0, 1).unsqueeze(-1)  # [M_s, H_q, 1]
-        lt = lse_tail_shared.transpose(0, 1).unsqueeze(-1)
-        m = torch.maximum(lp, lt)
-        wp = torch.exp(lp - m)
-        wt = torch.exp(lt - m)
-        inv = 1.0 / (wp + wt)
-        o_merged = (o_pre.float() * (wp * inv) + o_tail_shared.float() * (wt * inv)).to(o_pre.dtype)
-
+    # Stage 3: Exact FP32 online-softmax LSE merge for shared branches
+    n_sh_rows = len(b_sh) * q_len
+    o_merged = _merge_two_lse_states(
+        o_pre_cat, lse_pre_cat, o_tail_all[:n_sh_rows], lse_tail_all[:n_sh_rows]
+    )
     outputs: list[Any] = [None] * num_branches
-    for idx, b in enumerate(shared_branch_ids):
-        outputs[b] = o_merged[idx * q_len : (idx + 1) * q_len]
-    for idx, b in enumerate(unshared_ids):
-        off = (n_shared + idx) * q_len
+    for idx_b, b in enumerate(b_sh):
+        outputs[b] = o_merged[idx_b * q_len : (idx_b + 1) * q_len]
+    for idx_u, b in enumerate(unshared_ids):
+        off = n_sh_rows + idx_u * q_len
         outputs[b] = o_tail_all[off : off + q_len]
     return outputs
 
@@ -684,7 +781,7 @@ def shared_prefix_cfg_attention(
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
     # Preferred default: FlashPrefix-CFG (native FA2 Tensor Core 250 TFLOPS + zero-copy prefix + Triton LSE merge!)
-    if backend == "flash_prefix" and q_list[0].is_cuda and l_shared > 0 and len(shared_branch_ids) >= 2:
+    if backend == "flash_prefix" and q_list[0].is_cuda and l_shared >= 256 and len(shared_branch_ids) >= 2:
         fp_out = _run_flash_prefix_cfg(
             q_list=q_list,
             k_loc_list=k_loc_list,

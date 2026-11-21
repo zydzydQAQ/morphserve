@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "1880c488682e7929800c659e3b6a30b490a8224b",
+  "short_commit": "1880c48",
+  "subject": "fix(m3,m4): enable vllm_varlen keyword FA2, Pillow-exact GPU loopback, and 1.5x-2.5x SLO calibration",
+  "built_utc": "2026-11-21T05:42:11+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 41,
+  "bytes": 672049
+}

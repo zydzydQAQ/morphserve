@@ -463,6 +463,23 @@ def _run_unshared_single_branch(
 
 _FA2_BACKEND_CACHE: dict[tuple[str, int, int, int], tuple[str, float, Any, bool]] = {}
 _FA2_BACKEND_ERRORS: list[str] = []
+_CU_SEQLENS_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
+
+
+def _get_cu_seqlens(lens: list[int], device: Any) -> Any:
+    import torch
+
+    key = (str(device), tuple(int(x) for x in lens))
+    cached = _CU_SEQLENS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    vals = [0]
+    for x in lens:
+        vals.append(vals[-1] + int(x))
+    t = torch.tensor(vals, dtype=torch.int32, device=device)
+    if len(_CU_SEQLENS_CACHE) < 256:
+        _CU_SEQLENS_CACHE[key] = t
+    return t
 
 
 def get_fa2_backend_status() -> dict[str, Any]:
@@ -487,7 +504,7 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
 
     if HAS_TRITON and oa_2d.is_cuda and d in (64, 128):
         out_2d = torch.empty_like(oa_2d)
-        block_r = 16
+        block_r = 64 if n_rows >= 256 else 16
         grid = (triton.cdiv(n_rows, block_r),)
         _merge_two_lse_fwd[grid](
             oa_2d,
@@ -504,6 +521,7 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any) -> Any:
             n_rows,
             BLOCK_R=block_r,
             HEAD_DIM=d,
+            num_warps=4,
         )
         return out_2d.reshape(m_tot, h_q, d)
 
@@ -642,14 +660,8 @@ def _run_varlen_fa2_with_lse(
     total_q = int(q_cat.shape[0])
 
     if kind == "vllm_varlen":
-        cu_q_vals = [0]
-        for x in q_lens:
-            cu_q_vals.append(cu_q_vals[-1] + int(x))
-        cu_k_vals = [0]
-        for x in k_lens:
-            cu_k_vals.append(cu_k_vals[-1] + int(x))
-        cu_q = torch.tensor(cu_q_vals, dtype=torch.int32, device=q_cat.device)
-        cu_k = torch.tensor(cu_k_vals, dtype=torch.int32, device=q_cat.device)
+        cu_q = _get_cu_seqlens(q_lens, q_cat.device)
+        cu_k = _get_cu_seqlens(k_lens, q_cat.device)
         out, lse = fn(
             q_cat,
             k_cat,

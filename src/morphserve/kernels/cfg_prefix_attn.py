@@ -788,16 +788,39 @@ def _run_unpadded_varlen_cfg(
     sm_scale: float,
     attn_noncausal: Any | None = None,
 ) -> list[Any] | None:
-    """Single-pass unpadded varlen FA2 across all CFG branches without left-padding or LSE merge."""
+    """Unpadded single-pass CFG attention without left-padding, Q-stacking, or LSE merge."""
     import torch
 
     num_branches = len(q_list)
     q_len, h_q, head_dim = q_list[0].shape
     h_kv = k_loc_list[0].shape[1]
-    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
-    kind, _, fn, _ = backend
     shared_set = set(shared_branch_ids)
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
+
+    # Fast path when native vLLM-Omni non-causal attention operator is available:
+    # avoids 3D->4D Q stack copy, avoids left-pad + mask unpadding, and evaluates each
+    # branch on its exact unpadded KV length in a single K/V cat per branch.
+    if attn_noncausal is not None:
+        outs: list[Any] = []
+        for b in range(num_branches):
+            k_parts: list[Any] = []
+            v_parts: list[Any] = []
+            if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
+                k_parts.append(k_prefix)
+                v_parts.append(v_prefix)
+            ks, vs = k_suffix_list[b], v_suffix_list[b]
+            if ks is not None and vs is not None and ks.shape[0] > 0:
+                k_parts.append(ks)
+                v_parts.append(vs)
+            k_parts.append(k_loc_list[b])
+            v_parts.append(v_loc_list[b])
+            kb = k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=0)
+            vb = v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=0)
+            outs.append(attn_noncausal(q_list[b].unsqueeze(0), kb.unsqueeze(0), vb.unsqueeze(0), None).squeeze(0))
+        return outs
+
+    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
+    kind, _, fn, _ = backend
 
     all_k_parts: list[Any] = []
     all_v_parts: list[Any] = []
@@ -839,8 +862,8 @@ def _run_unpadded_varlen_cfg(
         out_cat = res[0] if isinstance(res, tuple) else res
         return list(out_cat.split(q_len, dim=0))
 
-    if kind == "flashinfer" or attn_noncausal is not None:
-        outs: list[Any] = []
+    if kind == "flashinfer":
+        outs = []
         for b in range(num_branches):
             ks, vs = k_suffix_list[b], v_suffix_list[b]
             if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
@@ -848,7 +871,7 @@ def _run_unpadded_varlen_cfg(
                 vs = torch.cat([v_prefix, vs], dim=0) if (vs is not None and vs.shape[0] > 0) else v_prefix
             outs.append(
                 _run_unshared_single_branch(
-                    q_list[b], ks, vs, k_loc_list[b], v_loc_list[b], sm_scale, attn_noncausal=attn_noncausal
+                    q_list[b], ks, vs, k_loc_list[b], v_loc_list[b], sm_scale, attn_noncausal=None
                 )
             )
         return outs

@@ -7,6 +7,8 @@ from pathlib import Path
 from morphserve.bench.interleaved_bench import InterleavedSession, InterleavedTurn, WorkloadSuite
 from morphserve.bench.run_phase2_bagel_main import build_ablation_configs, stratify_suite
 from morphserve.bench.run_phase2_overnight_deep import build_static_split_configs
+from morphserve.bench.validate_phase2_internvl_u import run_internvlu_generality_validation  # noqa: F401
+from morphserve.bench.validate_phase2_multinode_2x8 import evaluate_cross_node_routing_check
 from morphserve.sim import run_scale_and_interconnect_sweep
 
 
@@ -70,4 +72,18 @@ def test_build_static_split_configs() -> None:
     assert set(splits.keys()) == {"morphserve_elastic", "static_2und_6gen", "static_4und_4gen", "static_6und_2gen"}
     assert len(splits["static_2und_6gen"].static_und_ranks) == 2
     assert len(splits["static_6und_2gen"].static_und_ranks) == 6
+
+
+def test_multinode_16gpu_cross_node_routing_check() -> None:
+    for inter_bw in (1.1, 11.5):
+        chk = evaluate_cross_node_routing_check(
+            world_size=16,
+            gpus_per_node=8,
+            intra_bw=24.0,
+            socket_bw=18.0,
+            inter_bw=inter_bw,
+        )
+        assert chk["routing_pass"] is True
+        assert chk["bridge_24mib_decision"]["dst_gpu"] == 8
+        assert chk["suppressed_cross_node_1gib_kv_ship"] is True
 

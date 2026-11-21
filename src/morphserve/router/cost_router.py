@@ -38,7 +38,7 @@ class CPTGRequestSpec:
 
     def effective_state_bytes(self) -> int:
         if self.architecture == "bridge_mllm_dit":
-            return int(self.bridge_bytes)
+            return int(self.bridge_bytes if self.bridge_bytes > 0 else self.kv_bytes)
         if self.architecture == "tight_mot":
             return int(self.kv_bytes)
         raise ValueError(f"unsupported CPTG architecture: {self.architecture}")

@@ -489,6 +489,7 @@ def run_internvlu_generality_validation(
                             req_id=bid,
                             src_gpu=src_g,
                             architecture="bridge_mllm_dit",
+                            bridge_bytes=b_bytes,
                             kv_bytes=b_bytes,
                             dit_step1_ms=150.0,
                             dit_total_steps=16,

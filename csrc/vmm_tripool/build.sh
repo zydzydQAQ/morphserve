@@ -53,6 +53,12 @@ if [ -n "$CXX" ] && command -v "$CXX" >/dev/null 2>&1; then
     -o "$INSTALL_TMP/lib/libtripool_pluggable.so" \
     -ldl
 
+  echo "== compiling libtripool_vmm.so with $CXX"
+  "$CXX" "${COMMON_FLAGS[@]}" -shared -fPIC \
+    "$VMM_SRC/tripool_vmm.cpp" \
+    -o "$INSTALL_TMP/lib/libtripool_vmm.so" \
+    -ldl
+
   cat > "$INSTALL_TMP/VMM_BUILD_STATUS.json" <<EOF
 {"compiled": true, "compiler": "$CXX", "has_cuda_h": $HAS_CUDA_H}
 EOF

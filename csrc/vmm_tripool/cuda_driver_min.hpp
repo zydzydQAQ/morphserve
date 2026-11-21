@@ -87,7 +87,9 @@ typedef enum CUmemAllocationGranularity_flags_enum {
 
 constexpr unsigned int CU_STREAM_NON_BLOCKING = 0x1;
 constexpr unsigned int CU_EVENT_DEFAULT = 0x0;
+constexpr unsigned int CU_EVENT_DISABLE_TIMING = 0x2;
 constexpr unsigned int CU_MEMHOSTALLOC_PORTABLE = 0x1;
+constexpr unsigned int CU_MEMHOSTREGISTER_PORTABLE = 0x1;
 
 #endif  // __has_include(<cuda.h>)
 
@@ -126,15 +128,20 @@ struct CudaDriver {
 
     CUresult (*cuMemHostAlloc)(void**, size_t, unsigned int) = nullptr;
     CUresult (*cuMemFreeHost)(void*) = nullptr;
+    CUresult (*cuMemHostRegister)(void*, size_t, unsigned int) = nullptr;
+    CUresult (*cuMemHostUnregister)(void*) = nullptr;
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void*, size_t) = nullptr;
     CUresult (*cuMemcpyDtoH)(void*, CUdeviceptr, size_t) = nullptr;
     CUresult (*cuMemcpyHtoDAsync)(CUdeviceptr, const void*, size_t, CUstream) = nullptr;
     CUresult (*cuMemcpyDtoHAsync)(void*, CUdeviceptr, size_t, CUstream) = nullptr;
     CUresult (*cuMemsetD8Async)(CUdeviceptr, unsigned char, size_t, CUstream) = nullptr;
 
+    CUresult (*cuCtxGetStreamPriorityRange)(int*, int*) = nullptr;
     CUresult (*cuStreamCreate)(CUstream*, unsigned int) = nullptr;
+    CUresult (*cuStreamCreateWithPriority)(CUstream*, unsigned int, int) = nullptr;
     CUresult (*cuStreamDestroy)(CUstream) = nullptr;
     CUresult (*cuStreamSynchronize)(CUstream) = nullptr;
+    CUresult (*cuStreamWaitEvent)(CUstream, CUevent, unsigned int) = nullptr;
     CUresult (*cuEventCreate)(CUevent*, unsigned int) = nullptr;
     CUresult (*cuEventDestroy)(CUevent) = nullptr;
     CUresult (*cuEventRecord)(CUevent, CUstream) = nullptr;
@@ -209,15 +216,20 @@ private:
 
         load(cuMemHostAlloc, "cuMemHostAlloc");
         load(cuMemFreeHost, "cuMemFreeHost");
+        load(cuMemHostRegister, "cuMemHostRegister_v2", "cuMemHostRegister");
+        load(cuMemHostUnregister, "cuMemHostUnregister");
         load(cuMemcpyHtoD, "cuMemcpyHtoD_v2", "cuMemcpyHtoD");
         load(cuMemcpyDtoH, "cuMemcpyDtoH_v2", "cuMemcpyDtoH");
         load(cuMemcpyHtoDAsync, "cuMemcpyHtoDAsync_v2", "cuMemcpyHtoDAsync");
         load(cuMemcpyDtoHAsync, "cuMemcpyDtoHAsync_v2", "cuMemcpyDtoHAsync");
         load(cuMemsetD8Async, "cuMemsetD8Async");
 
+        load(cuCtxGetStreamPriorityRange, "cuCtxGetStreamPriorityRange");
         load(cuStreamCreate, "cuStreamCreate");
+        load(cuStreamCreateWithPriority, "cuStreamCreateWithPriority");
         load(cuStreamDestroy, "cuStreamDestroy_v2", "cuStreamDestroy");
         load(cuStreamSynchronize, "cuStreamSynchronize");
+        load(cuStreamWaitEvent, "cuStreamWaitEvent");
         load(cuEventCreate, "cuEventCreate");
         load(cuEventDestroy, "cuEventDestroy_v2", "cuEventDestroy");
         load(cuEventRecord, "cuEventRecord");

@@ -1,0 +1,105 @@
+"""Offline unit tests for Module 3 (LECP CoW Cache, SharedPrefixCache, and shell syntax)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = REPO_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from morphserve.kernels.lecp_cache import SharedPrefixCache, cow_fork_context  # noqa: E402
+
+
+class _MockTensor:
+    """Minimal CPU tensor duck-type for offline LECP tests when torch isn't installed on WSL."""
+
+    def __init__(self, rows: list[int], base_id: int | None = None, offset: int = 0) -> None:
+        self._rows = rows
+        self._base_id = id(rows) if base_id is None else base_id
+        self._offset = offset
+        self.shape = (len(rows), 4, 128)
+        self.dtype = "bf16"
+        self.device = "mock:0"
+
+    def data_ptr(self) -> int:
+        return self._base_id * 100000 + self._offset
+
+    def stride(self) -> tuple[int, int, int]:
+        return (512, 128, 1)
+
+    def __getitem__(self, slc):
+        assert isinstance(slc, slice)
+        start = slc.start or 0
+        stop = len(self._rows) if slc.stop is None else slc.stop
+        return _MockTensor(self._rows[start:stop], base_id=self._base_id, offset=self._offset + start)
+
+
+class _MockCache:
+    def __init__(self, num_layers: int) -> None:
+        self.key_cache = {l: None for l in range(num_layers)}
+        self.value_cache = {l: None for l in range(num_layers)}
+        self.key_values_lens = None
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.key_cache)
+
+
+class TestModule3Offline(unittest.TestCase):
+    def test_cow_fork_and_shared_prefix_cache_zero_copy(self) -> None:
+        SharedPrefixCache.clear_memo()
+        base = _MockCache(4)
+        shared_k = _MockTensor(list(range(2048)))
+        shared_v = _MockTensor(list(range(2048)))
+        for l in range(4):
+            base.key_cache[l] = shared_k
+            base.value_cache[l] = shared_v
+        ctx_main = {"kv_lens": [2048], "ropes": [2048], "past_key_values": base}
+
+        # Zero-copy fork BEFORE appending turn prompt
+        ctx_cfg_text = cow_fork_context(ctx_main)
+        self.assertEqual(ctx_cfg_text["past_key_values"].key_cache[0].data_ptr(), shared_k.data_ptr())
+
+        # Verify SharedPrefixCache detects exact O(1) prefix sharing when storage aliases
+        ctx_cfg_img = _MockCache(4)
+        img_k = _MockTensor(list(range(20)))
+        img_v = _MockTensor(list(range(20)))
+        for l in range(4):
+            ctx_cfg_img.key_cache[l] = img_k
+            ctx_cfg_img.value_cache[l] = img_v
+
+        sp = SharedPrefixCache.from_branch_caches(
+            [ctx_main["past_key_values"], ctx_cfg_text["past_key_values"], ctx_cfg_img],
+            min_shared_tokens=32,
+        )
+        self.assertEqual(sp.shared_prefix_len, 2048)
+        self.assertEqual(sp.shared_branch_ids, [0, 1])
+        self.assertEqual(sp.unshared_branch_ids, [2])
+        self.assertEqual(sp.unique_kv_tokens, 2048 + 20)
+        self.assertEqual(sp.naive_kv_tokens, 2048 + 2048 + 20)
+        self.assertEqual(sp.padded_naive_kv_tokens, 2048 * 3)
+        self.assertGreater(sp.kv_reduction_ratio, 1.98)
+
+    def test_module3_script_syntax_and_imports(self) -> None:
+        script = REPO_ROOT / "deploy/kairos/scripts/05_phase1_module3_validate.sh"
+        proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        for rel in (
+            "src/morphserve/kernels/__init__.py",
+            "src/morphserve/kernels/lecp_cache.py",
+            "src/morphserve/kernels/cfg_prefix_attn.py",
+            "src/morphserve/kernels/gpu_loopback.py",
+            "src/morphserve/bench/validate_module3_cfg_loopback.py",
+        ):
+            p = REPO_ROOT / rel
+            res = subprocess.run([sys.executable, "-m", "py_compile", str(p)], capture_output=True, text=True)
+            self.assertEqual(res.returncode, 0, msg=f"py_compile failed on {rel}: {res.stderr}")
+
+
+if __name__ == "__main__":
+    unittest.main()

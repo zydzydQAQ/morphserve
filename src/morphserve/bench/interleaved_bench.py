@@ -259,25 +259,29 @@ def _save_png_capped(raw_cell: Any, dst_path: Path, max_edge: int = 1024) -> boo
 
 
 def _extract_mmvet(pq: Any, parquet_path: Path, out_dir: Path) -> list[dict[str, Any]]:
-    table = pq.read_table(str(parquet_path))
-    rows = table.to_pylist()
     img_dir = out_dir / "images/mmvet"
     img_dir.mkdir(parents=True, exist_ok=True)
     items: list[dict[str, Any]] = []
-    for idx, row in enumerate(rows):
-        qid = str(row.get("question_id") or f"mmvet_{idx:04d}")
-        rel = f"images/mmvet/{idx:04d}.png"
-        if not _save_png_capped(row.get("image"), out_dir / rel, max_edge=1024):
-            continue
-        items.append(
-            {
-                "question_id": qid,
-                "image_path": rel,
-                "question": str(row.get("question") or "").strip(),
-                "answer": str(row.get("answer") or "").strip(),
-                "capability": str(row.get("capability") or "").strip(),
-            }
-        )
+    idx = 0
+    with parquet_path.open("rb") as fh:
+        pf = pq.ParquetFile(fh)
+        cols = [c for c in ("question_id", "image", "question", "answer", "capability") if c in pf.schema_arrow.names]
+        for batch in pf.iter_batches(batch_size=8, columns=cols):
+            for row in batch.to_pylist():
+                qid = str(row.get("question_id") or f"mmvet_{idx:04d}")
+                rel = f"images/mmvet/{idx:04d}.png"
+                idx += 1
+                if not _save_png_capped(row.get("image"), out_dir / rel, max_edge=1024):
+                    continue
+                items.append(
+                    {
+                        "question_id": qid,
+                        "image_path": rel,
+                        "question": str(row.get("question") or "").strip(),
+                        "answer": str(row.get("answer") or "").strip(),
+                        "capability": str(row.get("capability") or "").strip(),
+                    }
+                )
     (out_dir / "mmvet_questions.json").write_text(
         json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -285,33 +289,42 @@ def _extract_mmvet(pq: Any, parquet_path: Path, out_dir: Path) -> list[dict[str,
 
 
 def _extract_magicbrush(pq: Any, parquet_path: Path, out_dir: Path, max_sessions: int = 45) -> list[dict[str, Any]]:
-    table = pq.read_table(str(parquet_path))
-    rows = table.to_pylist()
     img_dir = out_dir / "images/magicbrush"
     img_dir.mkdir(parents=True, exist_ok=True)
 
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        img_id = str(row.get("img_id") or "")
-        if not img_id:
-            continue
-        grouped.setdefault(img_id, []).append(row)
+    src_bytes_by_id: dict[str, bytes] = {}
+    with parquet_path.open("rb") as fh:
+        pf = pq.ParquetFile(fh)
+        cols = [c for c in ("img_id", "turn_index", "source_img", "instruction") if c in pf.schema_arrow.names]
+        for batch in pf.iter_batches(batch_size=8, columns=cols):
+            for row in batch.to_pylist():
+                img_id = str(row.get("img_id") or "")
+                if not img_id:
+                    continue
+                t_idx = int(row.get("turn_index") or 1)
+                if img_id not in src_bytes_by_id or t_idx == 1:
+                    sc = row.get("source_img")
+                    b = sc.get("bytes") if isinstance(sc, dict) else sc
+                    if isinstance(b, (bytes, bytearray, memoryview)) and img_id not in src_bytes_by_id:
+                        src_bytes_by_id[img_id] = bytes(b)
+                grouped.setdefault(img_id, []).append(
+                    {"turn_index": t_idx, "instruction": str(row.get("instruction") or "").strip()}
+                )
+            if len(grouped) >= max_sessions * 3:
+                break
 
     sessions: list[dict[str, Any]] = []
-    # Prefer multi-turn MagicBrush sessions first
     ordered_ids = sorted(grouped.keys(), key=lambda k: (-len(grouped[k]), k))
     for img_id in ordered_ids:
-        turns_raw = sorted(grouped[img_id], key=lambda r: int(r.get("turn_index") or 1))
+        turns_raw = sorted(grouped[img_id], key=lambda r: int(r["turn_index"]))
         rel_src = f"images/magicbrush/{img_id}_src.png"
-        if not _save_png_capped(turns_raw[0].get("source_img"), out_dir / rel_src, max_edge=1024):
+        if not _save_png_capped(src_bytes_by_id.get(img_id), out_dir / rel_src, max_edge=1024):
             continue
         turns = [
-            {
-                "turn_index": int(r.get("turn_index") or (ti + 1)),
-                "instruction": str(r.get("instruction") or "").strip(),
-            }
-            for ti, r in enumerate(turns_raw)
-            if str(r.get("instruction") or "").strip()
+            {"turn_index": int(r["turn_index"]), "instruction": r["instruction"]}
+            for r in turns_raw
+            if r["instruction"]
         ]
         if not turns:
             continue

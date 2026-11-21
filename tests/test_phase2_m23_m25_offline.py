@@ -6,6 +6,7 @@ from pathlib import Path
 
 from morphserve.bench.interleaved_bench import InterleavedSession, InterleavedTurn, WorkloadSuite
 from morphserve.bench.run_phase2_bagel_main import build_ablation_configs, stratify_suite
+from morphserve.bench.run_phase2_overnight_deep import build_static_split_configs
 from morphserve.sim import run_scale_and_interconnect_sweep
 
 
@@ -62,3 +63,11 @@ def test_cluster_simulator_64gpu_sweep(tmp_path: Path) -> None:
     by_pol = {r["policy_name"]: r for r in nvlink_64}
     assert by_pol["morphserve"]["joint_slo_goodput_rps"] > by_pol["monolithic_dp"]["joint_slo_goodput_rps"]
     assert by_pol["morphserve"]["crossover_kv_mib"] > 1000.0
+
+
+def test_build_static_split_configs() -> None:
+    splits = dict(build_static_split_configs(num_gpus=8))
+    assert set(splits.keys()) == {"morphserve_elastic", "static_2und_6gen", "static_4und_4gen", "static_6und_2gen"}
+    assert len(splits["static_2und_6gen"].static_und_ranks) == 2
+    assert len(splits["static_6und_2gen"].static_und_ranks) == 6
+

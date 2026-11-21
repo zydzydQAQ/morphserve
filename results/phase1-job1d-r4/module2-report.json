@@ -1,0 +1,338 @@
+{
+  "schema": "morphserve.phase1.module2.v1",
+  "timestamp_utc": "2026-11-21T07:07:12Z",
+  "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+  "steps": 20,
+  "live_topology": {
+    "num_gpus": 8,
+    "gpu_names": [
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB",
+      "NVIDIA A100-PCIE-40GB"
+    ],
+    "half_groups": [
+      {
+        "group_id": 0,
+        "numa_node": 0,
+        "gpu_ids": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "aggregate_h2d_gbps": 12.4,
+        "solo_h2d_gbps": 12.34
+      },
+      {
+        "group_id": 1,
+        "numa_node": 1,
+        "gpu_ids": [
+          4,
+          5,
+          6,
+          7
+        ],
+        "aggregate_h2d_gbps": 12.4,
+        "solo_h2d_gbps": 12.34
+      }
+    ],
+    "intra_half_p2p_cap_gbps": 19.67,
+    "cross_half_p2p_cap_gbps": 9.98,
+    "p2p_bw_gbps": [
+      [
+        0.0,
+        9.11,
+        9.84,
+        9.11,
+        9.97,
+        9.11,
+        9.99,
+        9.11
+      ],
+      [
+        9.84,
+        0.0,
+        9.84,
+        9.11,
+        9.99,
+        9.11,
+        9.97,
+        9.11
+      ],
+      [
+        9.84,
+        9.11,
+        0.0,
+        9.11,
+        9.97,
+        9.11,
+        9.96,
+        9.11
+      ],
+      [
+        9.84,
+        9.11,
+        9.84,
+        0.0,
+        9.98,
+        9.1,
+        9.91,
+        9.11
+      ],
+      [
+        9.96,
+        9.1,
+        9.98,
+        9.11,
+        0.0,
+        9.11,
+        9.85,
+        9.11
+      ],
+      [
+        9.98,
+        9.1,
+        9.98,
+        9.1,
+        9.85,
+        0.0,
+        9.85,
+        9.11
+      ],
+      [
+        9.95,
+        9.1,
+        9.98,
+        9.1,
+        9.85,
+        9.11,
+        0.0,
+        9.11
+      ],
+      [
+        9.95,
+        9.08,
+        9.98,
+        9.11,
+        9.85,
+        9.11,
+        9.85,
+        0.0
+      ]
+    ]
+  },
+  "test1_shared_numa_memfd_and_h2d_pacer": {
+    "world_size": 8,
+    "payload_per_mirror_gib": 12.25,
+    "naive_8gpu_host_ram_gib": 98.0,
+    "shared_2socket_host_ram_gib": 24.5,
+    "observed_shmem_delta_gib": 24.5,
+    "host_ram_savings_x": 4.0,
+    "all_inodes_matched": true,
+    "all_sentinels_matched": true,
+    "unpaced_4gpu_half0_agg_gbps": 12.4,
+    "unpaced_4gpu_half0_per_gpu_gbps": 3.1,
+    "unpaced_4gpu_half0_wall_ms": 1517.53,
+    "paced_dual_half_per_gpu_gbps": 12.34,
+    "paced_dual_half_4req_wall_ms": 764.28,
+    "h2d_per_gpu_speedup_x": 3.98,
+    "ranks": [
+      {
+        "rank": 0,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.53,
+        "paced_bw_gbps": 12.34,
+        "paced_dma_ms": 381.38,
+        "paced_wait_plus_dma_ms": 763.12
+      },
+      {
+        "rank": 1,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.46,
+        "paced_bw_gbps": 12.35,
+        "paced_dma_ms": 380.99,
+        "paced_wait_plus_dma_ms": 381.71
+      },
+      {
+        "rank": 2,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.49,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 3,
+        "numa_node": 0,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 3.1,
+        "unpaced_half0_ms": 1517.5,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 4,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 12.32,
+        "paced_dma_ms": 381.6,
+        "paced_wait_plus_dma_ms": 382.63
+      },
+      {
+        "rank": 5,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 12.33,
+        "paced_dma_ms": 381.49,
+        "paced_wait_plus_dma_ms": 764.28
+      },
+      {
+        "rank": 6,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      },
+      {
+        "rank": 7,
+        "numa_node": 1,
+        "inode_match": true,
+        "sentinel_match": true,
+        "unpaced_half0_bw_gbps": 0.0,
+        "unpaced_half0_ms": 0.0,
+        "paced_bw_gbps": 0.0,
+        "paced_dma_ms": 0.0,
+        "paced_wait_plus_dma_ms": 0.0
+      }
+    ]
+  },
+  "test2_bagel_dualpath_crossover": {
+    "t0_short_kv": {
+      "kv_mib": 0.98,
+      "router_decision": "state_ship",
+      "router_dst_gpu": 1,
+      "path_a_ship_ms": 0.324,
+      "path_a_bw_gbps": 3.184,
+      "path_b_morph_overhead_ms": 258.79,
+      "path_a_bit_exact": true,
+      "path_b_bit_exact": true
+    },
+    "t3_long_interleaved_kv": {
+      "seq_len": 23822,
+      "kv_mib": 1302.77,
+      "router_decision": "in_place_morph",
+      "router_dst_gpu": 0,
+      "path_a_gamma2_ship_ms": 329.08,
+      "path_a_bw_gbps": 10.362,
+      "path_b_morph_overhead_ms": 214.92,
+      "path_a_bit_exact": true,
+      "path_b_bit_exact": true
+    }
+  },
+  "test3_mixed_cptg_8req_burst": {
+    "decisions": [
+      {
+        "req_id": "req0_bagel_t0_short",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 1,
+        "t_ship_ms": 3.46,
+        "t_morph_ms": 405.642,
+        "reason": "tight_mot: same_half state_ship(4.0MiB) 3.5ms < morph 405.6ms"
+      },
+      {
+        "req_id": "req1_internvl_u_bridge",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 3,
+        "t_ship_ms": 8.525,
+        "t_morph_ms": 395.292,
+        "reason": "bridge_mllm_dit: same_half state_ship(24.0MiB) 8.5ms < morph 395.3ms"
+      },
+      {
+        "req_id": "req2_bagel_t4_long",
+        "path": "in_place_morph",
+        "src_gpu": 2,
+        "dst_gpu": 2,
+        "t_ship_ms": 451.483,
+        "t_morph_ms": 37.896,
+        "reason": "tight_mot: in_place_morph(alpha=0.75) 37.9ms <= ship 451.5ms"
+      },
+      {
+        "req_id": "req3_bagel_1024px",
+        "path": "in_place_morph",
+        "src_gpu": 4,
+        "dst_gpu": 4,
+        "t_ship_ms": 261.491,
+        "t_morph_ms": 6.0,
+        "reason": "tight_mot: in_place_morph(alpha=0.50) 6.0ms <= ship 261.5ms"
+      },
+      {
+        "req_id": "req4_internvl_u_h1",
+        "path": "state_ship",
+        "src_gpu": 4,
+        "dst_gpu": 5,
+        "t_ship_ms": 10.367,
+        "t_morph_ms": 28050.0,
+        "reason": "bridge_mllm_dit: same_half state_ship(32.0MiB) 10.4ms < morph 28050.0ms"
+      },
+      {
+        "req_id": "req6_bagel_t0_spill",
+        "path": "state_ship",
+        "src_gpu": 0,
+        "dst_gpu": 7,
+        "t_ship_ms": 3.691,
+        "t_morph_ms": 670.037,
+        "reason": "tight_mot: cross_half state_ship(6.0MiB) 3.7ms < morph 670.0ms"
+      },
+      {
+        "req_id": "req5_bagel_t3_long_h1",
+        "path": "in_place_morph",
+        "src_gpu": 6,
+        "dst_gpu": 6,
+        "t_ship_ms": 1091.802,
+        "t_morph_ms": 566.687,
+        "reason": "tight_mot: in_place_morph(alpha=0.75) 566.7ms <= ship 1091.8ms"
+      },
+      {
+        "req_id": "req7_bagel_1024_h0",
+        "path": "in_place_morph",
+        "src_gpu": 0,
+        "dst_gpu": 0,
+        "t_ship_ms": 5227.305,
+        "t_morph_ms": 270.396,
+        "reason": "tight_mot: in_place_morph(alpha=0.50) 270.4ms <= ship 5227.3ms"
+      }
+    ],
+    "bridge_all_shipped": true,
+    "short_all_shipped": true,
+    "long_and_1024_all_in_place": true
+  },
+  "status": "ok"
+}

@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "16c21dd703c077d9571c8e56d33c4474938bcae0",
+  "short_commit": "16c21dd",
+  "subject": "fix(m2): benchmark Turn-0 cold Und->Gen handoff at initial alpha=0.50",
+  "built_utc": "2026-11-21T07:04:21+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 47,
+  "bytes": 760821
+}

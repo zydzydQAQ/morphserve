@@ -518,15 +518,16 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     _update_text_ctx(pipeline, ctx_ar_gpu, "Describe the colors and textures in this image concisely.")
     ar_text_gpu = _generate_ar_text(pipeline, ctx_ar_gpu, max_tokens=24)
 
+    ip_dict = pipeline.image_processor.to_dict() if hasattr(pipeline.image_processor, "to_dict") else {}
     report["test2_gpu_inplace_loopback"] = {
         "image_processor_class": type(pipeline.image_processor).__name__,
         "image_processor_cfg": {
-            "do_resize": getattr(pipeline.image_processor, "do_resize", None),
-            "size": getattr(pipeline.image_processor, "size", None),
-            "do_rescale": getattr(pipeline.image_processor, "do_rescale", None),
-            "do_normalize": getattr(pipeline.image_processor, "do_normalize", None),
-            "image_mean": getattr(pipeline.image_processor, "image_mean", None),
-            "image_std": getattr(pipeline.image_processor, "image_std", None),
+            "do_resize": ip_dict.get("do_resize"),
+            "size": ip_dict.get("size"),
+            "do_rescale": ip_dict.get("do_rescale"),
+            "do_normalize": ip_dict.get("do_normalize"),
+            "image_mean": ip_dict.get("image_mean"),
+            "image_std": ip_dict.get("image_std"),
         },
         "cpu_decode_plus_prep_ms": round(cpu_loopback_ms, 2),
         "gpu_decode_plus_prep_p50_ms": round(float(np.median(gpu_times)), 2),
@@ -649,6 +650,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                 }
             )
             del cfg_text_ctx, cfg_img_ctx
+            torch.cuda.empty_cache()
         del main_ctx
         gc.collect()
         torch.cuda.empty_cache()

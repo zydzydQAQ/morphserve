@@ -12,6 +12,7 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from morphserve.kernels.gpu_loopback import _extract_target_hw  # noqa: E402
 from morphserve.kernels.lecp_cache import SharedPrefixCache, cow_fork_context  # noqa: E402
 
 
@@ -84,6 +85,14 @@ class TestModule3Offline(unittest.TestCase):
         self.assertEqual(sp.naive_kv_tokens, 2048 + 2048 + 20)
         self.assertEqual(sp.padded_naive_kv_tokens, 2048 * 3)
         self.assertGreater(sp.kv_reduction_ratio, 1.98)
+
+    def test_extract_target_hw_supports_dict_and_sizedict_object(self) -> None:
+        class _SizeDict:
+            height = 980
+            width = 980
+
+        self.assertEqual(_extract_target_hw({"height": 980, "width": 980}, 512, 512), (980, 980))
+        self.assertEqual(_extract_target_hw(_SizeDict(), 512, 512), (980, 980))
 
     def test_module3_script_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/05_phase1_module3_validate.sh"

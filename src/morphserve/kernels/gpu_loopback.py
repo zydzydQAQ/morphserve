@@ -154,6 +154,27 @@ def prepare_vae_images_gpu(
     return generation_input, newlens, new_rope
 
 
+def _extract_target_hw(size_cfg: Any, h: int, w: int) -> tuple[int, int]:
+    """Extract target (height, width) from dict or transformers 5.x SizeDict/dataclass."""
+    if size_cfg is None:
+        return h, w
+    if isinstance(size_cfg, int):
+        return int(size_cfg), int(size_cfg)
+    # Support both plain dict and transformers 5.x SizeDict / object attributes
+    get_val = (lambda k: size_cfg.get(k)) if isinstance(size_cfg, dict) else (lambda k: getattr(size_cfg, k, None))
+    th = get_val("height")
+    tw = get_val("width")
+    if th is not None and tw is not None:
+        return int(th), int(tw)
+    se = get_val("shortest_edge")
+    if se is not None:
+        se_i = int(se)
+        if h <= w:
+            return se_i, int(round(w * se_i / h))
+        return int(round(h * se_i / w)), se_i
+    return h, w
+
+
 def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
     """Exact GPU equivalent of HuggingFace `SiglipImageProcessor` / `BagelImageProcessor` on `[3, H, W]` uint8."""
     import torch
@@ -162,24 +183,14 @@ def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
     device = img_u8.device
     x = img_u8.to(torch.float32)  # [3, H, W] in [0, 255]
 
-    do_resize = bool(getattr(image_processor, "do_resize", False))
-    size_cfg = getattr(image_processor, "size", None)
-    if do_resize and size_cfg:
+    cfg = image_processor.to_dict() if hasattr(image_processor, "to_dict") else {}
+    do_resize = bool(cfg.get("do_resize", getattr(image_processor, "do_resize", False)))
+    size_cfg = cfg.get("size", getattr(image_processor, "size", None))
+    if do_resize and size_cfg is not None:
         _, h, w = x.shape
-        target_h, target_w = h, w
-        if isinstance(size_cfg, dict):
-            if "height" in size_cfg and "width" in size_cfg:
-                target_h, target_w = int(size_cfg["height"]), int(size_cfg["width"])
-            elif "shortest_edge" in size_cfg:
-                se = int(size_cfg["shortest_edge"])
-                if h <= w:
-                    target_h, target_w = se, int(round(w * se / h))
-                else:
-                    target_w, target_h = se, int(round(h * se / w))
-        elif isinstance(size_cfg, int):
-            target_h = target_w = int(size_cfg)
+        target_h, target_w = _extract_target_hw(size_cfg, h, w)
         if target_h != h or target_w != w:
-            resample = int(getattr(image_processor, "resample", 3))
+            resample = int(cfg.get("resample", getattr(image_processor, "resample", 3)))
             # PIL resample: 2=BILINEAR, 3=BICUBIC
             mode = "bilinear" if resample == 2 else "bicubic"
             x = F.interpolate(
@@ -189,17 +200,18 @@ def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
                 align_corners=False,
                 antialias=True,
             )[0]
+            # Match PIL uint8 quantization after Image.resize(...) before rescale/normalize
+            x = x.round().clamp(0.0, 255.0)
 
-    # Ensure dimensions are multiples of vit_patch_size if processor has patch alignment
-    do_rescale = bool(getattr(image_processor, "do_rescale", True))
+    do_rescale = bool(cfg.get("do_rescale", getattr(image_processor, "do_rescale", True)))
     if do_rescale:
-        rescale_factor = float(getattr(image_processor, "rescale_factor", 1.0 / 255.0))
+        rescale_factor = float(cfg.get("rescale_factor", getattr(image_processor, "rescale_factor", 1.0 / 255.0)))
         x = x * rescale_factor
 
-    do_normalize = bool(getattr(image_processor, "do_normalize", True))
+    do_normalize = bool(cfg.get("do_normalize", getattr(image_processor, "do_normalize", True)))
     if do_normalize:
-        mean = getattr(image_processor, "image_mean", [0.5, 0.5, 0.5])
-        std = getattr(image_processor, "image_std", [0.5, 0.5, 0.5])
+        mean = cfg.get("image_mean", getattr(image_processor, "image_mean", [0.5, 0.5, 0.5]))
+        std = cfg.get("image_std", getattr(image_processor, "image_std", [0.5, 0.5, 0.5]))
         mean_t = torch.tensor(mean, dtype=torch.float32, device=device).view(3, 1, 1)
         std_t = torch.tensor(std, dtype=torch.float32, device=device).view(3, 1, 1)
         x = (x - mean_t) / std_t

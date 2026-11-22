@@ -1,0 +1,212 @@
+{
+  "cuda": {
+    "available": true,
+    "devices": [
+      {
+        "capability": [
+          8,
+          0
+        ],
+        "index": 0,
+        "name": "NVIDIA A100-PCIE-40GB",
+        "total_memory_bytes": 42406903808
+      }
+    ],
+    "version": "13.0"
+  },
+  "models": {
+    "bagel": {
+      "config": {
+        "architectures": [
+          "BagelForConditionalGeneration"
+        ],
+        "connector_act": "gelu_pytorch_tanh",
+        "interpolate_pos": false,
+        "latent_patch_size": 2,
+        "llm_config": {
+          "architectures": [
+            "Qwen2ForCausalLM"
+          ],
+          "attention_dropout": 0.0,
+          "bos_token_id": 151643,
+          "eos_token_id": 151645,
+          "hidden_act": "silu",
+          "hidden_size": 3584,
+          "initializer_range": 0.02,
+          "intermediate_size": 18944,
+          "max_position_embeddings": 32768,
+          "max_window_layers": 28,
+          "model_type": "qwen2",
+          "num_attention_heads": 28,
+          "num_hidden_layers": 28,
+          "num_key_value_heads": 4,
+          "qk_norm": true,
+          "rms_norm_eps": 1e-06,
+          "rope_theta": 1000000.0,
+          "sliding_window": 131072,
+          "tie_word_embeddings": false,
+          "torch_dtype": "bfloat16",
+          "transformers_version": "4.43.1",
+          "use_cache": true,
+          "use_sliding_window": false,
+          "vocab_size": 152064
+        },
+        "max_latent_size": 32,
+        "model_type": "bagel",
+        "timestep_shift": 1.0,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.49.0",
+        "vae_config": {
+          "downsample": 8,
+          "z_channels": 16
+        },
+        "visual_gen": true,
+        "visual_und": true,
+        "vit_config": {
+          "hidden_size": 1152,
+          "image_size": 980,
+          "intermediate_size": 4304,
+          "model_type": "siglip_vision_model",
+          "num_attention_heads": 16,
+          "num_channels": 3,
+          "num_hidden_layers": 27,
+          "patch_size": 14
+        },
+        "vit_max_num_patch_per_side": 70
+      },
+      "exists": true,
+      "root": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT"
+    },
+    "internvlu": {
+      "exists": true,
+      "model_index": {
+        "_class_name": "InternVLUPipeline",
+        "generation_decoder": [
+          "internvlu.diffusion",
+          "InternVLUGenerationDecoder"
+        ],
+        "processor": [
+          "internvlu.processing_internvlu",
+          "InternVLUProcessor"
+        ],
+        "scheduler": [
+          "diffusers",
+          "DPMSolverMultistepScheduler"
+        ],
+        "vae": [
+          "diffusers",
+          "AutoencoderKLQwenImage"
+        ],
+        "vlm": [
+          "internvlu.vlm",
+          "InternVLUChatModel"
+        ]
+      },
+      "root": "/shared/data/MORPHSERVE/models/InternVL-U",
+      "scheduler_config": {
+        "_class_name": "DPMSolverMultistepScheduler",
+        "_diffusers_version": "0.32.0.dev0",
+        "algorithm_type": "dpmsolver++",
+        "beta_end": 0.02,
+        "beta_schedule": "linear",
+        "beta_start": 0.0001,
+        "dynamic_thresholding_ratio": 0.995,
+        "euler_at_final": false,
+        "final_sigmas_type": "zero",
+        "flow_shift": 3.0,
+        "lambda_min_clipped": -Infinity,
+        "lower_order_final": true,
+        "num_train_timesteps": 1000,
+        "prediction_type": "flow_prediction",
+        "rescale_betas_zero_snr": false,
+        "sample_max_value": 1.0,
+        "solver_order": 2,
+        "solver_type": "midpoint",
+        "steps_offset": 0,
+        "thresholding": false,
+        "timestep_spacing": "linspace",
+        "trained_betas": null,
+        "use_beta_sigmas": false,
+        "use_exponential_sigmas": false,
+        "use_flow_sigmas": true,
+        "use_karras_sigmas": false,
+        "use_lu_lambdas": false,
+        "variance_type": null
+      },
+      "vae_config": {
+        "_class_name": "AutoencoderKLQwenImage",
+        "_diffusers_version": "0.34.0.dev0",
+        "attn_scales": [],
+        "base_dim": 96,
+        "dim_mult": [
+          1,
+          2,
+          4,
+          4
+        ],
+        "dropout": 0.0,
+        "latents_mean": [
+          -0.7571,
+          -0.7089,
+          -0.9113,
+          0.1075,
+          -0.1745,
+          0.9653,
+          -0.1517,
+          1.5508,
+          0.4134,
+          -0.0715,
+          0.5517,
+          -0.3632,
+          -0.1922,
+          -0.9497,
+          0.2503,
+          -0.2921
+        ],
+        "latents_std": [
+          2.8184,
+          1.4541,
+          2.3275,
+          2.6558,
+          1.2196,
+          1.7708,
+          2.6052,
+          2.0743,
+          3.2687,
+          2.1526,
+          2.8652,
+          1.5579,
+          1.6382,
+          1.1253,
+          2.8251,
+          1.916
+        ],
+        "num_res_blocks": 2,
+        "temperal_downsample": [
+          false,
+          true,
+          true
+        ],
+        "z_dim": 16
+      }
+    }
+  },
+  "nvidia_smi": [
+    "0, GPU-d3c1776a-33b0-8800-0ed7-431fc605ba83, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0"
+  ],
+  "packages": {
+    "accelerate": "1.12.0",
+    "diffusers": "0.40.0",
+    "numpy": "2.2.6",
+    "safetensors": "0.8.0",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.14.1",
+    "vllm": "0.30.0"
+  },
+  "platform": "Linux-6.8.0-57-generic-x86_64-with-glibc2.39",
+  "project": "MORPHSERVE",
+  "python": "3.12.3",
+  "run_id": "morphserve-p2-smk1g-20261122-r3",
+  "schema": "kairos.runtime-audit.v1",
+  "topology": "\t\u001b[4mGPU0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \t0-79\t0-1\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n"
+}

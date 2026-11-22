@@ -776,6 +776,7 @@ def run_worker_process(
 
         if sched is not None:
             sched.reset_telemetry()
+            sched.ema_layer_ms = 37.0 if height >= 1024 else 10.5
             sched.external_arrival_poll = _poll_external_ar
             sched.on_task_complete = lambda _t: _flush_completed_ar()
 
@@ -1024,9 +1025,9 @@ def run_worker_process(
                 pipeline,
                 mode=policy.preemption_mode,
                 tpot_slo_ms=policy.ar_tpot_slo_ms,
-                guard_ms=4.0,
+                guard_ms=14.0,
                 init_layer_ms=10.5,
-                init_ar_step_ms=22.0,
+                init_ar_step_ms=66.0,
                 pager=pager,
             )
 

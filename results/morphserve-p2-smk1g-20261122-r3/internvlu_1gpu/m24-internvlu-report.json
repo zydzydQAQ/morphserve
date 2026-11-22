@@ -1,0 +1,39 @@
+{
+  "schema": "morphserve.phase2.m24_internvlu.v1",
+  "timestamp_utc": "2026-11-22T04:23:01Z",
+  "architecture": "bridge_mllm_dit",
+  "model_repo": "InternVL-U/InternVL-U",
+  "num_gpus": 1,
+  "smoke_1gpu": true,
+  "vmm_lossless_parity_ssim": 1.0,
+  "hybrid_hbm_saved_mib": 2802.0,
+  "results": [
+    {
+      "policy_name": "morphserve",
+      "wall_seconds": 6.66,
+      "throughput_rps": 0.6,
+      "vqa_mean_ms": 1337.13,
+      "t2i_p95_ms": 2002.56,
+      "mean_bridge_kib": 464.1,
+      "mean_nccl_ship_ms": 0.0,
+      "path_a_ships": 0,
+      "path_b_morphs": 2,
+      "hybrid_idle_reserved_mib": 5474.0,
+      "peak_reserved_mib": 8276.0
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "wall_seconds": 6.32,
+      "throughput_rps": 0.633,
+      "vqa_mean_ms": 1231.05,
+      "t2i_p95_ms": 1941.7,
+      "mean_bridge_kib": 464.1,
+      "mean_nccl_ship_ms": 0.0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "hybrid_idle_reserved_mib": 8276.0,
+      "peak_reserved_mib": 9816.0
+    }
+  ],
+  "status": "ok"
+}

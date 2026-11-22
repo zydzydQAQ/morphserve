@@ -195,7 +195,7 @@ class UnifiedPreemptiveScheduler:
             task.last_step_time_s = now_s
             self.ar_steps_executed += 1
             self.ar_compute_total_ms += step_ms
-            self.ema_ar_step_ms = 0.7 * self.ema_ar_step_ms + 0.3 * step_ms
+            self.ema_ar_step_ms = 0.5 * self.ema_ar_step_ms + 0.5 * step_ms
 
             reached_len = len(task.generated_token_ids) >= task.max_tokens
             hit_eos = task.end_token_id is not None and int(next_tok[0].item()) == int(task.end_token_id)

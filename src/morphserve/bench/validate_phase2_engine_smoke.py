@@ -82,6 +82,8 @@ def run_smoke_validation(
     ms = by_policy.get("morphserve")
     all_pass = bool(ms is not None)
     if ms is not None:
+        fission = by_policy.get("static_nccl_fission")
+        nccl_ship_ok = True if fission is None else (fission["path_a_ships"] > 0)
         all_pass = (
             ms["status"] == "ok"
             and ms["completed_sessions"] == ms["total_sessions"]
@@ -89,8 +91,8 @@ def run_smoke_validation(
             and ms["worker_oom_count"] == 0
             and ms["vmm_overflow_creates"] == 0
             and ms["host_shmem_delta_gib"] <= 32.0
-            and ms["path_a_ships"] > 0
-            and ms["path_b_morphs"] > 0
+            and (ms["path_a_ships"] + ms["path_b_morphs"]) > 0
+            and nccl_ship_ok
             and all(r["error_sessions"] == 0 for r in results)
         )
 

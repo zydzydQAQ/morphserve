@@ -1,0 +1,3869 @@
+{
+  "schema": "morphserve.phase2.m22_smoke.v1",
+  "timestamp_utc": "2026-11-22T14:12:47Z",
+  "model_dir": "/shared/data/MORPHSERVE/models/BAGEL-7B-MoT",
+  "bench_root": "/shared/data/MORPHSERVE/benchmarks/interleaved-bench-v1",
+  "num_gpus": 8,
+  "offered_qps": 0.8,
+  "results": [
+    {
+      "policy_name": "morphserve",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 74.92,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.8,
+      "raw_wall_goodput_rps": 0.1602,
+      "steady_state_goodput_rps": 0.8,
+      "steady_state_attainment_pct": 100.0,
+      "joint_slo_attainment_pct": 100.0,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 100.0,
+      "ar_ttft_p50_ms": 850.25,
+      "ar_ttft_p95_ms": 998.43,
+      "ar_ttft_p99_ms": 999.66,
+      "ar_tpot_p50_ms": 71.7,
+      "ar_tpot_p95_ms": 75.33,
+      "ar_tpot_p99_ms": 77.06,
+      "dit_turn_p50_ms": 3329.64,
+      "dit_turn_p95_ms": 8948.87,
+      "dit_turn_p99_ms": 10304.3,
+      "peak_gpu_reserved_mib": 18798.0,
+      "host_shmem_delta_gib": 24.72,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 28,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 25,
+      "path_a_ships": 0,
+      "path_b_morphs": 12,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 91.7,
+          "goodput_rps": 0.7333
+        },
+        "2.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "2.5x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 13077.68,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            3630.01,
+            3209.03
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 2,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2953.69,
+          "ar_ttfts_ms": [
+            288.14
+          ],
+          "ar_tpots_ms": [
+            76.74,
+            72.55,
+            72.4,
+            75.53,
+            73.17,
+            72.31,
+            72.09,
+            72.19,
+            72.45,
+            74.15
+          ],
+          "dit_turns_ms": [
+            2953.57
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10359.05,
+          "ar_ttfts_ms": [
+            794.17,
+            889.96
+          ],
+          "ar_tpots_ms": [
+            71.55,
+            71.46,
+            71.29,
+            71.6,
+            71.25,
+            71.78,
+            72.14,
+            73.98,
+            71.45,
+            71.39,
+            71.48,
+            71.69,
+            71.54,
+            71.98,
+            71.68,
+            71.47,
+            74.19,
+            72.08,
+            71.53,
+            71.5,
+            71.49,
+            74.59,
+            72.28,
+            72.37,
+            72.62,
+            72.33,
+            72.03,
+            71.94,
+            73.05,
+            73.06,
+            72.03,
+            72.46,
+            73.81,
+            71.73,
+            71.93,
+            72.05,
+            71.9,
+            71.67,
+            72.1,
+            72.4,
+            73.21,
+            72.98,
+            75.28,
+            72.23,
+            75.11,
+            73.69
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9467.57,
+          "ar_ttfts_ms": [
+            805.58,
+            911.85
+          ],
+          "ar_tpots_ms": [
+            68.77,
+            69.22,
+            68.54,
+            68.22,
+            68.36,
+            68.36,
+            69.71,
+            70.93,
+            71.93,
+            70.8,
+            69.57,
+            69.23,
+            69.21,
+            68.83,
+            70.74,
+            73.81,
+            72.8,
+            76.97,
+            76.2,
+            72.64,
+            72.13,
+            76.45,
+            72.09,
+            74.66,
+            72.21,
+            77.34,
+            75.32
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 10643.25,
+          "ar_ttfts_ms": [
+            999.97
+          ],
+          "ar_tpots_ms": [
+            71.77,
+            69.52,
+            69.44,
+            69.48,
+            69.44,
+            69.4,
+            69.55,
+            70.03,
+            76.36,
+            70.22,
+            71.8,
+            70.63,
+            69.83,
+            69.65,
+            69.47,
+            72.67,
+            69.69,
+            70.85,
+            72.25,
+            69.41,
+            69.05,
+            69.47,
+            69.52
+          ],
+          "dit_turns_ms": [
+            10643.16
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the orange flower buds removed while keeping the overall structure of the image intact. The design"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 4725.24,
+          "ar_ttfts_ms": [
+            996.54
+          ],
+          "ar_tpots_ms": [
+            69.8,
+            68.53,
+            68.15,
+            68.28,
+            67.81,
+            71.51,
+            70.36,
+            69.1,
+            70.2,
+            69.31,
+            69.06,
+            68.89,
+            68.49,
+            68.58,
+            68.31,
+            71.21,
+            68.3,
+            67.98,
+            68.04,
+            68.16,
+            73.1,
+            69.52,
+            68.24
+          ],
+          "dit_turns_ms": [
+            4725.17
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the snowman's top hat replaced with a red Santa hat while keeping the rest of"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 11363.16,
+          "ar_ttfts_ms": [
+            836.94,
+            863.55
+          ],
+          "ar_tpots_ms": [
+            71.89,
+            71.75,
+            71.64,
+            71.54,
+            71.44,
+            72.42,
+            72.23,
+            73.43,
+            74.54,
+            72.08,
+            72.02,
+            71.83,
+            72.06,
+            71.92,
+            71.26,
+            71.03,
+            72.77,
+            71.12,
+            70.82,
+            70.91,
+            70.86,
+            71.1,
+            71.32,
+            72.39,
+            72.11,
+            72.88,
+            73.06,
+            72.23,
+            71.94,
+            71.5,
+            71.59,
+            71.86,
+            71.71,
+            75.04,
+            71.78,
+            71.36,
+            77.16,
+            72.24,
+            71.16,
+            71.91,
+            71.69,
+            72.15,
+            71.53,
+            71.44,
+            71.3,
+            71.45
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2526.44,
+          "ar_ttfts_ms": [
+            218.3
+          ],
+          "ar_tpots_ms": [
+            77.03,
+            73.7,
+            73.3,
+            72.99,
+            72.78
+          ],
+          "dit_turns_ms": [
+            2526.36
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 2085.85,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2085.75
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12551.37,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2974.75,
+            3529.64
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 2,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 11898.97,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2974.77,
+            3450.24
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 2,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 7562.73,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            7562.64
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 1,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 87.26,
+      "init_summary": {
+        "host_shmem_delta_gib": 24.72,
+        "mirror_inodes": [
+          112266,
+          151694
+        ]
+      }
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 74.78,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.8,
+      "raw_wall_goodput_rps": 0.1605,
+      "steady_state_goodput_rps": 0.8,
+      "steady_state_attainment_pct": 100.0,
+      "joint_slo_attainment_pct": 100.0,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 100.0,
+      "ar_ttft_p50_ms": 924.61,
+      "ar_ttft_p95_ms": 1114.98,
+      "ar_ttft_p99_ms": 1149.01,
+      "ar_tpot_p50_ms": 61.97,
+      "ar_tpot_p95_ms": 66.09,
+      "ar_tpot_p99_ms": 69.37,
+      "dit_turn_p50_ms": 3184.18,
+      "dit_turn_p95_ms": 8874.76,
+      "dit_turn_p99_ms": 10156.72,
+      "peak_gpu_reserved_mib": 36788.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 91.7,
+          "goodput_rps": 0.7333
+        },
+        "2.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "2.5x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12605.65,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2938.22,
+            3429.11
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2858.11,
+          "ar_ttfts_ms": [
+            337.59
+          ],
+          "ar_tpots_ms": [
+            65.02,
+            62.68,
+            64.91,
+            62.65,
+            62.67,
+            65.03,
+            62.59,
+            64.74,
+            62.64,
+            66.18
+          ],
+          "dit_turns_ms": [
+            2858.07
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10050.0,
+          "ar_ttfts_ms": [
+            968.26,
+            873.25
+          ],
+          "ar_tpots_ms": [
+            61.55,
+            63.86,
+            62.27,
+            61.26,
+            64.03,
+            61.93,
+            61.48,
+            61.38,
+            63.48,
+            61.41,
+            61.53,
+            61.05,
+            61.67,
+            63.16,
+            63.29,
+            61.16,
+            61.18,
+            67.95,
+            61.98,
+            63.41,
+            61.1,
+            60.94,
+            60.97,
+            61.95,
+            61.62,
+            61.67,
+            61.77,
+            63.54,
+            61.49,
+            61.57,
+            61.42,
+            62.17,
+            61.44,
+            61.58,
+            61.58,
+            67.15,
+            62.27,
+            62.1,
+            61.78,
+            61.79,
+            61.74,
+            61.62,
+            61.54,
+            61.69,
+            62.44,
+            62.11
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9351.31,
+          "ar_ttfts_ms": [
+            951.43,
+            896.35
+          ],
+          "ar_tpots_ms": [
+            62.46,
+            64.25,
+            62.47,
+            62.18,
+            65.36,
+            62.37,
+            62.02,
+            62.09,
+            62.02,
+            62.16,
+            62.25,
+            62.04,
+            62.02,
+            62.6,
+            62.04,
+            62.1,
+            62.23,
+            62.17,
+            62.46,
+            62.23,
+            62.06,
+            61.98,
+            62.12,
+            65.26,
+            62.69,
+            62.52,
+            62.68
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 10477.28,
+          "ar_ttfts_ms": [
+            1063.01
+          ],
+          "ar_tpots_ms": [
+            60.48,
+            59.91,
+            59.86,
+            59.86,
+            59.86,
+            59.95,
+            59.7,
+            60.13,
+            59.76,
+            59.74,
+            60.01,
+            59.82,
+            62.85,
+            60.25,
+            60.1,
+            60.25,
+            60.5,
+            60.42,
+            62.29,
+            61.08,
+            60.65,
+            60.7,
+            60.41
+          ],
+          "dit_turns_ms": [
+            10477.21
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the orange flower buds removed while keeping the overall structure of the image intact. The design"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 4742.89,
+          "ar_ttfts_ms": [
+            1157.51
+          ],
+          "ar_tpots_ms": [
+            61.37,
+            61.22,
+            61.28,
+            61.35,
+            61.03,
+            60.91,
+            60.77,
+            63.69,
+            77.08,
+            62.42,
+            61.67,
+            61.57,
+            60.97,
+            60.94,
+            60.95,
+            61.24,
+            61.19,
+            61.39,
+            63.14,
+            61.75,
+            63.87,
+            61.33,
+            61.04
+          ],
+          "dit_turns_ms": [
+            4742.81
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the snowman's top hat replaced with a red Santa hat while keeping the rest of"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 11114.64,
+          "ar_ttfts_ms": [
+            957.83,
+            897.79
+          ],
+          "ar_tpots_ms": [
+            63.77,
+            62.25,
+            65.46,
+            61.56,
+            61.54,
+            61.33,
+            61.24,
+            61.44,
+            61.25,
+            61.61,
+            61.9,
+            61.87,
+            61.07,
+            61.17,
+            63.68,
+            68.8,
+            61.86,
+            61.65,
+            61.72,
+            61.27,
+            67.86,
+            63.65,
+            61.09,
+            66.09,
+            62.46,
+            66.12,
+            63.83,
+            63.77,
+            63.48,
+            62.93,
+            71.5,
+            65.15,
+            63.3,
+            63.1,
+            66.74,
+            63.7,
+            63.34,
+            62.91,
+            62.76,
+            62.42,
+            62.48,
+            65.99,
+            62.78,
+            62.37,
+            62.37,
+            62.4
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2572.67,
+          "ar_ttfts_ms": [
+            328.78
+          ],
+          "ar_tpots_ms": [
+            61.97,
+            61.42,
+            61.63,
+            61.81,
+            61.63
+          ],
+          "dit_turns_ms": [
+            2572.6
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 2045.16,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2045.08
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12424.53,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2974.35,
+            3403.86
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 11837.74,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2971.34,
+            3394.02
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 7563.74,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            7563.67
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 35.86,
+      "init_summary": {
+        "host_shmem_delta_gib": 0.21,
+        "mirror_inodes": []
+      }
+    },
+    {
+      "policy_name": "twostage_shm",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 80.39,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5333,
+      "raw_wall_goodput_rps": 0.0995,
+      "steady_state_goodput_rps": 0.5333,
+      "steady_state_attainment_pct": 66.7,
+      "joint_slo_attainment_pct": 66.7,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 66.7,
+      "ar_ttft_p50_ms": 860.07,
+      "ar_ttft_p95_ms": 1122.01,
+      "ar_ttft_p99_ms": 1128.81,
+      "ar_tpot_p50_ms": 62.65,
+      "ar_tpot_p95_ms": 65.54,
+      "ar_tpot_p99_ms": 68.09,
+      "dit_turn_p50_ms": 5984.9,
+      "dit_turn_p95_ms": 10342.04,
+      "dit_turn_p99_ms": 12947.26,
+      "peak_gpu_reserved_mib": 36294.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 12,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 58.3,
+          "goodput_rps": 0.4667
+        },
+        "2.0x": {
+          "attainment_pct": 66.7,
+          "goodput_rps": 0.5333
+        },
+        "2.5x": {
+          "attainment_pct": 91.7,
+          "goodput_rps": 0.7333
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 18402.1,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            6127.32,
+            6035.26
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            636059648,
+            681132032
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2783.19,
+          "ar_ttfts_ms": [
+            188.76
+          ],
+          "ar_tpots_ms": [
+            65.5,
+            61.22,
+            60.81,
+            60.86,
+            62.15,
+            61.12,
+            62.58,
+            64.08,
+            61.26,
+            65.02
+          ],
+          "dit_turns_ms": [
+            2783.14
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            2007040
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9996.32,
+          "ar_ttfts_ms": [
+            849.32,
+            906.1
+          ],
+          "ar_tpots_ms": [
+            63.01,
+            62.94,
+            65.06,
+            62.69,
+            62.49,
+            63.14,
+            62.41,
+            62.79,
+            62.73,
+            62.36,
+            62.4,
+            62.36,
+            62.25,
+            63.78,
+            63.04,
+            62.71,
+            62.43,
+            62.09,
+            62.1,
+            62.1,
+            62.38,
+            62.55,
+            62.51,
+            63.12,
+            62.84,
+            62.52,
+            62.76,
+            64.43,
+            62.7,
+            62.94,
+            62.87,
+            62.49,
+            62.31,
+            62.36,
+            62.26,
+            62.42,
+            62.25,
+            62.39,
+            62.26,
+            64.48,
+            63.88,
+            66.32,
+            63.18,
+            63.27,
+            63.19,
+            63.25
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9194.49,
+          "ar_ttfts_ms": [
+            833.44,
+            901.8
+          ],
+          "ar_tpots_ms": [
+            61.17,
+            60.76,
+            64.55,
+            60.98,
+            61.13,
+            61.18,
+            60.88,
+            60.82,
+            60.84,
+            63.35,
+            61.18,
+            60.82,
+            60.88,
+            59.98,
+            59.97,
+            60.01,
+            59.99,
+            59.82,
+            59.96,
+            59.85,
+            60.03,
+            60.25,
+            63.74,
+            60.59,
+            60.35,
+            60.3,
+            60.32
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 13598.64,
+          "ar_ttfts_ms": [
+            1130.51
+          ],
+          "ar_tpots_ms": [
+            61.96,
+            62.65,
+            63.29,
+            62.65,
+            62.45,
+            62.21,
+            62.03,
+            62.36,
+            62.23,
+            62.19,
+            62.18,
+            62.18,
+            62.8,
+            65.53,
+            62.89,
+            62.85,
+            62.86,
+            62.87,
+            68.86,
+            63.28,
+            62.83,
+            62.84,
+            62.09
+          ],
+          "dit_turns_ms": [
+            13598.56
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            637206528
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the small orange flower buds removed from the pot design while keeping the overall structure and layout"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 7651.33,
+          "ar_ttfts_ms": [
+            1111.63
+          ],
+          "ar_tpots_ms": [
+            61.79,
+            61.65,
+            61.71,
+            64.67,
+            64.75,
+            61.63,
+            61.62,
+            61.51,
+            61.48,
+            61.34,
+            61.13,
+            61.01,
+            61.14,
+            60.99,
+            61.22,
+            61.05,
+            61.15,
+            63.81,
+            60.95,
+            60.75,
+            60.6,
+            60.68,
+            65.11
+          ],
+          "dit_turns_ms": [
+            7651.25
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            682967040
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the snowman's top hat replaced with a red Santa hat while keeping the rest of"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10925.74,
+          "ar_ttfts_ms": [
+            775.1,
+            870.82
+          ],
+          "ar_tpots_ms": [
+            62.8,
+            69.52,
+            62.89,
+            62.5,
+            62.64,
+            62.66,
+            62.89,
+            63.03,
+            62.68,
+            62.86,
+            62.88,
+            62.82,
+            66.76,
+            63.53,
+            63.77,
+            63.3,
+            63.37,
+            63.27,
+            63.18,
+            62.94,
+            63.1,
+            67.89,
+            63.43,
+            64.46,
+            66.51,
+            67.15,
+            63.3,
+            63.08,
+            63.35,
+            63.02,
+            66.23,
+            64.45,
+            63.35,
+            63.17,
+            63.0,
+            62.99,
+            65.68,
+            63.66,
+            63.05,
+            63.01,
+            62.91,
+            62.77,
+            62.69,
+            62.97,
+            62.9,
+            63.0
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2422.17,
+          "ar_ttfts_ms": [
+            174.03
+          ],
+          "ar_tpots_ms": [
+            59.63,
+            62.09,
+            62.08,
+            60.07,
+            59.65
+          ],
+          "dit_turns_ms": [
+            2422.09
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            1146880
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 2142.28,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2142.2
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            802816
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 17978.33,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            5931.33,
+            6000.3
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            640991232,
+            681476096
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 17407.57,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            5969.49,
+            5969.07
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            645922816,
+            681705472
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 7677.68,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            7677.61
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            802816
+          ],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 35.01,
+      "init_summary": {
+        "host_shmem_delta_gib": 0.21,
+        "mirror_inodes": []
+      }
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 75.11,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.8,
+      "raw_wall_goodput_rps": 0.1598,
+      "steady_state_goodput_rps": 0.8,
+      "steady_state_attainment_pct": 100.0,
+      "joint_slo_attainment_pct": 100.0,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 100.0,
+      "ar_ttft_p50_ms": 843.8,
+      "ar_ttft_p95_ms": 905.44,
+      "ar_ttft_p99_ms": 906.58,
+      "ar_tpot_p50_ms": 63.59,
+      "ar_tpot_p95_ms": 66.47,
+      "ar_tpot_p99_ms": 68.61,
+      "dit_turn_p50_ms": 3357.86,
+      "dit_turn_p95_ms": 8466.92,
+      "dit_turn_p99_ms": 9446.86,
+      "peak_gpu_reserved_mib": 36900.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 12,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 91.7,
+          "goodput_rps": 0.7333
+        },
+        "2.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "2.5x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 13003.14,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            3393.98,
+            3371.67
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            564150272,
+            563462144
+          ],
+          "ship_ms_list": [
+            81.018,
+            76.828
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2779.24,
+          "ar_ttfts_ms": [
+            185.92
+          ],
+          "ar_tpots_ms": [
+            60.41,
+            60.11,
+            60.06,
+            60.15,
+            60.01,
+            59.93,
+            59.94,
+            59.58,
+            59.81,
+            59.93
+          ],
+          "dit_turns_ms": [
+            2779.2
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            2007040
+          ],
+          "ship_ms_list": [
+            37.911
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10082.47,
+          "ar_ttfts_ms": [
+            839.31,
+            893.12
+          ],
+          "ar_tpots_ms": [
+            64.56,
+            64.75,
+            64.53,
+            66.8,
+            64.94,
+            64.6,
+            64.44,
+            64.83,
+            64.49,
+            64.6,
+            64.72,
+            64.55,
+            64.42,
+            64.72,
+            64.63,
+            64.6,
+            70.36,
+            65.12,
+            64.69,
+            64.81,
+            64.54,
+            64.6,
+            64.45,
+            65.28,
+            65.09,
+            65.02,
+            65.14,
+            64.84,
+            68.03,
+            65.53,
+            65.25,
+            65.13,
+            65.16,
+            65.44,
+            65.23,
+            64.97,
+            65.35,
+            64.94,
+            69.16,
+            65.36,
+            65.49,
+            65.1,
+            66.25,
+            65.48,
+            65.55,
+            65.04
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9186.5,
+          "ar_ttfts_ms": [
+            803.99,
+            887.47
+          ],
+          "ar_tpots_ms": [
+            61.25,
+            61.39,
+            61.41,
+            61.43,
+            61.56,
+            61.31,
+            61.17,
+            61.29,
+            61.16,
+            61.11,
+            63.65,
+            61.46,
+            61.41,
+            63.89,
+            62.29,
+            62.03,
+            61.88,
+            61.71,
+            61.95,
+            66.41,
+            61.95,
+            61.64,
+            61.65,
+            61.65,
+            61.8,
+            66.61,
+            63.4
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 9691.94,
+          "ar_ttfts_ms": [
+            903.7
+          ],
+          "ar_tpots_ms": [
+            61.8,
+            61.61,
+            61.96,
+            61.37,
+            61.55,
+            61.59
+          ],
+          "dit_turns_ms": [
+            9691.85
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            564322304
+          ],
+          "ship_ms_list": [
+            83.419
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The image is a photograph."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 4014.62,
+          "ar_ttfts_ms": [
+            848.29
+          ],
+          "ar_tpots_ms": [
+            65.43,
+            61.81,
+            61.64,
+            61.32,
+            61.4,
+            61.25,
+            61.25,
+            61.52,
+            62.75,
+            62.25
+          ],
+          "dit_turns_ms": [
+            4014.56
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            564551680
+          ],
+          "ship_ms_list": [
+            58.356
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "No, it's not mentioned in the image."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10943.67,
+          "ar_ttfts_ms": [
+            767.62,
+            906.87
+          ],
+          "ar_tpots_ms": [
+            62.68,
+            62.44,
+            62.98,
+            62.95,
+            66.51,
+            63.29,
+            62.88,
+            62.44,
+            65.35,
+            62.51,
+            62.4,
+            62.4,
+            62.2,
+            62.56,
+            62.51,
+            62.17,
+            62.36,
+            62.21,
+            62.34,
+            62.34,
+            64.79,
+            62.72,
+            62.52,
+            63.45,
+            62.8,
+            64.47,
+            63.64,
+            67.0,
+            64.09,
+            63.89,
+            64.49,
+            63.8,
+            63.55,
+            63.71,
+            63.46,
+            63.11,
+            64.54,
+            64.2,
+            64.34,
+            64.08,
+            63.91,
+            63.72,
+            66.75,
+            63.38,
+            63.63,
+            63.28
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2501.2,
+          "ar_ttfts_ms": [
+            190.59
+          ],
+          "ar_tpots_ms": [
+            65.42,
+            64.62,
+            64.41,
+            64.5,
+            64.8
+          ],
+          "dit_turns_ms": [
+            2501.13
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            1146880
+          ],
+          "ship_ms_list": [
+            24.184
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 2108.64,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2108.57
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            802816
+          ],
+          "ship_ms_list": [
+            18.688
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12733.16,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            3342.35,
+            3344.05
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            563691520,
+            563806208
+          ],
+          "ship_ms_list": [
+            57.314,
+            58.871
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12184.43,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            3385.07,
+            3325.33
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 2,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            563920896,
+            564035584
+          ],
+          "ship_ms_list": [
+            70.414,
+            57.324
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 7464.76,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            7464.71
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 1,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [
+            802816
+          ],
+          "ship_ms_list": [
+            0.387
+          ],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 35.93,
+      "init_summary": {
+        "host_shmem_delta_gib": 0.21,
+        "mirror_inodes": []
+      }
+    },
+    {
+      "policy_name": "prism_tetriserve_coloc",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 74.83,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.8,
+      "raw_wall_goodput_rps": 0.1604,
+      "steady_state_goodput_rps": 0.8,
+      "steady_state_attainment_pct": 100.0,
+      "joint_slo_attainment_pct": 100.0,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 100.0,
+      "ar_ttft_p50_ms": 934.7,
+      "ar_ttft_p95_ms": 1144.26,
+      "ar_ttft_p99_ms": 1167.5,
+      "ar_tpot_p50_ms": 69.32,
+      "ar_tpot_p95_ms": 73.61,
+      "ar_tpot_p99_ms": 75.34,
+      "dit_turn_p50_ms": 3230.69,
+      "dit_turn_p95_ms": 9010.03,
+      "dit_turn_p99_ms": 10367.49,
+      "peak_gpu_reserved_mib": 36102.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 91.7,
+          "goodput_rps": 0.7333
+        },
+        "2.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "2.5x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.8
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12645.9,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2978.27,
+            3429.24
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 3056.02,
+          "ar_ttfts_ms": [
+            466.28
+          ],
+          "ar_tpots_ms": [
+            66.53,
+            66.33,
+            66.35,
+            66.02,
+            65.94,
+            66.27,
+            71.6,
+            68.51,
+            65.94,
+            65.79
+          ],
+          "dit_turns_ms": [
+            3055.98
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10400.49,
+          "ar_ttfts_ms": [
+            954.72,
+            887.32
+          ],
+          "ar_tpots_ms": [
+            70.54,
+            69.96,
+            69.87,
+            69.47,
+            69.51,
+            69.59,
+            71.83,
+            69.65,
+            69.51,
+            69.29,
+            69.71,
+            69.42,
+            69.25,
+            69.47,
+            69.37,
+            73.94,
+            73.64,
+            69.78,
+            69.63,
+            69.41,
+            69.27,
+            69.2,
+            69.49,
+            69.16,
+            69.33,
+            71.65,
+            69.55,
+            69.01,
+            71.51,
+            69.75,
+            69.1,
+            68.75,
+            68.57,
+            68.55,
+            68.58,
+            68.5,
+            70.25,
+            69.07,
+            69.6,
+            69.48,
+            69.25,
+            69.29,
+            68.88,
+            73.05,
+            69.38,
+            68.99
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9624.21,
+          "ar_ttfts_ms": [
+            975.75,
+            883.48
+          ],
+          "ar_tpots_ms": [
+            72.34,
+            71.7,
+            71.41,
+            70.91,
+            70.97,
+            71.14,
+            71.02,
+            74.0,
+            71.51,
+            71.41,
+            73.61,
+            72.46,
+            72.01,
+            73.0,
+            71.49,
+            71.74,
+            72.67,
+            72.23,
+            75.4,
+            71.83,
+            72.05,
+            74.7,
+            71.95,
+            71.96,
+            72.44,
+            72.14,
+            71.91
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 10706.97,
+          "ar_ttfts_ms": [
+            1108.76
+          ],
+          "ar_tpots_ms": [
+            68.98,
+            68.52,
+            68.78,
+            68.27,
+            68.24,
+            69.06,
+            70.93,
+            68.77,
+            68.63,
+            68.46,
+            68.59,
+            68.36,
+            68.52,
+            74.88,
+            68.86,
+            72.38,
+            69.28,
+            71.77,
+            68.54,
+            68.37,
+            68.12,
+            68.32,
+            68.2
+          ],
+          "dit_turns_ms": [
+            10706.86
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the orange flower buds removed while keeping the overall structure of the image intact. The design"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 4874.77,
+          "ar_ttfts_ms": [
+            1173.31
+          ],
+          "ar_tpots_ms": [
+            67.62,
+            67.34,
+            67.02,
+            70.63,
+            67.35,
+            66.88,
+            67.16,
+            72.43,
+            68.37,
+            67.48,
+            67.4,
+            67.14,
+            67.28,
+            66.78,
+            67.14,
+            67.02,
+            66.98,
+            67.18,
+            67.25,
+            67.06,
+            70.21,
+            66.99,
+            67.36
+          ],
+          "dit_turns_ms": [
+            4874.69
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the snowman's top hat replaced with a red Santa hat while keeping the rest of"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 11449.68,
+          "ar_ttfts_ms": [
+            968.93,
+            914.68
+          ],
+          "ar_tpots_ms": [
+            68.48,
+            68.31,
+            68.66,
+            71.55,
+            68.25,
+            68.51,
+            68.76,
+            68.51,
+            68.26,
+            67.87,
+            68.17,
+            68.24,
+            68.19,
+            71.16,
+            68.39,
+            69.82,
+            68.55,
+            68.47,
+            68.68,
+            68.64,
+            68.64,
+            68.7,
+            68.95,
+            70.38,
+            75.12,
+            70.15,
+            70.24,
+            70.07,
+            69.75,
+            75.32,
+            70.46,
+            69.62,
+            69.32,
+            69.72,
+            79.65,
+            70.15,
+            70.47,
+            70.65,
+            70.37,
+            69.95,
+            70.79,
+            71.01,
+            70.13,
+            70.05,
+            73.13,
+            70.05
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 2742.84,
+          "ar_ttfts_ms": [
+            476.96
+          ],
+          "ar_tpots_ms": [
+            67.44,
+            66.89,
+            66.68,
+            69.63,
+            67.34
+          ],
+          "dit_turns_ms": [
+            2742.77
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 2024.36,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2024.28
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 12451.11,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2999.11,
+            3405.4
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 11867.96,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            2975.4,
+            3419.22
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 7621.79,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            7621.72
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 35.37,
+      "init_summary": {
+        "host_shmem_delta_gib": 0.21,
+        "mirror_inodes": []
+      }
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "suite_name": "smoke_8gpu_12",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 87.95,
+      "total_sessions": 12,
+      "completed_sessions": 12,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.2667,
+      "raw_wall_goodput_rps": 0.0455,
+      "steady_state_goodput_rps": 0.2667,
+      "steady_state_attainment_pct": 33.3,
+      "joint_slo_attainment_pct": 33.3,
+      "ar_slo_attainment_pct": 83.3,
+      "dit_slo_attainment_pct": 33.3,
+      "ar_ttft_p50_ms": 872.36,
+      "ar_ttft_p95_ms": 5413.78,
+      "ar_ttft_p99_ms": 6272.62,
+      "ar_tpot_p50_ms": 62.88,
+      "ar_tpot_p95_ms": 66.27,
+      "ar_tpot_p99_ms": 68.16,
+      "dit_turn_p50_ms": 9997.19,
+      "dit_turn_p95_ms": 16992.11,
+      "dit_turn_p99_ms": 19903.58,
+      "peak_gpu_reserved_mib": 18168.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 33.3,
+          "goodput_rps": 0.2667
+        },
+        "2.0x": {
+          "attainment_pct": 33.3,
+          "goodput_rps": 0.2667
+        },
+        "2.5x": {
+          "attainment_pct": 41.7,
+          "goodput_rps": 0.3333
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.4
+        }
+      },
+      "status": "ok",
+      "sessions": [
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_000",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 31725.85,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            14014.47,
+            11474.04
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_002",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 9457.91,
+          "ar_ttfts_ms": [
+            196.01
+          ],
+          "ar_tpots_ms": [
+            64.08,
+            63.4,
+            63.49,
+            63.66,
+            63.68,
+            63.41,
+            70.25,
+            64.25,
+            66.26,
+            63.29
+          ],
+          "dit_turns_ms": [
+            9457.87
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a red bowl and a pink sink"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_001",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9984.37,
+          "ar_ttfts_ms": [
+            851.15,
+            911.46
+          ],
+          "ar_tpots_ms": [
+            62.89,
+            62.84,
+            62.86,
+            62.69,
+            62.56,
+            65.21,
+            62.97,
+            62.92,
+            63.05,
+            66.67,
+            63.01,
+            65.56,
+            62.93,
+            62.64,
+            62.62,
+            65.82,
+            62.82,
+            62.81,
+            62.68,
+            62.7,
+            62.85,
+            62.87,
+            63.11,
+            61.99,
+            62.05,
+            61.73,
+            62.14,
+            61.9,
+            61.66,
+            62.09,
+            61.42,
+            61.27,
+            61.39,
+            61.26,
+            64.44,
+            61.26,
+            61.22,
+            61.08,
+            61.17,
+            61.07,
+            61.35,
+            61.17,
+            61.27,
+            61.31,
+            61.5,
+            61.29
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, as it uses the format of a math problem to ask about a",
+            "The question appears to be a play on words, as it uses the format of a math problem to ask about a"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_002",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 9331.9,
+          "ar_ttfts_ms": [
+            828.57,
+            918.25
+          ],
+          "ar_tpots_ms": [
+            64.99,
+            64.97,
+            64.92,
+            64.74,
+            64.78,
+            77.17,
+            65.45,
+            67.61,
+            67.0,
+            65.83,
+            65.88,
+            65.44,
+            65.18,
+            64.22,
+            64.2,
+            64.0,
+            64.16,
+            64.43,
+            64.37,
+            64.45,
+            64.23,
+            65.21,
+            64.18,
+            66.64,
+            64.3,
+            66.36,
+            64.85
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The answer to the second equation on the right is 1.",
+            "The answer to the second last equation on the right is 1."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_003",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 20631.53,
+          "ar_ttfts_ms": [
+            6487.33
+          ],
+          "ar_tpots_ms": [
+            63.69,
+            62.37,
+            67.13,
+            62.77,
+            62.51,
+            64.13,
+            62.47,
+            62.67,
+            62.52,
+            64.61,
+            62.46,
+            62.92,
+            63.37,
+            65.73,
+            62.52,
+            66.12,
+            62.73,
+            64.56,
+            62.9,
+            62.74,
+            65.34,
+            63.19,
+            63.21
+          ],
+          "dit_turns_ms": [
+            20631.45
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": false,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the orange flower buds removed from the design while keeping the overall structure and layout intact."
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_000",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 11194.71,
+          "ar_ttfts_ms": [
+            4101.67
+          ],
+          "ar_tpots_ms": [
+            62.56,
+            64.92,
+            62.56,
+            62.72,
+            62.59,
+            62.5,
+            62.52,
+            62.58,
+            65.45,
+            62.74,
+            62.47,
+            62.87,
+            62.55,
+            62.68,
+            63.04,
+            62.73,
+            63.2,
+            63.08,
+            62.92,
+            65.54,
+            63.01,
+            65.99,
+            62.49
+          ],
+          "dit_turns_ms": [
+            11194.63
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": false,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "<think>\nThe user wants the snowman's top hat replaced with a red Santa hat while keeping the rest of"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multi_image_vqa_000",
+          "quadrant": "multi_image_vqa",
+          "status": "ok",
+          "e2e_ms": 10952.03,
+          "ar_ttfts_ms": [
+            819.98,
+            893.56
+          ],
+          "ar_tpots_ms": [
+            62.41,
+            62.43,
+            62.71,
+            66.03,
+            62.63,
+            62.93,
+            62.69,
+            62.84,
+            62.59,
+            65.11,
+            62.88,
+            62.64,
+            64.85,
+            62.54,
+            65.84,
+            62.87,
+            62.44,
+            62.82,
+            63.22,
+            62.63,
+            62.46,
+            61.97,
+            61.66,
+            64.75,
+            61.92,
+            65.52,
+            61.66,
+            64.0,
+            62.04,
+            62.57,
+            61.74,
+            63.76,
+            61.64,
+            62.08,
+            61.35,
+            62.98,
+            64.07,
+            61.53,
+            61.78,
+            61.6,
+            63.96,
+            61.4,
+            61.36,
+            61.34,
+            63.01,
+            61.46
+          ],
+          "dit_turns_ms": [],
+          "dit_turn_heights": [],
+          "dit_turn_steps": [],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "The question seems to be a play on words, using the format of \"What is x in the equation?\" to",
+            "The question appears to be a variation of the \"What is x in the equation?\" format, but instead of asking"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_visual_cot_001",
+          "quadrant": "visual_cot",
+          "status": "ok",
+          "e2e_ms": 6875.93,
+          "ar_ttfts_ms": [
+            188.56
+          ],
+          "ar_tpots_ms": [
+            64.61,
+            63.86,
+            63.38,
+            67.5,
+            62.53
+          ],
+          "dit_turns_ms": [
+            6875.84
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [
+            "a photo of a bed"
+          ],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_000",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 5820.94,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            5820.82
+          ],
+          "dit_turn_heights": [
+            512
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_002",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 24300.44,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            9448.72,
+            8803.71
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_multiturn_edit_001",
+          "quadrant": "multiturn_edit",
+          "status": "ok",
+          "e2e_ms": 25462.66,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            9931.38,
+            10063.01
+          ],
+          "dit_turn_heights": [
+            512,
+            512
+          ],
+          "dit_turn_steps": [
+            8,
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": false,
+          "joint_slo_met": false,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        },
+        {
+          "session_id": "smoke_8gpu_12_highres_t2i_001",
+          "quadrant": "highres_t2i",
+          "status": "ok",
+          "e2e_ms": 10280.93,
+          "ar_ttfts_ms": [],
+          "ar_tpots_ms": [],
+          "dit_turns_ms": [
+            10280.85
+          ],
+          "dit_turn_heights": [
+            1024
+          ],
+          "dit_turn_steps": [
+            8
+          ],
+          "ar_slo_met": true,
+          "dit_slo_met": true,
+          "joint_slo_met": true,
+          "path_a_ships": 0,
+          "path_b_morphs": 0,
+          "ship_bytes_list": [],
+          "ship_ms_list": [],
+          "preempted_ar_turns": 0,
+          "total_yields": 0,
+          "oom_retries": 0,
+          "ar_texts": [],
+          "image_paths_out": [],
+          "error": ""
+        }
+      ],
+      "startup_seconds": 47.16,
+      "init_summary": {
+        "host_shmem_delta_gib": 0.21,
+        "mirror_inodes": []
+      }
+    }
+  ],
+  "status": "check_failed"
+}

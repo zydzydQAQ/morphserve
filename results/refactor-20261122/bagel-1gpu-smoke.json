@@ -1,0 +1,141 @@
+{
+  "policy_name": "morphserve",
+  "suite_name": "smoke_1gpu_preempt",
+  "num_gpus": 1,
+  "offered_qps": 1.0,
+  "wall_seconds": 14.19,
+  "total_sessions": 2,
+  "completed_sessions": 2,
+  "oom_sessions": 0,
+  "error_sessions": 0,
+  "joint_slo_goodput_rps": 1.0,
+  "raw_wall_goodput_rps": 0.141,
+  "steady_state_goodput_rps": 1.0,
+  "steady_state_attainment_pct": 100.0,
+  "joint_slo_attainment_pct": 100.0,
+  "ar_slo_attainment_pct": 100.0,
+  "dit_slo_attainment_pct": 100.0,
+  "ar_ttft_p50_ms": 401.92,
+  "ar_ttft_p95_ms": 401.92,
+  "ar_ttft_p99_ms": 401.92,
+  "ar_tpot_p50_ms": 102.59,
+  "ar_tpot_p95_ms": 105.3,
+  "ar_tpot_p99_ms": 108.63,
+  "dit_turn_p50_ms": 4878.93,
+  "dit_turn_p95_ms": 5266.49,
+  "dit_turn_p99_ms": 5300.94,
+  "peak_gpu_reserved_mib": 16952.0,
+  "host_shmem_delta_gib": 12.27,
+  "vmm_overflow_creates": 0,
+  "vmm_super_to_fine_carves": 2,
+  "vmm_expert_evictions_for_kv": 0,
+  "vmm_expert_evictions_for_transient": 0,
+  "path_a_ships": 0,
+  "path_b_morphs": 0,
+  "preempted_ar_count": 1,
+  "total_yields": 20,
+  "worker_oom_count": 0,
+  "oom_retry_count": 0,
+  "slo_curve_by_k": {
+    "1.5x": {
+      "attainment_pct": 50.0,
+      "goodput_rps": 0.5
+    },
+    "2.0x": {
+      "attainment_pct": 100.0,
+      "goodput_rps": 1.0
+    },
+    "2.5x": {
+      "attainment_pct": 100.0,
+      "goodput_rps": 1.0
+    },
+    "3.0x": {
+      "attainment_pct": 100.0,
+      "goodput_rps": 1.0
+    }
+  },
+  "status": "ok",
+  "sessions": [
+    {
+      "session_id": "smk_edit_0",
+      "quadrant": "multiturn_edit",
+      "status": "ok",
+      "e2e_ms": 14181.57,
+      "ar_ttfts_ms": [],
+      "ar_tpots_ms": [],
+      "dit_turns_ms": [
+        5309.55,
+        4448.3
+      ],
+      "dit_turn_heights": [
+        512,
+        512
+      ],
+      "dit_turn_steps": [
+        12,
+        12
+      ],
+      "ar_slo_met": true,
+      "dit_slo_met": true,
+      "joint_slo_met": true,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "preempted_ar_turns": 0,
+      "total_yields": 20,
+      "oom_retries": 0,
+      "ar_texts": [],
+      "image_paths_out": [],
+      "error": ""
+    },
+    {
+      "session_id": "smk_vqa_mid_dit",
+      "quadrant": "multi_image_vqa",
+      "status": "ok",
+      "e2e_ms": 2360.51,
+      "ar_ttfts_ms": [
+        401.92
+      ],
+      "ar_tpots_ms": [
+        103.29,
+        102.56,
+        101.29,
+        102.62,
+        104.07,
+        109.46,
+        102.22,
+        101.93,
+        102.66,
+        104.84,
+        103.57,
+        102.44,
+        102.15,
+        101.76,
+        102.59,
+        104.1,
+        101.21,
+        101.02,
+        103.81
+      ],
+      "dit_turns_ms": [],
+      "dit_turn_heights": [],
+      "dit_turn_steps": [],
+      "ar_slo_met": true,
+      "dit_slo_met": true,
+      "joint_slo_met": true,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "preempted_ar_turns": 1,
+      "total_yields": 0,
+      "oom_retries": 0,
+      "ar_texts": [
+        "1. Calm water surface with minimal ripples or waves.\n2. Surrounding landscape with"
+      ],
+      "image_paths_out": [],
+      "error": ""
+    }
+  ]
+}

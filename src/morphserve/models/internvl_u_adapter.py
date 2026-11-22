@@ -184,20 +184,24 @@ def load_internvlu_pipeline(
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")
 
-    # Load each verified sub-directory directly to bypass diffusers>=0.40 custom module_path restrictions
+    # Load each verified sub-directory directly with low_cpu_mem_usage=False so transformers>=5
+    # never leaves non-persistent plain tensor attributes (e.g. UnifiedMSRoPE.all_inv_freqs) on meta device.
     vlm = InternVLUChatModel.from_pretrained(
         str(model_dir / "vlm"),
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=False,
         local_files_only=True,
     )
     generation_decoder = InternVLUGenerationDecoder.from_pretrained(
         str(model_dir / "generation_decoder"),
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=False,
         local_files_only=True,
     )
     vae = AutoencoderKLQwenImage.from_pretrained(
         str(model_dir / "vae"),
         torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=False,
         local_files_only=True,
     )
     scheduler = DPMSolverMultistepScheduler.from_pretrained(
@@ -244,6 +248,20 @@ def load_internvlu_pipeline(
         processor=processor,
     )
     pipe = pipe.to(dev)
+    for root_mod in (pipe.vlm, pipe.generation_decoder, pipe.vae):
+        for mod in root_mod.modules():
+            if hasattr(mod, "all_inv_freqs") and hasattr(mod, "axes_dim") and hasattr(mod, "theta"):
+                inv_f = getattr(mod, "all_inv_freqs", None)
+                if inv_f is None or getattr(inv_f, "is_meta", False) or inv_f.device != dev:
+                    inv_list = [
+                        1.0
+                        / torch.pow(
+                            mod.theta,
+                            torch.arange(0, dim, 2, device=dev, dtype=torch.float32).div(dim),
+                        )
+                        for dim in mod.axes_dim
+                    ]
+                    mod.all_inv_freqs = torch.cat(inv_list, dim=0).float()
     pipe.vlm.eval()
     pipe.generation_decoder.eval()
     pipe.vae.eval()

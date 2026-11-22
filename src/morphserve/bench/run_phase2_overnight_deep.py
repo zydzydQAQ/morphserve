@@ -1,4 +1,4 @@
-"""Phase-2 Wave-3 Overnight Deepening: Full 80-Session Curve & Static Split-Ratio (2:6/4:4/6:2) Sensitivity."""
+"""Phase-2 Wave-3 Overnight Deepening: Steady-State (`n=80-96`) Curve & Static Split-Ratio (2:6/4:4/6:2) Sensitivity."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import argparse
 from dataclasses import replace
 import gc
 import json
-import math
 from pathlib import Path
 import time
 from typing import Any
@@ -16,7 +15,13 @@ from morphserve.bench.interleaved_bench import (
     load_burstgpt_interarrivals,
     load_gentd26_interarrivals,
 )
-from morphserve.bench.run_phase2_bagel_main import stratify_suite
+from morphserve.bench.run_phase2_bagel_main import (
+    DEFAULT_MAIN_SESSIONS,
+    DEFAULT_SKEW_SESSIONS,
+    _local_tmp_base,
+    _resolve_sources_dir,
+    scale_suite_sessions,
+)
 from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine
 from morphserve.telemetry import percentile as _pct
 
@@ -45,19 +50,31 @@ def _quadrant_breakdown(sessions_raw: list[dict[str, Any]]) -> dict[str, dict[st
 
 
 def build_static_split_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolicyConfig]]:
-    """Compare MorphServe elastic alpha against 2:6, 4:4, and 6:2 static NCCL P2P splits."""
-    assert num_gpus == 8
-    base_static = EnginePolicyConfig.from_preset("static_nccl_fission", num_gpus=8)
+    """Compare MorphServe elastic alpha against 1:3 (2:6), 2:2 (4:4), and 3:1 (6:2) static NCCL P2P splits."""
+    n = int(num_gpus)
+    if n < 4 or n % 4 != 0:
+        raise ValueError(f"build_static_split_configs requires num_gpus >= 4 and divisible by 4, got {n}")
+    base_static = EnginePolicyConfig.from_preset("static_nccl_fission", num_gpus=n)
+    if n % 8 == 0:
+        und_1_3 = tuple(g for g in range(n) if (g % 8) in (0, 4))
+        und_3_1 = tuple(g for g in range(n) if (g % 8) in (0, 1, 2, 4, 5, 6))
+    else:
+        q = n // 4
+        und_1_3 = tuple(range(q))
+        und_3_1 = tuple(range(3 * q))
+    gen_1_3 = tuple(g for g in range(n) if g not in und_1_3)
+    gen_3_1 = tuple(g for g in range(n) if g not in und_3_1)
+
     splits = [
-        ("morphserve_elastic", EnginePolicyConfig.from_preset("morphserve", num_gpus=8)),
+        ("morphserve_elastic", EnginePolicyConfig.from_preset("morphserve", num_gpus=n)),
         (
             "static_2und_6gen",
             replace(
                 base_static,
                 policy_name="static_2und_6gen",
-                static_und_ranks=(0, 4),
-                static_gen_ranks=(1, 2, 3, 5, 6, 7),
-                initial_alphas={g: (0.0 if g in (0, 4) else 1.0) for g in range(8)},
+                static_und_ranks=und_1_3,
+                static_gen_ranks=gen_1_3,
+                initial_alphas={g: (0.0 if g in und_1_3 else 1.0) for g in range(n)},
             ),
         ),
         (
@@ -69,9 +86,9 @@ def build_static_split_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolic
             replace(
                 base_static,
                 policy_name="static_6und_2gen",
-                static_und_ranks=(0, 1, 2, 4, 5, 6),
-                static_gen_ranks=(3, 7),
-                initial_alphas={g: (1.0 if g in (3, 7) else 0.0) for g in range(8)},
+                static_und_ranks=und_3_1,
+                static_gen_ranks=gen_3_1,
+                initial_alphas={g: (0.0 if g in und_3_1 else 1.0) for g in range(n)},
             ),
         ),
     ]
@@ -83,26 +100,30 @@ def run_overnight_deep(
     bench_root: Path,
     output_dir: Path,
     num_gpus: int = 8,
+    main_sessions: int = DEFAULT_MAIN_SESSIONS,
+    skew_sessions: int = DEFAULT_SKEW_SESSIONS,
 ) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    sources_dir = bench_root / "sources"
+    sources_dir = _resolve_sources_dir(bench_root)
     burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
     gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
 
-    # Part 1: Full un-subsampled 80-session `main_mix_80.json` comparison (`morphserve` vs top 2 static/coloc baselines)
-    full_suite = WorkloadSuite.load_json(bench_root / "suites/main_mix_80.json")
-    full80_results: list[dict[str, Any]] = []
+    tmp_base = _local_tmp_base()
+    # Part 1: Steady-state `n=96` main_mix comparison (`morphserve` vs top static/colocation baselines)
+    raw_main = WorkloadSuite.load_json(bench_root / "suites/main_mix_80.json")
+    full_suite = scale_suite_sessions(raw_main, target_sessions=main_sessions)
+    full_results: list[dict[str, Any]] = []
     for pol_name in ("morphserve", "prism_tetriserve_coloc", "static_nccl_fission", "monolithic_dp"):
         pol = EnginePolicyConfig.from_preset(pol_name, num_gpus=num_gpus)
         eng = MorphServeClusterEngine(
             policy=pol,
             model_dir=model_dir,
             bench_root=bench_root,
-            tmp_root=Path(f"/tmp/ms_deep80_{pol_name}"),
+            tmp_root=tmp_base / f"ms_deep_{pol_name}",
         )
         try:
             eng.start()
-            for qps in (0.6, 1.1):
+            for qps in (0.6, 1.1, 1.4):
                 rep = eng.run_suite(
                     full_suite,
                     target_qps=qps,
@@ -112,19 +133,20 @@ def run_overnight_deep(
                 d = rep.to_dict()
                 d["per_quadrant"] = _quadrant_breakdown(rep.sessions)
                 d.pop("sessions", None)
-                full80_results.append(d)
+                full_results.append(d)
                 print(
-                    f"[DEEP-80] policy={pol_name} qps={qps} goodput={rep.joint_slo_goodput_rps:.3f} "
-                    f"joint_slo={rep.joint_slo_attainment_pct}% oom={rep.oom_sessions}",
+                    f"[DEEP-MAIN] policy={pol_name} n={len(full_suite.sessions)} qps={qps} "
+                    f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
+                    f"steady_slo={rep.steady_state_attainment_pct}% oom={rep.oom_sessions}",
                     flush=True,
                 )
         finally:
             eng.shutdown()
             gc.collect()
 
-    # Part 2: Static split-ratio sensitivity (2:6 vs 4:4 vs 6:2 vs MorphServe) across 3 modality skews
+    # Part 2: Steady-state `n=80` static split-ratio sensitivity (2:6 vs 4:4 vs 6:2 vs MorphServe) across 3 skews
     skew_suites = [
-        (tag, stratify_suite(WorkloadSuite.load_json(bench_root / rel), max_sessions=24))
+        (tag, scale_suite_sessions(WorkloadSuite.load_json(bench_root / rel), target_sessions=skew_sessions))
         for tag, rel in (
             ("ar80_dit20", "suites/skew_ar80_dit20.json"),
             ("ar50_dit50", "suites/skew_ar50_dit50.json"),
@@ -137,7 +159,7 @@ def run_overnight_deep(
             policy=cfg,
             model_dir=model_dir,
             bench_root=bench_root,
-            tmp_root=Path(f"/tmp/ms_ratio_{cfg_label}"),
+            tmp_root=tmp_base / f"ms_ratio_{cfg_label}",
         )
         try:
             eng.start()
@@ -154,8 +176,9 @@ def run_overnight_deep(
                 d["skew_tag"] = sk_tag
                 ratio_results.append(d)
                 print(
-                    f"[DEEP-RATIO] cfg={cfg_label} skew={sk_tag} goodput={rep.joint_slo_goodput_rps:.3f} "
-                    f"joint_slo={rep.joint_slo_attainment_pct}%",
+                    f"[DEEP-RATIO] cfg={cfg_label} skew={sk_tag} n={len(sk_suite.sessions)} "
+                    f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
+                    f"steady_slo={rep.steady_state_attainment_pct}%",
                     flush=True,
                 )
         finally:
@@ -163,11 +186,13 @@ def run_overnight_deep(
             gc.collect()
 
     report = {
-        "schema": "morphserve.phase2.wave3_deep.v1",
+        "schema": "morphserve.osdi27.wave3_deep.v2",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "full_80session_runs": full80_results,
+        "main_sessions_per_point": len(full_suite.sessions),
+        "skew_sessions_per_point": skew_sessions,
+        "full_80session_runs": full_results,
         "static_ratio_sensitivity": ratio_results,
-        "status": "ok" if all(r["error_sessions"] == 0 for r in full80_results + ratio_results) else "check_failed",
+        "status": "ok" if all(r["error_sessions"] == 0 for r in full_results + ratio_results) else "check_failed",
     }
     out_path = output_dir / "wave3-deep-report.json"
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -181,8 +206,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bench-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--main-sessions", type=int, default=DEFAULT_MAIN_SESSIONS)
+    parser.add_argument("--skew-sessions", type=int, default=DEFAULT_SKEW_SESSIONS)
     args = parser.parse_args(argv)
-    rep = run_overnight_deep(args.model_dir, args.bench_root, args.output_dir, num_gpus=args.num_gpus)
+    rep = run_overnight_deep(
+        args.model_dir,
+        args.bench_root,
+        args.output_dir,
+        num_gpus=args.num_gpus,
+        main_sessions=args.main_sessions,
+        skew_sessions=args.skew_sessions,
+    )
     return 0 if rep.get("status") == "ok" else 2
 
 

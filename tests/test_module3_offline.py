@@ -1,4 +1,4 @@
-"""Offline unit tests for Module 3 (LECP CoW Cache, SharedPrefixCache, and shell syntax)."""
+"""Offline unit tests for Module 3 (LECP CoW Cache, Cascade-CFG gate, GPU bicubic math, and syntax)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,20 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from morphserve.kernels import SharedPrefixCache, cow_fork_context, should_use_flash_prefix_split  # noqa: E402
-from morphserve.kernels.gpu_loopback import _extract_target_hw, pil_bicubic_resize_gpu  # noqa: E402
+from morphserve.kernels import (  # noqa: E402
+    SharedPrefixCache,
+    cow_fork_context,
+    detect_lecp_prefix_len,
+    rebind_cow_prefix,
+    should_use_cascade_cfg_split,
+    should_use_flash_prefix_split,
+)
+import morphserve.kernels.cfg_prefix_attn as cfg_prefix_attn  # noqa: E402
+from morphserve.kernels.gpu_loopback import (  # noqa: E402
+    _extract_target_hw,
+    pil_bicubic_resize_gpu,
+    pil_bicubic_resize_np,
+)
 
 
 class _MockTensor:
@@ -86,6 +98,34 @@ class TestModule3Offline(unittest.TestCase):
         self.assertEqual(sp.padded_naive_kv_tokens, 2048 * 3)
         self.assertGreater(sp.kv_reduction_ratio, 1.98)
 
+    def test_lecp_rebind_and_empty_boundary_cases(self) -> None:
+        SharedPrefixCache.clear_memo()
+        empty_a = _MockCache(2)
+        empty_b = _MockCache(2)
+        self.assertEqual(detect_lecp_prefix_len(empty_a, empty_b), 0)
+        self.assertEqual(rebind_cow_prefix(empty_a, empty_b), 0)
+
+        # Simulate parent appending new suffix into a fresh contiguous buffer `[0..2099]`
+        # while `cfg_text` still points to the old `[0..2047]` buffer; `rebind_cow_prefix` restores zero-copy aliasing.
+        parent = _MockCache(2)
+        child = _MockCache(2)
+        parent_k = _MockTensor(list(range(2100)), base_id=11)
+        parent_v = _MockTensor(list(range(2100)), base_id=12)
+        old_child_k = _MockTensor(list(range(2048)), base_id=99)
+        old_child_v = _MockTensor(list(range(2048)), base_id=98)
+        for l in range(2):
+            parent.key_cache[l] = parent_k
+            parent.value_cache[l] = parent_v
+            child.key_cache[l] = old_child_k
+            child.value_cache[l] = old_child_v
+
+        rebound = rebind_cow_prefix(parent, child, prefix_len=2048)
+        self.assertEqual(rebound, 2048)
+        self.assertEqual(child.key_cache[0].data_ptr(), parent.key_cache[0].data_ptr())
+        self.assertEqual(detect_lecp_prefix_len(parent, child), 2048)
+        # Mismatched target length is safely rejected
+        self.assertEqual(rebind_cow_prefix(parent, child, prefix_len=1024), 0)
+
     def test_extract_target_hw_supports_dict_and_sizedict_object(self) -> None:
         class _SizeDict:
             height = 980
@@ -93,6 +133,21 @@ class TestModule3Offline(unittest.TestCase):
 
         self.assertEqual(_extract_target_hw({"height": 980, "width": 980}, 512, 512), (980, 980))
         self.assertEqual(_extract_target_hw(_SizeDict(), 512, 512), (980, 980))
+        self.assertEqual(_extract_target_hw({"shortest_edge": 384}, 512, 512), (384, 384))
+        self.assertEqual(_extract_target_hw(None, 512, 768), (512, 768))
+
+    def test_pil_bicubic_resize_np_matches_pillow_catmull_rom_offline(self) -> None:
+        import numpy as np
+        from PIL import Image
+
+        rng = np.random.default_rng(2026)
+        for src_hw, dst_hw in (((64, 64), (122, 122)), ((122, 122), (37, 53)), ((48, 48), (48, 48)), ((2, 2), (7, 5))):
+            arr = rng.integers(0, 256, size=(src_hw[0], src_hw[1], 3), dtype=np.uint8)
+            pil_out = np.asarray(Image.fromarray(arr).resize((dst_hw[1], dst_hw[0]), Image.BICUBIC), dtype=np.int16)
+            chw_in = arr.transpose(2, 0, 1).astype(np.float32)
+            np_out = pil_bicubic_resize_np(chw_in, dst_hw[0], dst_hw[1]).astype(np.int16).transpose(1, 2, 0)
+            max_diff = int(np.abs(np_out - pil_out).max())
+            self.assertLessEqual(max_diff, 1, msg=f"src={src_hw} dst={dst_hw} max_diff={max_diff}")
 
     def test_pil_bicubic_resize_matches_pillow_catmull_rom(self) -> None:
         try:
@@ -117,6 +172,65 @@ class TestModule3Offline(unittest.TestCase):
         self.assertTrue(should_use_flash_prefix_split(4098, 16392, 2))
         self.assertFalse(should_use_flash_prefix_split(1026, 128, 2))
 
+    def test_converged_cfg_prefix_attn_dead_single_pass_kernels_removed(self) -> None:
+        self.assertFalse(hasattr(cfg_prefix_attn, "_shared_prefix_cfg2_attn_fwd"))
+        self.assertFalse(hasattr(cfg_prefix_attn, "_shared_prefix_cfg3_attn_fwd"))
+        src_text = Path(cfg_prefix_attn.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("_shared_prefix_cfg2_attn_fwd", src_text)
+        self.assertNotIn("_shared_prefix_cfg3_attn_fwd", src_text)
+        self.assertIn("def _merge_two_lse_fwd(", src_text)
+        self.assertIn("def _run_flash_prefix_cfg(", src_text)
+
+        # Exact boundary conditions on `should_use_cascade_cfg_split`
+        self.assertFalse(should_use_cascade_cfg_split(0, 4096, 2))
+        self.assertFalse(should_use_cascade_cfg_split(-4, 4096, 2))
+        self.assertFalse(should_use_cascade_cfg_split(1026, 0, 2))
+        self.assertFalse(should_use_cascade_cfg_split(1026, 4096, 1))
+        self.assertTrue(should_use_cascade_cfg_split(1026, 1539, 2))
+        self.assertFalse(should_use_cascade_cfg_split(1026, 1538, 2))
+        self.assertFalse(should_use_cascade_cfg_split(4098, 16391, 2))
+        self.assertTrue(should_use_cascade_cfg_split(4098, 16392, 2))
+
+        # Verify `BagelSharedPrefixPatch.uninstall()` flushes workspace caches cleanly
+        class _DummyAttn:
+            def _forward_gen(self, *a, **kw):
+                return a, kw
+
+        class _DummyLayer:
+            def __init__(self) -> None:
+                self.self_attn = _DummyAttn()
+
+        class _DummyPipe:
+            class bagel:
+                class language_model:
+                    class model:
+                        layers = [_DummyLayer()]
+
+        cfg_prefix_attn._DIRECT_WS_CACHE[("mock:0", "bf16")] = {"dummy": 1}
+        cfg_prefix_attn._CU_SEQLENS_CACHE[("mock:0", (10,))] = [0, 10]
+        patch = cfg_prefix_attn.BagelSharedPrefixPatch(_DummyPipe())
+        patch._installed = True
+        patch._orig_forward_gens = [(_DummyPipe.bagel.language_model.model.layers[0].self_attn, lambda *a, **kw: None)]
+        patch.uninstall()
+        self.assertEqual(len(cfg_prefix_attn._DIRECT_WS_CACHE), 0)
+        self.assertEqual(len(cfg_prefix_attn._CU_SEQLENS_CACHE), 0)
+
+    def test_validate_module3_chat_strip_and_whole_word_rubric(self) -> None:
+        from morphserve.bench.exactness import score_mmvet_answer
+        from morphserve.bench.validate_module3_cfg_loopback import (
+            _extract_cot_rubric_clause,
+            _strip_chat_markers,
+        )
+
+        raw = "<|im_start|><think>Observing the vivid blue fire hydrant, centered in foreground.</think><|im_end|>"
+        self.assertEqual(
+            _strip_chat_markers(raw),
+            "<think>Observing the vivid blue fire hydrant, centered in foreground.</think>",
+        )
+        clause = _extract_cot_rubric_clause(raw)
+        self.assertEqual(clause, "Observing<AND>the<AND>vivid<AND>blue")
+        self.assertEqual(score_mmvet_answer(raw, clause), 1.0)
+
     def test_module3_script_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/05_phase1_module3_validate.sh"
         proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
@@ -126,6 +240,7 @@ class TestModule3Offline(unittest.TestCase):
             "src/morphserve/kernels/lecp_cache.py",
             "src/morphserve/kernels/cfg_prefix_attn.py",
             "src/morphserve/kernels/gpu_loopback.py",
+            "src/morphserve/bench/exactness.py",
             "src/morphserve/bench/validate_module3_cfg_loopback.py",
         ):
             p = REPO_ROOT / rel

@@ -16,6 +16,15 @@ from morphserve.bench.interleaved_bench import (
 )
 from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine, VALID_POLICIES
 
+MULTI_GPU_ONLY_POLICIES = ("twostage_shm", "static_nccl_fission")
+
+
+def _resolve_sources_dir(bench_root: Path) -> Path:
+    for cand in (bench_root / "sources", bench_root.parent / "bench_sources"):
+        if cand.is_dir():
+            return cand
+    return bench_root / "sources"
+
 
 def run_smoke_validation(
     model_dir: Path,
@@ -25,13 +34,21 @@ def run_smoke_validation(
     num_gpus: int = 8,
     policies: tuple[str, ...] = VALID_POLICIES,
 ) -> dict[str, Any]:
+    num_gpus = int(num_gpus)
+    if num_gpus < 1:
+        raise ValueError("num_gpus must be >= 1")
+
     output_dir.mkdir(parents=True, exist_ok=True)
     suite_path = bench_root / "suites/smoke_8gpu_12.json"
     if not suite_path.is_file():
         raise FileNotFoundError(f"missing Interleaved-Bench smoke suite: {suite_path}")
     suite = WorkloadSuite.load_json(suite_path)
 
-    sources_dir = bench_root / "sources"
+    policies = tuple(policies)
+    if num_gpus < 2 and policies == VALID_POLICIES:
+        policies = tuple(p for p in policies if p not in MULTI_GPU_ONLY_POLICIES)
+
+    sources_dir = _resolve_sources_dir(bench_root)
     burst_csv = sources_dir / "burstgpt_1_sample.csv"
     gentd_csv = sources_dir / "gentd26_lora_request_trace.csv"
     burst_deltas = load_burstgpt_interarrivals(burst_csv) if burst_csv.is_file() else None
@@ -84,6 +101,7 @@ def run_smoke_validation(
     if ms is not None:
         fission = by_policy.get("static_nccl_fission")
         nccl_ship_ok = True if fission is None else (fission["path_a_ships"] > 0)
+        dual_path_ok = True if num_gpus < 2 else ((ms["path_a_ships"] + ms["path_b_morphs"]) > 0)
         all_pass = (
             ms["status"] == "ok"
             and ms["completed_sessions"] == ms["total_sessions"]
@@ -91,7 +109,7 @@ def run_smoke_validation(
             and ms["worker_oom_count"] == 0
             and ms["vmm_overflow_creates"] == 0
             and ms["host_shmem_delta_gib"] <= 32.0
-            and (ms["path_a_ships"] + ms["path_b_morphs"]) > 0
+            and dual_path_ok
             and nccl_ship_ok
             and all(r["error_sessions"] == 0 for r in results)
         )

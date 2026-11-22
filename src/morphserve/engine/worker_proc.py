@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import gc
 import os
 from pathlib import Path
@@ -17,7 +18,32 @@ from morphserve.telemetry import read_shmem_kib
 from morphserve.vmm import NumaMemfdMirror
 
 from .config import EnginePolicyConfig
-from .worker_runtime import WorkerFleet, WorkerRuntime
+from .worker_runtime import WorkerFleet, WorkerRuntime, query_worker_kv_free_bytes
+
+
+def _localize_policy_for_device(policy: EnginePolicyConfig, global_rank: int, local_dev: int) -> EnginePolicyConfig:
+    """Align `local_dev` role & initial_alpha with `global_rank` when `global_rank >= gpus_per_node`."""
+    if int(global_rank) == int(local_dev):
+        return policy
+    alphas = dict(policy.initial_alphas)
+    alphas[int(local_dev)] = float(policy.initial_alphas.get(int(global_rank), 1.0))
+    und_set = set(policy.static_und_ranks)
+    gen_set = set(policy.static_gen_ranks)
+    if int(global_rank) in und_set:
+        und_set.add(int(local_dev))
+        gen_set.discard(int(local_dev))
+    elif int(global_rank) in gen_set:
+        gen_set.add(int(local_dev))
+        und_set.discard(int(local_dev))
+    else:
+        und_set.discard(int(local_dev))
+        gen_set.discard(int(local_dev))
+    return replace(
+        policy,
+        initial_alphas=alphas,
+        static_und_ranks=tuple(sorted(und_set)),
+        static_gen_ranks=tuple(sorted(gen_set)),
+    )
 
 
 def _instantiate_gpu_adapter(
@@ -53,30 +79,35 @@ def run_worker_process(
     bench_root_str: str,
     cmd_q: Any,
     ack_q: Any,
+    gpus_per_node: int | None = None,
 ) -> None:
-    """Entry point for each persistent GPU worker process managed by `MpSpawnGpuWorkerFleet`."""
+    """Entry point for each persistent GPU worker process managed by `MpSpawnGpuWorkerFleet` or multi-node host."""
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     import torch
 
-    local_dev = rank % max(1, torch.cuda.device_count()) if torch.cuda.is_available() else rank
+    dev_cnt = max(1, torch.cuda.device_count()) if torch.cuda.is_available() else max(1, gpus_per_node or policy.num_gpus)
+    eff_gpn = int(gpus_per_node) if gpus_per_node is not None else min(8, max(1, min(policy.num_gpus, dev_cnt)))
+    local_dev = rank % dev_cnt if torch.cuda.is_available() else (rank % eff_gpn)
     if torch.cuda.is_available():
         torch.cuda.set_device(local_dev)
 
     topo = (
         ClusterTopologyProfile.a100_pcie_8gpu_default()
-        if policy.num_gpus == 8
+        if (policy.num_gpus == 8 and eff_gpn == 8)
         else ClusterTopologyProfile.from_multinode_measurements(
             world_size=policy.num_gpus,
-            gpus_per_node=min(8, max(1, policy.num_gpus)),
+            gpus_per_node=eff_gpn,
             intra_bw=10.6,
             socket_bw=9.55,
             inter_bw=11.5,
         )
     )
-    numa_node = topo.numa_node_of(rank)
+    grp = topo.half_group_of(rank)
+    numa_node = grp.numa_node
     pacer = HalfNodeH2DPacer(topo, max_concurrent_per_half=1) if policy.use_h2d_pacer else None
+    local_policy = _localize_policy_for_device(policy, rank, local_dev)
 
     adapter: CPTGModelAdapter | None = None
     shared_mirror: NumaMemfdMirror | None = None
@@ -88,28 +119,28 @@ def run_worker_process(
     try:
         adapter = _instantiate_gpu_adapter(
             rank=local_dev,
-            policy=policy,
+            policy=local_policy,
             model_dir=Path(model_dir_str),
             bench_root=Path(bench_root_str),
             numa_node=numa_node,
         )
 
-        # Phase 1: Per-NUMA-socket shared `NumaMemfdMirror` handshake
+        # Phase 1: Per-half-group (intra-node NUMA socket) shared `NumaMemfdMirror` handshake
         if policy.use_expert_pager:
-            if policy.use_shared_numa_mirror and policy.num_gpus >= 2:
-                grp = topo.half_group_of(rank)
+            if policy.use_shared_numa_mirror and len(grp.gpu_ids) >= 2:
                 is_leader = rank == grp.gpu_ids[0]
                 if is_leader:
                     shared_mirror = NumaMemfdMirror.create(
                         nbytes=adapter.total_mirror_bytes,
                         numa_node=numa_node,
-                        name=f"ms_eng_{policy.model_family}_numa{numa_node}_{os.getpid()}",
+                        name=f"ms_eng_{policy.model_family}_grp{grp.group_id}_{os.getpid()}",
                     )
                     adapter.attach_expert_mirror(shared_mirror, populate=True)
                     ack_q.put(
                         {
                             "op": "INIT_LEADER_MIRROR",
                             "rank": rank,
+                            "group_id": grp.group_id,
                             "numa_node": numa_node,
                             "pid": os.getpid(),
                             "fd": shared_mirror.fd,
@@ -118,13 +149,21 @@ def run_worker_process(
                         }
                     )
                 else:
-                    ack_q.put({"op": "INIT_FOLLOWER_READY", "rank": rank, "numa_node": numa_node})
+                    ack_q.put(
+                        {
+                            "op": "INIT_FOLLOWER_READY",
+                            "rank": rank,
+                            "group_id": grp.group_id,
+                            "numa_node": numa_node,
+                        }
+                    )
 
                 attach_msg = cmd_q.get()
                 if attach_msg.get("op") != "ATTACH_SHARED_MIRROR":
                     raise RuntimeError(f"unexpected init message: {attach_msg}")
                 if not is_leader:
-                    info = attach_msg["leaders"][str(numa_node)]
+                    leaders_map = attach_msg["leaders"]
+                    info = leaders_map.get(str(grp.group_id)) or leaders_map[str(numa_node)]
                     shared_mirror = NumaMemfdMirror.attach_proc_fd(
                         leader_pid=int(info["pid"]),
                         leader_fd=int(info["fd"]),
@@ -182,6 +221,7 @@ def run_worker_process(
                 "op": "WORKER_READY",
                 "rank": rank,
                 "resident_alpha": adapter.resident_alpha(),
+                "kv_free_bytes": query_worker_kv_free_bytes(adapter, local_policy, local_dev),
                 "reserved_mib": st.get("peak_reserved_mib", bind_info.get("reserved_mib", 0.0)),
                 "mirror_inode": shared_mirror.inode if shared_mirror is not None else None,
             }
@@ -293,12 +333,15 @@ class MpSpawnGpuWorkerFleet(WorkerFleet):
             leaders: dict[str, dict[str, Any]] = {}
             for m in init_msgs.values():
                 if m.get("op") == "INIT_LEADER_MIRROR":
-                    leaders[str(m["numa_node"])] = {
+                    info = {
                         "pid": m["pid"],
                         "fd": m["fd"],
                         "nbytes": m["nbytes"],
                         "inode": m["inode"],
                     }
+                    if "group_id" in m:
+                        leaders[str(m["group_id"])] = info
+                    leaders[str(m["numa_node"])] = info
             for rank in range(n):
                 self._cmd_qs[rank].put({"op": "ATTACH_SHARED_MIRROR", "leaders": leaders})
 

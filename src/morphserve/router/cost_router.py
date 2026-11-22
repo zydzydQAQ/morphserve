@@ -165,6 +165,9 @@ class DualPathMorphRouter:
         self.max_inter_node_state_bytes = int(max_inter_node_state_bytes)
 
         self.worker_states: dict[int, WorkerState] = {}
+        self._raw_kv_free_bytes: dict[int, int] = {}
+        self._inflight_kv_reserved_bytes: dict[int, int] = {}
+        self._last_telemetry_seq: dict[int, int] = {}
         self.rr_cursor: int = 0
         self._mu = threading.Lock()
 
@@ -173,21 +176,58 @@ class DualPathMorphRouter:
         num_gpus: int,
         role_of: Callable[[int], str],
         initial_alphas: Mapping[int, float],
-        kv_free_bytes: int = 16 * GIB,
+        kv_free_bytes: int | Mapping[int, int] = 16 * GIB,
     ) -> dict[int, WorkerState]:
         """Initialize the router's authoritative `WorkerState` ledger."""
-        self.worker_states = {
-            g: WorkerState(
-                gpu_id=g,
-                role=role_of(g),
-                expert_alpha=float(initial_alphas.get(g, 1.0)),
-                queue_wait_ms=0.0,
-                kv_free_bytes=int(kv_free_bytes),
-            )
-            for g in range(int(num_gpus))
-        }
-        self.rr_cursor = 0
-        return self.worker_states
+        with self._mu:
+            n = int(num_gpus)
+            self._raw_kv_free_bytes = {
+                g: int(kv_free_bytes.get(g, 16 * GIB)) if isinstance(kv_free_bytes, Mapping) else int(kv_free_bytes)
+                for g in range(n)
+            }
+            self._inflight_kv_reserved_bytes = {g: 0 for g in range(n)}
+            self._last_telemetry_seq = {g: -1 for g in range(n)}
+            self.worker_states = {
+                g: WorkerState(
+                    gpu_id=g,
+                    role=role_of(g),
+                    expert_alpha=float(initial_alphas.get(g, 1.0)),
+                    queue_wait_ms=0.0,
+                    kv_free_bytes=max(0, self._raw_kv_free_bytes[g]),
+                )
+                for g in range(n)
+            }
+            self.rr_cursor = 0
+            return self.worker_states
+
+    def update_worker_telemetry(
+        self,
+        gpu_id: int,
+        *,
+        expert_alpha: float | None = None,
+        kv_free_bytes: int | None = None,
+        telemetry_seq: int | None = None,
+        workers: dict[int, WorkerState] | None = None,
+    ) -> None:
+        """Real-time monotonic sync of `expert_alpha` and `kv_free_bytes` preserving pre-unpack reservations."""
+        w_map = workers if workers is not None else self.worker_states
+        gid = int(gpu_id)
+        with self._mu:
+            w = w_map.get(gid)
+            if w is None:
+                return
+            if telemetry_seq is not None and w_map is self.worker_states:
+                seq_i = int(telemetry_seq)
+                if seq_i < self._last_telemetry_seq.get(gid, -1):
+                    return
+                self._last_telemetry_seq[gid] = seq_i
+            if expert_alpha is not None:
+                w.expert_alpha = float(expert_alpha)
+            if kv_free_bytes is not None:
+                raw_b = max(0, int(kv_free_bytes))
+                self._raw_kv_free_bytes[gid] = raw_b
+                inflight_b = self._inflight_kv_reserved_bytes.get(gid, 0) if w_map is self.worker_states else 0
+                w.kv_free_bytes = max(0, raw_b - inflight_b)
 
     # --- Stateful Placement & Reservation Authority (replaces shallow ClusterPolicyCore) ---
 
@@ -212,12 +252,15 @@ class DualPathMorphRouter:
         pre_map = active_preemptions or {}
         n = int(num_gpus)
 
+        min_kv_b = 128 * MIB
+
         with self._mu:
             cur = self.rr_cursor
             if routing_mode in ("twostage_shm", "static_nccl_fission") and static_und_ranks:
                 cands = list(static_und_ranks)
                 cands.sort(
                     key=lambda g: (
+                        0 if w_map[g].kv_free_bytes >= min_kv_b else 1,
                         w_map[g].queue_wait_ms,
                         bool(busy.get(g, False)),
                         (g - cur) % n,
@@ -229,7 +272,11 @@ class DualPathMorphRouter:
 
             if modality_plan == "ar_only":
                 idle = [
-                    g for g in range(n) if (not bool(busy.get(g, False))) and w_map[g].queue_wait_ms <= 1.0
+                    g
+                    for g in range(n)
+                    if (not bool(busy.get(g, False)))
+                    and w_map[g].queue_wait_ms <= 1.0
+                    and w_map[g].kv_free_bytes >= min_kv_b
                 ]
                 if idle:
                     idle.sort(key=lambda g: (w_map[g].expert_alpha, (g - cur) % n))
@@ -237,7 +284,11 @@ class DualPathMorphRouter:
                     self.rr_cursor = (chosen + 1) % n
                     return chosen
                 if preemption_mode != "non_preemptive":
-                    elig = [g for g in range(n) if pre_map.get(g, 0) < max_preemptions_per_gpu]
+                    elig = [
+                        g
+                        for g in range(n)
+                        if pre_map.get(g, 0) < max_preemptions_per_gpu and w_map[g].kv_free_bytes >= min_kv_b
+                    ]
                     if elig:
                         elig.sort(
                             key=lambda g: (
@@ -253,7 +304,11 @@ class DualPathMorphRouter:
 
             if modality_plan == "cot_then_dit":
                 idle = [
-                    g for g in range(n) if (not bool(busy.get(g, False))) and w_map[g].queue_wait_ms <= 1.0
+                    g
+                    for g in range(n)
+                    if (not bool(busy.get(g, False)))
+                    and w_map[g].queue_wait_ms <= 1.0
+                    and w_map[g].kv_free_bytes >= min_kv_b
                 ]
                 if idle:
                     idle.sort(key=lambda g: ((g - cur) % n, w_map[g].expert_alpha))
@@ -261,7 +316,11 @@ class DualPathMorphRouter:
                     self.rr_cursor = (chosen + 1) % n
                     return chosen
                 if preemption_mode != "non_preemptive":
-                    elig = [g for g in range(n) if pre_map.get(g, 0) < max_preemptions_per_gpu]
+                    elig = [
+                        g
+                        for g in range(n)
+                        if pre_map.get(g, 0) < max_preemptions_per_gpu and w_map[g].kv_free_bytes >= min_kv_b
+                    ]
                     if elig:
                         elig.sort(
                             key=lambda g: (
@@ -277,6 +336,7 @@ class DualPathMorphRouter:
             cands = list(range(n))
             cands.sort(
                 key=lambda g: (
+                    0 if w_map[g].kv_free_bytes >= min_kv_b else 1,
                     w_map[g].queue_wait_ms,
                     bool(busy.get(g, False)),
                     -w_map[g].expert_alpha if routing_mode == "dual_path" else 0.0,
@@ -296,6 +356,7 @@ class DualPathMorphRouter:
         src_und_gpu: int,
         workers: Mapping[int, WorkerState] | None = None,
         gpu_busy: Mapping[int, bool] | None = None,
+        required_kv_bytes: int = 64 * MIB,
     ) -> int:
         """Select destination generation rank for `twostage_shm` or `static_nccl_fission`."""
         w_map = workers if workers is not None else self.worker_states
@@ -304,16 +365,24 @@ class DualPathMorphRouter:
             idx = list(static_und_ranks).index(src_und_gpu)
             return static_gen_ranks[idx % len(static_gen_ranks)]
 
+        need_b = max(64 * MIB, int(required_kv_bytes))
+        state_b = max(1 * MIB, int(required_kv_bytes))
         tier_order = {"intra_half": 0, "inter_socket": 1, "inter_node": 2}
         cands = list(static_gen_ranks)
-        cands.sort(
-            key=lambda g: (
+
+        def _static_gen_cost_key(g: int) -> tuple[int, float, int, bool, int]:
+            bw = max(0.5, self.topology.effective_p2p_gbps(src_und_gpu, g))
+            t_ship_ms = (state_b / 1e9) / bw * 1000.0 + self.topology.handoff_ms(src_und_gpu, g)
+            total_wait_ms = round(t_ship_ms + float(w_map[g].queue_wait_ms), 3)
+            return (
+                0 if w_map[g].kv_free_bytes >= need_b else 1,
+                total_wait_ms,
                 tier_order.get(self.topology.fabric_tier(src_und_gpu, g), 3),
-                w_map[g].queue_wait_ms,
                 bool(busy.get(g, False)),
                 g,
             )
-        )
+
+        cands.sort(key=_static_gen_cost_key)
         return cands[0]
 
     def plan_and_reserve_transition(
@@ -351,6 +420,7 @@ class DualPathMorphRouter:
                     src_und_gpu=req.src_gpu,
                     workers=w_map,
                     gpu_busy=gpu_busy,
+                    required_kv_bytes=req.effective_state_bytes(),
                 )
                 ship_mode = "nccl_static" if routing_mode == "static_nccl_fission" else "shm_static"
                 bw = self.topology.effective_p2p_gbps(req.src_gpu, dst_gpu)
@@ -387,8 +457,77 @@ class DualPathMorphRouter:
                     hop_tier="in_place",
                 )
 
+            if ship_mode != "none" and dst_gpu != req.src_gpu:
+                res_kv = max(0, int(req.effective_state_bytes()))
+                if w_map is self.worker_states:
+                    if dst_gpu not in self._raw_kv_free_bytes:
+                        self._raw_kv_free_bytes[dst_gpu] = max(0, int(w_map[dst_gpu].kv_free_bytes))
+                    self._inflight_kv_reserved_bytes[dst_gpu] = (
+                        self._inflight_kv_reserved_bytes.get(dst_gpu, 0) + res_kv
+                    )
+                w_map[dst_gpu].kv_free_bytes = max(0, int(w_map[dst_gpu].kv_free_bytes) - res_kv)
+
             w_map[dst_gpu].queue_wait_ms += max(0.0, float(est_dit_ms))
             return dec, ship_mode
+
+    def reserve_kv_bytes(
+        self,
+        gpu_id: int,
+        reserved_kv_bytes: int,
+        *,
+        workers: dict[int, WorkerState] | None = None,
+    ) -> None:
+        """Atomically pre-deduct `reserved_kv_bytes` on `gpu_id` prior to async unpack (e.g., return leg)."""
+        w_map = workers if workers is not None else self.worker_states
+        gid = int(gpu_id)
+        res_kv = max(0, int(reserved_kv_bytes))
+        if res_kv <= 0:
+            return
+        with self._mu:
+            w = w_map.get(gid)
+            if w is None:
+                return
+            if w_map is self.worker_states:
+                if gid not in self._raw_kv_free_bytes:
+                    self._raw_kv_free_bytes[gid] = max(0, int(w.kv_free_bytes))
+                self._inflight_kv_reserved_bytes[gid] = self._inflight_kv_reserved_bytes.get(gid, 0) + res_kv
+            w.kv_free_bytes = max(0, int(w.kv_free_bytes) - res_kv)
+
+    def release_kv_reservation(
+        self,
+        gpu_id: int,
+        reserved_kv_bytes: int,
+        *,
+        latest_kv_free_bytes: int | None = None,
+        telemetry_seq: int | None = None,
+        workers: dict[int, WorkerState] | None = None,
+    ) -> None:
+        """Release pre-unpack `kv_free_bytes` reservation once `UNPACK_CTX` / `RECV_SHM` completes or aborts."""
+        w_map = workers if workers is not None else self.worker_states
+        gid = int(gpu_id)
+        rel = max(0, int(reserved_kv_bytes))
+        with self._mu:
+            w = w_map.get(gid)
+            if w is None:
+                return
+            if w_map is self.worker_states:
+                cur_inf = max(0, self._inflight_kv_reserved_bytes.get(gid, 0) - rel)
+                self._inflight_kv_reserved_bytes[gid] = cur_inf
+                accept_latest = latest_kv_free_bytes is not None
+                if accept_latest and telemetry_seq is not None:
+                    seq_i = int(telemetry_seq)
+                    if seq_i < self._last_telemetry_seq.get(gid, -1):
+                        accept_latest = False
+                    else:
+                        self._last_telemetry_seq[gid] = seq_i
+                if accept_latest and latest_kv_free_bytes is not None:
+                    self._raw_kv_free_bytes[gid] = max(0, int(latest_kv_free_bytes))
+                raw_b = self._raw_kv_free_bytes.get(gid, int(w.kv_free_bytes) + rel)
+                w.kv_free_bytes = max(0, raw_b - cur_inf)
+            elif latest_kv_free_bytes is not None:
+                w.kv_free_bytes = max(0, int(latest_kv_free_bytes))
+            else:
+                w.kv_free_bytes = max(0, int(w.kv_free_bytes) + rel)
 
     def release_dit_reservation(
         self,

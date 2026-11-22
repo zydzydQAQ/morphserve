@@ -47,6 +47,25 @@ struct UnifiedVmmStats {
     double expert_map_us;
     double expert_unmap_us;
     double expert_h2d_submit_us;
+
+    // Bidirectional handle mapping & real-time KV capacity telemetry
+    uint64_t fine_to_super_bundles;
+    uint64_t transient_fine_bundles_current;
+    uint64_t expert_fine_bundles_current;
+    uint64_t pool_total_bytes;
+    uint64_t pool_free_bytes;
+    uint64_t expert_unpinned_bytes;
+    uint64_t kv_free_bytes;
+    uint64_t kv_dit_headroom_bytes;
+
+    // Arena 1 <-> Host Pinned DRAM async KV swap telemetry
+    uint64_t kv_swapped_pages_current;
+    uint64_t kv_swapped_bytes_current;
+    uint64_t kv_swap_outs_total;
+    uint64_t kv_swap_ins_total;
+    uint64_t kv_swap_d2h_bytes_total;
+    uint64_t kv_swap_h2d_bytes_total;
+    uint64_t kv_host_pinned_pool_bytes;
 };
 
 // Initialize unified TriPool-VMM on `device`.
@@ -84,6 +103,14 @@ uint64_t tripool_kv_region_ensure(int32_t region_id, size_t needed_bytes, void* 
 uint64_t tripool_kv_region_va(int32_t region_id);
 size_t tripool_kv_region_mapped_bytes(int32_t region_id);
 int tripool_kv_region_free(int32_t region_id, void* stream);
+
+uint64_t tripool_kv_free_bytes(int for_dit);
+int tripool_kv_region_set_evictable(int32_t region_id, int evictable, size_t valid_bytes, void* compute_stream);
+int tripool_kv_region_swap_out_async(int32_t region_id, size_t valid_bytes, void* compute_stream);
+int tripool_kv_region_swap_in_async(int32_t region_id, void* target_stream);
+int tripool_kv_region_is_swapped(int32_t region_id);
+size_t tripool_kv_region_swapped_bytes(int32_t region_id);
+int tripool_kv_flush_swaps();
 
 // Arena 3: Opportunistic Expert Cache & Background Async H2D Streamer
 // Registers an expert with `num_layers`, each occupying `layer_stride_mib` (rounded to super_handle_mib).

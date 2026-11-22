@@ -27,6 +27,7 @@ class ArDecodeTask:
     token_timestamps_s: list[float] = field(default_factory=list)
     last_step_time_s: float = 0.0
     finished: bool = False
+    _curr_tok_int: int | None = field(default=None, repr=False)
 
     def next_deadline_s(self) -> float:
         base = self.last_step_time_s if self.last_step_time_s > 0.0 else self.arrival_time_s
@@ -49,8 +50,8 @@ class ArDecodeTask:
 class UnifiedPreemptiveScheduler:
     """Single-process AR+DiT EDF scheduler (`non_preemptive`, `step_preemptive`, `layer_chunk`).
 
-    Restores immediate `on_task_complete` mid-DiT ACK emission (`e27bce5`), A100-calibrated step/layer
-    EMAs (`0805fc1`), and batched yield execution across concurrent active `ArDecodeTask`s.
+    Combines immediate `on_task_complete` mid-DiT ACK emission, adaptive `k >= 1` layer-chunk bounds,
+    and true `[B, D]` packed GEMM microbatch execution across concurrent active `ArDecodeTask`s.
     """
 
     def __init__(
@@ -62,6 +63,7 @@ class UnifiedPreemptiveScheduler:
         init_layer_ms: float = 10.5,
         init_ar_step_ms: float = 66.0,
         max_ar_tokens_per_yield: int = 1,
+        max_microbatch_cap: int = 8,
         pager: Any | None = None,
         external_arrival_poll: Callable[[float], list[ArDecodeTask]] | None = None,
         on_task_complete: Callable[[ArDecodeTask], None] | None = None,
@@ -78,6 +80,7 @@ class UnifiedPreemptiveScheduler:
         self.ema_layer_ms = float(init_layer_ms)
         self.ema_ar_step_ms = float(init_ar_step_ms)
         self.max_ar_tokens_per_yield = int(max_ar_tokens_per_yield)
+        self.max_microbatch_cap = max(1, int(max_microbatch_cap))
         self.pager = pager
         self.external_arrival_poll = external_arrival_poll
         self.on_task_complete = on_task_complete
@@ -88,32 +91,52 @@ class UnifiedPreemptiveScheduler:
         self._run_t0_s: float = 0.0
         self._last_sync_s: float = 0.0
         self._queued_gpu_ms: float = 0.0
+        self._step0_h2d_streaming: bool = False
+        self._layer_calibrated: bool = False
 
         # Telemetry
         self.yield_count: int = 0
         self.ar_steps_executed: int = 0
         self.ar_compute_total_ms: float = 0.0
+        self.batched_ar_yields: int = 0
+        self.max_microbatch_size: int = 0
         self.layer_times_ms: list[float] = []
         self.step_times_ms: list[float] = []
         self.last_effective_chunk_layers: int = self.compute_adaptive_chunk_layers()
         self.in_ar_yield: bool = False
 
-    def reset_telemetry(self) -> None:
+    def reset_telemetry(self, *, preserve_layer_calibration: bool = False) -> None:
         self.yield_count = 0
         self.ar_steps_executed = 0
         self.ar_compute_total_ms = 0.0
-        self.layer_times_ms = []
+        self.batched_ar_yields = 0
+        self.max_microbatch_size = 0
+        if not preserve_layer_calibration:
+            self.layer_times_ms = []
+            self._layer_calibrated = False
         self.step_times_ms = []
         self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
         self.active_ar_tasks.clear()
         self.completed_ar_tasks.clear()
         self._pending_arrivals.clear()
 
+    @property
+    def interceptor(self) -> BagelExecutionInterceptor:
+        return BagelExecutionInterceptor.for_pipeline(self.pipeline)
+
     def begin_session_clock(self) -> None:
         now = time.perf_counter()
         self._run_t0_s = now
         self._last_sync_s = now
         self._queued_gpu_ms = 0.0
+        streaming = False
+        if self.pager is not None and getattr(self.pager, "vmm", None) is not None:
+            res_alpha_fn = getattr(self.pager, "resident_alpha", None)
+            if callable(res_alpha_fn):
+                streaming = float(res_alpha_fn()) < 0.999
+            elif callable(getattr(self.pager.vmm, "expert_resident_count", None)):
+                streaming = int(self.pager.vmm.expert_resident_count(self.pager.expert_id)) < int(self.pager.num_layers)
+        self._step0_h2d_streaming = streaming
         self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
 
     def schedule_ar_arrival(self, offset_ms: float, task: ArDecodeTask) -> None:
@@ -141,7 +164,7 @@ class UnifiedPreemptiveScheduler:
         return min(t.next_deadline_s() for t in self.active_ar_tasks)
 
     def compute_adaptive_chunk_layers(self, tpot_slo_ms: float | None = None) -> int:
-        """Analytical layer-chunk bound derived from deterministic layer time + AR step time."""
+        """Analytical layer-chunk bound `k >= 1` derived from deterministic layer time + AR step time."""
         slo = self.tpot_slo_ms if tpot_slo_ms is None else float(tpot_slo_ms)
         budget_ms = max(0.0, slo - self.ema_ar_step_ms - self.guard_ms)
         num_layers = len(self.lm_model.layers)
@@ -167,64 +190,89 @@ class UnifiedPreemptiveScheduler:
         else:
             self.active_ar_tasks.append(task)
 
-    def _run_one_ar_step(self, task: ArDecodeTask, sync_gpu: bool = True) -> None:
-        import torch
+    def _execute_packed_ar_tasks(self, live_tasks: list[ArDecodeTask], sync_gpu: bool = True) -> int:
+        if not live_tasks:
+            return 0
+        interceptor = BagelExecutionInterceptor.for_pipeline(self.pipeline)
+        if self.pager is not None:
+            interceptor.bind_pager(self.pager)
 
-        if task.finished:
-            return
         t0 = time.perf_counter()
         self.in_ar_yield = True
         try:
-            task.generated_token_ids.append(int(task.curr_tokens[0].item()))
-            query_lens = torch.ones_like(task.curr_tokens)
-            out = self.bagel.language_model(
-                packed_text_ids=task.curr_tokens,
-                query_lens=query_lens,
-                packed_query_position_ids=task.pos_ids,
-                past_key_values=task.kv_cache,
-                update_past_key_values=True,
-                is_causal=True,
-                mode="und",
+            for task in live_tasks:
+                tok_val = (
+                    task._curr_tok_int
+                    if task._curr_tok_int is not None
+                    else (
+                        int(task.curr_tokens.reshape(-1)[0].item())
+                        if hasattr(task.curr_tokens, "reshape")
+                        else int(task.curr_tokens)
+                    )
+                )
+                task.generated_token_ids.append(tok_val)
+
+            next_tokens, updated_caches = interceptor.forward_ar_step_batch(
+                [t.curr_tokens for t in live_tasks],
+                [t.pos_ids for t in live_tasks],
+                [t.kv_cache for t in live_tasks],
             )
-            task.kv_cache = out.past_key_values
-            logits = self.lm_head(out.packed_query_sequence)
-            next_tok = torch.argmax(logits, dim=-1)
-            task.curr_tokens = next_tok
-            task.pos_ids = task.pos_ids + 1
-            if sync_gpu:
-                _sync_cuda_if_present()
+            # Single compact D2H copy of [B] int64 token IDs also synchronizes stream completion cleanly
+            raw_tok_iter = next_tokens.detach().cpu().tolist() if hasattr(next_tokens, "detach") else list(next_tokens)
+            next_ids = [int(x) for x in raw_tok_iter]
+            if sync_gpu and not bool(getattr(next_tokens, "is_cuda", False)):
+                _sync_cuda_if_present(getattr(self.pipeline, "device", None))
             now_s = time.perf_counter()
-            step_ms = (now_s - t0) * 1000.0
+            batch_ms = (now_s - t0) * 1000.0
 
-            task.token_timestamps_s.append(now_s)
-            task.last_step_time_s = now_s
-            self.ar_steps_executed += 1
-            self.ar_compute_total_ms += step_ms
-            self.ema_ar_step_ms = 0.5 * self.ema_ar_step_ms + 0.5 * step_ms
+            for idx, task in enumerate(live_tasks):
+                nxt_id = next_ids[idx]
+                task.kv_cache = updated_caches[idx]
+                task.curr_tokens = next_tokens[idx : idx + 1] if hasattr(next_tokens, "ndim") else nxt_id
+                task._curr_tok_int = nxt_id
+                task.pos_ids = task.pos_ids + 1
+                task.token_timestamps_s.append(now_s)
+                task.last_step_time_s = now_s
+                reached_len = len(task.generated_token_ids) >= task.max_tokens
+                hit_eos = task.end_token_id is not None and nxt_id == int(task.end_token_id)
+                if reached_len or hit_eos:
+                    task.finished = True
+
+            n_served = len(live_tasks)
+            if n_served > 1:
+                self.batched_ar_yields += 1
+            self.max_microbatch_size = max(self.max_microbatch_size, n_served)
+            self.ar_steps_executed += n_served
+            self.ar_compute_total_ms += batch_ms
+            self.ema_ar_step_ms = 0.5 * self.ema_ar_step_ms + 0.5 * batch_ms
             self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
-
-            reached_len = len(task.generated_token_ids) >= task.max_tokens
-            hit_eos = task.end_token_id is not None and int(next_tok[0].item()) == int(task.end_token_id)
-            if reached_len or hit_eos:
-                task.finished = True
+            return n_served
         finally:
             self.in_ar_yield = False
 
+    def _run_one_ar_step(self, task: ArDecodeTask, sync_gpu: bool = True) -> None:
+        if task.finished:
+            return
+        self._execute_packed_ar_tasks([task], sync_gpu=sync_gpu)
+
     def _run_ar_microbatch(self, tasks: list[ArDecodeTask]) -> int:
-        """Advance a microbatch of active AR tasks in one synchronized yield window."""
-        if not tasks:
+        """Advance a microbatch of active AR tasks in `[B, D]` packed GEMM yield windows (capped at `max_microbatch_cap`)."""
+        live = [t for t in tasks if not t.finished]
+        if not live:
             return 0
-        n = len(tasks)
-        for idx, t in enumerate(tasks):
-            # Only synchronize on the final task of the microbatch when running real steps
-            if getattr(self._run_one_ar_step, "__func__", None) is UnifiedPreemptiveScheduler._run_one_ar_step:
-                self._run_one_ar_step(t, sync_gpu=(idx == n - 1))
-            else:
+        if getattr(self._run_one_ar_step, "__func__", None) is not UnifiedPreemptiveScheduler._run_one_ar_step:
+            for t in live:
                 self._run_one_ar_step(t)  # Supports unit-test overrides cleanly
-        return n
+            return len(live)
+        cap = max(1, self.max_microbatch_cap)
+        served_total = 0
+        for off in range(0, len(live), cap):
+            served_total += self._execute_packed_ar_tasks(live[off : off + cap], sync_gpu=True)
+        return served_total
 
     def service_one_step_round(self) -> int:
         """Serve one AR decode token across all active tasks at a DiT step boundary."""
+        self._admit_due_arrivals(time.perf_counter())
         batch_len = len(self.active_ar_tasks)
         if batch_len == 0:
             return 0
@@ -242,21 +290,21 @@ class UnifiedPreemptiveScheduler:
         return served
 
     def service_due_ar_tasks(self, force_all_urgent: bool = False) -> int:
-        """Execute urgent AR decode steps (EDF order, microbatched) during a DiT preemption boundary."""
+        """Execute urgent AR decode steps (EDF order, `[B, D]` microbatched) during a DiT preemption boundary."""
+        now_s = time.perf_counter()
+        self._admit_due_arrivals(now_s)
         if not self.active_ar_tasks:
             return 0
-        now_s = time.perf_counter()
         ordered = sorted(self.active_ar_tasks, key=lambda t: t.next_deadline_s())
         self.active_ar_tasks.clear()
 
         due: list[ArDecodeTask] = []
         deferred: list[ArDecodeTask] = []
-        max_serve = max(self.max_ar_tokens_per_yield, len(ordered))
+        max_serve = max(1, self.max_microbatch_cap)
+        coalesce_window_ms = self.ema_ar_step_ms + self.ema_layer_ms + self.guard_ms
         for idx, task in enumerate(ordered):
             slack_ms = (task.next_deadline_s() - now_s) * 1000.0
-            if force_all_urgent or idx == 0 or (
-                len(due) < max_serve and slack_ms <= (self.ema_ar_step_ms + self.guard_ms)
-            ):
+            if force_all_urgent or idx == 0 or (len(due) < max_serve and slack_ms <= coalesce_window_ms):
                 due.append(task)
             else:
                 deferred.append(task)
@@ -273,7 +321,7 @@ class UnifiedPreemptiveScheduler:
         return served
 
     def drain_remaining_ar_tasks(self) -> None:
-        """Finish any remaining or not-yet-arrived AR tasks after DiT completes."""
+        """Finish any remaining or not-yet-arrived AR tasks after DiT completes via `[B, D]` packed GEMMs."""
         while self._pending_arrivals or self.active_ar_tasks:
             now_s = time.perf_counter()
             self._admit_due_arrivals(now_s)
@@ -292,12 +340,21 @@ class UnifiedPreemptiveScheduler:
 
     def on_gen_layer_complete(self, layer_idx: int, num_layers: int, t_layer_start_s: float) -> None:
         """Invoked by `BagelExecutionInterceptor` after each `mode='gen'` decoder block."""
-        if len(self.layer_times_ms) < num_layers and not self.active_ar_tasks and not self._pending_arrivals:
-            _sync_cuda_if_present()
+        dev = getattr(self.pipeline, "device", None)
+        if (
+            not self._layer_calibrated
+            and not self._step0_h2d_streaming
+            and len(self.layer_times_ms) < num_layers
+            and not self.active_ar_tasks
+            and not self._pending_arrivals
+        ):
+            _sync_cuda_if_present(dev)
             now_s = time.perf_counter()
             dt_l = (now_s - t_layer_start_s) * 1000.0
             self.layer_times_ms.append(dt_l)
             self.ema_layer_ms = 0.7 * self.ema_layer_ms + 0.3 * dt_l
+            if len(self.layer_times_ms) >= num_layers:
+                self._layer_calibrated = True
             self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
             self._last_sync_s = now_s
             self._queued_gpu_ms = 0.0
@@ -306,7 +363,7 @@ class UnifiedPreemptiveScheduler:
         self._queued_gpu_ms += self.ema_layer_ms
         est_gpu_s = max(time.perf_counter(), self._last_sync_s + self._queued_gpu_ms / 1000.0)
         if self._should_yield_now(est_gpu_s, next_unit_ms=self.ema_layer_ms):
-            _sync_cuda_if_present()
+            _sync_cuda_if_present(dev)
             real_now = time.perf_counter()
             self._last_sync_s = real_now
             self._queued_gpu_ms = 0.0
@@ -318,10 +375,12 @@ class UnifiedPreemptiveScheduler:
 
     def on_dit_step_complete(self, step_start_s: float, ar_compute_before_ms: float) -> None:
         """Invoked by `BagelExecutionInterceptor` after each `bagel.forward` denoising step."""
-        _sync_cuda_if_present()
+        dev = getattr(self.pipeline, "device", None)
+        _sync_cuda_if_present(dev)
         now_s = time.perf_counter()
         self._last_sync_s = now_s
         self._queued_gpu_ms = 0.0
+        self._step0_h2d_streaming = False
         pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
         self.step_times_ms.append(pure_step_ms)
 
@@ -332,7 +391,7 @@ class UnifiedPreemptiveScheduler:
                     self.service_one_step_round()
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0
-                elif self._should_yield_now(now_s, next_unit_ms=self.ema_layer_ms):
+                elif self._should_yield_now(now_s, next_unit_ms=1.6 * self.ema_layer_ms):
                     self.service_due_ar_tasks(force_all_urgent=False)
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0

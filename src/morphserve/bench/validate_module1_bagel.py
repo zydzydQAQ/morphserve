@@ -11,7 +11,7 @@ import time
 
 from morphserve.bench.exactness import MIB, gpu_mem_info_mib, pil_sha256, tensor_sha256
 from morphserve.models import load_bagel_pipeline
-from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, TriPoolVMM
+from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, TriPoolVMM, VmmNaiveCache
 
 
 def _build_turn0_context(pipeline, prompt: str, device):
@@ -407,12 +407,152 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "final_stats": vmm_tight.stats_dict(),
     }
 
+    # ==================== 5. Test 5 (C2 + C1): Bidirectional 32x2MiB->64MiB Mapping, kv_free_bytes & Async Thinking-KV Swap ====================
+    # With 224 x 64 MiB super + 256 MiB fine = 14,592 MiB strict pool (allow_overflow=False) and 12,544 MiB Gen Expert:
+    #   Allocate 8 thinking-period VmmNaiveCache sessions totaling 4,096 MiB KV (> 2,048 MiB DiT headroom!).
+    #   This carves 60 super-handles -> 1,920 fine pages (leaving 164 < 196 super-handles!), requiring BOTH:
+    #     (1) Async high-watermark swap-out of thinking-period KV to Host Pinned DRAM before DiT, AND
+    #     (2) Bidirectional batch-mapping of 32 x 2 MiB fine bundles (+ single cuMemSetAccess) for Gen Expert reload!
+    torch.cuda.synchronize()
+    kv_free_before_c2 = vmm_tight.kv_free_bytes(for_dit=False)
+    kv_dit_headroom_before_c2 = vmm_tight.kv_free_bytes(for_dit=True)
+
+    thinking_sessions: list[VmmNaiveCache] = []
+    torch.manual_seed(2027)
+    s0_prefill_k = torch.randn((250, 32, 128), dtype=torch.bfloat16, device=device)
+    s0_prefill_v = torch.randn((250, 32, 128), dtype=torch.bfloat16, device=device)
+    s0_steps_k = [torch.randn((1, 32, 128), dtype=torch.bfloat16, device=device) for _ in range(16)]
+    s0_steps_v = [torch.randn((1, 32, 128), dtype=torch.bfloat16, device=device) for _ in range(16)]
+    s0_tail_k = torch.randn((4096 - 266, 32, 128), dtype=torch.bfloat16, device=device)
+    s0_tail_v = torch.randn((4096 - 266, 32, 128), dtype=torch.bfloat16, device=device)
+    bulk_chunk_k = torch.randn((4096, 32, 128), dtype=torch.bfloat16, device=device)
+    bulk_chunk_v = torch.randn((4096, 32, 128), dtype=torch.bfloat16, device=device)
+
+    s0 = VmmNaiveCache(num_layers=8, vmm=vmm_tight, max_seq_len=4096, max_row_bytes=8192)
+    s0.mark_active()
+    fk0, _ = s0.append_inplace(0, s0_prefill_k, s0_prefill_v)
+    s0_va_ptr_init = int(fk0.data_ptr())
+    for sk, sv in zip(s0_steps_k, s0_steps_v):
+        fk0, _ = s0.append_inplace(0, sk, sv)
+    s0_va_ptr_crossed_2mb = int(fk0.data_ptr())
+    fk0, fv0 = s0.append_inplace(0, s0_tail_k, s0_tail_v)
+    s0_va_ptr_full = int(fk0.data_ptr())
+    for lidx in range(1, 8):
+        s0.append_inplace(lidx, bulk_chunk_k, bulk_chunk_v)
+    torch.cuda.synchronize()
+    s0_k0_sha_before = tensor_sha256(s0.key_cache[0])
+    s0_v0_sha_before = tensor_sha256(s0.value_cache[0])
+    s0.mark_thinking(trigger_watermark_check=False)
+    thinking_sessions.append(s0)
+
+    for idx in range(7):
+        sc = VmmNaiveCache(num_layers=8, vmm=vmm_tight, max_seq_len=4096, max_row_bytes=8192)
+        sc.mark_active()
+        prefill_n = 4095 if idx < 4 else 4096
+        for lidx in range(8):
+            sc.append_inplace(lidx, bulk_chunk_k[:prefill_n], bulk_chunk_v[:prefill_n])
+        if idx >= 4:
+            sc.mark_thinking(trigger_watermark_check=False)
+        thinking_sessions.append(sc)
+
+    # Exercise strided packed `[B=4, H, D]` `VmmNaiveCache.append_batch_inplace` on CUDA bf16 tensors (`4095 -> 4096`)
+    packed_qkv_step = torch.randn((4, 3 * 32, 128), dtype=torch.bfloat16, device=device)
+    _, strided_bk, strided_bv = packed_qkv_step.split([32, 32, 32], dim=1)
+    batch_targets = thinking_sessions[1:5]
+    for lidx in range(8):
+        ks_b, vs_b, lens_b = VmmNaiveCache.append_batch_inplace(batch_targets, lidx, strided_bk, strided_bv)
+    torch.cuda.synchronize()
+    batched_append_exact = bool(
+        lens_b == [4096, 4096, 4096, 4096]
+        and all(torch.equal(ks_b[b][-1], strided_bk[b]) and torch.equal(vs_b[b][-1], strided_bv[b]) for b in range(4))
+    )
+    for sc in batch_targets:
+        sc.mark_thinking(trigger_watermark_check=False)
+
+    del (
+        s0_prefill_k,
+        s0_prefill_v,
+        s0_steps_k,
+        s0_steps_v,
+        s0_tail_k,
+        s0_tail_v,
+        bulk_chunk_k,
+        bulk_chunk_v,
+        packed_qkv_step,
+        strided_bk,
+        strided_bv,
+        ks_b,
+        vs_b,
+    )
+    torch.cuda.synchronize()
+
+    kv_free_mid_c2 = vmm_tight.kv_free_bytes(for_dit=False)
+    kv_dit_headroom_mid_c2 = vmm_tight.kv_free_bytes(for_dit=True)
+    st_mid_c2 = vmm_tight.stats_dict()
+
+    t_c2_0 = time.perf_counter()
+    with pager.generation_mode(prefetch_all=True):
+        c2_img, _ = _run_bagel_generate(
+            pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52, sync_before=False
+        )
+    c2_gen_ms = (time.perf_counter() - t_c2_0) * 1000.0
+    c2_img_sha = pil_sha256(c2_img)
+    del c2_img
+    st_after_c2_dit = vmm_tight.stats_dict()
+
+    # Also exercise 7 GiB `1024x1024 b=2` VAE transient spike via CUDAPluggableAllocator while pool is carved + swapped
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        c2_vae_out = pipeline.vae.decode(vae_lat_1024_b2)
+    torch.cuda.synchronize()
+    c2_vae_sha = tensor_sha256(c2_vae_out)
+    del c2_vae_out
+
+    # Wake Session 0 (oldest LRU thinking victim -> guaranteed swapped out to Host Pinned DRAM!)
+    s0_was_swapped = bool(s0.is_swapped_out)
+    s0.mark_active()
+    torch.cuda.synchronize()
+    s0_va_ptr_restored = int(s0.key_cache[0].data_ptr())
+    s0_k0_sha_after = tensor_sha256(s0.key_cache[0])
+    s0_v0_sha_after = tensor_sha256(s0.value_cache[0])
+
+    for sc in thinking_sessions:
+        sc.close()
+    thinking_sessions.clear()
+    vmm_tight.flush_kv_swaps()
+    st_after_c2_clean = vmm_tight.stats_dict()
+
+    report["test5_c2_bidirectional_and_thinking_kv_swap"] = {
+        "kv_free_before_mib": round(kv_free_before_c2 / MIB, 2),
+        "kv_free_after_4gib_kv_mib": round(kv_free_mid_c2 / MIB, 2),
+        "kv_dit_headroom_before_mib": round(kv_dit_headroom_before_c2 / MIB, 2),
+        "kv_dit_headroom_after_4gib_kv_mib": round(kv_dit_headroom_mid_c2 / MIB, 2),
+        "kv_free_sync_accurate": (kv_free_before_c2 - kv_free_mid_c2) == 4096 * MIB
+        and kv_dit_headroom_mid_c2 == 0,
+        "super_handles_remaining_after_carve": st_mid_c2["super_pool_total_handles"],
+        "fine_to_super_bundles_used": st_after_c2_clean["fine_to_super_bundles"],
+        "kv_swap_outs_total": st_after_c2_clean["kv_swap_outs_total"],
+        "kv_swap_ins_total": st_after_c2_clean["kv_swap_ins_total"],
+        "s0_was_swapped_out": s0_was_swapped,
+        "batched_append_exact": batched_append_exact,
+        "inplace_append_va_invariant": (
+            s0_va_ptr_init == s0_va_ptr_crossed_2mb == s0_va_ptr_full == s0_va_ptr_restored
+        ),
+        "swapped_kv_bit_exact": (s0_k0_sha_after == s0_k0_sha_before and s0_v0_sha_after == s0_v0_sha_before),
+        "dit_under_kv_swap_and_fine_bundles_ms": round(c2_gen_ms, 2),
+        "dit_bit_exact": c2_img_sha == ref_sha,
+        "vae_1024_b2_under_carved_pool_bit_exact": c2_vae_sha == vae_ref_sha,
+        "overflow_creates": st_after_c2_clean["overflow_creates"],
+        "all_kv_reclaimed_after_close": st_after_c2_clean["kv_mapped_pages_current"] == 0
+        and st_after_c2_clean["kv_swapped_pages_current"] == 0,
+    }
+
     pager.close()
     vmm_tight.shutdown()
     del vae_lat_1024_b2, main_ctx, cfg_img_ctx, pipeline
     gc.collect()
     torch.cuda.empty_cache()
 
+    t5 = report["test5_c2_bidirectional_and_thinking_kv_swap"]
     all_pass = (
         report["ar_isolation_check"]["zero_gen_faults_in_ar_mode"]
         and report["layer_hook_telemetry"]["layer_hook_calls"] > 0
@@ -426,6 +566,17 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         and report["test2_tight_pool_7gib_vae_pressure"]["overflow_creates"] == 0
         and report["test2_tight_pool_7gib_vae_pressure"]["vae_1024_b2_bit_exact"]
         and report["test2_tight_pool_7gib_vae_pressure"]["post_eviction_dit_bit_exact"]
+        and t5["kv_free_sync_accurate"]
+        and t5["fine_to_super_bundles_used"] > 0
+        and t5["kv_swap_outs_total"] > 0
+        and t5["s0_was_swapped_out"]
+        and t5["batched_append_exact"]
+        and t5["inplace_append_va_invariant"]
+        and t5["swapped_kv_bit_exact"]
+        and t5["dit_bit_exact"]
+        and t5["vae_1024_b2_under_carved_pool_bit_exact"]
+        and t5["overflow_creates"] == 0
+        and t5["all_kv_reclaimed_after_close"]
     )
     report["status"] = "ok" if all_pass else "check_failed"
 
@@ -454,6 +605,14 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                     "vae_bit_exact": report["test2_tight_pool_7gib_vae_pressure"]["vae_1024_b2_bit_exact"],
                     "post_dit_bit_exact": report["test2_tight_pool_7gib_vae_pressure"]["post_eviction_dit_bit_exact"],
                     "overflow": report["test2_tight_pool_7gib_vae_pressure"]["overflow_creates"],
+                },
+                "c2_bidirectional_and_kv_swap": {
+                    "fine_to_super_bundles": t5["fine_to_super_bundles_used"],
+                    "kv_swap_outs": t5["kv_swap_outs_total"],
+                    "kv_swap_ins": t5["kv_swap_ins_total"],
+                    "va_invariant": t5["inplace_append_va_invariant"],
+                    "kv_bit_exact": t5["swapped_kv_bit_exact"],
+                    "dit_bit_exact": t5["dit_bit_exact"],
                 },
             },
             ensure_ascii=False,

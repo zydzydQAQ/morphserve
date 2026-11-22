@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import os
 import socket
+import threading
 import time
 from typing import Any
 
@@ -63,6 +64,7 @@ class DirectNcclMesh:
             "ncclCommInitRank",
         )
         self.transfer_stream = torch.cuda.Stream(device=self.device)
+        self._comm_lock = threading.Lock()
 
     @staticmethod
     def generate_unique_id_bytes() -> bytes:
@@ -108,48 +110,87 @@ class DirectNcclMesh:
         if int(rc) != 0:
             raise RuntimeError(f"{op} failed with ncclResult_t={rc}")
 
-    def send_u8(self, tensor_u8: Any, dst_rank: int, sync_stream: bool = True) -> float:
+    def alloc_recv_u8(self, nbytes: int) -> Any:
         import torch
 
+        torch.cuda.set_device(self.device)
+        with torch.cuda.stream(self.transfer_stream):
+            return torch.empty((max(0, int(nbytes)),), dtype=torch.uint8, device=self.device)
+
+    def send_u8(
+        self,
+        tensor_u8: Any,
+        dst_rank: int,
+        sync_stream: bool = True,
+        *,
+        ready_event: Any = None,
+    ) -> float:
+        import torch
+
+        torch.cuda.set_device(self.device)
         nbytes = int(tensor_u8.numel())
         t0 = time.perf_counter()
         if nbytes > 0:
-            ev = torch.cuda.current_stream(self.device).record_event()
-            self.transfer_stream.wait_event(ev)
-            self._check(
-                self._nccl.ncclSend(
-                    ctypes.c_void_p(int(tensor_u8.data_ptr())),
-                    ctypes.c_size_t(nbytes),
-                    ctypes.c_int(0),  # ncclInt8 (1 byte)
-                    ctypes.c_int(int(dst_rank)),
-                    self.comm,
-                    ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
-                ),
-                "ncclSend",
-            )
-            if sync_stream:
-                self.transfer_stream.synchronize()
+            with self._comm_lock:
+                if ready_event is not None:
+                    self.transfer_stream.wait_event(ready_event)
+                else:
+                    ev = torch.cuda.current_stream(self.device).record_event()
+                    self.transfer_stream.wait_event(ev)
+                if hasattr(tensor_u8, "record_stream"):
+                    tensor_u8.record_stream(self.transfer_stream)
+                self._check(
+                    self._nccl.ncclSend(
+                        ctypes.c_void_p(int(tensor_u8.data_ptr())),
+                        ctypes.c_size_t(nbytes),
+                        ctypes.c_int(0),  # ncclInt8 (1 byte)
+                        ctypes.c_int(int(dst_rank)),
+                        self.comm,
+                        ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
+                    ),
+                    "ncclSend",
+                )
+                if sync_stream:
+                    self.transfer_stream.synchronize()
         return round((time.perf_counter() - t0) * 1000.0, 3)
 
-    def recv_u8(self, nbytes: int, src_rank: int, sync_stream: bool = True) -> tuple[Any, float]:
+    def recv_u8(
+        self,
+        nbytes: int,
+        src_rank: int,
+        sync_stream: bool = True,
+        *,
+        out_tensor: Any = None,
+    ) -> tuple[Any, float]:
         import torch
 
+        torch.cuda.set_device(self.device)
         t0 = time.perf_counter()
-        flat = torch.empty((int(nbytes),), dtype=torch.uint8, device=self.device)
-        if nbytes > 0:
-            self._check(
-                self._nccl.ncclRecv(
-                    ctypes.c_void_p(int(flat.data_ptr())),
-                    ctypes.c_size_t(int(nbytes)),
-                    ctypes.c_int(0),
-                    ctypes.c_int(int(src_rank)),
-                    self.comm,
-                    ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
-                ),
-                "ncclRecv",
-            )
-            if sync_stream:
-                self.transfer_stream.synchronize()
+        nb = max(0, int(nbytes))
+        if out_tensor is not None:
+            if int(out_tensor.numel()) < nb:
+                raise ValueError(f"out_tensor numel {int(out_tensor.numel())} < requested recv nbytes {nb}")
+            flat = out_tensor
+        else:
+            with torch.cuda.stream(self.transfer_stream):
+                flat = torch.empty((nb,), dtype=torch.uint8, device=self.device)
+        if nb > 0:
+            with self._comm_lock:
+                if hasattr(flat, "record_stream"):
+                    flat.record_stream(self.transfer_stream)
+                self._check(
+                    self._nccl.ncclRecv(
+                        ctypes.c_void_p(int(flat.data_ptr())),
+                        ctypes.c_size_t(nb),
+                        ctypes.c_int(0),
+                        ctypes.c_int(int(src_rank)),
+                        self.comm,
+                        ctypes.c_void_p(int(self.transfer_stream.cuda_stream)),
+                    ),
+                    "ncclRecv",
+                )
+                if sync_stream:
+                    self.transfer_stream.synchronize()
         return flat, round((time.perf_counter() - t0) * 1000.0, 3)
 
     def close(self) -> None:

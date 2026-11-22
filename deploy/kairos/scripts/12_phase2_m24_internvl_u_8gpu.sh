@@ -5,8 +5,8 @@ set -euo pipefail
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
 
 # Strict pre-download storage gate (< 790G and < 80% used)
-USED_PCT=$(df -P /shared | awk 'NR==2 {gsub("%","",$5); print $5}')
-if [ "${USED_PCT}" -ge 80 ]; then
+USED_PCT=$(df -P "${KAIROS_SHARED_ROOT:-/shared}" | awk 'NR==2 {for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+%$/) {sub("%", "", $i); print $i; exit}}')
+if [ -z "${USED_PCT}" ] || [ "${USED_PCT}" -ge 80 ]; then
   echo "error: /shared usage ${USED_PCT}% >= 80% pre-download gate; stopping immediately" >&2
   exit 1
 fi
@@ -40,11 +40,12 @@ python3 /shared/data/MORPHSERVE/scripts/kairos_runtime_audit.py \
 SAMPLER_PID=$!
 
 _cleanup() {
-  if kill -0 "$SAMPLER_PID" 2>/dev/null; then
+  if [ -n "${SAMPLER_PID:-}" ] && kill -0 "$SAMPLER_PID" 2>/dev/null; then
     kill -TERM "$SAMPLER_PID" 2>/dev/null || true
     wait "$SAMPLER_PID" 2>/dev/null || true
   fi
-  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ivlu_parity_*.png 2>/dev/null || true
+  SAMPLER_PID=""
+  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_ivlu_* /tmp/ivlu_parity_* /tmp/morphserve_h2d_locks /dev/shm/ms_shm_* 2>/dev/null || true
   _kairos_cleanup
 }
 trap _cleanup EXIT

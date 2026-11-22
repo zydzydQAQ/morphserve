@@ -1,4 +1,4 @@
-"""Phase-1 Module 3 live A100 validation: Shared-Prefix Triton CFG Attention + LECP CoW + GPU In-Place Loopback."""
+"""Phase-1 Module 3 live A100 validation: Cross-Paradigm State De-Redundancy (LECP CoW, GPU Loopback & Cascade-CFG)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,14 @@ import math
 from pathlib import Path
 import time
 
-from morphserve.bench.exactness import MIB, compute_ssim_rgb as _compute_ssim_rgb
+from morphserve.bench.exactness import (
+    ClipEditingScorer,
+    MIB,
+    OwlV2GenEvalScorer,
+    compute_ssim_rgb as _compute_ssim_rgb,
+    pil_sha256,
+    score_mmvet_answer,
+)
 from morphserve.kernels import (
     GpuInPlaceLoopback,
     SharedPrefixCache,
@@ -234,7 +241,9 @@ def _run_bagel_generate_3branch(
     seed: int = 52,
     height: int = 512,
     width: int = 512,
+    decode_gpu_u8: bool = False,
 ):
+    from PIL import Image
     import torch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -264,19 +273,68 @@ def _run_bagel_generate_3branch(
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.inference_mode():
+        if decode_gpu_u8:
+            prep = pipeline._forward_single(
+                {"prompt": prompt, "modalities": ["image"]},
+                sampling,
+                prepare_only=True,
+            )
+            gp = prep["gen_params"]
+            img_shape = prep["image_shape"]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                latents, *_ = pipeline.bagel.generate_image(
+                    past_key_values=prep["gen_context"]["past_key_values"],
+                    cfg_text_past_key_values=prep["cfg_text_context"]["past_key_values"],
+                    cfg_img_past_key_values=prep["cfg_img_context"]["past_key_values"],
+                    num_timesteps=gp.num_timesteps,
+                    timestep_shift=gp.timestep_shift,
+                    cfg_text_scale=gp.cfg_text_scale,
+                    cfg_img_scale=gp.cfg_img_scale,
+                    cfg_interval=gp.cfg_interval,
+                    cfg_renorm_min=gp.cfg_renorm_min,
+                    cfg_renorm_type=gp.cfg_renorm_type,
+                    **prep["generation_input"],
+                    cfg_text_packed_position_ids=prep["cfg_text_packed_position_ids"],
+                    cfg_img_packed_position_ids=prep["cfg_img_packed_position_ids"],
+                    return_trajectory_latents=False,
+                    scheduler=pipeline.scheduler,
+                    scheduler_kwargs=pipeline.scheduler_kwargs,
+                )
+                img_u8 = decode_latent_to_u8_gpu(pipeline.bagel, pipeline.vae, latents[0], img_shape)
+            torch.cuda.synchronize()
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            pil_img = Image.fromarray(img_u8.permute(1, 2, 0).contiguous().cpu().numpy())
+            return pil_img, elapsed_ms, img_u8
+
         out = pipeline._forward_single({"prompt": prompt, "modalities": ["image"]}, sampling)
     torch.cuda.synchronize()
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    return out.output["payload"]["image"], elapsed_ms
+    return out.output["payload"]["image"], elapsed_ms, None
+
+
+def _strip_chat_markers(text: str) -> str:
+    clean = text.split("<|im_end|>")[0].split("<|im_start|>")[-1].strip()
+    return clean if clean else text.strip()
+
+
+def _extract_cot_rubric_clause(text: str, max_words: int = 4) -> str:
+    cleaned = _strip_chat_markers(text).replace("<think>", " ").replace("</think>", " ")
+    words = [
+        tok
+        for raw in cleaned.split()
+        if (tok := raw.strip(".,;:!?\"'()[]{}")).isalpha()
+    ][:max_words]
+    return "<AND>".join(words)
 
 
 def _update_text_ctx(pipeline, ctx: dict, prompt: str) -> None:
     import torch
 
+    clean = _strip_chat_markers(prompt) or prompt
     inp, new_lens, new_rope = pipeline.bagel.prepare_prompts(
         curr_kvlens=ctx["kv_lens"],
         curr_rope=ctx["ropes"],
-        prompts=[prompt],
+        prompts=[clean],
         tokenizer=pipeline.tokenizer,
         new_token_ids=pipeline.new_token_ids,
     )
@@ -369,7 +427,12 @@ def _kv_cache_unique_bytes(caches: list) -> int:
     return total
 
 
-def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
+def run_validation(
+    model_dir: Path,
+    output_dir: Path,
+    steps: int = 20,
+    allow_eval_download: bool = False,
+) -> dict:
     import numpy as np
     from PIL import Image
     import torch
@@ -521,7 +584,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     gc.collect()
     torch.cuda.empty_cache()
 
-    # ==================== Test 3: End-to-End 4-Turn Interleaved Visual-CoT (Stock vs MorphServe M3) ====================
+    # ==================== Test 3: End-to-End 4-Turn Interleaved Editing (Stock vs MorphServe M3) ====================
     prompts = [
         "A serene wooden cabin beside an alpine lake at golden hour, realistic photography.",
         "Add warm glowing lights inside the cabin windows and a wooden rowboat at the dock.",
@@ -531,22 +594,22 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
     # Run identical 4-turn editing session under:
     #   (A) Stock vLLM-Omni: deepcopy(main) -> cfg_text + NaiveCache.merge + left_pad_stack + CPU PNG loopback
-    #   (B) MorphServe Module 3: CoW fork + SharedPrefixCache + Single-Read Triton CFG Attention + GPU In-Place Loopback
+    #   (B) MorphServe Module 3: LECP CoW + SharedPrefixCache + Cascade-CFG Attention + True GPU In-Place Loopback
     def run_4turn_session(use_morphserve: bool, capture_turn3_ctx: bool = False) -> tuple[list[dict], list, Any]:
         SharedPrefixCache.clear_memo()
         main_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
         turn_logs = []
         imgs = []
+        last_u8_gpu = None
         turn3_snapshot = None
         for turn_idx, p in enumerate(prompts):
             loopback_ms = 0.0
             if turn_idx > 0:
                 if use_morphserve:
-                    # Simulate GPU tensor already on GPU after previous turn's VAE decode!
-                    prev_u8 = torch.from_numpy(np.array(imgs[-1].convert("RGB"), dtype=np.uint8, copy=True)).permute(2, 0, 1).to(device)
+                    assert last_u8_gpu is not None
                     torch.cuda.synchronize()
                     t_lb0 = time.perf_counter()
-                    loopback.update_context_from_u8_gpu(main_ctx, prev_u8)
+                    loopback.update_context_from_u8_gpu(main_ctx, last_u8_gpu)
                     torch.cuda.synchronize()
                     loopback_ms = (time.perf_counter() - t_lb0) * 1000.0
                 else:
@@ -588,21 +651,30 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
             if use_morphserve:
                 with cfg_patch.active(reset_stats=True):
-                    img, gen_ms = _run_bagel_generate_3branch(
-                        pipeline, main_ctx, cfg_text_ctx, cfg_img_ctx, p, steps=steps, seed=52 + turn_idx
+                    img, gen_ms, last_u8_gpu = _run_bagel_generate_3branch(
+                        pipeline,
+                        main_ctx,
+                        cfg_text_ctx,
+                        cfg_img_ctx,
+                        p,
+                        steps=steps,
+                        seed=52 + turn_idx,
+                        decode_gpu_u8=True,
                     )
                 shared_len = cfg_patch.last_shared_prefix_len
                 shared_calls = cfg_patch.shared_attn_calls
+                cascade_calls = cfg_patch.cascade_split_calls
                 naive_toks = cfg_patch.last_naive_kv_tokens
                 padded_toks = cfg_patch.last_padded_naive_kv_tokens
                 uniq_toks = cfg_patch.last_unique_kv_tokens
             else:
                 cfg_patch.enabled = False
-                img, gen_ms = _run_bagel_generate_3branch(
+                img, gen_ms, _ = _run_bagel_generate_3branch(
                     pipeline, main_ctx, cfg_text_ctx, cfg_img_ctx, p, steps=steps, seed=52 + turn_idx
                 )
                 shared_len = 0
                 shared_calls = 0
+                cascade_calls = 0
                 l0 = main_ctx["past_key_values"].seq_lens
                 l1 = cfg_text_ctx["past_key_values"].seq_lens
                 l2 = cfg_img_ctx["past_key_values"].seq_lens
@@ -623,6 +695,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                     "gen_ms": round(gen_ms, 2),
                     "shared_prefix_len": shared_len,
                     "shared_triton_attn_calls": shared_calls,
+                    "cascade_split_calls": cascade_calls,
                     "unique_kv_tokens": uniq_toks,
                     "naive_kv_tokens": naive_toks,
                     "padded_naive_kv_tokens": padded_toks,
@@ -630,29 +703,40 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             )
             del cfg_text_ctx, cfg_img_ctx
             torch.cuda.empty_cache()
-        del main_ctx
+        del main_ctx, last_u8_gpu
         gc.collect()
         torch.cuda.empty_cache()
         return turn_logs, imgs, turn3_snapshot
 
-    # Warmup once (both stock and morphserve FlashPrefix-CFG kernels) so 4-turn run has zero cold JIT stall
+    # Warmup once (both stock and morphserve Cascade-CFG kernels) so 4-turn run has zero cold JIT stall
     _w_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
     _update_text_ctx(pipeline, _w_ctx, prompts[0])
-    _, _ = _run_bagel_generate_3branch(pipeline, _w_ctx, deepcopy(_w_ctx), deepcopy(_w_ctx), prompts[0], steps=4, seed=1)
+    _, _, _ = _run_bagel_generate_3branch(
+        pipeline, _w_ctx, deepcopy(_w_ctx), deepcopy(_w_ctx), prompts[0], steps=4, seed=1
+    )
     del _w_ctx
     torch.cuda.empty_cache()
 
     stock_turns, stock_imgs, turn3_snap = run_4turn_session(use_morphserve=False, capture_turn3_ctx=True)
-    # Same-History Turn-3 Isolation Check: run MorphServe on exact same 17.8k-token Stock Turn-3 context
+    # Same-History Turn-3 Isolation Check + Lossless Fallback Bit-Exact Check
     m_c, ct_c, ci_c, p_t3 = turn3_snap
+    m_l, ct_l, ci_l = deepcopy(m_c), deepcopy(ct_c), deepcopy(ci_c)
     rebind_cow_prefix(m_c["past_key_values"], ct_c["past_key_values"])
     SharedPrefixCache.clear_memo()
-    with cfg_patch.active(reset_stats=True):
-        same_ctx_t3_img, same_ctx_t3_ms = _run_bagel_generate_3branch(
+    with cfg_patch.active(reset_stats=True, allow_cascade_split=True):
+        same_ctx_t3_img, same_ctx_t3_ms, _ = _run_bagel_generate_3branch(
             pipeline, m_c, ct_c, ci_c, p_t3, steps=steps, seed=52 + len(prompts) - 1
         )
     same_ctx_turn3_qual = _compute_ssim_rgb(stock_imgs[-1], same_ctx_t3_img)
-    del turn3_snap, m_c, ct_c, ci_c, same_ctx_t3_img
+
+    rebind_cow_prefix(m_l["past_key_values"], ct_l["past_key_values"])
+    SharedPrefixCache.clear_memo()
+    with cfg_patch.active(reset_stats=True, allow_cascade_split=False):
+        lossless_t3_img, _, _ = _run_bagel_generate_3branch(
+            pipeline, m_l, ct_l, ci_l, p_t3, steps=steps, seed=52 + len(prompts) - 1
+        )
+    lossless_t3_bit_exact = pil_sha256(stock_imgs[-1]) == pil_sha256(lossless_t3_img)
+    del turn3_snap, m_c, ct_c, ci_c, m_l, ct_l, ci_l, same_ctx_t3_img, lossless_t3_img
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -680,6 +764,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                 "morphserve_gen_ms": mt["gen_ms"],
                 "gen_speedup_x": round(st["gen_ms"] / max(mt["gen_ms"], 1e-6), 3),
                 "shared_triton_attn_calls": mt["shared_triton_attn_calls"],
+                "cascade_split_calls": mt["cascade_split_calls"],
                 **qual,
             }
         )
@@ -690,6 +775,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             "morphserve_gen_ms": round(same_ctx_t3_ms, 2),
             "stock_gen_ms": stock_turns[-1]["gen_ms"],
             "speedup_x": round(stock_turns[-1]["gen_ms"] / max(same_ctx_t3_ms, 1e-6), 3),
+            "lossless_fallback_bit_exact": lossless_t3_bit_exact,
             **same_ctx_turn3_qual,
         },
         "total_stock_gen_ms": round(sum(t["stock_gen_ms"] for t in turn_comparisons), 2),
@@ -699,8 +785,92 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "min_ssim_across_4turns": min(t["ssim"] for t in turn_comparisons),
     }
 
+    # ==================== Test 4: Visual-CoT (`L_shared > 0`) & Downstream Scorers (`CLIP` / `OWLv2` / `MMVet`) ====================
+    cot_prompt = "a photo of a blue fire hydrant"
+    cot_plan_prompt = (
+        "Think step by step to plan the exact object count, vivid blue color, centered foreground placement, "
+        f"and clean outdoor street background before generating the image: {cot_prompt}"
+    )
+    cot_meta = {"tag": "colors", "include": [{"class": "fire hydrant", "count": 1, "color": "blue"}], "prompt": cot_prompt}
+
+    def _run_visual_cot_once(use_ms: bool):
+        ctx_m = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
+        _update_text_ctx(pipeline, ctx_m, cot_plan_prompt)
+        # Append <think> reasoning tokens into main_ctx so L_shared > 0 when CFG forks!
+        think_txt = _generate_ar_text(pipeline, ctx_m, max_tokens=48)
+        _update_text_ctx(pipeline, ctx_m, think_txt)
+        ct_ctx = cow_fork_context(ctx_m) if use_ms else deepcopy(ctx_m)
+        _update_text_ctx(pipeline, ctx_m, cot_prompt)
+        if use_ms:
+            rebind_cow_prefix(ctx_m["past_key_values"], ct_ctx["past_key_values"])
+        ci_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
+        _update_text_ctx(pipeline, ci_ctx, cot_prompt)
+        SharedPrefixCache.clear_memo()
+        if use_ms:
+            with cfg_patch.active(reset_stats=True):
+                im, gms, u8_cot = _run_bagel_generate_3branch(
+                    pipeline, ctx_m, ct_ctx, ci_ctx, cot_prompt, steps=steps, seed=77, decode_gpu_u8=True
+                )
+            sh_l = cfg_patch.last_shared_prefix_len
+            sh_c = cfg_patch.shared_attn_calls
+        else:
+            cfg_patch.enabled = False
+            im, gms, u8_cot = _run_bagel_generate_3branch(
+                pipeline, ctx_m, ct_ctx, ci_ctx, cot_prompt, steps=steps, seed=77
+            )
+            sh_l, sh_c = 0, 0
+
+        # Post-generation VQA turn exercising loopback -> AR VQA (`MMVet` rubric)
+        vqa_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
+        if use_ms and u8_cot is not None:
+            loopback.update_context_from_u8_gpu(vqa_ctx, u8_cot, update_vae=False, update_vit=True)
+        else:
+            _update_image_ctx_cpu_pil(pipeline, vqa_ctx, im)
+        _update_text_ctx(pipeline, vqa_ctx, "What color is the fire hydrant in this image?")
+        vqa_ans = _generate_ar_text(pipeline, vqa_ctx, max_tokens=24)
+        del ctx_m, ct_ctx, ci_ctx, vqa_ctx, u8_cot
+        return im, gms, sh_l, sh_c, think_txt, vqa_ans
+
+    cot_stock_img, cot_stock_ms, _, _, cot_think_stock, cot_vqa_stock = _run_visual_cot_once(use_ms=False)
+    cot_ms_img, cot_ms_ms, cot_l_shared, cot_sh_calls, cot_think_ms, cot_vqa_ms = _run_visual_cot_once(use_ms=True)
+    cot_qual = _compute_ssim_rgb(cot_stock_img, cot_ms_img)
+
+    clip_scorer = ClipEditingScorer(allow_hf_download=allow_eval_download)
+    owlv2_scorer = OwlV2GenEvalScorer(allow_hf_download=allow_eval_download)
+    clip_turn_deltas: list[float] = []
+    if clip_scorer.available:
+        src_img = stock_imgs[0]
+        for ti_idx, p_txt in enumerate(prompts):
+            sr = clip_scorer.score_edit_turn(stock_imgs[ti_idx], p_txt, source_img=src_img)
+            mr = clip_scorer.score_edit_turn(ms_imgs[ti_idx], p_txt, source_img=src_img)
+            if sr["clip_t_pct"] is not None and mr["clip_t_pct"] is not None:
+                clip_turn_deltas.append(float(mr["clip_t_pct"]) - float(sr["clip_t_pct"]))
+    owl_ref = owlv2_scorer.score_image(cot_stock_img, cot_meta)
+    owl_ms = owlv2_scorer.score_image(cot_ms_img, cot_meta)
+    mmvet_ref_score = score_mmvet_answer(cot_vqa_stock, "blue")
+    mmvet_ms_score = score_mmvet_answer(cot_vqa_ms, "blue")
+    # Extract whole words (never mid-word character slices) for deterministic CoT rubric parity check
+    mmvet_cot_parity = score_mmvet_answer(cot_think_ms, _extract_cot_rubric_clause(cot_think_stock))
+
+    report["test4_visual_cot_and_downstream"] = {
+        "cot_shared_prefix_len": cot_l_shared,
+        "cot_shared_attn_calls": cot_sh_calls,
+        "cot_think_exact_match": cot_think_stock == cot_think_ms,
+        "cot_stock_gen_ms": round(cot_stock_ms, 2),
+        "cot_morphserve_gen_ms": round(cot_ms_ms, 2),
+        "cot_ssim": cot_qual["ssim"],
+        "clip_backend": clip_scorer.backend,
+        "clip_t_mean_delta_pct": round(sum(clip_turn_deltas) / len(clip_turn_deltas), 4) if clip_turn_deltas else None,
+        "owlv2_backend": owlv2_scorer.backend,
+        "owlv2_ref_score": owl_ref["score"],
+        "owlv2_morphserve_score": owl_ms["score"],
+        "mmvet_vqa_ref_score": mmvet_ref_score,
+        "mmvet_vqa_morphserve_score": mmvet_ms_score,
+        "mmvet_rubric_smoke_score": mmvet_cot_parity,
+    }
+
     cfg_patch.uninstall()
-    del stock_imgs, ms_imgs, pipeline
+    del stock_imgs, ms_imgs, cot_stock_img, cot_ms_img, pipeline
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -717,6 +887,10 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         and report["test2_gpu_inplace_loopback"]["ar_text_exact_match"]
         and all(t["shared_triton_attn_calls"] > 0 for t in turn_comparisons if t["turn"] >= 1)
         and same_ctx_turn3_qual["ssim"] >= 0.995
+        and lossless_t3_bit_exact
+        and cot_l_shared > 0
+        and cot_sh_calls > 0
+        and cot_qual["ssim"] >= 0.985
         and all(t["ssim"] >= 0.965 for t in turn_comparisons)
         and all(t["kv_hbm_saved_pct"] >= 45.0 for t in turn_comparisons if t["turn"] >= 1)
         and report["test3_4turn_interleaved_e2e"]["total_morphserve_gen_ms"]
@@ -758,6 +932,8 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                     "ar_match": report["test2_gpu_inplace_loopback"]["ar_text_exact_match"],
                 },
                 "same_ctx_turn3_ssim": same_ctx_turn3_qual["ssim"],
+                "lossless_t3_bit_exact": lossless_t3_bit_exact,
+                "visual_cot_l_shared": cot_l_shared,
                 "e2e_4turn": [
                     {
                         "turn": t["turn"],
@@ -778,12 +954,18 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="MorphServe Module 3 (Shared-Prefix CFG + GPU Loopback) validation")
+    parser = argparse.ArgumentParser(description="MorphServe Module 3 (LECP CoW + GPU Loopback + Cascade-CFG) validation")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--allow-eval-download", action="store_true")
     args = parser.parse_args(argv)
-    rep = run_validation(args.model_dir, args.output_dir, steps=args.steps)
+    rep = run_validation(
+        args.model_dir,
+        args.output_dir,
+        steps=args.steps,
+        allow_eval_download=args.allow_eval_download,
+    )
     return 0 if rep.get("status") == "ok" else 2
 
 

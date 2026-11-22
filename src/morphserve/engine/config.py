@@ -51,6 +51,7 @@ class EnginePolicyConfig:
     inter_turn_think_s_range: tuple[float, float] = (3.0, 8.0)
     steady_state_trim_frac: float = 0.15
     gpu_memory_fraction: float | None = None
+    gpu_memory_quota_mib: float | None = None
 
     # TriPool-VMM physical & virtual sizing
     super_pool_mib: int = 14336
@@ -112,6 +113,16 @@ class EnginePolicyConfig:
         if policy_name == "morphserve":
             # Warm alpha=1.0 startup across all workers (`D1`); tail expert layers drop strictly on demand!
             alphas = {g: 1.0 for g in range(n)}
+            mem_frac = overrides.get("gpu_memory_fraction")
+            quota_mib = overrides.get("gpu_memory_quota_mib")
+            is_ivlu_capped = fam == "internvl_u" and (
+                (mem_frac is not None and float(mem_frac) <= 0.5)
+                or (quota_mib is not None and 0.0 < float(quota_mib) <= 20_480.0)
+            )
+            # On unconstrained 40 GB GPUs, give InternVL-U (`~4.5–5.1 GiB` decoder + `~2.4 GiB` 1024px VAE spike)
+            # a 12,288 MiB super-pool so scoped VAE transients never falsely evict resident decoder blocks;
+            # under <=50% memory quota (e.g. 12 GiB Regime B), tighten to 4,864 MiB with strict VMM cap.
+            ivlu_super_mib = 4864 if is_ivlu_capped else 12288
             cfg = cls(
                 policy_name="morphserve",
                 num_gpus=n,
@@ -133,10 +144,11 @@ class EnginePolicyConfig:
                 dit_512_slo_ms=slo_map["dit_512_slo_ms"],
                 dit_1024_slo_ms=slo_map["dit_1024_slo_ms"],
                 inter_turn_think_s_range=think_default,
-                super_pool_mib=4864 if fam == "internvl_u" else 14336,
+                super_pool_mib=ivlu_super_mib if fam == "internvl_u" else 14336,
                 fine_kv_pool_mib=512 if fam == "internvl_u" else 256,
                 transient_va_gib=16,
-                kv_va_gib=4 if fam == "internvl_u" else 16,
+                kv_va_gib=8 if fam == "internvl_u" else 16,
+                allow_vmm_overflow=False if is_ivlu_capped else True,
             )
         elif policy_name == "monolithic_dp":
             cfg = cls(

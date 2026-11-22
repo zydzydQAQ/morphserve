@@ -12,6 +12,21 @@ if [ ! -f "${MODEL_DIR}/MODEL_MANIFEST.json" ]; then
   exit 1
 fi
 
+_has_eval_weights() {
+  local d="$1"
+  [ -f "${d}/config.json" ] && {
+    [ -f "${d}/model.safetensors" ] || [ -f "${d}/pytorch_model.bin" ] || \
+    [ -f "${d}/model.safetensors.index.json" ] || [ -f "${d}/pytorch_model.bin.index.json" ]
+  }
+}
+
+export MORPHSERVE_EVAL_MODELS_DIR="${DATA}/eval_models"
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+if ! _has_eval_weights "${MORPHSERVE_EVAL_MODELS_DIR}/owlv2-base-patch16-ensemble" || \
+   ! _has_eval_weights "${MORPHSERVE_EVAL_MODELS_DIR}/clip-vit-large-patch14"; then
+  unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE || true
+fi
+
 python3 /shared/data/MORPHSERVE/scripts/kairos_runtime_audit.py \
   --output "${RUN_DIR}/runtime-facts.json" \
   --model-dir "bagel=${MODEL_DIR}"
@@ -33,7 +48,8 @@ trap _morphserve_job1b_cleanup EXIT
 python3 -m morphserve.bench.validate_module3_cfg_loopback \
   --model-dir "${MODEL_DIR}" \
   --output-dir "${RUN_DIR}" \
-  --steps 20
+  --steps 20 \
+  --allow-eval-download
 
 kairos_check_shared_storage
 echo "== Phase-1 Job 1b (Module 3 Shared-Prefix CFG + GPU Loopback) completed cleanly: ${RUN_DIR}"

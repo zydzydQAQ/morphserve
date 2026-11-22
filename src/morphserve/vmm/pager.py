@@ -408,14 +408,43 @@ class LayerExpertPager:
                 setattr(vae_mod, meth_name, self._wrap_vae_callable(orig_fn, is_decode=(meth_name == "decode")))
                 self._orig_vae_methods.append((vae_mod, meth_name, orig_fn))
 
+    def _ensure_expert_headroom(self, missing_layers: int, *, for_dit: bool = True) -> None:
+        if self.vmm is None or missing_layers <= 0:
+            return
+        missing_bytes = int(missing_layers) * self.layer_stride_bytes
+        s_ptr = _current_cuda_stream_ptr(self.vmm.device)
+        opt_s = s_ptr if s_ptr != 0 else None
+        if for_dit and hasattr(self.vmm, "maybe_evict_thinking_kv_on_high_watermark"):
+            self.vmm.maybe_evict_thinking_kv_on_high_watermark(
+                sync=True,
+                for_dit=True,
+                stream_ptr=opt_s,
+            )
+        st = self.vmm.stats_dict()
+        pool_free = int(st.get("pool_free_bytes", 0))
+        self_unpinned = int(self.vmm.expert_resident_count(self.expert_id)) * self.layer_stride_bytes
+        other_unpinned = max(0, int(st.get("expert_unpinned_bytes", 0)) - self_unpinned)
+        non_self_pool_free = pool_free + other_unpinned
+        if non_self_pool_free < missing_bytes and hasattr(self.vmm, "reclaim_thinking_kv_bytes"):
+            self.vmm.reclaim_thinking_kv_bytes(
+                missing_bytes - non_self_pool_free,
+                sync=True,
+                stream_ptr=opt_s,
+            )
+        elif pool_free < missing_bytes and hasattr(self.vmm, "flush_kv_swaps"):
+            self.vmm.flush_kv_swaps()
+
     def resident_alpha(self) -> float:
         if self.vmm is None or self.num_layers <= 0:
             return 0.0
         return self.vmm.expert_resident_count(self.expert_id) / float(self.num_layers)
 
     def ensure_all_resident_sync(self) -> None:
-        if self.vmm is not None and self.vmm.expert_resident_count(self.expert_id) < self.num_layers:
-            self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
+        if self.vmm is not None:
+            cur = self.vmm.expert_resident_count(self.expert_id)
+            if cur < self.num_layers:
+                self._ensure_expert_headroom(self.num_layers - cur)
+                self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
 
     def set_residency_alpha(self, alpha: float) -> int:
         assert self.vmm is not None
@@ -427,6 +456,9 @@ class LayerExpertPager:
         self.vmm.set_expert_pinned(self.expert_id, False)
         if target < self.num_layers:
             self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
+        cur = self.vmm.expert_resident_count(self.expert_id)
+        if target > cur:
+            self._ensure_expert_headroom(target - cur, for_dit=(target == self.num_layers))
         if target > 0:
             self.vmm.load_expert_layers_sync(self.expert_id, 0, target)
         return int(self.vmm.expert_resident_count(self.expert_id))
@@ -434,6 +466,10 @@ class LayerExpertPager:
     @contextmanager
     def generation_mode(self, prefetch_all: bool = True):
         assert self.vmm is not None
+        if prefetch_all:
+            cur = self.vmm.expert_resident_count(self.expert_id)
+            if cur < self.num_layers:
+                self._ensure_expert_headroom(self.num_layers - cur)
         self.vmm.set_expert_pinned(self.expert_id, True)
         self._generation_active = True
         if prefetch_all:

@@ -1,4 +1,12 @@
-"""Single-HBM-Read Triton Shared-Prefix Multi-Branch CFG Attention & BAGEL runtime hooks."""
+"""Arithmetic-Intensity-Gated Cascade-CFG Attention, Fused LSE Merge & BAGEL runtime hooks.
+
+Module 3 Cross-Paradigm State De-Redundancy combines:
+  1. `LECP CoW` (`SharedPrefixCache`) eliminating ~50% multi-turn CFG KV HBM duplication;
+  2. `GpuInPlaceLoopback` eliminating CPU PIL/PNG round-trips across editing/Visual-CoT turns;
+  3. Arithmetic-intensity-gated two-pass `Cascade-CFG` attention (`_run_flash_prefix_cfg` +
+     fused Triton `_merge_two_lse_fwd`), automatically falling back to lossless unpadded
+     attention when `Q` is large relative to `L_shared` (e.g., high-res `1024^2` early turns).
+"""
 
 from __future__ import annotations
 
@@ -20,311 +28,6 @@ except ImportError:
 
 if HAS_TRITON:
 
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=2),
-        ],
-        key=["Q_LEN", "L_SHARED", "HEAD_DIM"],
-    )
-    @triton.jit
-    def _shared_prefix_cfg2_attn_fwd(
-        Q0, Q1, K_pre, V_pre,
-        K_suf0, V_suf0, K_suf1, V_suf1,
-        K_loc0, V_loc0, K_loc1, V_loc1,
-        Out0, Out1,
-        sq0_m, sq0_h, sq0_d,
-        sq1_m, sq1_h, sq1_d,
-        skp_n, skp_h, skp_d,
-        svp_n, svp_h, svp_d,
-        sks0_n, sks0_h, sks0_d,
-        svs0_n, svs0_h, svs0_d,
-        sks1_n, sks1_h, sks1_d,
-        svs1_n, svs1_h, svs1_d,
-        skl0_n, skl0_h, skl0_d,
-        svl0_n, svl0_h, svl0_d,
-        skl1_n, skl1_h, skl1_d,
-        svl1_n, svl1_h, svl1_d,
-        so0_m, so0_h, so0_d,
-        so1_m, so1_h, so1_d,
-        Q_LEN, L_SHARED, L_SUF0, L_SUF1,
-        sm_scale_log2,
-        GQA_GROUP: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Exact non-causal FlashAttention-2 for 2 CFG branches sharing `L_SHARED` KV tokens.
-
-        Reads every `(K_pre, V_pre)` tile ONCE from HBM and updates BOTH branches in registers,
-        then continues online softmax over each branch's private suffix + local `[text, vae]` KV.
-        """
-        pid_m = tl.program_id(0)
-        pid_h = tl.program_id(1)
-        kv_h = pid_h // GQA_GROUP
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
-        offs_n = tl.arange(0, BLOCK_N)
-        m_mask = offs_m < Q_LEN
-
-        q0 = tl.load(Q0 + offs_m[:, None] * sq0_m + pid_h * sq0_h + offs_d[None, :] * sq0_d, mask=m_mask[:, None], other=0.0)
-        q1 = tl.load(Q1 + offs_m[:, None] * sq1_m + pid_h * sq1_h + offs_d[None, :] * sq1_d, mask=m_mask[:, None], other=0.0)
-
-        m0 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-        l0 = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc0 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-        m1 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-        l1 = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc1 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-        # Segment 1: Shared Prefix [0, L_SHARED) — SINGLE HBM LOAD FOR BOTH BRANCHES!
-        for start_n in range(0, L_SHARED, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SHARED
-            k = tl.load(K_pre + cur_n[:, None] * skp_n + kv_h * skp_h + offs_d[None, :] * skp_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_pre + cur_n[:, None] * svp_n + kv_h * svp_h + offs_d[None, :] * svp_d, mask=n_mask[:, None], other=0.0)
-
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_new = tl.maximum(m0, tl.max(qk0, axis=1))
-            alpha0 = tl.math.exp2(m0 - m0_new)
-            p0 = tl.math.exp2(qk0 - m0_new[:, None])
-            l0 = l0 * alpha0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * alpha0[:, None])
-            m0 = m0_new
-
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_new = tl.maximum(m1, tl.max(qk1, axis=1))
-            alpha1 = tl.math.exp2(m1 - m1_new)
-            p1 = tl.math.exp2(qk1 - m1_new[:, None])
-            l1 = l1 * alpha1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * alpha1[:, None])
-            m1 = m1_new
-
-        # Segment 2a: Branch 0 private suffix
-        for start_n in range(0, L_SUF0, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SUF0
-            k = tl.load(K_suf0 + cur_n[:, None] * sks0_n + kv_h * sks0_h + offs_d[None, :] * sks0_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_suf0 + cur_n[:, None] * svs0_n + kv_h * svs0_h + offs_d[None, :] * svs0_d, mask=n_mask[:, None], other=0.0)
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_new = tl.maximum(m0, tl.max(qk0, axis=1))
-            alpha0 = tl.math.exp2(m0 - m0_new)
-            p0 = tl.math.exp2(qk0 - m0_new[:, None])
-            l0 = l0 * alpha0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * alpha0[:, None])
-            m0 = m0_new
-
-        # Segment 2b: Branch 1 private suffix
-        for start_n in range(0, L_SUF1, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SUF1
-            k = tl.load(K_suf1 + cur_n[:, None] * sks1_n + kv_h * sks1_h + offs_d[None, :] * sks1_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_suf1 + cur_n[:, None] * svs1_n + kv_h * svs1_h + offs_d[None, :] * svs1_d, mask=n_mask[:, None], other=0.0)
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_new = tl.maximum(m1, tl.max(qk1, axis=1))
-            alpha1 = tl.math.exp2(m1 - m1_new)
-            p1 = tl.math.exp2(qk1 - m1_new[:, None])
-            l1 = l1 * alpha1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * alpha1[:, None])
-            m1 = m1_new
-
-        # Segment 3a: Branch 0 local [text, vae]
-        for start_n in range(0, Q_LEN, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < Q_LEN
-            k = tl.load(K_loc0 + cur_n[:, None] * skl0_n + kv_h * skl0_h + offs_d[None, :] * skl0_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_loc0 + cur_n[:, None] * svl0_n + kv_h * svl0_h + offs_d[None, :] * svl0_d, mask=n_mask[:, None], other=0.0)
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_new = tl.maximum(m0, tl.max(qk0, axis=1))
-            alpha0 = tl.math.exp2(m0 - m0_new)
-            p0 = tl.math.exp2(qk0 - m0_new[:, None])
-            l0 = l0 * alpha0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * alpha0[:, None])
-            m0 = m0_new
-
-        # Segment 3b: Branch 1 local [text, vae]
-        for start_n in range(0, Q_LEN, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < Q_LEN
-            k = tl.load(K_loc1 + cur_n[:, None] * skl1_n + kv_h * skl1_h + offs_d[None, :] * skl1_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_loc1 + cur_n[:, None] * svl1_n + kv_h * svl1_h + offs_d[None, :] * svl1_d, mask=n_mask[:, None], other=0.0)
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_new = tl.maximum(m1, tl.max(qk1, axis=1))
-            alpha1 = tl.math.exp2(m1 - m1_new)
-            p1 = tl.math.exp2(qk1 - m1_new[:, None])
-            l1 = l1 * alpha1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * alpha1[:, None])
-            m1 = m1_new
-
-        tl.store(Out0 + offs_m[:, None] * so0_m + pid_h * so0_h + offs_d[None, :] * so0_d, (acc0 / l0[:, None]).to(Out0.dtype.element_ty), mask=m_mask[:, None])
-        tl.store(Out1 + offs_m[:, None] * so1_m + pid_h * so1_h + offs_d[None, :] * so1_d, (acc1 / l1[:, None]).to(Out1.dtype.element_ty), mask=m_mask[:, None])
-
-    @triton.autotune(
-        configs=[
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
-            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=8, num_stages=2),
-        ],
-        key=["Q_LEN", "L_SHARED", "HEAD_DIM"],
-    )
-    @triton.jit
-    def _shared_prefix_cfg3_attn_fwd(
-        Q0, Q1, Q2, K_pre, V_pre,
-        K_suf0, V_suf0, K_suf1, V_suf1, K_suf2, V_suf2,
-        K_loc0, V_loc0, K_loc1, V_loc1, K_loc2, V_loc2,
-        Out0, Out1, Out2,
-        sq0_m, sq0_h, sq0_d, sq1_m, sq1_h, sq1_d, sq2_m, sq2_h, sq2_d,
-        skp_n, skp_h, skp_d, svp_n, svp_h, svp_d,
-        sks0_n, sks0_h, sks0_d, svs0_n, svs0_h, svs0_d,
-        sks1_n, sks1_h, sks1_d, svs1_n, svs1_h, svs1_d,
-        sks2_n, sks2_h, sks2_d, svs2_n, svs2_h, svs2_d,
-        skl0_n, skl0_h, skl0_d, svl0_n, svl0_h, svl0_d,
-        skl1_n, skl1_h, skl1_d, svl1_n, svl1_h, svl1_d,
-        skl2_n, skl2_h, skl2_d, svl2_n, svl2_h, svl2_d,
-        so0_m, so0_h, so0_d, so1_m, so1_h, so1_d, so2_m, so2_h, so2_d,
-        Q_LEN, L_SHARED, L_SUF0, L_SUF1, L_SUF2,
-        sm_scale_log2,
-        GQA_GROUP: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        """Exact non-causal FlashAttention-2 for 3 CFG branches sharing `L_SHARED` KV tokens."""
-        pid_m = tl.program_id(0)
-        pid_h = tl.program_id(1)
-        kv_h = pid_h // GQA_GROUP
-
-        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-        offs_d = tl.arange(0, HEAD_DIM)
-        offs_n = tl.arange(0, BLOCK_N)
-        m_mask = offs_m < Q_LEN
-
-        q0 = tl.load(Q0 + offs_m[:, None] * sq0_m + pid_h * sq0_h + offs_d[None, :] * sq0_d, mask=m_mask[:, None], other=0.0)
-        q1 = tl.load(Q1 + offs_m[:, None] * sq1_m + pid_h * sq1_h + offs_d[None, :] * sq1_d, mask=m_mask[:, None], other=0.0)
-        q2 = tl.load(Q2 + offs_m[:, None] * sq2_m + pid_h * sq2_h + offs_d[None, :] * sq2_d, mask=m_mask[:, None], other=0.0)
-
-        m0 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-        l0 = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc0 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-        m1 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-        l1 = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc1 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-        m2 = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
-        l2 = tl.zeros([BLOCK_M], dtype=tl.float32)
-        acc2 = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-        for start_n in range(0, L_SHARED, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SHARED
-            k = tl.load(K_pre + cur_n[:, None] * skp_n + kv_h * skp_h + offs_d[None, :] * skp_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_pre + cur_n[:, None] * svp_n + kv_h * svp_h + offs_d[None, :] * svp_d, mask=n_mask[:, None], other=0.0)
-
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_n = tl.maximum(m0, tl.max(qk0, axis=1))
-            a0 = tl.math.exp2(m0 - m0_n)
-            p0 = tl.math.exp2(qk0 - m0_n[:, None])
-            l0 = l0 * a0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * a0[:, None])
-            m0 = m0_n
-
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_n = tl.maximum(m1, tl.max(qk1, axis=1))
-            a1 = tl.math.exp2(m1 - m1_n)
-            p1 = tl.math.exp2(qk1 - m1_n[:, None])
-            l1 = l1 * a1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * a1[:, None])
-            m1 = m1_n
-
-            qk2 = tl.where(n_mask[None, :], tl.dot(q2, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m2_n = tl.maximum(m2, tl.max(qk2, axis=1))
-            a2 = tl.math.exp2(m2 - m2_n)
-            p2 = tl.math.exp2(qk2 - m2_n[:, None])
-            l2 = l2 * a2 + tl.sum(p2, axis=1)
-            acc2 = tl.dot(p2.to(v.dtype), v, acc2 * a2[:, None])
-            m2 = m2_n
-
-        for start_n in range(0, L_SUF0, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SUF0
-            k = tl.load(K_suf0 + cur_n[:, None] * sks0_n + kv_h * sks0_h + offs_d[None, :] * sks0_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_suf0 + cur_n[:, None] * svs0_n + kv_h * svs0_h + offs_d[None, :] * svs0_d, mask=n_mask[:, None], other=0.0)
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_n = tl.maximum(m0, tl.max(qk0, axis=1))
-            a0 = tl.math.exp2(m0 - m0_n)
-            p0 = tl.math.exp2(qk0 - m0_n[:, None])
-            l0 = l0 * a0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * a0[:, None])
-            m0 = m0_n
-        for start_n in range(0, Q_LEN, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < Q_LEN
-            k = tl.load(K_loc0 + cur_n[:, None] * skl0_n + kv_h * skl0_h + offs_d[None, :] * skl0_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_loc0 + cur_n[:, None] * svl0_n + kv_h * svl0_h + offs_d[None, :] * svl0_d, mask=n_mask[:, None], other=0.0)
-            qk0 = tl.where(n_mask[None, :], tl.dot(q0, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m0_n = tl.maximum(m0, tl.max(qk0, axis=1))
-            a0 = tl.math.exp2(m0 - m0_n)
-            p0 = tl.math.exp2(qk0 - m0_n[:, None])
-            l0 = l0 * a0 + tl.sum(p0, axis=1)
-            acc0 = tl.dot(p0.to(v.dtype), v, acc0 * a0[:, None])
-            m0 = m0_n
-
-        for start_n in range(0, L_SUF1, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SUF1
-            k = tl.load(K_suf1 + cur_n[:, None] * sks1_n + kv_h * sks1_h + offs_d[None, :] * sks1_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_suf1 + cur_n[:, None] * svs1_n + kv_h * svs1_h + offs_d[None, :] * svs1_d, mask=n_mask[:, None], other=0.0)
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_n = tl.maximum(m1, tl.max(qk1, axis=1))
-            a1 = tl.math.exp2(m1 - m1_n)
-            p1 = tl.math.exp2(qk1 - m1_n[:, None])
-            l1 = l1 * a1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * a1[:, None])
-            m1 = m1_n
-        for start_n in range(0, Q_LEN, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < Q_LEN
-            k = tl.load(K_loc1 + cur_n[:, None] * skl1_n + kv_h * skl1_h + offs_d[None, :] * skl1_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_loc1 + cur_n[:, None] * svl1_n + kv_h * svl1_h + offs_d[None, :] * svl1_d, mask=n_mask[:, None], other=0.0)
-            qk1 = tl.where(n_mask[None, :], tl.dot(q1, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m1_n = tl.maximum(m1, tl.max(qk1, axis=1))
-            a1 = tl.math.exp2(m1 - m1_n)
-            p1 = tl.math.exp2(qk1 - m1_n[:, None])
-            l1 = l1 * a1 + tl.sum(p1, axis=1)
-            acc1 = tl.dot(p1.to(v.dtype), v, acc1 * a1[:, None])
-            m1 = m1_n
-
-        for start_n in range(0, L_SUF2, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < L_SUF2
-            k = tl.load(K_suf2 + cur_n[:, None] * sks2_n + kv_h * sks2_h + offs_d[None, :] * sks2_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_suf2 + cur_n[:, None] * svs2_n + kv_h * svs2_h + offs_d[None, :] * svs2_d, mask=n_mask[:, None], other=0.0)
-            qk2 = tl.where(n_mask[None, :], tl.dot(q2, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m2_n = tl.maximum(m2, tl.max(qk2, axis=1))
-            a2 = tl.math.exp2(m2 - m2_n)
-            p2 = tl.math.exp2(qk2 - m2_n[:, None])
-            l2 = l2 * a2 + tl.sum(p2, axis=1)
-            acc2 = tl.dot(p2.to(v.dtype), v, acc2 * a2[:, None])
-            m2 = m2_n
-        for start_n in range(0, Q_LEN, BLOCK_N):
-            cur_n = start_n + offs_n
-            n_mask = cur_n < Q_LEN
-            k = tl.load(K_loc2 + cur_n[:, None] * skl2_n + kv_h * skl2_h + offs_d[None, :] * skl2_d, mask=n_mask[:, None], other=0.0)
-            v = tl.load(V_loc2 + cur_n[:, None] * svl2_n + kv_h * svl2_h + offs_d[None, :] * svl2_d, mask=n_mask[:, None], other=0.0)
-            qk2 = tl.where(n_mask[None, :], tl.dot(q2, tl.trans(k)) * sm_scale_log2, float("-inf"))
-            m2_n = tl.maximum(m2, tl.max(qk2, axis=1))
-            a2 = tl.math.exp2(m2 - m2_n)
-            p2 = tl.math.exp2(qk2 - m2_n[:, None])
-            l2 = l2 * a2 + tl.sum(p2, axis=1)
-            acc2 = tl.dot(p2.to(v.dtype), v, acc2 * a2[:, None])
-            m2 = m2_n
-
-        tl.store(Out0 + offs_m[:, None] * so0_m + pid_h * so0_h + offs_d[None, :] * so0_d, (acc0 / l0[:, None]).to(Out0.dtype.element_ty), mask=m_mask[:, None])
-        tl.store(Out1 + offs_m[:, None] * so1_m + pid_h * so1_h + offs_d[None, :] * so1_d, (acc1 / l1[:, None]).to(Out1.dtype.element_ty), mask=m_mask[:, None])
-        tl.store(Out2 + offs_m[:, None] * so2_m + pid_h * so2_h + offs_d[None, :] * so2_d, (acc2 / l2[:, None]).to(Out2.dtype.element_ty), mask=m_mask[:, None])
-
     @triton.jit
     def _merge_two_lse_fwd(
         Oa,
@@ -342,7 +45,7 @@ if HAS_TRITON:
         BLOCK_R: tl.constexpr,
         HEAD_DIM: tl.constexpr,
     ):
-        """Fused exact online-softmax LSE merge for FlashPrefix-CFG (zero autotune stall)."""
+        """Fused exact online-softmax LSE merge for Cascade-CFG (zero autotune stall)."""
         pid_r = tl.program_id(0)
         offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
         offs_d = tl.arange(0, HEAD_DIM)
@@ -350,7 +53,7 @@ if HAS_TRITON:
 
         la = tl.load(Lse_a + offs_r, mask=mask_r, other=-1.0e20)
         lb = tl.load(Lse_b + offs_r, mask=mask_r, other=-1.0e20)
-        m = tl.maximum(la, lb)
+        m = tl.maximum(tl.maximum(la, lb), -1.0e30)
         wa = tl.exp(la - m)
         wb = tl.exp(lb - m)
         inv = 1.0 / (wa + wb)
@@ -506,7 +209,14 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any |
     lb_1d = lse_b.reshape(n_rows).contiguous()
 
     if HAS_TRITON and oa_2d.is_cuda and d in (64, 128):
-        out_2d = ob_2d if (out is o_b and ob_2d.is_contiguous()) else torch.empty_like(oa_2d)
+        can_write_out_direct = (
+            out is not None
+            and out.shape == (m_tot, h_q, d)
+            and out.dtype == oa_2d.dtype
+            and out.device == oa_2d.device
+            and out.is_contiguous()
+        )
+        out_2d = out.view(n_rows, d) if can_write_out_direct else torch.empty_like(oa_2d)
         block_r = 64 if n_rows >= 256 else 16
         grid = (triton.cdiv(n_rows, block_r),)
         _merge_two_lse_fwd[grid](
@@ -526,9 +236,13 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any |
             HEAD_DIM=d,
             num_warps=4,
         )
-        return out_2d.reshape(m_tot, h_q, d)
+        res_3d = out_2d.reshape(m_tot, h_q, d)
+        if out is not None and not can_write_out_direct:
+            out.copy_(res_3d)
+            return out
+        return res_3d
 
-    m = torch.maximum(lse_a, lse_b)
+    m = torch.clamp_min(torch.maximum(lse_a, lse_b), -1.0e30)
     wa = torch.exp(lse_a - m)
     wb = torch.exp(lse_b - m)
     inv = 1.0 / (wa + wb)
@@ -773,13 +487,17 @@ def _run_flash_prefix_cfg(
     return outputs
 
 
-def should_use_flash_prefix_split(q_len: int, l_shared: int, num_shared_branches: int) -> bool:
-    """Gate two-pass FlashPrefix-CFG + LSE merge on empirically calibrated arithmetic-intensity payoff."""
-    if num_shared_branches < 2 or l_shared < 256:
+def should_use_cascade_cfg_split(q_len: int, l_shared: int, num_shared_branches: int) -> bool:
+    """Gate two-pass Cascade-CFG + fused LSE merge on empirically calibrated arithmetic-intensity payoff."""
+    if q_len <= 0 or num_shared_branches < 2 or l_shared < 256:
         return False
     if q_len <= 2048:
         return l_shared >= max(256, int(1.5 * q_len))
     return l_shared >= 4 * q_len
+
+
+# Backward-compatible alias used across Module 3 callers and unit tests
+should_use_flash_prefix_split = should_use_cascade_cfg_split
 
 
 def _get_cached_left_pad_meta(lens: tuple[int, ...], device: Any) -> Any:
@@ -1000,23 +718,22 @@ def shared_prefix_cfg_attention(
     v_suffix_list: list[Any | None],
     sm_scale: float | None = None,
     attn_noncausal: Any | None = None,
-    backend: str = "flash_prefix",
+    backend: str = "cascade_cfg",
+    stats_out: dict[str, int] | None = None,
 ) -> list[Any]:
-    """Dispatch multi-branch CFG attention via FlashPrefix-CFG (default) or single-pass Triton kernel."""
+    """Dispatch multi-branch CFG attention via arithmetic-intensity-gated Cascade-CFG or lossless varlen."""
     import torch
 
     num_branches = len(q_list)
-    q_len, h_q, head_dim = q_list[0].shape
-    h_kv = k_loc_list[0].shape[1]
+    q_len, _, head_dim = q_list[0].shape
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
-    sm_scale_log2 = sm_scale * 1.4426950408889634
-    gqa_group = h_q // h_kv
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
-    # Preferred default: FlashPrefix-CFG when shared prefix compute outweighs LSE merge, else unpadded FA2 varlen.
-    if backend == "flash_prefix" and q_list[0].is_cuda:
-        if should_use_flash_prefix_split(q_len, l_shared, len(shared_branch_ids)):
+    if q_list[0].is_cuda:
+        if backend in ("cascade_cfg", "flash_prefix") and should_use_cascade_cfg_split(
+            q_len, l_shared, len(shared_branch_ids)
+        ):
             fp_out = _run_flash_prefix_cfg(
                 q_list=q_list,
                 k_loc_list=k_loc_list,
@@ -1029,96 +746,30 @@ def shared_prefix_cfg_attention(
                 sm_scale=sm_scale,
             )
             if fp_out is not None:
+                if stats_out is not None:
+                    stats_out["cascade_split_executed"] = stats_out.get("cascade_split_executed", 0) + 1
                 return fp_out
-        unpadded_out = _run_unpadded_varlen_cfg(
-            q_list=q_list,
-            k_loc_list=k_loc_list,
-            v_loc_list=v_loc_list,
-            k_prefix=k_prefix,
-            v_prefix=v_prefix,
-            shared_branch_ids=shared_branch_ids,
-            k_suffix_list=k_suffix_list,
-            v_suffix_list=v_suffix_list,
-            sm_scale=sm_scale,
-            attn_noncausal=attn_noncausal,
-        )
-        if unpadded_out is not None:
-            return unpadded_out
+
+        if backend in ("cascade_cfg", "flash_prefix", "lossless_varlen", "unpadded_varlen"):
+            unpadded_out = _run_unpadded_varlen_cfg(
+                q_list=q_list,
+                k_loc_list=k_loc_list,
+                v_loc_list=v_loc_list,
+                k_prefix=k_prefix,
+                v_prefix=v_prefix,
+                shared_branch_ids=shared_branch_ids,
+                k_suffix_list=k_suffix_list,
+                v_suffix_list=v_suffix_list,
+                sm_scale=sm_scale,
+                attn_noncausal=attn_noncausal,
+            )
+            if unpadded_out is not None:
+                return unpadded_out
 
     outputs: list[Any] = [None] * num_branches
-    handled: set[int] = set()
-
-    use_triton = (
-        HAS_TRITON
-        and q_list[0].is_cuda
-        and head_dim in (64, 128)
-        and l_shared > 0
-        and len(shared_branch_ids) in (2, 3)
-    )
-
-    def _prep_suf(ks, vs, fb_k, fb_v):
-        ln = int(ks.shape[0]) if ks is not None else 0
-        return (ks.contiguous(), vs.contiguous(), ln) if ln > 0 else (fb_k, fb_v, 0)
-
-    if use_triton and len(shared_branch_ids) == 2:
-        b0, b1 = shared_branch_ids[0], shared_branch_ids[1]
-        q0, q1 = q_list[b0].contiguous(), q_list[b1].contiguous()
-        kl0, vl0 = k_loc_list[b0].contiguous(), v_loc_list[b0].contiguous()
-        kl1, vl1 = k_loc_list[b1].contiguous(), v_loc_list[b1].contiguous()
-        kp, vp = k_prefix.contiguous(), v_prefix.contiguous()
-        ks0, vs0, l_suf0 = _prep_suf(k_suffix_list[b0], v_suffix_list[b0], kl0, vl0)
-        ks1, vs1, l_suf1 = _prep_suf(k_suffix_list[b1], v_suffix_list[b1], kl1, vl1)
-        out0, out1 = torch.empty_like(q0), torch.empty_like(q1)
-        grid = lambda meta: (triton.cdiv(q_len, meta["BLOCK_M"]), h_q)
-        _shared_prefix_cfg2_attn_fwd[grid](
-            q0, q1, kp, vp, ks0, vs0, ks1, vs1, kl0, vl0, kl1, vl1, out0, out1,
-            q0.stride(0), q0.stride(1), q0.stride(2), q1.stride(0), q1.stride(1), q1.stride(2),
-            kp.stride(0), kp.stride(1), kp.stride(2), vp.stride(0), vp.stride(1), vp.stride(2),
-            ks0.stride(0), ks0.stride(1), ks0.stride(2), vs0.stride(0), vs0.stride(1), vs0.stride(2),
-            ks1.stride(0), ks1.stride(1), ks1.stride(2), vs1.stride(0), vs1.stride(1), vs1.stride(2),
-            kl0.stride(0), kl0.stride(1), kl0.stride(2), vl0.stride(0), vl0.stride(1), vl0.stride(2),
-            kl1.stride(0), kl1.stride(1), kl1.stride(2), vl1.stride(0), vl1.stride(1), vl1.stride(2),
-            out0.stride(0), out0.stride(1), out0.stride(2), out1.stride(0), out1.stride(1), out1.stride(2),
-            q_len, l_shared, l_suf0, l_suf1, sm_scale_log2, GQA_GROUP=gqa_group, HEAD_DIM=head_dim,
-        )
-        outputs[b0], outputs[b1] = out0, out1
-        handled.update((b0, b1))
-
-    elif use_triton and len(shared_branch_ids) == 3:
-        b0, b1, b2 = shared_branch_ids[0], shared_branch_ids[1], shared_branch_ids[2]
-        q0, q1, q2 = q_list[b0].contiguous(), q_list[b1].contiguous(), q_list[b2].contiguous()
-        kl0, vl0 = k_loc_list[b0].contiguous(), v_loc_list[b0].contiguous()
-        kl1, vl1 = k_loc_list[b1].contiguous(), v_loc_list[b1].contiguous()
-        kl2, vl2 = k_loc_list[b2].contiguous(), v_loc_list[b2].contiguous()
-        kp, vp = k_prefix.contiguous(), v_prefix.contiguous()
-        ks0, vs0, l_suf0 = _prep_suf(k_suffix_list[b0], v_suffix_list[b0], kl0, vl0)
-        ks1, vs1, l_suf1 = _prep_suf(k_suffix_list[b1], v_suffix_list[b1], kl1, vl1)
-        ks2, vs2, l_suf2 = _prep_suf(k_suffix_list[b2], v_suffix_list[b2], kl2, vl2)
-        out0, out1, out2 = torch.empty_like(q0), torch.empty_like(q1), torch.empty_like(q2)
-        grid = lambda meta: (triton.cdiv(q_len, meta["BLOCK_M"]), h_q)
-        _shared_prefix_cfg3_attn_fwd[grid](
-            q0, q1, q2, kp, vp, ks0, vs0, ks1, vs1, ks2, vs2,
-            kl0, vl0, kl1, vl1, kl2, vl2, out0, out1, out2,
-            q0.stride(0), q0.stride(1), q0.stride(2), q1.stride(0), q1.stride(1), q1.stride(2),
-            q2.stride(0), q2.stride(1), q2.stride(2), kp.stride(0), kp.stride(1), kp.stride(2),
-            vp.stride(0), vp.stride(1), vp.stride(2), ks0.stride(0), ks0.stride(1), ks0.stride(2),
-            vs0.stride(0), vs0.stride(1), vs0.stride(2), ks1.stride(0), ks1.stride(1), ks1.stride(2),
-            vs1.stride(0), vs1.stride(1), vs1.stride(2), ks2.stride(0), ks2.stride(1), ks2.stride(2),
-            vs2.stride(0), vs2.stride(1), vs2.stride(2), kl0.stride(0), kl0.stride(1), kl0.stride(2),
-            vl0.stride(0), vl0.stride(1), vl0.stride(2), kl1.stride(0), kl1.stride(1), kl1.stride(2),
-            vl1.stride(0), vl1.stride(1), vl1.stride(2), kl2.stride(0), kl2.stride(1), kl2.stride(2),
-            vl2.stride(0), vl2.stride(1), vl2.stride(2), out0.stride(0), out0.stride(1), out0.stride(2),
-            out1.stride(0), out1.stride(1), out1.stride(2), out2.stride(0), out2.stride(1), out2.stride(2),
-            q_len, l_shared, l_suf0, l_suf1, l_suf2, sm_scale_log2, GQA_GROUP=gqa_group, HEAD_DIM=head_dim,
-        )
-        outputs[b0], outputs[b1], outputs[b2] = out0, out1, out2
-        handled.update((b0, b1, b2))
-
     for b in range(num_branches):
-        if b in handled:
-            continue
         k_suf, v_suf = k_suffix_list[b], v_suffix_list[b]
-        if b in shared_branch_ids and l_shared > 0:
+        if b in shared_branch_ids and l_shared > 0 and k_prefix is not None and v_prefix is not None:
             k_suf = torch.cat([k_prefix, k_suf], dim=0) if (k_suf is not None and k_suf.shape[0] > 0) else k_prefix
             v_suf = torch.cat([v_prefix, v_suf], dim=0) if (v_suf is not None and v_suf.shape[0] > 0) else v_prefix
         outputs[b] = _run_unshared_single_branch(
@@ -1149,6 +800,7 @@ def _ensure_contextvar_naive_merge_hook() -> None:
         )
         patch.merge_calls += 1
         patch.last_shared_prefix_len = sp.shared_prefix_len
+        patch.max_shared_prefix_len = max(patch.max_shared_prefix_len, sp.shared_prefix_len)
         patch.last_unique_kv_tokens = sp.unique_kv_tokens
         patch.last_naive_kv_tokens = sp.naive_kv_tokens
         patch.last_padded_naive_kv_tokens = sp.padded_naive_kv_tokens
@@ -1158,13 +810,19 @@ def _ensure_contextvar_naive_merge_hook() -> None:
 
 
 class BagelSharedPrefixPatch:
-    """ContextVar-scoped SharedPrefixCache + FlashPrefix-CFG attention hook for a `BagelPipeline`."""
+    """ContextVar-scoped SharedPrefixCache (LECP CoW) + Cascade-CFG attention hook for `BagelPipeline`."""
 
-    def __init__(self, pipeline: Any, min_shared_tokens: int = 32) -> None:
+    def __init__(
+        self,
+        pipeline: Any,
+        min_shared_tokens: int = 32,
+        allow_cascade_split: bool = True,
+    ) -> None:
         self.pipeline = pipeline
         self.bagel = pipeline.bagel
         self.layers = pipeline.bagel.language_model.model.layers
         self.min_shared_tokens = int(min_shared_tokens)
+        self.allow_cascade_split = bool(allow_cascade_split)
         self.enabled = False
         self._installed = False
         self._orig_forward_gens: list[tuple[Any, Any]] = []
@@ -1173,8 +831,10 @@ class BagelSharedPrefixPatch:
     def reset_telemetry(self) -> None:
         self.merge_calls = 0
         self.shared_attn_calls = 0
+        self.cascade_split_calls = 0
         self.unpadded_single_branch_calls = 0
         self.last_shared_prefix_len = 0
+        self.max_shared_prefix_len = 0
         self.last_unique_kv_tokens = 0
         self.last_naive_kv_tokens = 0
         self.last_padded_naive_kv_tokens = 0
@@ -1268,6 +928,8 @@ class BagelSharedPrefixPatch:
                     ]
 
                     lidx = mod.layer_idx
+                    mode_backend = "cascade_cfg" if patch.allow_cascade_split else "lossless_varlen"
+                    call_stats: dict[str, int] = {}
                     branch_outs = shared_prefix_cfg_attention(
                         q_list=q_list,
                         k_loc_list=k_loc_list,
@@ -1279,9 +941,12 @@ class BagelSharedPrefixPatch:
                         v_suffix_list=[past_key_values.branch_suffix_v[b][lidx] for b in range(num_branches)],
                         sm_scale=1.0 / math.sqrt(mod.head_dim),
                         attn_noncausal=mod.attn_noncausal,
+                        backend=mode_backend,
+                        stats_out=call_stats,
                     )
                     if past_key_values.shared_prefix_len > 0:
                         patch.shared_attn_calls += 1
+                        patch.cascade_split_calls += int(call_stats.get("cascade_split_executed", 0))
                     patch.unpadded_single_branch_calls += len(past_key_values.unshared_branch_ids)
 
                     attn_out = torch.stack(branch_outs, dim=0).reshape(num_branches, -1, mod.q_size)
@@ -1312,25 +977,40 @@ class BagelSharedPrefixPatch:
         for attn_mod, orig_fn in self._orig_forward_gens:
             attn_mod._forward_gen = orig_fn
         self._orig_forward_gens.clear()
+        _DIRECT_WS_CACHE.clear()
+        _CU_SEQLENS_CACHE.clear()
+        _ATTN_META_CACHE.clear()
         self._installed = False
 
     @contextmanager
-    def active(self, reset_stats: bool = True):
+    def active(self, reset_stats: bool = True, allow_cascade_split: bool | None = None):
         if not self._installed:
             self.install()
         if reset_stats:
             self.reset_telemetry()
         prev_enabled = self.enabled
+        prev_split = self.allow_cascade_split
+        if allow_cascade_split is not None:
+            self.allow_cascade_split = bool(allow_cascade_split)
         tok = _ACTIVE_CFG_PATCH.set(self)
         self.enabled = True
         try:
             yield self
         finally:
             self.enabled = prev_enabled
+            self.allow_cascade_split = prev_split
             _ACTIVE_CFG_PATCH.reset(tok)
 
 
-def install_shared_prefix_bagel_hooks(pipeline: Any, min_shared_tokens: int = 32) -> BagelSharedPrefixPatch:
-    patch = BagelSharedPrefixPatch(pipeline, min_shared_tokens=min_shared_tokens)
+def install_shared_prefix_bagel_hooks(
+    pipeline: Any,
+    min_shared_tokens: int = 32,
+    allow_cascade_split: bool = True,
+) -> BagelSharedPrefixPatch:
+    patch = BagelSharedPrefixPatch(
+        pipeline,
+        min_shared_tokens=min_shared_tokens,
+        allow_cascade_split=allow_cascade_split,
+    )
     patch.install()
     return patch

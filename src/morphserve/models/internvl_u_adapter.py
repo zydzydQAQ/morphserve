@@ -1,9 +1,11 @@
-"""Deep `InternVLUCPTGAdapter` (`bridge_mllm_dit`) built atop `LayerExpertPager` + `c62ec05` shims."""
+"""Deep `InternVLUCPTGAdapter` (`bridge_mllm_dit`) built atop `LayerExpertPager` + dual-regime HBM accounting."""
 
 from __future__ import annotations
 
 import gc
 import inspect
+import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -19,9 +21,152 @@ from morphserve.vmm import (
     drop_partition_weights,
 )
 
-from .base import CPTGModelAdapter, PackedTransferState
+from .base import CPTGModelAdapter, PackedTransferState, compute_vmm_available_kv_bytes
 
 MIB = 1024**2
+GIB = 1024**3
+
+
+def compute_internvlu_memory_plan(
+    *,
+    total_dev_mib: float,
+    free_dev_mib: float,
+    base_pytorch_alloc_mib: float,
+    mirror_bytes: int,
+    policy_super_pool_mib: int,
+    policy_fine_kv_pool_mib: int,
+    super_handle_mib: int = 64,
+    allow_vmm_overflow: bool = True,
+    gpu_memory_fraction: float | None = None,
+    gpu_memory_quota_mib: float | None = None,
+) -> dict[str, Any]:
+    """Compute physical `TriPoolVMM` + PyTorch budget plan for `InternVL-U` Regime A (40/80GB) & Regime B (12GiB).
+
+    Guarantees:
+      1. Unconstrained 40GB/80GB Regime A: sizes `super_pool_mib >= aligned_mirror_mib + 5632 MiB`
+         (when HBM permits) so all 20 `generation_decoder` blocks (`~5.0 GiB`) and `1024^2` scoped
+         `vae.decode` spikes coexist with zero premature expert evictions and zero H2D stalls.
+      2. Quota-capped 12GiB Regime B: enforces `pytorch_cap_mib + super_pool_mib + fine_kv_pool_mib <= usable_quota_mib`
+         strictly `<= 12 GiB` (`12,288 MiB`) with `allow_overflow = False` while ensuring `super_pool_mib >= mirror_mib`.
+    """
+    handle_mib = max(2, int(super_handle_mib))
+    mirror_mib = int(math.ceil(max(0, int(mirror_bytes)) / float(MIB)))
+    aligned_mirror_mib = ((mirror_mib + handle_mib - 1) // handle_mib) * handle_mib if mirror_mib > 0 else 0
+
+    raw_quota_mib: float | None = None
+    if gpu_memory_quota_mib is not None and float(gpu_memory_quota_mib) > 0.0:
+        raw_quota_mib = float(gpu_memory_quota_mib)
+    elif gpu_memory_fraction is not None and float(gpu_memory_fraction) < 0.999:
+        frac_mib = float(total_dev_mib) * float(gpu_memory_fraction)
+        if (
+            not allow_vmm_overflow
+            and aligned_mirror_mib > 0
+            and int(policy_super_pool_mib) >= aligned_mirror_mib
+            and frac_mib < float(aligned_mirror_mib) + float(base_pytorch_alloc_mib) + 1_024.0
+        ):
+            # Caller (`compute_internvlu_memory_quota_overrides`) passed an explicit VMM pool
+            # alongside a pre-discounted PyTorch startup cap (`~8,640 MiB` out of `12,288 MiB`).
+            super_mib = max(aligned_mirror_mib, (int(policy_super_pool_mib) // handle_mib) * handle_mib)
+            fine_mib = max(0, (int(policy_fine_kv_pool_mib) // 2) * 2)
+            vmm_mib = super_mib + fine_mib
+            if 11_500.0 <= float(vmm_mib) + frac_mib <= 14_000.0:
+                inferred_quota_mib = 12_288.0
+            else:
+                inferred_quota_mib = float(vmm_mib) + frac_mib
+            usable_quota_mib = max(float(handle_mib * 2), inferred_quota_mib - 128.0)
+            if float(vmm_mib) + float(base_pytorch_alloc_mib) + 256.0 > usable_quota_mib:
+                super_mib = max(
+                    handle_mib,
+                    int((usable_quota_mib - float(base_pytorch_alloc_mib) - 256.0 - fine_mib) // handle_mib)
+                    * handle_mib,
+                )
+                vmm_mib = super_mib + fine_mib
+            pytorch_cap_mib = min(frac_mib, max(float(base_pytorch_alloc_mib), usable_quota_mib - float(vmm_mib)))
+            if pytorch_cap_mib + float(vmm_mib) > inferred_quota_mib:
+                super_mib = max(
+                    handle_mib,
+                    int((inferred_quota_mib - pytorch_cap_mib - fine_mib) // handle_mib) * handle_mib,
+                )
+                vmm_mib = super_mib + fine_mib
+            pt_frac = min(float(gpu_memory_fraction), max(0.05, pytorch_cap_mib / max(1.0, float(total_dev_mib))))
+            return {
+                "quota_constrained": True,
+                "quota_mib": round(inferred_quota_mib, 2),
+                "usable_quota_mib": round(usable_quota_mib, 2),
+                "super_pool_mib": int(super_mib),
+                "fine_kv_pool_mib": int(fine_mib),
+                "vmm_physical_pool_mib": int(vmm_mib),
+                "pytorch_cap_mib": round(pytorch_cap_mib, 2),
+                "pytorch_memory_fraction": round(pt_frac, 6),
+                "allow_overflow": False,
+            }
+        raw_quota_mib = frac_mib
+        if 11_500.0 <= raw_quota_mib <= 12_500.0:
+            raw_quota_mib = min(raw_quota_mib, 12_288.0)
+
+    if raw_quota_mib is not None:
+        ctx_headroom_mib = 256.0
+        usable_quota_mib = max(float(handle_mib * 2), raw_quota_mib - ctx_headroom_mib)
+        fine_mib = min(max(0, (int(policy_fine_kv_pool_mib) // 2) * 2), 64)
+        min_super_mib = max(handle_mib, aligned_mirror_mib)
+        min_pt_act_mib = 1_536.0
+
+        hard_max_super = max(
+            handle_mib,
+            int((usable_quota_mib - (float(base_pytorch_alloc_mib) + min_pt_act_mib) - fine_mib) // handle_mib)
+            * handle_mib,
+        )
+        desired_super = max(min_super_mib, int(policy_super_pool_mib))
+        if min_super_mib + fine_mib + float(base_pytorch_alloc_mib) + 1_024.0 <= usable_quota_mib:
+            super_mib = max(min_super_mib, min(desired_super, hard_max_super))
+        else:
+            super_mib = min(desired_super, hard_max_super)
+        super_mib = max(handle_mib, (int(super_mib) // handle_mib) * handle_mib)
+
+        pytorch_cap_mib = max(float(base_pytorch_alloc_mib) + 512.0, usable_quota_mib - float(super_mib + fine_mib))
+        if pytorch_cap_mib + float(super_mib + fine_mib) > usable_quota_mib:
+            super_mib = max(
+                handle_mib,
+                int((usable_quota_mib - pytorch_cap_mib - fine_mib) // handle_mib) * handle_mib,
+            )
+            pytorch_cap_mib = max(float(base_pytorch_alloc_mib), usable_quota_mib - float(super_mib + fine_mib))
+
+        max_frac = float(gpu_memory_fraction) if gpu_memory_fraction is not None else 1.0
+        pt_frac = min(max_frac, max(0.05, pytorch_cap_mib / max(1.0, float(total_dev_mib))))
+        return {
+            "quota_constrained": True,
+            "quota_mib": round(raw_quota_mib, 2),
+            "usable_quota_mib": round(usable_quota_mib, 2),
+            "super_pool_mib": int(super_mib),
+            "fine_kv_pool_mib": int(fine_mib),
+            "vmm_physical_pool_mib": int(super_mib + fine_mib),
+            "pytorch_cap_mib": round(pytorch_cap_mib, 2),
+            "pytorch_memory_fraction": round(pt_frac, 6),
+            "allow_overflow": False,
+        }
+
+    fine_mib = max(0, (int(policy_fine_kv_pool_mib) // 2) * 2)
+    desired_super = max(
+        int(policy_super_pool_mib),
+        (aligned_mirror_mib + 5_632) if aligned_mirror_mib > 0 else int(policy_super_pool_mib),
+    )
+    if float(free_dev_mib) > 0.0:
+        safe_ceiling = max(max(handle_mib, aligned_mirror_mib), int(float(free_dev_mib) - 8_192.0 - fine_mib))
+        super_mib = min(desired_super, safe_ceiling)
+    else:
+        super_mib = desired_super
+    super_mib = max(handle_mib, ((int(super_mib) + handle_mib - 1) // handle_mib) * handle_mib)
+    return {
+        "quota_constrained": False,
+        "quota_mib": None,
+        "usable_quota_mib": None,
+        "super_pool_mib": int(super_mib),
+        "fine_kv_pool_mib": int(fine_mib),
+        "vmm_physical_pool_mib": int(super_mib + fine_mib),
+        "pytorch_cap_mib": None,
+        "pytorch_memory_fraction": None,
+        "allow_overflow": bool(allow_vmm_overflow),
+    }
 
 
 def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
@@ -103,12 +248,25 @@ def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
         sys.modules["transformers.models.internvl.video_processing_internvl"] = vpi_mod
 
 
+def _drop_module_params_to_empty_device(mod: Any, dev: Any) -> None:
+    import torch
+
+    for p in mod.parameters():
+        p.data = torch.empty(0, dtype=p.dtype, device=dev)
+    for b in mod.buffers():
+        b.data = b.data.to(dev)
+
+
 def load_internvlu_pipeline(
     model_dir: Path,
     vendor_dir: Path | None = None,
     device_index: int = 0,
+    *,
+    defer_decoder_gpu: bool = False,
+    drop_vlm_on_load: bool = False,
+    drop_vae_on_load: bool = False,
 ) -> Any:
-    """Load `InternVLUPipeline` with `low_cpu_mem_usage=False` & `UnifiedMSRoPE` meta-tensor guard (`c62ec05`)."""
+    """Load `InternVLUPipeline` avoiding redundant GPU weight spikes when paging or fissioning (`c62ec05`)."""
     import torch
 
     if vendor_dir is None:
@@ -252,7 +410,25 @@ def load_internvlu_pipeline(
         scheduler=scheduler,
         processor=processor,
     )
-    pipe = pipe.to(dev)
+
+    if drop_vlm_on_load:
+        _drop_module_params_to_empty_device(pipe.vlm, dev)
+    else:
+        pipe.vlm.to(dev)
+
+    if drop_vae_on_load:
+        _drop_module_params_to_empty_device(pipe.vae, dev)
+    else:
+        pipe.vae.to(dev)
+
+    if defer_decoder_gpu:
+        # Keep 5 GiB decoder parameters on CPU for direct copy into NumaMemfdMirror / CPU offloader
+        # without ever touching GPU `cudaMalloc` during model load!
+        for b in pipe.generation_decoder.buffers():
+            b.data = b.data.to(dev)
+    else:
+        pipe.generation_decoder.to(dev)
+
     # Materialize non-persistent plain tensor attributes (e.g. UnifiedMSRoPE.all_inv_freqs) (`c62ec05`)
     for root_mod in (pipe.vlm, pipe.generation_decoder, pipe.vae):
         for mod in root_mod.modules():
@@ -272,6 +448,8 @@ def load_internvlu_pipeline(
     pipe.vlm.eval()
     pipe.generation_decoder.eval()
     pipe.vae.eval()
+    gc.collect()
+    torch.cuda.empty_cache()
     return pipe
 
 
@@ -354,6 +532,50 @@ def unpack_internvlu_bridge_state(meta: dict[str, Any], flat_u8: Any) -> dict[st
     return {k: _dec(v) for k, v in meta["tree"].items()}
 
 
+def _trim_internvlu_generated_tokens(seq: Any, tokenizer: Any) -> list[int]:
+    """Strip right-padded PAD/EOS/`<|im_end|>`/`<img>` tokens so batch length never distorts `tpots_ms`."""
+    raw_ids = [int(x) for x in (seq.detach().cpu().tolist() if hasattr(seq, "detach") else list(seq))]
+    if not raw_ids:
+        return []
+
+    stop_ids: set[int] = set()
+    pad_id: int | None = None
+    if tokenizer is not None:
+        raw_pad = getattr(tokenizer, "pad_token_id", None)
+        if isinstance(raw_pad, int) and raw_pad >= 0:
+            pad_id = int(raw_pad)
+        raw_eos = getattr(tokenizer, "eos_token_id", None)
+        if isinstance(raw_eos, int) and raw_eos >= 0:
+            stop_ids.add(int(raw_eos))
+        elif isinstance(raw_eos, (list, tuple, set)):
+            for eid in raw_eos:
+                if isinstance(eid, int) and eid >= 0:
+                    stop_ids.add(int(eid))
+        conv_fn = getattr(tokenizer, "convert_tokens_to_ids", None)
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        if callable(conv_fn):
+            for tok_str in ("<|im_end|>", "<|endoftext|>", "<img>"):
+                try:
+                    tid = conv_fn(tok_str)
+                except Exception:
+                    tid = None
+                if isinstance(tid, int) and tid >= 0 and tid != unk_id:
+                    stop_ids.add(int(tid))
+
+    # Truncate right after the first semantic stop token (`eos` / `<|im_end|>` / `<img>`) when `pad_id != stop_id`,
+    # then strip trailing right-padding tokens.
+    non_pad_stops = stop_ids - ({pad_id} if pad_id is not None else set())
+    trimmed = raw_ids
+    for idx, tid in enumerate(raw_ids):
+        if tid in non_pad_stops:
+            trimmed = raw_ids[: idx + 1]
+            break
+    if pad_id is not None:
+        while len(trimmed) > 1 and trimmed[-1] == pad_id:
+            trimmed.pop()
+    return trimmed
+
+
 class InternVLUCPTGAdapter(CPTGModelAdapter):
     """Production `InternVL-U` (`bridge_mllm_dit`) adapter running inside `MorphServeClusterEngine`."""
 
@@ -376,17 +598,39 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         self.numa_node = int(numa_node)
         self.role = policy.role_of(self.rank)
         self.device = torch.device(f"cuda:{self.rank}")
+
+        is_static_fission = policy.routing_mode == "static_nccl_fission"
+        defer_decoder = bool(
+            policy.use_expert_pager or policy.use_naive_offload or (is_static_fission and self.role == "und")
+        )
+        drop_vlm = bool(is_static_fission and self.role == "gen")
+        drop_vae = bool(is_static_fission and self.role == "und")
+
+        # Enforce startup cap immediately during `load_internvlu_pipeline` (even when `use_tripool_vmm=True`),
+        # then tighten PyTorch's fraction in `bind_runtime_resources` before `TriPoolVMM` allocates `cuMemCreate`!
         if getattr(policy, "gpu_memory_fraction", None) is not None:
             torch.cuda.set_per_process_memory_fraction(float(policy.gpu_memory_fraction), self.device)
-        vendor_p = Path(policy.vendor_dir) if getattr(policy, "vendor_dir", None) else None
 
-        self.pipe = load_internvlu_pipeline(self.model_dir, vendor_dir=vendor_p, device_index=self.rank)
+        vendor_p = Path(policy.vendor_dir) if getattr(policy, "vendor_dir", None) else None
+        self.pipe = load_internvlu_pipeline(
+            self.model_dir,
+            vendor_dir=vendor_p,
+            device_index=self.rank,
+            defer_decoder_gpu=defer_decoder,
+            drop_vlm_on_load=drop_vlm,
+            drop_vae_on_load=drop_vae,
+        )
+
         self.pager: LayerExpertPager | None = None
         self.naive_offloader: NaiveHostOffloader | None = None
         self.vmm: TriPoolVMM | None = None
         self.pacer: Any = None
         self._ctx_store: dict[str, dict[str, Any]] = {}
+        self._vmm_initial_pool_mib: float = 0.0
+        self._memory_plan: dict[str, Any] = {}
+        self._quota_constrained: bool = False
         self._max_reserved_mib = 0.0
+        self._max_pytorch_reserved_mib = 0.0
 
         dec_spec = ExpertPartitionSpec.for_internvlu(
             self.pipe,
@@ -395,18 +639,9 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         )
         self.num_expert_layers = dec_spec.num_layers
 
-        if policy.routing_mode == "static_nccl_fission":
+        if is_static_fission:
             if self.role == "und":
                 drop_partition_weights(dec_spec, device=self.device)
-                for p in self.pipe.vae.parameters():
-                    p.data = torch.empty(0, dtype=p.dtype, device=self.device)
-                gc.collect()
-                torch.cuda.empty_cache()
-            elif self.role == "gen":
-                for p in self.pipe.vlm.parameters():
-                    p.data = torch.empty(0, dtype=p.dtype, device=self.device)
-                gc.collect()
-                torch.cuda.empty_cache()
         elif policy.use_naive_offload:
             self.naive_offloader = NaiveHostOffloader(dec_spec, device=self.device)
             self.naive_offloader.offload_to_cpu()
@@ -425,30 +660,100 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         else:
             self.pager.offload_to_host_mirror()
 
+    def _vmm_physical_pool_mib(self) -> float:
+        if self.vmm is None:
+            return 0.0
+        st = self.vmm.stats_dict()
+        if "pool_total_bytes" in st:
+            return float(st["pool_total_bytes"]) / MIB
+        if "physical_pool_bytes" in st:
+            return float(st["physical_pool_bytes"]) / MIB
+        overflow_b = int(st.get("overflow_creates", 0)) * int(
+            st.get("super_handle_bytes", int(self.policy.super_handle_mib) * MIB)
+        )
+        return self._vmm_initial_pool_mib + float(overflow_b) / MIB
+
+    def available_kv_bytes(self, *, for_dit: bool = False) -> int:
+        import torch
+
+        if self.vmm is not None:
+            return compute_vmm_available_kv_bytes(
+                self.vmm,
+                has_pageable_experts=(self.pager is not None),
+                for_dit=for_dit,
+            )
+        if not torch.cuda.is_available():
+            return 0
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        if getattr(self.policy, "gpu_memory_fraction", None) is not None:
+            quota_b = int(total_drv * float(self.policy.gpu_memory_fraction))
+            alloc_b = int(torch.cuda.memory_allocated(self.device))
+            return max(0, quota_b - alloc_b - 256 * MIB)
+        return max(0, int(free_drv) - 1024 * MIB)
+
     def bind_runtime_resources(self, pacer: Any | None = None) -> dict[str, Any]:
         import torch
 
         self.pacer = pacer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        free_b, total_b = torch.cuda.mem_get_info(self.device)
+        total_dev_mib = float(total_b / MIB)
+        free_dev_mib = float(free_b / MIB)
+        base_pt_mib = float(torch.cuda.memory_allocated(self.device) / MIB)
+
         if self.policy.use_tripool_vmm:
-            pool_mib = int(self.policy.super_pool_mib)
+            plan = compute_internvlu_memory_plan(
+                total_dev_mib=total_dev_mib,
+                free_dev_mib=free_dev_mib,
+                base_pytorch_alloc_mib=base_pt_mib,
+                mirror_bytes=self.total_mirror_bytes,
+                policy_super_pool_mib=int(self.policy.super_pool_mib),
+                policy_fine_kv_pool_mib=int(self.policy.fine_kv_pool_mib),
+                super_handle_mib=int(self.policy.super_handle_mib),
+                allow_vmm_overflow=bool(self.policy.allow_vmm_overflow),
+                gpu_memory_fraction=getattr(self.policy, "gpu_memory_fraction", None),
+                gpu_memory_quota_mib=getattr(self.policy, "gpu_memory_quota_mib", None),
+            )
+            self._memory_plan = plan
+            self._quota_constrained = bool(plan["quota_constrained"])
+            if plan["pytorch_memory_fraction"] is not None:
+                torch.cuda.set_per_process_memory_fraction(float(plan["pytorch_memory_fraction"]), self.device)
+
+            self._vmm_initial_pool_mib = float(plan["vmm_physical_pool_mib"])
             self.vmm = TriPoolVMM(
                 device=self.rank,
-                super_pool_mib=pool_mib,
-                fine_kv_pool_mib=self.policy.fine_kv_pool_mib,
-                super_handle_mib=self.policy.super_handle_mib,
-                transient_va_gib=self.policy.transient_va_gib,
-                kv_va_gib=self.policy.kv_va_gib,
-                allow_overflow=self.policy.allow_vmm_overflow,
+                super_pool_mib=int(plan["super_pool_mib"]),
+                fine_kv_pool_mib=int(plan["fine_kv_pool_mib"]),
+                super_handle_mib=int(self.policy.super_handle_mib),
+                transient_va_gib=int(self.policy.transient_va_gib),
+                kv_va_gib=int(self.policy.kv_va_gib),
+                allow_overflow=bool(plan["allow_overflow"]),
             )
             if self.pager is not None:
-                self.pager.bind_vmm(self.vmm, initial_alpha=self.policy.initial_alphas.get(self.rank, 1.0))
+                init_alpha = float(self.policy.initial_alphas.get(self.rank, 1.0))
+                if not bool(plan["allow_overflow"]):
+                    max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
+                    max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
+                    init_alpha = min(init_alpha, max_fit_alpha)
+                self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
+        else:
+            self._quota_constrained = getattr(self.policy, "gpu_memory_fraction", None) is not None
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
-        self._max_reserved_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        self._max_pytorch_reserved_mib = pt_mib
+        self._max_reserved_mib = pt_mib + self._vmm_physical_pool_mib()
         return {
             "resident_alpha": self.resident_alpha(),
-            "reserved_mib": round(self._max_reserved_mib, 2),
+            "reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "combined_physical_mib": round(self._max_reserved_mib, 2),
+            "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
+            "kv_free_bytes": self.available_kv_bytes(),
+            "memory_plan": dict(self._memory_plan),
         }
 
     def warmup(self) -> None:
@@ -459,11 +764,12 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
         cur = float(torch.cuda.memory_reserved(self.device) / MIB)
         pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
-        self._max_reserved_mib = max(self._max_reserved_mib, cur, pk)
+        pt_peak = max(cur, pk)
+        self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
+        self._max_reserved_mib = max(self._max_reserved_mib, pt_peak + self._vmm_physical_pool_mib())
 
     def _load_pil_if_any(self, cmd: dict[str, Any]) -> Any:
         from PIL import Image
-        import os
 
         paths = cmd.get("image_paths") or []
         if not paths:
@@ -482,10 +788,16 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
         prompt = str(cmd["prompt"])
         prep_dit = bool(cmd.get("prepare_for_dit", False))
+        prev_ent = self._ctx_store.get(ctx_id)
         pil_img = self._load_pil_if_any(cmd)
+        if pil_img is None and prev_ent is not None and not (cmd.get("image_paths")):
+            pil_img = prev_ent.get("pil_img")
         if not prep_dit:
             self._ctx_store[ctx_id] = {"prompt": prompt, "pil_img": pil_img, "bridge_bytes": 4096}
             return 4096
+
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
 
         h = int(cmd.get("height", 512))
         w = int(cmd.get("width", 512))
@@ -516,8 +828,11 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 generation_flags=inp["generation_flags"],
                 vlm_hidden_states=v_out.hidden_states,
             )
+            del inp, v_out
             meta, flat = pack_internvlu_bridge_state(diff_inp, device=self.device)
-        torch.cuda.synchronize(self.device)
+        torch.cuda.current_stream(self.device).synchronize()
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
         b_bytes = int(meta["total_bytes"])
         self._ctx_store[ctx_id] = {
             "prompt": prompt,
@@ -538,6 +853,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         entry = self._ctx_store[ctx_id]
         prompt = entry["prompt"]
         pil_img = entry.get("pil_img")
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
         t0 = time.perf_counter()
         with torch.inference_mode():
             out = self.pipe(
@@ -547,12 +864,14 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 max_new_tokens=int(max_tokens),
                 do_sample=False,
             )
-        torch.cuda.synchronize(self.device)
+        torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t0) * 1000.0
-        tok_seq = out.generate_output[0]
+        tok_seq = _trim_internvlu_generated_tokens(out.generate_output[0], self.pipe.tokenizer)
         n_tok = max(1, int(len(tok_seq)))
-        txt = self.pipe.tokenizer.decode(tok_seq, skip_special_tokens=True)
+        txt = self.pipe.tokenizer.decode(tok_seq, skip_special_tokens=True) if tok_seq else ""
         per_tok = dt_ms / float(n_tok)
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
         self._update_hwm()
         return {
             "text": txt,
@@ -561,7 +880,97 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             "tpots_ms": [round(per_tok, 2) for _ in range(max(0, n_tok - 1))],
             "kv_bytes": int(entry.get("bridge_bytes", 4096)),
             "resident_alpha": self.resident_alpha(),
+            "kv_free_bytes": self.available_kv_bytes(),
         }
+
+    def decode_ar_batch(self, batch_cmds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Batched `[B, L]` VLM greedy decoding for concurrent text-only requests; CoT-aware fallback for multimodal."""
+        import torch
+
+        if not batch_cmds:
+            return []
+
+        if any(bool(c.get("prepare_for_dit")) for c in batch_cmds):
+            # Visual-CoT (`cot_then_dit`): decode CoT text FIRST, then condition the diffusion bridge state on it!
+            results: list[dict[str, Any]] = []
+            for cmd in batch_cmds:
+                cid = str(cmd["ctx_id"])
+                enq_s = float(cmd.get("enqueue_time_s", 0.0))
+                t_cmd0 = time.perf_counter()
+                if not cmd.get("_skip_prepare", False):
+                    self.prepare_turn(cid, dict(cmd, prepare_for_dit=False))
+                ar_out = self.decode_ar(cid, max(1, int(cmd.get("max_ar_tokens", 32))))
+                if bool(cmd.get("prepare_for_dit")):
+                    base_prompt = str(cmd.get("prompt", self._ctx_store[cid].get("prompt", "")))
+                    cot_prompt = f"{base_prompt}\n{ar_out['text']}".strip() if ar_out.get("text") else base_prompt
+                    b_bytes = self.prepare_turn(cid, dict(cmd, prompt=cot_prompt, prepare_for_dit=True))
+                    ar_out["kv_bytes"] = b_bytes
+                    ar_out["kv_free_bytes"] = self.available_kv_bytes()
+                    ar_out["resident_alpha"] = self.resident_alpha()
+                if enq_s > 0.0:
+                    ar_out["ttft_ms"] = round(float(ar_out["ttft_ms"]) + max(0.0, (t_cmd0 - enq_s) * 1000.0), 2)
+                results.append(ar_out)
+            return results
+
+        if len(batch_cmds) <= 1 or any(bool(c.get("image_paths")) for c in batch_cmds):
+            return super().decode_ar_batch(batch_cmds)
+
+        t_start = time.perf_counter()
+        prompts: list[str] = []
+        max_toks: list[int] = []
+        for cmd in batch_cmds:
+            cid = str(cmd["ctx_id"])
+            if not cmd.get("_skip_prepare", False):
+                self.prepare_turn(cid, cmd)
+            prompts.append(str(self._ctx_store[cid]["prompt"]))
+            max_toks.append(max(1, int(cmd.get("max_ar_tokens", 32))))
+
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
+
+        t_gen0 = time.perf_counter()
+        with torch.inference_mode():
+            out = self.pipe(
+                prompt=prompts,
+                image=None,
+                generation_mode="text",
+                max_new_tokens=max(max_toks),
+                do_sample=False,
+            )
+        torch.cuda.current_stream(self.device).synchronize()
+        dt_ms = (time.perf_counter() - t_gen0) * 1000.0
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
+        self._update_hwm()
+
+        alpha_now = self.resident_alpha()
+        free_kv_now = self.available_kv_bytes()
+        trimmed_seqs = [
+            _trim_internvlu_generated_tokens(out.generate_output[idx][: max_toks[idx]], self.pipe.tokenizer)
+            for idx in range(len(batch_cmds))
+        ]
+        max_steps_executed = max((max(1, len(s)) for s in trimmed_seqs), default=1)
+        per_step_ms = dt_ms / float(max_steps_executed)
+        results = []
+        for idx, cmd in enumerate(batch_cmds):
+            enq_s = float(cmd.get("enqueue_time_s", 0.0))
+            q_wait_ms = max(0.0, (t_start - enq_s) * 1000.0) if enq_s > 0.0 else 0.0
+            seq = trimmed_seqs[idx]
+            n_tok = max(1, int(len(seq)))
+            txt = self.pipe.tokenizer.decode(seq, skip_special_tokens=True) if seq else ""
+            results.append(
+                {
+                    "text": txt,
+                    "tokens": n_tok,
+                    "ttft_ms": round(q_wait_ms + per_step_ms, 2),
+                    "tpots_ms": [round(per_step_ms, 2) for _ in range(max(0, n_tok - 1))],
+                    "kv_bytes": 4096,
+                    "resident_alpha": alpha_now,
+                    "kv_free_bytes": free_kv_now,
+                    "batched_width": len(batch_cmds),
+                }
+            )
+        return results
 
     def pack_state(self, ctx_id: str, include_cfg_dup: bool = False) -> PackedTransferState:
         entry = self._ctx_store[ctx_id]
@@ -600,8 +1009,19 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         import torch
 
         entry = self._ctx_store[ctx_id]
-        if "diff_inp" not in entry:
-            self.prepare_turn(ctx_id, dict(cmd, prepare_for_dit=True))
+        stride = self.pipe.processor.image_gen_processor.merge_size * self.pipe.processor.image_gen_processor.patch_size
+        req_h = int(cmd.get("height", entry.get("gh", 512)))
+        req_w = int(cmd.get("width", entry.get("gw", 512)))
+        req_gh, req_gw = (req_h // stride) * stride, (req_w // stride) * stride
+
+        if "diff_inp" not in entry or (
+            (req_gh, req_gw) != (int(entry["gh"]), int(entry["gw"])) and getattr(self.pipe, "vlm", None) is not None
+        ):
+            eff_prompt = str(entry.get("prompt") or cmd.get("prompt", ""))
+            self.prepare_turn(
+                ctx_id,
+                dict(cmd, prompt=eff_prompt, height=req_gh, width=req_gw, prepare_for_dit=True),
+            )
             entry = self._ctx_store[ctx_id]
 
         diff_inp = entry["diff_inp"]
@@ -610,6 +1030,9 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         steps = int(cmd.get("dit_steps", 16))
         seed = int(cmd.get("seed", 42))
         save_tmp_path = cmd.get("save_tmp_image_path")
+
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
 
         t0 = time.perf_counter()
         if self.naive_offloader is not None:
@@ -631,7 +1054,10 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             with torch.inference_mode():
                 if self.pager is not None:
                     with self.pager.generation_mode(prefetch_all=True):
-                        imgs_t = self.pipe.image_pipeline(
+                        # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
+                        # `generation_decoder.prepare_forward_input` BEFORE `transformer_blocks[0]`'s pre-hook!
+                        self.pager.wait_layer_if_needed(0, "prepare_forward_input")
+                        latents_out = self.pipe.image_pipeline(
                             **diff_inp,
                             all_cfg_scale=4.5,
                             part_cfg_scale=2.0,
@@ -641,9 +1067,25 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                             height=gh,
                             width=gw,
                             generator=gen,
+                            output_type="latent",
                         ).images
+                    # Run QwenImage VAE decode OUTSIDE `generation_mode` so decoder blocks are unpinned
+                    # under 12 GiB quota while staying 100% resident under ample 40/80 GB `super_pool`!
+                    imgs_t = self.pipe.image_pipeline.latents_to_pixels(latents_out.to(torch.bfloat16))
+                    del latents_out
                 else:
                     imgs_t = self.pipe.image_pipeline(
+                        **diff_inp,
+                        all_cfg_scale=4.5,
+                        part_cfg_scale=2.0,
+                        num_inference_steps=steps,
+                        num_images_per_prompt=1,
+                        use_resolution_binning=False,
+                        height=gh,
+                        width=gw,
+                        generator=gen,
+                        generator_device=None,
+                    ).images if "generator_device" in inspect.signature(self.pipe.image_pipeline.__call__).parameters else self.pipe.image_pipeline(
                         **diff_inp,
                         all_cfg_scale=4.5,
                         part_cfg_scale=2.0,
@@ -660,13 +1102,16 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             if self.naive_offloader is not None:
                 self.naive_offloader.drop_from_gpu()
 
-        torch.cuda.synchronize(self.device)
+        torch.cuda.current_stream(self.device).synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         if save_tmp_path:
             out_c = ((127.5 * imgs_t[0] + 128.0) / 255.0).clamp(0, 1)
             pil = Image.fromarray((out_c.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
             Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
             pil.save(save_tmp_path, format="PNG")
+        del imgs_t
+        if self._quota_constrained:
+            torch.cuda.empty_cache()
 
         self._update_hwm()
         return {
@@ -675,6 +1120,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             "elapsed_ms": round(elapsed_ms, 2),
             "kv_bytes": int(entry.get("bridge_bytes", 0)),
             "resident_alpha": self.resident_alpha(),
+            "kv_free_bytes": self.available_kv_bytes(),
             "yield_count": 0,
         }
 
@@ -692,15 +1138,25 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         import torch
 
         self._ctx_store.pop(ctx_id, None)
-        if self.vmm is None:
+        if (self.vmm is None or self._quota_constrained) and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def memory_and_vmm_stats(self) -> dict[str, Any]:
         self._update_hwm()
+        vmm_st = self.vmm.stats_dict() if self.vmm is not None else {}
         return {
-            "peak_reserved_mib": round(self._max_reserved_mib, 2),
-            "vmm_stats": self.vmm.stats_dict() if self.vmm is not None else {},
+            "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "combined_physical_mib": round(self._max_reserved_mib, 2),
+            "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
+            "vmm_stats": vmm_st,
             "active_contexts": len(self._ctx_store),
+            "kv_free_bytes": self.available_kv_bytes(),
+            "swapped_kv_contexts": 0,
+            "kv_host_swap_outs": int(vmm_st.get("kv_swap_outs_total", 0)),
+            "kv_host_swap_ins": int(vmm_st.get("kv_swap_ins_total", 0)),
+            "kv_host_pinned_bytes": int(vmm_st.get("kv_swapped_bytes_current", 0)),
+            "memory_plan": dict(self._memory_plan),
         }
 
     def close(self) -> None:

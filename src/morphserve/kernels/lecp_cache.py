@@ -229,10 +229,13 @@ class SharedPrefixCache:
         lens = []
         for c in caches:
             k0 = c.key_cache[0]
+            v0 = c.value_cache[0]
             ln = int(k0.shape[0]) if k0 is not None else 0
             ptr = int(k0.data_ptr()) if k0 is not None else 0
+            v_ptr = int(v0.data_ptr()) if v0 is not None else 0
+            cow_h = int(getattr(c, "_cow_shared_prefix_len", 0) or 0)
             lens.append(ln)
-            sig_parts.extend((id(c), ln, ptr))
+            sig_parts.extend((id(c), ln, ptr, v_ptr, cow_h))
         memo_key = tuple(sig_parts)
 
         cached = cls._lecp_memo.get(memo_key)

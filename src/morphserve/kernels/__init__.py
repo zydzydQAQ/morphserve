@@ -1,4 +1,4 @@
-"""MorphServe Module 3: Zero-Approximation Shared-Prefix CFG Attention, LECP CoW Cache & GPU Loopback."""
+"""MorphServe Module 3: Cross-Paradigm State De-Redundancy (LECP CoW, GPU Loopback & Cascade-CFG Attention)."""
 
 from .cfg_prefix_attn import (
     BagelSharedPrefixPatch,
@@ -6,6 +6,7 @@ from .cfg_prefix_attn import (
     install_shared_prefix_bagel_hooks,
     shared_prefix_cfg_attention,
     shared_prefix_cfg_attention_ref,
+    should_use_cascade_cfg_split,
     should_use_flash_prefix_split,
 )
 from .gpu_loopback import (
@@ -37,5 +38,6 @@ __all__ = [
     "rebind_cow_prefix",
     "shared_prefix_cfg_attention",
     "shared_prefix_cfg_attention_ref",
+    "should_use_cascade_cfg_split",
     "should_use_flash_prefix_split",
 ]

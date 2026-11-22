@@ -171,14 +171,9 @@ def _extract_target_hw(size_cfg: Any, h: int, w: int) -> tuple[int, int]:
 _PIL_BICUBIC_WEIGHT_CACHE: dict[tuple[str, int, int], Any] = {}
 
 
-def _get_pil_bicubic_weights(in_size: int, out_size: int, device: Any) -> Any:
-    """Cached exact Pillow `Image.BICUBIC` (Catmull-Rom a=-0.5) 1D separable weight matrix [out_size, in_size]."""
-    key = (str(device), int(in_size), int(out_size))
-    cached = _PIL_BICUBIC_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
+def _compute_pil_bicubic_weights_np(in_size: int, out_size: int) -> Any:
+    """Compute exact Pillow `Image.BICUBIC` (Catmull-Rom a=-0.5) 1D weight matrix `[out_size, in_size]` in float32."""
     import numpy as np
-    import torch
 
     scale = in_size / out_size
     fscale = max(1.0, scale)
@@ -199,7 +194,35 @@ def _get_pil_bicubic_weights(in_size: int, out_size: int, device: Any) -> Any:
         if s != 0.0:
             k /= s
         w[i, xmin:xmax] = k
-    wt = torch.from_numpy(w.astype(np.float32)).to(device=device)
+    return w.astype(np.float32)
+
+
+def pil_bicubic_resize_np(img_chw_f32: Any, target_h: int, target_w: int) -> Any:
+    """Torch-free NumPy reference of `pil_bicubic_resize_gpu` (`[3, H, W] -> [3, target_h, target_w]`)."""
+    import numpy as np
+
+    _, in_h, in_w = img_chw_f32.shape
+    x = img_chw_f32.astype(np.float32, copy=False)
+    if target_w != in_w:
+        w_w = _compute_pil_bicubic_weights_np(in_w, target_w)
+        x = np.matmul(x, w_w.T)
+        x = np.clip(np.floor(x + 0.5), 0.0, 255.0)
+    if target_h != in_h:
+        w_h = _compute_pil_bicubic_weights_np(in_h, target_h)
+        x = np.matmul(w_h, x)
+        x = np.clip(np.floor(x + 0.5), 0.0, 255.0)
+    return x
+
+
+def _get_pil_bicubic_weights(in_size: int, out_size: int, device: Any) -> Any:
+    """Cached exact Pillow `Image.BICUBIC` (Catmull-Rom a=-0.5) 1D separable weight matrix [out_size, in_size]."""
+    key = (str(device), int(in_size), int(out_size))
+    cached = _PIL_BICUBIC_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    import torch
+
+    wt = torch.from_numpy(_compute_pil_bicubic_weights_np(in_size, out_size)).to(device=device)
     _PIL_BICUBIC_WEIGHT_CACHE[key] = wt
     return wt
 

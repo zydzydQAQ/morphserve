@@ -22,11 +22,12 @@ python3 /shared/data/MORPHSERVE/scripts/kairos_runtime_audit.py \
 SAMPLER_PID=$!
 
 _cleanup() {
-  if kill -0 "$SAMPLER_PID" 2>/dev/null; then
+  if [ -n "${SAMPLER_PID:-}" ] && kill -0 "$SAMPLER_PID" 2>/dev/null; then
     kill -TERM "$SAMPLER_PID" 2>/dev/null || true
     wait "$SAMPLER_PID" 2>/dev/null || true
   fi
-  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_deep80_* /tmp/ms_ratio_* 2>/dev/null || true
+  SAMPLER_PID=""
+  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_deep_* /tmp/ms_deep80_* /tmp/ms_ratio_* /tmp/morphserve_h2d_locks /dev/shm/ms_shm_* 2>/dev/null || true
   _kairos_cleanup
 }
 trap _cleanup EXIT

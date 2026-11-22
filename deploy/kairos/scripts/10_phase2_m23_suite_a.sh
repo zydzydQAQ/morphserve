@@ -22,11 +22,12 @@ python3 /shared/data/MORPHSERVE/scripts/kairos_runtime_audit.py \
 SAMPLER_PID=$!
 
 _cleanup() {
-  if kill -0 "$SAMPLER_PID" 2>/dev/null; then
+  if [ -n "${SAMPLER_PID:-}" ] && kill -0 "$SAMPLER_PID" 2>/dev/null; then
     kill -TERM "$SAMPLER_PID" 2>/dev/null || true
     wait "$SAMPLER_PID" 2>/dev/null || true
   fi
-  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_m23a_* /tmp/ms_m23ab_* 2>/dev/null || true
+  SAMPLER_PID=""
+  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_m23a_* /tmp/ms_m23ab_* /tmp/morphserve_h2d_locks /dev/shm/ms_shm_* 2>/dev/null || true
   _kairos_cleanup
 }
 trap _cleanup EXIT
@@ -37,7 +38,7 @@ python3 -m morphserve.bench.run_phase2_bagel_main \
   --bench-root "${BENCH_DIR}" \
   --output-dir "${RUN_DIR}" \
   --num-gpus 8 \
-  --max-sessions 28
+  ${MORPHSERVE_MAX_SESSIONS:+--max-sessions "${MORPHSERVE_MAX_SESSIONS}"}
 
 kairos_check_shared_storage
 echo "== Phase-2 Job 2c (M2.3 Suite A) completed cleanly: ${RUN_DIR}"

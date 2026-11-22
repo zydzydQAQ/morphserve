@@ -230,6 +230,126 @@ class TestModule2Offline(unittest.TestCase):
         finally:
             m0.close()
 
+    def test_realtime_kv_free_bytes_sync_and_inflight_reservation(self) -> None:
+        topo = ClusterTopologyProfile.a100_pcie_8gpu_default()
+        router = DualPathMorphRouter(topo, pacer=HalfNodeH2DPacer(topo, max_concurrent_per_half=1))
+        router.init_workers(
+            num_gpus=4,
+            role_of=lambda g: "gen" if g in (1, 3) else "hybrid",
+            initial_alphas={0: 0.5, 1: 1.0, 2: 0.5, 3: 1.0},
+            kv_free_bytes={0: 16 * GIB, 1: 600 * MIB, 2: 16 * GIB, 3: 16 * GIB},
+        )
+        # First 400 MiB Path-A request fits on GPU 1 (`600 MiB -> 200 MiB` reserved pre-unpack)
+        req1 = CPTGRequestSpec(
+            req_id="kv_r1",
+            src_gpu=0,
+            architecture="tight_mot",
+            kv_bytes=400 * MIB,
+            dit_step1_ms=280.0,
+            dit_total_steps=20,
+        )
+        d1, mode1 = router.plan_and_reserve_transition(
+            routing_mode="dual_path",
+            static_und_ranks=(),
+            static_gen_ranks=(),
+            req=req1,
+            est_dit_ms=50.0,
+            now_ms=0.0,
+        )
+        self.assertEqual((d1.path, d1.dst_gpu, mode1), ("state_ship", 1, "nccl_dual"))
+        self.assertEqual(router.worker_states[1].kv_free_bytes, 200 * MIB)
+
+        # Unrelated ACK arriving on GPU 1 BEFORE `req1` unpacks must NOT erase the 400 MiB in-flight reservation!
+        router.update_worker_telemetry(1, expert_alpha=1.0, kv_free_bytes=600 * MIB)
+        self.assertEqual(router.worker_states[1].kv_free_bytes, 200 * MIB)
+
+        # Second 400 MiB request sees `200 MiB < 400 MiB` on GPU 1 and steers to GPU 3 (never OOM-stampeding GPU 1!)
+        req2 = CPTGRequestSpec(
+            req_id="kv_r2",
+            src_gpu=0,
+            architecture="tight_mot",
+            kv_bytes=400 * MIB,
+            dit_step1_ms=280.0,
+            dit_total_steps=20,
+        )
+        d2, mode2 = router.plan_and_reserve_transition(
+            routing_mode="dual_path",
+            static_und_ranks=(),
+            static_gen_ranks=(),
+            req=req2,
+            est_dit_ms=50.0,
+            now_ms=1.0,
+        )
+        self.assertEqual((d2.path, d2.dst_gpu, mode2), ("state_ship", 3, "nccl_dual"))
+
+        # Once `req1` unpacks, worker reports physical `kv_free_bytes = 200 MiB`; releasing reservation avoids double-subtraction!
+        router.release_kv_reservation(1, 400 * MIB, latest_kv_free_bytes=200 * MIB)
+        self.assertEqual(router.worker_states[1].kv_free_bytes, 200 * MIB)
+
+        # Initial placement avoids critically KV-exhausted rank 0 (`< 128 MiB`)
+        router.update_worker_telemetry(0, expert_alpha=0.25, kv_free_bytes=32 * MIB)
+        picked = router.select_initial_gpu(
+            num_gpus=4,
+            routing_mode="dual_path",
+            preemption_mode="layer_chunk",
+            static_und_ranks=(),
+            modality_plan="ar_only",
+            gpu_busy={0: False, 1: False, 2: False, 3: False},
+        )
+        self.assertNotEqual(picked, 0)
+
+    def test_static_fission_cost_based_gen_selection_and_monotonic_telemetry_seq(self) -> None:
+        from morphserve.engine import InMemoryByteBus, TcpByteMesh
+
+        topo = ClusterTopologyProfile.a100_pcie_8gpu_default()
+        router = DualPathMorphRouter(topo, pacer=HalfNodeH2DPacer(topo, max_concurrent_per_half=1))
+        router.init_workers(
+            num_gpus=8,
+            role_of=lambda g: "und" if g in (0, 1, 4, 5) else "gen",
+            initial_alphas={g: (0.0 if g in (0, 1, 4, 5) else 1.0) for g in range(8)},
+            kv_free_bytes=16 * GIB,
+        )
+        # Intra-half `gen` GPUs (2, 3) have 21s queue backlog while Socket-1 `gen` GPU 6 is idle (`0ms`):
+        # fair cost-based `select_static_gen_gpu` MUST pick idle GPU 6 (`~3.4ms` ship) rather than waiting 21s!
+        router.worker_states[2].queue_wait_ms = 21_000.0
+        router.worker_states[3].queue_wait_ms = 21_000.0
+        router.worker_states[6].queue_wait_ms = 0.0
+        router.worker_states[7].queue_wait_ms = 5_000.0
+        chosen_gen = router.select_static_gen_gpu(
+            routing_mode="static_nccl_fission",
+            static_und_ranks=(0, 1, 4, 5),
+            static_gen_ranks=(2, 3, 6, 7),
+            src_und_gpu=0,
+            required_kv_bytes=4 * MIB,
+        )
+        self.assertEqual(chosen_gen, 6)
+
+        # Monotonic `telemetry_seq` guard prevents stale out-of-order coroutine ACKs from overwriting newer KV state
+        router.update_worker_telemetry(6, expert_alpha=0.75, kv_free_bytes=8 * GIB, telemetry_seq=10)
+        router.update_worker_telemetry(6, expert_alpha=1.00, kv_free_bytes=15 * GIB, telemetry_seq=9)  # stale!
+        self.assertEqual(router.worker_states[6].kv_free_bytes, 8 * GIB)
+        self.assertAlmostEqual(router.worker_states[6].expert_alpha, 0.75)
+
+        # Verify `InMemoryPeerMesh` and `TcpByteMesh` `recv_u8(..., out_tensor=buf)` populate `buf` in-place
+        bus = InMemoryByteBus(2)
+        m0, m1 = bus.endpoint_for(0), bus.endpoint_for(1)
+        m0.send_u8(b"INPLACE_MEM", dst_rank=1)
+        buf_mem = m1.alloc_recv_u8(11)
+        out_mem, _ = m1.recv_u8(11, src_rank=0, out_tensor=buf_mem)
+        self.assertIs(out_mem, buf_mem)
+        self.assertEqual(bytes(buf_mem), b"INPLACE_MEM")
+
+        tcp_mesh = TcpByteMesh(2)
+        try:
+            t0, t1 = tcp_mesh.endpoint_for(0), tcp_mesh.endpoint_for(1)
+            t0.send_u8(b"INPLACE_TCP", dst_rank=1)
+            buf_tcp = t1.alloc_recv_u8(11)
+            out_tcp, _ = t1.recv_u8(11, src_rank=0, out_tensor=buf_tcp)
+            self.assertIs(out_tcp, buf_tcp)
+            self.assertEqual(bytes(buf_tcp), b"INPLACE_TCP")
+        finally:
+            tcp_mesh.close()
+
     def test_module2_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/07_phase1_module2_validate.sh"
         if script.exists():

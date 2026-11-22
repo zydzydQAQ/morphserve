@@ -69,14 +69,23 @@ else
 EOF
 fi
 
-echo "== installing Python package and configs into $INSTALL_TMP"
-for subdir in src configs docs csrc; do
+echo "== installing Python package, configs, tests, deploy scripts, and baseline results into $INSTALL_TMP"
+for subdir in src configs docs csrc tests deploy results; do
   if [ -d "$SRC_DIR/$subdir" ]; then
     rm -rf "$INSTALL_TMP/$subdir"
-    cp -R "$SRC_DIR/$subdir" "$INSTALL_TMP/$subdir"
+    tar -C "$SRC_DIR" \
+      --exclude='__pycache__' \
+      --exclude='*.pyc' \
+      --exclude='*.pyo' \
+      --exclude='*.log' \
+      --exclude='*.nsys-rep' \
+      --exclude='*.sqlite' \
+      --exclude='vllm_omni_ref' \
+      --exclude='results/raw' \
+      -cf - "$subdir" | tar -C "$INSTALL_TMP" -xf -
   fi
 done
-for topfile in README.md pyproject.toml; do
+for topfile in README.md pyproject.toml GLOSSARY.md; do
   if [ -f "$SRC_DIR/$topfile" ]; then
     cp "$SRC_DIR/$topfile" "$INSTALL_TMP/$topfile"
   fi

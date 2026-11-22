@@ -97,55 +97,55 @@ def _crossover_kv_mib(hw: HardwareInterconnectSpec, cold_expert_gib: float = 6.0
     return round(kv_gib * 1024.0, 1)
 
 
-# Default reference measurements from live 8xA100-PCIe-40GB Phase-2 M2.3a (qps=0.8, n=28, Effective Goodput = QPS * Attainment)
+# Default reference measurements from live 8xA100-PCIe-40GB Phase-2 M2.3a-r3 (qps=0.8, n=28, Effective Goodput = QPS * Attainment)
 DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
     {
         "policy_name": "morphserve",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.4286,
-        "ar_tpot_p95_ms": 68.08,
-        "dit_turn_p95_ms": 28900.0,
+        "joint_slo_goodput_rps": 0.5143,
+        "ar_tpot_p95_ms": 69.38,
+        "dit_turn_p95_ms": 32057.44,
     },
     {
         "policy_name": "monolithic_dp",
         "offered_qps": 0.8,
         "total_sessions": 28,
         "joint_slo_goodput_rps": 0.4000,
-        "ar_tpot_p95_ms": 67.02,
-        "dit_turn_p95_ms": 29084.46,
+        "ar_tpot_p95_ms": 66.79,
+        "dit_turn_p95_ms": 29338.42,
     },
     {
         "policy_name": "twostage_shm",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.3143,
-        "ar_tpot_p95_ms": 66.98,
-        "dit_turn_p95_ms": 50684.96,
+        "joint_slo_goodput_rps": 0.3429,
+        "ar_tpot_p95_ms": 67.16,
+        "dit_turn_p95_ms": 44118.23,
     },
     {
         "policy_name": "static_nccl_fission",
         "offered_qps": 0.8,
         "total_sessions": 28,
         "joint_slo_goodput_rps": 0.3429,
-        "ar_tpot_p95_ms": 67.95,
-        "dit_turn_p95_ms": 38147.29,
+        "ar_tpot_p95_ms": 66.86,
+        "dit_turn_p95_ms": 36467.46,
     },
     {
         "policy_name": "prism_tetriserve_coloc",
         "offered_qps": 0.8,
         "total_sessions": 28,
         "joint_slo_goodput_rps": 0.4000,
-        "ar_tpot_p95_ms": 67.23,
-        "dit_turn_p95_ms": 24962.26,
+        "ar_tpot_p95_ms": 66.88,
+        "dit_turn_p95_ms": 24971.52,
     },
     {
         "policy_name": "naive_host_offload",
         "offered_qps": 0.8,
         "total_sessions": 28,
         "joint_slo_goodput_rps": 0.3143,
-        "ar_tpot_p95_ms": 67.99,
-        "dit_turn_p95_ms": 45033.69,
+        "ar_tpot_p95_ms": 67.76,
+        "dit_turn_p95_ms": 45708.71,
     },
 )
 
@@ -287,8 +287,8 @@ def simulate_cluster_point(
         will_oom_in_vae = False
         if hw.gpu_hbm_gib <= 42.0:
             if policy_name == "prism_tetriserve_coloc":
-                # Without Transient-Pool Scoped-VAE or CoW, late high-res turns OOM inside VAE decode/encode!
-                if (quad == "multiturn_edit" and is_1024 and ti >= 3) or (
+                # Without Transient-Pool Scoped-VAE or CoW, multi-turn 1024px KV overflows by Turn 2!
+                if (quad == "multiturn_edit" and is_1024 and ti >= 2) or (
                     quad == "multiturn_edit" and (not is_1024) and ti >= 3 and (sid % 3 == 0)
                 ) or (quad == "highres_t2i" and is_1024 and (sid % 2 == 0)):
                     will_oom_in_vae = True
@@ -392,6 +392,9 @@ def simulate_cluster_point(
         step_ms = (dit1024_step_ms if is_1024 else dit512_step_ms) * kv_turn_scale
         cfg_factor = 0.95 if (policy_name == "morphserve" and not is_1024) else (0.98 if policy_name == "morphserve" else 1.0)
         dit_exec_ms = 20.0 * step_ms * cfg_factor + vae_ms
+        if policy_name == "morphserve" and hw.gpu_hbm_gib <= 42.0 and is_1024 and quad == "multiturn_edit":
+            # 40 GiB HBM watermark (7.5 GiB) parks/unparks inactive 1024px KV + Scoped-VAE tail handles instead of OOMing
+            dit_exec_ms += (1650.0 + 450.0 * ti) / max(1.0, hw.h2d_uni_gbps / 22.9)
         dst_gpu = cur_gpu
         trans_ms = 0.0
 
@@ -437,7 +440,7 @@ def simulate_cluster_point(
                 if miss_gib > 0:
                     half_h2d_free_at[src_half] = max(dit_ready_ms, half_h2d_free_at[src_half]) + h2d_raw_ms
                     gpu_alpha[dst_gpu] = 1.0
-                trans_ms = morph_unhidden_ms
+                trans_ms = morph_unhidden_ms + (420.0 if (quad == "multiturn_edit" and ti == 0) else 0.0)
                 morphs += 1
         elif policy_name == "static_nccl_fission":
             src_node = cur_gpu // hw.gpus_per_node
@@ -461,7 +464,7 @@ def simulate_cluster_point(
         start_dit = max(dit_ready_ms + trans_ms, gpu_free_at[dst_gpu])
         if will_oom_in_vae:
             # GPU executes denoising / attention up to the failing VAE / late-step allocation (`torch.cuda.empty_cache()` recovery)
-            oom_frac = 0.50 if policy_name == "prism_tetriserve_coloc" else 0.92
+            oom_frac = 0.26 if policy_name == "prism_tetriserve_coloc" else 0.92
             gpu_free_at[dst_gpu] = start_dit + dit_exec_ms * oom_frac
             sess_oom[sid] = True
             continue
@@ -525,7 +528,7 @@ def calibrate_against_real_8gpu(real_runs: list[dict[str, Any]]) -> tuple[dict[s
     best_score = float("inf")
     for d512 in (276.0, 290.0, 302.0, 314.0, 326.0):
         for d1024 in (960.0, 1005.0, 1050.0):
-            for shm_k in (5400.0, 6400.0, 7400.0):
+            for shm_k in (4400.0, 5400.0, 6400.0):
                 for fis_k in (40.0, 140.0, 240.0):
                     for swp_k in (3600.0, 4400.0, 5200.0):
                         cand = dict(

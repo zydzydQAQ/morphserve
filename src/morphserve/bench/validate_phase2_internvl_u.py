@@ -479,6 +479,7 @@ def run_internvlu_generality_validation(
 
             # Stage 2: Route compact conditioning bridge (`state_ship` vs `in_place_morph`) & run concurrent DiT decoders!
             dec_pending: dict[str, float] = {}
+            deferred_acks: list[dict[str, Any]] = []
             dit_assign_load = {g: 0.0 for g in range(num_gpus)}
             rank_alphas = {g: (1.0 if (g % 2 == 1) else 0.0) for g in range(num_gpus)}
             for idx, src_g, b_msg in vlm_done:
@@ -519,9 +520,13 @@ def run_internvlu_generality_validation(
                         while got_sr < 2:
                             m2 = ack_q.get(timeout=120.0)
                             if m2.get("cmd_id") in (s_cid, r_cid):
+                                if m2.get("status") == "error":
+                                    raise RuntimeError(m2.get("error"))
                                 got_sr += 1
                                 if "ship_ms" in m2:
                                     ship_ms_samples.append(float(m2["ship_ms"]))
+                            else:
+                                deferred_acks.append(m2)
                         ships += 1
                     else:
                         rank_alphas[dst_g] = 1.0
@@ -539,7 +544,11 @@ def run_internvlu_generality_validation(
                     while got_sr < 2:
                         m2 = ack_q.get(timeout=120.0)
                         if m2.get("cmd_id") in (s_cid, r_cid):
+                            if m2.get("status") == "error":
+                                raise RuntimeError(m2.get("error"))
                             got_sr += 1
+                        else:
+                            deferred_acks.append(m2)
                     ships += 1
 
                 dit_assign_load[dst_g] += 2200.0
@@ -550,7 +559,7 @@ def run_internvlu_generality_validation(
 
             dit_lats: list[float] = []
             while dec_pending:
-                m3 = ack_q.get(timeout=300.0)
+                m3 = deferred_acks.pop(0) if deferred_acks else ack_q.get(timeout=300.0)
                 dcid = str(m3.get("cmd_id"))
                 if dcid not in dec_pending:
                     continue

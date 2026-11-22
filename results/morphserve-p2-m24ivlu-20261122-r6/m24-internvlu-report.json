@@ -1,0 +1,65 @@
+{
+  "schema": "morphserve.phase2.m24_internvlu.v1",
+  "timestamp_utc": "2026-11-22T05:31:26Z",
+  "architecture": "bridge_mllm_dit",
+  "model_repo": "InternVL-U/InternVL-U",
+  "num_gpus": 8,
+  "smoke_1gpu": false,
+  "vmm_lossless_parity_ssim": 1.0,
+  "hybrid_hbm_saved_mib": 2802.0,
+  "results": [
+    {
+      "policy_name": "morphserve",
+      "wall_seconds": 11.3,
+      "throughput_rps": 1.415,
+      "vqa_mean_ms": 1724.76,
+      "t2i_p95_ms": 4231.39,
+      "mean_bridge_kib": 455.5,
+      "mean_nccl_ship_ms": 297.355,
+      "path_a_ships": 9,
+      "path_b_morphs": 3,
+      "hybrid_idle_reserved_mib": 5474.0,
+      "peak_reserved_mib": 8276.0
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "wall_seconds": 7.16,
+      "throughput_rps": 2.233,
+      "vqa_mean_ms": 1722.89,
+      "t2i_p95_ms": 4285.33,
+      "mean_bridge_kib": 455.5,
+      "mean_nccl_ship_ms": 0.0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "hybrid_idle_reserved_mib": 8276.0,
+      "peak_reserved_mib": 9814.0
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "wall_seconds": 11.74,
+      "throughput_rps": 1.363,
+      "vqa_mean_ms": 2031.75,
+      "t2i_p95_ms": 4152.27,
+      "mean_bridge_kib": 455.5,
+      "mean_nccl_ship_ms": 0.0,
+      "path_a_ships": 12,
+      "path_b_morphs": 0,
+      "hybrid_idle_reserved_mib": 5170.0,
+      "peak_reserved_mib": 8276.0
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "wall_seconds": 12.43,
+      "throughput_rps": 1.287,
+      "vqa_mean_ms": 2059.31,
+      "t2i_p95_ms": 5985.9,
+      "mean_bridge_kib": 455.5,
+      "mean_nccl_ship_ms": 0.0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "hybrid_idle_reserved_mib": 5474.0,
+      "peak_reserved_mib": 9880.0
+    }
+  ],
+  "status": "ok"
+}

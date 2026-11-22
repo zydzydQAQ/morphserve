@@ -38,6 +38,19 @@ from .config import EnginePolicyConfig
 MIB = 1024**2
 
 
+def _is_cuda_oom_exc(exc: BaseException) -> bool:
+    import torch
+
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    msg = str(exc)
+    return (
+        "out of memory" in msg.lower()
+        or 'torch_call_dispatcher( "aten::new_empty"' in msg
+        or 'torch_call_dispatcher( "aten::empty' in msg
+    )
+
+
 def _ctx_nbytes(ctx: dict[str, Any] | None) -> int:
     if ctx is None:
         return 0
@@ -831,22 +844,22 @@ def run_worker_process(
                             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                                 sched.drain_remaining_ar_tasks()
                             _flush_completed_ar()
-                        except torch.cuda.OutOfMemoryError as ar_oom:
-                            oom_count += 1
-                            torch.cuda.empty_cache()
-                            for c_id, _, _, _ in list(inflight_ar_meta.values()):
-                                ack_q.put({"cmd_id": c_id, "rank": rank, "status": "oom", "error": str(ar_oom)[:200]})
-                            inflight_ar_meta.clear()
                         except Exception as ar_exc:
-                            for c_id, _, _, _ in list(inflight_ar_meta.values()):
-                                ack_q.put(
-                                    {
-                                        "cmd_id": c_id,
-                                        "rank": rank,
-                                        "status": "error",
-                                        "error": f"{type(ar_exc).__name__}: {ar_exc}",
-                                    }
-                                )
+                            if _is_cuda_oom_exc(ar_exc):
+                                oom_count += 1
+                                torch.cuda.empty_cache()
+                                for c_id, _, _, _ in list(inflight_ar_meta.values()):
+                                    ack_q.put({"cmd_id": c_id, "rank": rank, "status": "oom", "error": str(ar_exc)[:200]})
+                            else:
+                                for c_id, _, _, _ in list(inflight_ar_meta.values()):
+                                    ack_q.put(
+                                        {
+                                            "cmd_id": c_id,
+                                            "rank": rank,
+                                            "status": "error",
+                                            "error": f"{type(ar_exc).__name__}: {ar_exc}",
+                                        }
+                                    )
                             inflight_ar_meta.clear()
                         finally:
                             for c_id, _, _, _ in list(inflight_ar_meta.values()):
@@ -1100,19 +1113,21 @@ def run_worker_process(
                             **ar_res,
                         }
                     )
-                except torch.cuda.OutOfMemoryError as exc:
-                    oom_count += 1
-                    torch.cuda.empty_cache()
-                    ack_q.put({"cmd_id": ar_msg["cmd_id"], "rank": rank, "status": "oom", "error": str(exc)[:200]})
                 except Exception as exc:
-                    ack_q.put(
-                        {
-                            "cmd_id": ar_msg["cmd_id"],
-                            "rank": rank,
-                            "status": "error",
-                            "error": f"{type(exc).__name__}: {exc}",
-                        }
-                    )
+                    if _is_cuda_oom_exc(exc):
+                        oom_count += 1
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        ack_q.put({"cmd_id": ar_msg["cmd_id"], "rank": rank, "status": "oom", "error": str(exc)[:200]})
+                    else:
+                        ack_q.put(
+                            {
+                                "cmd_id": ar_msg["cmd_id"],
+                                "rank": rank,
+                                "status": "error",
+                                "error": f"{type(exc).__name__}: {exc}",
+                            }
+                        )
                 continue
 
             try:
@@ -1287,21 +1302,22 @@ def run_worker_process(
                     )
                 else:
                     ack_q.put({"cmd_id": cmd_id, "rank": rank, "status": "error", "error": f"unknown op: {op}"})
-            except torch.cuda.OutOfMemoryError as exc:
-                oom_count += 1
-                gc.collect()
-                torch.cuda.empty_cache()
-                ack_q.put({"cmd_id": cmd_id, "rank": rank, "status": "oom", "error": str(exc)[:300]})
             except Exception as exc:
-                ack_q.put(
-                    {
-                        "cmd_id": cmd_id,
-                        "rank": rank,
-                        "status": "error",
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "traceback": traceback.format_exc()[-1200:],
-                    }
-                )
+                if _is_cuda_oom_exc(exc):
+                    oom_count += 1
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    ack_q.put({"cmd_id": cmd_id, "rank": rank, "status": "oom", "error": str(exc)[:300]})
+                else:
+                    ack_q.put(
+                        {
+                            "cmd_id": cmd_id,
+                            "rank": rank,
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "traceback": traceback.format_exc()[-1200:],
+                        }
+                    )
     except Exception as exc:
         ack_q.put(
             {

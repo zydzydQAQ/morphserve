@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "0805fc172e7adcaa6d672f43c012cee6be8bad53",
+  "short_commit": "0805fc1",
+  "subject": "Calibrate layer-chunk AR step EMA and 1024px layer horizon; archive 1-GPU smoke r3",
+  "built_utc": "2026-11-22T04:28:38+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/csrc/vmm_tripool/build.sh\"",
+  "files": 64,
+  "bytes": 1076316
+}

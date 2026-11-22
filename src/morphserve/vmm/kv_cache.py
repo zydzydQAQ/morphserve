@@ -57,6 +57,8 @@ class VmmNaiveCache:
         immediately and preserving base-pointer identity across `cow_fork_context` branches.
     """
 
+    _bagel_subclasses: dict[type, type] = {}
+
     def __init__(
         self,
         num_layers: int,
@@ -64,7 +66,7 @@ class VmmNaiveCache:
         max_seq_len: int = DEFAULT_MAX_KV_TOKENS,
         max_row_bytes: int = 1024,
     ) -> None:
-        self.num_layers = int(num_layers)
+        self._num_layers = int(num_layers)
         self.vmm = vmm
         self.max_seq_len = max(128, int(max_seq_len))
         self.default_max_va_bytes = max(2 * MIB, self.max_seq_len * int(max_row_bytes))
@@ -80,9 +82,28 @@ class VmmNaiveCache:
         self.key_cache = _VmmLayerTensorMap(self, "k")
         self.value_cache = _VmmLayerTensorMap(self, "v")
 
+    @property
+    def num_layers(self) -> int:
+        return self._num_layers
+
+    @classmethod
+    def create_for_bagel(
+        cls,
+        naive_cache_cls: type,
+        num_layers: int,
+        vmm: Any = None,
+        max_seq_len: int = DEFAULT_MAX_KV_TOKENS,
+    ) -> "VmmNaiveCache":
+        """Instantiate a `VmmNaiveCache` subclassing `vllm_omni`'s `NaiveCache` (`isinstance == True`)."""
+        sub_cls = cls._bagel_subclasses.get(naive_cache_cls)
+        if sub_cls is None:
+            sub_cls = type("BagelVmmNaiveCache", (cls, naive_cache_cls), {})
+            cls._bagel_subclasses[naive_cache_cls] = sub_cls
+        return sub_cls(num_layers, vmm=vmm, max_seq_len=max_seq_len)
+
     def __deepcopy__(self, memo: dict[int, Any]) -> "VmmNaiveCache":
         """Deep-copy KV contents into a fresh Arena-1 `VmmNaiveCache` without pickling `self.vmm` (`CDLL`)."""
-        dup = VmmNaiveCache(self.num_layers, vmm=self.vmm, max_seq_len=self.max_seq_len)
+        dup = type(self)(self.num_layers, vmm=self.vmm, max_seq_len=self.max_seq_len)
         memo[id(self)] = dup
         dup.key_values_lens = list(self.key_values_lens) if self.key_values_lens is not None else None
         dup._cow_shared_prefix_len = self._cow_shared_prefix_len

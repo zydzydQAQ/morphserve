@@ -284,6 +284,34 @@ class TestModule1VmmOffline(unittest.TestCase):
             c_dup = deepcopy(c0)
             self.assertEqual(c_dup.allocated_regions, regions_before)
             c_dup.close()
+
+            # Verify create_for_bagel satisfies vllm_omni NaiveCache.from_object isinstance check
+            class _StockNaiveCache:
+                def __init__(self, n: int):
+                    self.key_cache = {k: None for k in range(n)}
+                    self.value_cache = {k: None for k in range(n)}
+
+                @property
+                def num_layers(self) -> int:
+                    return len(self.key_cache)
+
+                @classmethod
+                def from_object(cls, obj):
+                    if isinstance(obj, cls):
+                        return obj
+                    out = cls(len(obj.key_cache))
+                    for i, (k, v) in enumerate(zip(obj.key_cache, obj.value_cache, strict=True)):
+                        out.key_cache[i] = k
+                        out.value_cache[i] = v
+                    return out
+
+            cb = VmmNaiveCache.create_for_bagel(_StockNaiveCache, 2, vmm=vmm, max_seq_len=128)
+            cb.key_cache[0] = _FakeKV()
+            cb.value_cache[0] = _FakeKV()
+            self.assertIsInstance(cb, _StockNaiveCache)
+            self.assertIs(_StockNaiveCache.from_object(cb), cb)
+            self.assertEqual(_StockNaiveCache.from_object(cb).key_cache[0].shape, (16, 4, 128))
+            cb.close()
         finally:
             c0.close()
             vmm.shutdown()

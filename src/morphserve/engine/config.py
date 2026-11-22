@@ -135,7 +135,7 @@ class EnginePolicyConfig:
                 inter_turn_think_s_range=think_default,
                 super_pool_mib=4864 if fam == "internvl_u" else 14336,
                 fine_kv_pool_mib=512 if fam == "internvl_u" else 256,
-                transient_va_gib=4 if fam == "internvl_u" else 16,
+                transient_va_gib=16,
                 kv_va_gib=4 if fam == "internvl_u" else 16,
             )
         elif policy_name == "monolithic_dp":

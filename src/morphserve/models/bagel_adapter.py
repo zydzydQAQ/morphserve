@@ -404,7 +404,13 @@ class BagelCPTGAdapter(CPTGModelAdapter):
 
     def _new_main_ctx(self) -> dict[str, Any]:
         if self.vmm is not None:
-            return {"kv_lens": [0], "ropes": [0], "past_key_values": VmmNaiveCache(self.num_expert_layers, self.vmm)}
+            return {
+                "kv_lens": [0],
+                "ropes": [0],
+                "past_key_values": VmmNaiveCache.create_for_bagel(
+                    self._naive_cache_cls, self.num_expert_layers, self.vmm
+                ),
+            }
         return {"kv_lens": [0], "ropes": [0], "past_key_values": self._naive_cache_cls(self.num_expert_layers)}
 
     def _new_aux_ctx(self) -> dict[str, Any]:
@@ -1031,7 +1037,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         if old is not None:
             _close_ctx_vmm_if_any(old.get("main_ctx"))
         main_factory = (
-            (lambda n: VmmNaiveCache(n, self.vmm))
+            (lambda n: VmmNaiveCache.create_for_bagel(self._naive_cache_cls, n, self.vmm))
             if self.vmm is not None
             else (lambda n: self._naive_cache_cls(n))
         )

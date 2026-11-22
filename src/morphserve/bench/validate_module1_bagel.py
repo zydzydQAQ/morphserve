@@ -4,101 +4,14 @@ from __future__ import annotations
 
 import argparse
 import gc
-import hashlib
 import inspect
-import io
 import json
 from pathlib import Path
 import time
 
-from morphserve.vmm import BagelExpertPager, TriPoolVMM
-
-MIB = 1024**2
-
-
-def _pil_sha256(img) -> str:
-    import numpy as np
-
-    arr = np.asarray(img.convert("RGB"), dtype=np.uint8)
-    return hashlib.sha256(arr.tobytes()).hexdigest()
-
-
-def _tensor_sha256(t) -> str:
-    import torch
-
-    raw = t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()
-    return hashlib.sha256(raw).hexdigest()
-
-
-def _mem_info_mib(device: int = 0) -> dict:
-    import torch
-
-    free_b, total_b = torch.cuda.mem_get_info(device)
-    return {
-        "torch_alloc_mib": round(torch.cuda.memory_allocated(device) / MIB, 2),
-        "torch_reserved_mib": round(torch.cuda.memory_reserved(device) / MIB, 2),
-        "driver_used_mib": round((total_b - free_b) / MIB, 2),
-        "driver_free_mib": round(free_b / MIB, 2),
-    }
-
-
-def load_bagel_pipeline(model_dir: Path, device_index: int = 0):
-    import torch
-    from vllm.config import set_current_vllm_config
-    from vllm.config.load import LoadConfig
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
-    from vllm_omni.diffusion.distributed.parallel_state import (
-        init_distributed_environment,
-        initialize_model_parallel,
-    )
-    from vllm_omni.diffusion.forward_context import set_forward_context
-    from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-    from vllm_omni.diffusion.vllm_config import create_diffusion_vllm_config
-    from vllm_omni.platforms import current_omni_platform
-
-    device = torch.device(f"cuda:{device_index}")
-    torch.cuda.set_device(device)
-    current_omni_platform.set_device(device)
-    od_config = OmniDiffusionConfig(
-        model=str(model_dir),
-        model_class_name="BagelPipeline",
-        dtype=torch.bfloat16,
-        num_gpus=1,
-        distributed_executor_backend="uni",
-        trust_remote_code=True,
-        enforce_eager=True,
-    )
-    vllm_config = create_diffusion_vllm_config(device, od_config)
-    current_omni_platform.init_diffusion_worker_vllm_config(vllm_config)
-    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
-    with (
-        set_forward_context(vllm_config=vllm_config, omni_diffusion_config=od_config),
-        set_current_vllm_config(vllm_config),
-    ):
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            distributed_init_method=f"file:///tmp/morphserve-m1-{time.time_ns()}",
-            local_rank=device_index,
-        )
-        current_omni_platform.set_device(device)
-        pc = od_config.parallel_config
-        initialize_model_parallel(
-            data_parallel_size=pc.data_parallel_size,
-            cfg_parallel_size=pc.cfg_parallel_size,
-            sequence_parallel_size=pc.sequence_parallel_size,
-            ulysses_degree=pc.ulysses_degree,
-            ring_degree=pc.ring_degree,
-            allgather_degree=pc.allgather_degree,
-            tensor_parallel_size=pc.tensor_parallel_size,
-            pipeline_parallel_size=pc.pipeline_parallel_size,
-            fully_shard_degree=pc.hsdp_shard_size if pc.use_hsdp else 1,
-            enable_expert_parallel=pc.enable_expert_parallel,
-            use_hsdp=pc.use_hsdp,
-        )
-        pipeline = loader.load_model(load_device=f"cuda:{device_index}")
-    pipeline.eval()
-    return pipeline
+from morphserve.bench.exactness import MIB, gpu_mem_info_mib, pil_sha256, tensor_sha256
+from morphserve.models import load_bagel_pipeline
+from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, TriPoolVMM
 
 
 def _build_turn0_context(pipeline, prompt: str, device):
@@ -189,7 +102,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     t_load0 = time.perf_counter()
     pipeline = load_bagel_pipeline(model_dir, device_index=0)
     report["load_seconds"] = round(time.perf_counter() - t_load0, 2)
-    report["mem_monolithic_loaded"] = _mem_info_mib(0)
+    report["mem_monolithic_loaded"] = gpu_mem_info_mib(0)
     try:
         import shutil
 
@@ -227,7 +140,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     _img_warm, _ = _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52)
     del _img_warm
     ref_img, ref_gen_ms = _run_bagel_generate(pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52)
-    ref_sha = _pil_sha256(ref_img)
+    ref_sha = pil_sha256(ref_img)
     ref_arr = np.asarray(ref_img.convert("RGB"), dtype=np.int16)
 
     # Reference 1024x1024 batch=2 FLUX VAE decode (fixed latent) for Test 2 bit-exactness!
@@ -240,7 +153,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         vae_ref_out = pipeline.vae.decode(vae_lat_1024_b2)
     torch.cuda.synchronize()
     vae_ref_ms = (time.perf_counter() - t_vref0) * 1000.0
-    vae_ref_sha = _tensor_sha256(vae_ref_out)
+    vae_ref_sha = tensor_sha256(vae_ref_out)
     del vae_ref_out
     gc.collect()
     torch.cuda.empty_cache()
@@ -253,9 +166,12 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     }
 
     # ==================== 1. Offload Gen Expert -> NUMA memfd & Verify HBM Drop ====================
-    pager = BagelExpertPager(pipeline, role="generation", numa_node=0, super_handle_mib=64, wrap_vae=True)
+    pager = LayerExpertPager(
+        ExpertPartitionSpec.for_bagel(pipeline, role="generation", super_handle_mib=64, wrap_vae=True),
+        numa_node=0,
+    )
     offload_info = pager.offload_to_host_mirror()
-    mem_after_offload = _mem_info_mib(0)
+    mem_after_offload = gpu_mem_info_mib(0)
     report["offload_info"] = offload_info
     report["mem_after_offload"] = mem_after_offload
 
@@ -273,7 +189,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     )
     bind_info = pager.bind_vmm(vmm, initial_alpha=1.0)
     report["bind_info"] = bind_info
-    report["mem_after_vmm_bind"] = _mem_info_mib(0)
+    report["mem_after_vmm_bind"] = gpu_mem_info_mib(0)
 
     # Also test AR-only prefill while Generation Expert is 100% evicted (alpha=0.0)!
     pager.set_residency_alpha(0.0)
@@ -303,7 +219,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         gen_ms = (time.perf_counter() - t_wall0) * 1000.0
 
         st_after = vmm.stats_dict()
-        sha = _pil_sha256(img)
+        sha = pil_sha256(img)
         arr = np.asarray(img.convert("RGB"), dtype=np.int16)
         max_px_diff = int(np.abs(arr - ref_arr).max())
         streamed_mib = round((st_after["expert_h2d_bytes_total"] - st_before["expert_h2d_bytes_total"]) / MIB, 2)
@@ -370,7 +286,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             )
         h_ms = (time.perf_counter() - t_wall0) * 1000.0
         st_after = vmm.stats_dict()
-        h_sha = _pil_sha256(h_img)
+        h_sha = pil_sha256(h_img)
         if hires_ref_sha is None:
             hires_ref_sha = h_sha
         streamed_mib = round((st_after["expert_h2d_bytes_total"] - st_before["expert_h2d_bytes_total"]) / MIB, 2)
@@ -453,7 +369,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         vae_vmm_out = pipeline.vae.decode(vae_lat_1024_b2)
     torch.cuda.synchronize()
     vae_vmm_ms = (time.perf_counter() - t_vt0) * 1000.0
-    vae_vmm_sha = _tensor_sha256(vae_vmm_out)
+    vae_vmm_sha = tensor_sha256(vae_vmm_out)
     del vae_vmm_out
 
     st_t1 = vmm_tight.stats_dict()
@@ -467,7 +383,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             pipeline, main_ctx, cfg_img_ctx, prompt, steps=steps, seed=52, sync_before=False
         )
     post_gen_ms = (time.perf_counter() - t_rec0) * 1000.0
-    post_sha = _pil_sha256(post_img)
+    post_sha = pil_sha256(post_img)
     del post_img
 
     report["test2_tight_pool_7gib_vae_pressure"] = {

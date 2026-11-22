@@ -74,10 +74,16 @@ void tripool_free(void* ptr, ssize_t size, int device, void* stream);
 void tripool_scope_begin();
 int tripool_scope_end(void* stream);
 
-// Arena 1: Persistent KV 2 MiB Paged Pool
+// Arena 1: Persistent KV 2 MiB Paged Pool & Contiguous-VA Growable Regions
 uint64_t tripool_kv_va_base();
 int32_t tripool_kv_alloc_page();
 int tripool_kv_free_page(int32_t slot_idx, void* stream);
+
+int32_t tripool_kv_region_alloc(size_t max_va_bytes);
+uint64_t tripool_kv_region_ensure(int32_t region_id, size_t needed_bytes, void* stream);
+uint64_t tripool_kv_region_va(int32_t region_id);
+size_t tripool_kv_region_mapped_bytes(int32_t region_id);
+int tripool_kv_region_free(int32_t region_id, void* stream);
 
 // Arena 3: Opportunistic Expert Cache & Background Async H2D Streamer
 // Registers an expert with `num_layers`, each occupying `layer_stride_mib` (rounded to super_handle_mib).

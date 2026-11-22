@@ -1,23 +1,27 @@
-"""MorphServe CPTG + TriPool-VMM adapter for `InternVL-U` (`bridge_mllm_dit` architecture)."""
+"""Deep `InternVLUCPTGAdapter` (`bridge_mllm_dit`) built atop `LayerExpertPager` + `c62ec05` shims."""
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-import ctypes
+import gc
+import inspect
 from pathlib import Path
 import sys
+import time
 import types
-from typing import Any
+from typing import Any, Callable
 
-from morphserve.router import SharedNumaMemfdMirror
-from morphserve.vmm import TriPoolVMM
+from morphserve.vmm import (
+    ExpertPartitionSpec,
+    LayerExpertPager,
+    NaiveHostOffloader,
+    NumaMemfdMirror,
+    TriPoolVMM,
+    drop_partition_weights,
+)
+
+from .base import CPTGModelAdapter, PackedTransferState
 
 MIB = 1024**2
-ALIGN_BYTES = 256
-
-
-def _align_up(x: int, align: int = ALIGN_BYTES) -> int:
-    return ((x + align - 1) // align) * align
 
 
 def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
@@ -104,9 +108,13 @@ def load_internvlu_pipeline(
     vendor_dir: Path | None = None,
     device_index: int = 0,
 ) -> Any:
-    """Load `InternVLUPipeline` from verified local safetensors in `bfloat16` on `cuda:{device_index}`."""
-    import inspect
+    """Load `InternVLUPipeline` with `low_cpu_mem_usage=False` & `UnifiedMSRoPE` meta-tensor guard (`c62ec05`)."""
     import torch
+
+    if vendor_dir is None:
+        repo_vendor = Path(__file__).resolve().parents[3] / "data/internvlu_pkg"
+        if repo_vendor.is_dir():
+            vendor_dir = repo_vendor
 
     _install_runtime_compat_shims(vendor_dir=vendor_dir)
     from diffusers.models import AutoencoderKLQwenImage
@@ -184,8 +192,6 @@ def load_internvlu_pipeline(
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")
 
-    # Load each verified sub-directory directly with low_cpu_mem_usage=False so transformers>=5
-    # never leaves non-persistent plain tensor attributes (e.g. UnifiedMSRoPE.all_inv_freqs) on meta device.
     vlm = InternVLUChatModel.from_pretrained(
         str(model_dir / "vlm"),
         torch_dtype=torch.bfloat16,
@@ -226,7 +232,6 @@ def load_internvlu_pipeline(
         local_files_only=True,
     )
 
-    # Guard Qwen3ForCausalLM.forward against custom `padding_type` kwarg in transformers>=5
     lm = getattr(vlm, "language_model", None)
     if lm is not None and hasattr(lm, "forward"):
         orig_lm_fwd = lm.forward
@@ -248,6 +253,7 @@ def load_internvlu_pipeline(
         processor=processor,
     )
     pipe = pipe.to(dev)
+    # Materialize non-persistent plain tensor attributes (e.g. UnifiedMSRoPE.all_inv_freqs) (`c62ec05`)
     for root_mod in (pipe.vlm, pipe.generation_decoder, pipe.vae):
         for mod in root_mod.modules():
             if hasattr(mod, "all_inv_freqs") and hasattr(mod, "axes_dim") and hasattr(mod, "theta"):
@@ -262,200 +268,11 @@ def load_internvlu_pipeline(
                         for dim in mod.axes_dim
                     ]
                     mod.all_inv_freqs = torch.cat(inv_list, dim=0).float()
+
     pipe.vlm.eval()
     pipe.generation_decoder.eval()
     pipe.vae.eval()
     return pipe
-
-
-class InternVLUDecoderPager:
-    """TriPool-VMM Drop-Clean 64 MiB super-handle pager for `InternVL-U` GenerationDecoder + Scoped VAE."""
-
-    def __init__(
-        self,
-        pipeline: Any,
-        numa_node: int = 0,
-        super_handle_mib: int = 64,
-        wrap_vae: bool = True,
-    ) -> None:
-        import torch
-
-        self.pipeline = pipeline
-        self.decoder = pipeline.generation_decoder
-        self.vae = pipeline.vae
-        self.numa_node = int(numa_node)
-        self.super_handle_bytes = int(super_handle_mib) * MIB
-        self.expert_id = 0
-        self.wrap_vae = bool(wrap_vae)
-
-        # Partition decoder parameters across 20 logical layer buckets matching transformer blocks
-        dec_inner = getattr(self.decoder, "decoder", self.decoder)
-        blocks = getattr(dec_inner, "transformer_blocks", None) or getattr(dec_inner, "blocks", None)
-        self.num_layers = len(blocks) if blocks is not None and len(blocks) > 0 else 20
-
-        self._layer_params: list[list[tuple[str, Any, tuple[int, ...], Any, int, int]]] = [
-            [] for _ in range(self.num_layers)
-        ]
-        raw_params: list[tuple[int, str, Any]] = []
-        for pname, p in self.decoder.named_parameters():
-            lid = 0
-            for marker in ("transformer_blocks.", "blocks.", "layers."):
-                if marker in pname:
-                    tail = pname.split(marker, 1)[1]
-                    tok = tail.split(".", 1)[0]
-                    if tok.isdigit():
-                        lid = min(self.num_layers - 1, int(tok))
-                    break
-            raw_params.append((lid, pname, p))
-
-        layer_offsets = [0 for _ in range(self.num_layers)]
-        for lid, pname, p in raw_params:
-            nbytes = int(p.numel() * p.element_size())
-            off = _align_up(layer_offsets[lid], 512)
-            self._layer_params[lid].append((pname, p, tuple(p.shape), p.dtype, off, nbytes))
-            layer_offsets[lid] = off + nbytes
-
-        self.layer_used_bytes = [max(x, 4096) for x in layer_offsets]
-        max_used = max(self.layer_used_bytes)
-        self.layer_stride_bytes = _align_up(max_used, self.super_handle_bytes)
-        self.layer_stride_mib = self.layer_stride_bytes // MIB
-        self.layer_mirror_offsets = [lid * self.layer_stride_bytes for lid in range(self.num_layers)]
-        self.total_mirror_bytes = self.num_layers * self.layer_stride_bytes
-
-        self._orig_vae_decode = None
-        self._orig_vae_encode = None
-        self._is_pinned = False
-        self._va_views: list[Any] = []
-        self.mirror: SharedNumaMemfdMirror | None = None
-        self._owns_mirror = False
-        self.vmm: TriPoolVMM | None = None
-        self._device = next(self.decoder.parameters()).device
-
-    def offload_to_shared_mirror(self, shared_mirror: SharedNumaMemfdMirror, populate: bool = True) -> None:
-        import torch
-
-        self.mirror = shared_mirror
-        self._owns_mirror = False
-        base_addr = shared_mirror.ptr
-        for lid in range(self.num_layers):
-            l_base = base_addr + self.layer_mirror_offsets[lid]
-            for _, p, _, dtype, off, nbytes in self._layer_params[lid]:
-                if populate and nbytes > 0:
-                    cpu_t = p.detach().contiguous().cpu()
-                    ctypes.memmove(l_base + off, cpu_t.data_ptr(), nbytes)
-                p.data = torch.empty((0,), dtype=dtype, device=self._device)
-        torch.cuda.empty_cache()
-
-    def offload_to_host_mirror(self) -> SharedNumaMemfdMirror:
-        m = SharedNumaMemfdMirror.create(
-            nbytes=self.total_mirror_bytes,
-            numa_node=self.numa_node,
-            name="ms_internvlu_mirror",
-        )
-        self.offload_to_shared_mirror(m, populate=True)
-        self._owns_mirror = True
-        return m
-
-    def bind_vmm(self, vmm: TriPoolVMM, initial_alpha: float = 1.0) -> None:
-        assert self.mirror is not None
-        self.vmm = vmm
-        self.expert_id = vmm.register_expert(
-            num_layers=self.num_layers,
-            layer_stride_mib=self.layer_stride_mib,
-            mirror=self.mirror,
-        )
-        self._va_views = []
-        for lid in range(self.num_layers):
-            vmm.set_expert_layer_used_bytes(self.expert_id, lid, self.layer_used_bytes[lid])
-            u8_va = vmm.expert_layer_uint8_view(self.expert_id, lid)
-            self._va_views.append(u8_va)
-            for _, p, shape, dtype, off, nbytes in self._layer_params[lid]:
-                p.data = u8_va[off : off + nbytes].view(dtype).view(shape)
-
-        if self.wrap_vae:
-            orig_dec = self.vae.decode
-            orig_enc = self.vae.encode
-            self._orig_vae_decode = orig_dec
-            self._orig_vae_encode = orig_enc
-
-            def _wrapped_decode(*a, **kw):
-                was_pinned = self._is_pinned
-                self._is_pinned = False
-                vmm.set_expert_pinned(self.expert_id, False)
-                try:
-                    return vmm.run_in_transient_scope(orig_dec, *a, **kw)
-                finally:
-                    self._is_pinned = was_pinned
-                    if was_pinned:
-                        vmm.set_expert_pinned(self.expert_id, True)
-
-            def _wrapped_encode(*a, **kw):
-                was_pinned = self._is_pinned
-                prev_res = vmm.expert_resident_count(self.expert_id)
-                self._is_pinned = False
-                vmm.set_expert_pinned(self.expert_id, False)
-                try:
-                    return vmm.run_in_transient_scope(orig_enc, *a, **kw)
-                finally:
-                    if vmm.expert_resident_count(self.expert_id) < prev_res:
-                        vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
-                    self._is_pinned = was_pinned
-                    if was_pinned:
-                        vmm.set_expert_pinned(self.expert_id, True)
-
-            self.vae.decode = _wrapped_decode
-            self.vae.encode = _wrapped_encode
-
-        self.set_residency_alpha(initial_alpha)
-
-    def set_residency_alpha(self, alpha: float) -> int:
-        import torch
-
-        assert self.vmm is not None
-        target = max(0, min(self.num_layers, int(round(float(alpha) * self.num_layers))))
-        s_ptr = int(torch.cuda.current_stream(self._device).cuda_stream)
-        self._is_pinned = False
-        self.vmm.set_expert_pinned(self.expert_id, False)
-        if target < self.num_layers:
-            self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
-        if target > 0:
-            self.vmm.load_expert_layers_sync(self.expert_id, 0, target)
-        torch.cuda.synchronize(self._device)
-        return self.vmm.expert_resident_count(self.expert_id)
-
-    @contextmanager
-    def generation_mode(self):
-        import torch
-
-        assert self.vmm is not None
-        self._is_pinned = True
-        self.vmm.set_expert_pinned(self.expert_id, True)
-        if self.vmm.expert_resident_count(self.expert_id) < self.num_layers:
-            self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
-        torch.cuda.synchronize(self._device)
-        try:
-            yield
-        finally:
-            self._is_pinned = False
-            self.vmm.set_expert_pinned(self.expert_id, False)
-
-    def close(self) -> None:
-        import torch
-
-        if self._orig_vae_decode is not None:
-            self.vae.decode = self._orig_vae_decode
-            self._orig_vae_decode = None
-        if self._orig_vae_encode is not None:
-            self.vae.encode = self._orig_vae_encode
-            self._orig_vae_encode = None
-        for lid in range(self.num_layers):
-            for _, p, _, dtype, _, _ in self._layer_params[lid]:
-                p.data = torch.empty((0,), dtype=dtype, device=self._device)
-        self._va_views.clear()
-        self.vmm = None
-        if self.mirror is not None and self._owns_mirror:
-            self.mirror.close()
-        self.mirror = None
 
 
 _DTYPE_NAME_MAP = {
@@ -473,7 +290,6 @@ def pack_internvlu_bridge_state(diffusion_inputs: dict[str, Any], device: Any) -
     """Pack `InternVL-U` `diffusion_inputs` bridge tensors into a flat contiguous `uint8` CUDA tensor."""
     import torch
 
-    entries: list[dict[str, Any]] = []
     chunks: list[Any] = []
     offset = 0
 
@@ -502,7 +318,7 @@ def pack_internvlu_bridge_state(diffusion_inputs: dict[str, Any], device: Any) -
 
     tree = {k: _rec(k, v) for k, v in diffusion_inputs.items()}
     flat = torch.cat(chunks, dim=0) if chunks else torch.empty((0,), dtype=torch.uint8, device=device)
-    meta = {"total_bytes": int(flat.numel()), "tree": tree, "entries_count": len(entries)}
+    meta = {"total_bytes": int(flat.numel()), "tree": tree}
     return meta, flat
 
 
@@ -536,3 +352,370 @@ def unpack_internvlu_bridge_state(meta: dict[str, Any], flat_u8: Any) -> dict[st
         return node["value"]
 
     return {k: _dec(v) for k, v in meta["tree"].items()}
+
+
+class InternVLUCPTGAdapter(CPTGModelAdapter):
+    """Production `InternVL-U` (`bridge_mllm_dit`) adapter running inside `MorphServeClusterEngine`."""
+
+    architecture = "bridge_mllm_dit"
+
+    def __init__(
+        self,
+        rank: int,
+        policy: Any,
+        model_dir: Path,
+        bench_root: Path,
+        numa_node: int = 0,
+    ) -> None:
+        import torch
+
+        self.rank = int(rank)
+        self.policy = policy
+        self.model_dir = Path(model_dir)
+        self.bench_root = Path(bench_root)
+        self.numa_node = int(numa_node)
+        self.role = policy.role_of(self.rank)
+        self.device = torch.device(f"cuda:{self.rank}")
+        if getattr(policy, "gpu_memory_fraction", None) is not None:
+            torch.cuda.set_per_process_memory_fraction(float(policy.gpu_memory_fraction), self.device)
+        vendor_p = Path(policy.vendor_dir) if getattr(policy, "vendor_dir", None) else None
+
+        self.pipe = load_internvlu_pipeline(self.model_dir, vendor_dir=vendor_p, device_index=self.rank)
+        self.pager: LayerExpertPager | None = None
+        self.naive_offloader: NaiveHostOffloader | None = None
+        self.vmm: TriPoolVMM | None = None
+        self.pacer: Any = None
+        self._ctx_store: dict[str, dict[str, Any]] = {}
+        self._max_reserved_mib = 0.0
+
+        dec_spec = ExpertPartitionSpec.for_internvlu(
+            self.pipe,
+            super_handle_mib=policy.super_handle_mib,
+            wrap_vae=policy.use_scoped_vae,
+        )
+        self.num_expert_layers = dec_spec.num_layers
+
+        if policy.routing_mode == "static_nccl_fission":
+            if self.role == "und":
+                drop_partition_weights(dec_spec, device=self.device)
+                for p in self.pipe.vae.parameters():
+                    p.data = torch.empty(0, dtype=p.dtype, device=self.device)
+                gc.collect()
+                torch.cuda.empty_cache()
+            elif self.role == "gen":
+                for p in self.pipe.vlm.parameters():
+                    p.data = torch.empty(0, dtype=p.dtype, device=self.device)
+                gc.collect()
+                torch.cuda.empty_cache()
+        elif policy.use_naive_offload:
+            self.naive_offloader = NaiveHostOffloader(dec_spec, device=self.device)
+            self.naive_offloader.offload_to_cpu()
+        elif policy.use_expert_pager:
+            self.pager = LayerExpertPager(dec_spec, numa_node=self.numa_node)
+
+    @property
+    def total_mirror_bytes(self) -> int:
+        return self.pager.total_mirror_bytes if self.pager is not None else 0
+
+    def attach_expert_mirror(self, shared_mirror: NumaMemfdMirror | None, populate: bool = True) -> None:
+        if self.pager is None:
+            return
+        if shared_mirror is not None:
+            self.pager.offload_to_shared_mirror(shared_mirror, populate=populate)
+        else:
+            self.pager.offload_to_host_mirror()
+
+    def bind_runtime_resources(self, pacer: Any | None = None) -> dict[str, Any]:
+        import torch
+
+        self.pacer = pacer
+        if self.policy.use_tripool_vmm:
+            pool_mib = int(self.policy.super_pool_mib)
+            self.vmm = TriPoolVMM(
+                device=self.rank,
+                super_pool_mib=pool_mib,
+                fine_kv_pool_mib=self.policy.fine_kv_pool_mib,
+                super_handle_mib=self.policy.super_handle_mib,
+                transient_va_gib=self.policy.transient_va_gib,
+                kv_va_gib=self.policy.kv_va_gib,
+                allow_overflow=self.policy.allow_vmm_overflow,
+            )
+            if self.pager is not None:
+                self.pager.bind_vmm(self.vmm, initial_alpha=self.policy.initial_alphas.get(self.rank, 1.0))
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        self._max_reserved_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        return {
+            "resident_alpha": self.resident_alpha(),
+            "reserved_mib": round(self._max_reserved_mib, 2),
+        }
+
+    def warmup(self) -> None:
+        return None
+
+    def _update_hwm(self) -> None:
+        import torch
+
+        cur = float(torch.cuda.memory_reserved(self.device) / MIB)
+        pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
+        self._max_reserved_mib = max(self._max_reserved_mib, cur, pk)
+
+    def _load_pil_if_any(self, cmd: dict[str, Any]) -> Any:
+        from PIL import Image
+        import os
+
+        paths = cmd.get("image_paths") or []
+        if not paths:
+            return None
+        rel = str(paths[0])
+        p = self.bench_root / rel if not os.path.isabs(rel) else Path(rel)
+        if not p.is_file():
+            return None
+        with Image.open(p) as raw:
+            im = raw.convert("RGB")
+            im.load()
+            return im
+
+    def prepare_turn(self, ctx_id: str, cmd: dict[str, Any]) -> int:
+        import torch
+
+        prompt = str(cmd["prompt"])
+        prep_dit = bool(cmd.get("prepare_for_dit", False))
+        pil_img = self._load_pil_if_any(cmd)
+        if not prep_dit:
+            self._ctx_store[ctx_id] = {"prompt": prompt, "pil_img": pil_img, "bridge_bytes": 4096}
+            return 4096
+
+        h = int(cmd.get("height", 512))
+        w = int(cmd.get("width", 512))
+        stride = self.pipe.processor.image_gen_processor.merge_size * self.pipe.processor.image_gen_processor.patch_size
+        gh, gw = (h // stride) * stride, (w // stride) * stride
+        with torch.inference_mode():
+            inp = self.pipe.processor(
+                prompt=prompt,
+                image=pil_img,
+                generation_mode="image",
+                padding=True,
+                return_tensors="pt",
+                height=gh,
+                width=gw,
+            )
+            inp = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in inp.items()}
+            v_out = self.pipe.vlm.generate_hidden_states(
+                input_ids=inp["input_ids"],
+                attention_mask=inp["attention_mask"],
+                pixel_values=inp.get("pixel_values"),
+            )
+            diff_inp = self.pipe._prepare_diffusion_inputs(
+                input_ids=inp["input_ids"],
+                attention_mask=inp["attention_mask"],
+                pixel_values=inp.get("pixel_values"),
+                pixel_values_gen=inp.get("pixel_values_gen"),
+                image_grid_thw_gen=inp.get("image_grid_thw_gen"),
+                generation_flags=inp["generation_flags"],
+                vlm_hidden_states=v_out.hidden_states,
+            )
+            meta, flat = pack_internvlu_bridge_state(diff_inp, device=self.device)
+        torch.cuda.synchronize(self.device)
+        b_bytes = int(meta["total_bytes"])
+        self._ctx_store[ctx_id] = {
+            "prompt": prompt,
+            "pil_img": pil_img,
+            "diff_inp": diff_inp,
+            "gh": gh,
+            "gw": gw,
+            "packed_meta": meta,
+            "packed_flat": flat,
+            "bridge_bytes": b_bytes,
+        }
+        self._update_hwm()
+        return b_bytes
+
+    def decode_ar(self, ctx_id: str, max_tokens: int) -> dict[str, Any]:
+        import torch
+
+        entry = self._ctx_store[ctx_id]
+        prompt = entry["prompt"]
+        pil_img = entry.get("pil_img")
+        t0 = time.perf_counter()
+        with torch.inference_mode():
+            out = self.pipe(
+                prompt=prompt,
+                image=pil_img,
+                generation_mode="text",
+                max_new_tokens=int(max_tokens),
+                do_sample=False,
+            )
+        torch.cuda.synchronize(self.device)
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        tok_seq = out.generate_output[0]
+        n_tok = max(1, int(len(tok_seq)))
+        txt = self.pipe.tokenizer.decode(tok_seq, skip_special_tokens=True)
+        per_tok = dt_ms / float(n_tok)
+        self._update_hwm()
+        return {
+            "text": txt,
+            "tokens": n_tok,
+            "ttft_ms": round(per_tok, 2),
+            "tpots_ms": [round(per_tok, 2) for _ in range(max(0, n_tok - 1))],
+            "kv_bytes": int(entry.get("bridge_bytes", 4096)),
+            "resident_alpha": self.resident_alpha(),
+        }
+
+    def pack_state(self, ctx_id: str, include_cfg_dup: bool = False) -> PackedTransferState:
+        entry = self._ctx_store[ctx_id]
+        if "packed_flat" in entry and entry["packed_flat"] is not None:
+            meta = dict(entry["packed_meta"], gh=entry["gh"], gw=entry["gw"])
+            flat = entry.pop("packed_flat")
+        else:
+            raw_meta, flat = pack_internvlu_bridge_state(entry["diff_inp"], device=self.device)
+            meta = dict(raw_meta, gh=entry["gh"], gw=entry["gw"])
+        total_b = int(meta["total_bytes"])
+        meta["logical_bytes"] = total_b
+        return PackedTransferState(meta=meta, payload=flat, logical_bytes=total_b)
+
+    def unpack_state(self, new_ctx_id: str, meta: dict[str, Any], raw_payload: Any) -> int:
+        diff_inp = unpack_internvlu_bridge_state(meta, raw_payload)
+        total_b = int(meta["total_bytes"])
+        self._ctx_store[new_ctx_id] = {
+            "prompt": "",
+            "diff_inp": diff_inp,
+            "gh": int(meta["gh"]),
+            "gw": int(meta["gw"]),
+            "bridge_bytes": total_b,
+        }
+        self._update_hwm()
+        return total_b
+
+    def generate_dit(
+        self,
+        ctx_id: str,
+        cmd: dict[str, Any],
+        poll_preempt_cmds: Callable[[], list[dict[str, Any]]] | None = None,
+        emit_preempt_ack: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        import numpy as np
+        from PIL import Image
+        import torch
+
+        entry = self._ctx_store[ctx_id]
+        if "diff_inp" not in entry:
+            self.prepare_turn(ctx_id, dict(cmd, prepare_for_dit=True))
+            entry = self._ctx_store[ctx_id]
+
+        diff_inp = entry["diff_inp"]
+        entry.pop("packed_flat", None)
+        gh, gw = int(entry["gh"]), int(entry["gw"])
+        steps = int(cmd.get("dit_steps", 16))
+        seed = int(cmd.get("seed", 42))
+        save_tmp_path = cmd.get("save_tmp_image_path")
+
+        t0 = time.perf_counter()
+        if self.naive_offloader is not None:
+            self.naive_offloader.swap_in_sync()
+
+        pacer_cm = None
+        if (
+            self.pacer is not None
+            and self.pager is not None
+            and self.vmm is not None
+            and self.vmm.expert_resident_count(self.pager.expert_id) < self.pager.num_layers
+        ):
+            pacer_cm = self.pacer.acquire_process_slot(self.rank)
+
+        gen = torch.Generator(device=self.device).manual_seed(seed)
+        try:
+            if pacer_cm is not None:
+                pacer_cm.__enter__()
+            with torch.inference_mode():
+                if self.pager is not None:
+                    with self.pager.generation_mode(prefetch_all=True):
+                        imgs_t = self.pipe.image_pipeline(
+                            **diff_inp,
+                            all_cfg_scale=4.5,
+                            part_cfg_scale=2.0,
+                            num_inference_steps=steps,
+                            num_images_per_prompt=1,
+                            use_resolution_binning=False,
+                            height=gh,
+                            width=gw,
+                            generator=gen,
+                        ).images
+                else:
+                    imgs_t = self.pipe.image_pipeline(
+                        **diff_inp,
+                        all_cfg_scale=4.5,
+                        part_cfg_scale=2.0,
+                        num_inference_steps=steps,
+                        num_images_per_prompt=1,
+                        use_resolution_binning=False,
+                        height=gh,
+                        width=gw,
+                        generator=gen,
+                    ).images
+        finally:
+            if pacer_cm is not None:
+                pacer_cm.__exit__(None, None, None)
+            if self.naive_offloader is not None:
+                self.naive_offloader.drop_from_gpu()
+
+        torch.cuda.synchronize(self.device)
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if save_tmp_path:
+            out_c = ((127.5 * imgs_t[0] + 128.0) / 255.0).clamp(0, 1)
+            pil = Image.fromarray((out_c.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+            Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+            pil.save(save_tmp_path, format="PNG")
+
+        self._update_hwm()
+        return {
+            "status": "ok",
+            "ctx_id": ctx_id,
+            "elapsed_ms": round(elapsed_ms, 2),
+            "kv_bytes": int(entry.get("bridge_bytes", 0)),
+            "resident_alpha": self.resident_alpha(),
+            "yield_count": 0,
+        }
+
+    def set_residency_alpha(self, alpha: float) -> float:
+        if self.pager is not None and self.vmm is not None:
+            self.pager.set_residency_alpha(float(alpha))
+        return self.resident_alpha()
+
+    def resident_alpha(self) -> float:
+        if self.pager is not None and self.vmm is not None:
+            return round(self.pager.resident_alpha(), 3)
+        return round(float(self.policy.initial_alphas.get(self.rank, 1.0)), 3)
+
+    def release_context(self, ctx_id: str) -> None:
+        import torch
+
+        self._ctx_store.pop(ctx_id, None)
+        if self.vmm is None:
+            torch.cuda.empty_cache()
+
+    def memory_and_vmm_stats(self) -> dict[str, Any]:
+        self._update_hwm()
+        return {
+            "peak_reserved_mib": round(self._max_reserved_mib, 2),
+            "vmm_stats": self.vmm.stats_dict() if self.vmm is not None else {},
+            "active_contexts": len(self._ctx_store),
+        }
+
+    def close(self) -> None:
+        import torch
+
+        self._ctx_store.clear()
+        if self.pager is not None:
+            self.pager.close()
+            self.pager = None
+        if self.naive_offloader is not None:
+            self.naive_offloader.close()
+            self.naive_offloader = None
+        if self.vmm is not None:
+            self.vmm.shutdown()
+            self.vmm = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

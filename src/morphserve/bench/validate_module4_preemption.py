@@ -5,12 +5,11 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 import gc
-import hashlib
 import json
 from pathlib import Path
 import time
 
-from morphserve.bench.validate_module1_bagel import load_bagel_pipeline
+from morphserve.bench.exactness import compute_ssim_rgb, percentile as _pct, pil_sha256 as _pil_sha256
 from morphserve.kernels import (
     GpuInPlaceLoopback,
     SharedPrefixCache,
@@ -18,22 +17,9 @@ from morphserve.kernels import (
     install_shared_prefix_bagel_hooks,
     rebind_cow_prefix,
 )
-from morphserve.vmm import BagelExpertPager, TriPoolVMM
+from morphserve.models import load_bagel_pipeline
+from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, TriPoolVMM
 from morphserve.worker import ArDecodeTask, UnifiedPreemptiveScheduler
-
-
-def _pil_sha256(img) -> str:
-    import numpy as np
-
-    return hashlib.sha256(np.asarray(img.convert("RGB"), dtype=np.uint8).tobytes()).hexdigest()
-
-
-def _pct(vals: list[float], p: float) -> float:
-    import numpy as np
-
-    if not vals:
-        return 0.0
-    return round(float(np.percentile(vals, p)), 2)
 
 
 def _prepare_text_ctx(pipeline, prompt: str):
@@ -303,7 +289,10 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     SharedPrefixCache.clear_memo()
 
     # Attach Module 1 (TriPool-VMM) + Module 3 (SharedPrefixCache + FlashPrefix CFG) + Module 4 (Layer-Chunk Preemption)!
-    pager = BagelExpertPager(pipeline, role="generation", numa_node=0, super_handle_mib=64, wrap_vae=True)
+    pager = LayerExpertPager(
+        ExpertPartitionSpec.for_bagel(pipeline, role="generation", super_handle_mib=64, wrap_vae=True),
+        numa_node=0,
+    )
     pager.offload_to_host_mirror()
     vmm = TriPoolVMM(
         device=0,
@@ -337,9 +326,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     torch.cuda.synchronize()
     stack_wall_ms = (time.perf_counter() - ts0) * 1000.0
 
-    from morphserve.bench.validate_module3_cfg_loopback import _compute_ssim_rgb
-
-    stack_qual = _compute_ssim_rgb(ref_turn1_img, stack_img)
+    stack_qual = compute_ssim_rgb(ref_turn1_img, stack_img)
     stack_tpots = stack_ar.inter_token_latencies_ms()
     st_vmm = vmm.stats_dict()
 

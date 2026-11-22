@@ -4,46 +4,27 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-import gc
-import hashlib
 import json
 import os
 from pathlib import Path
 import time
 from typing import Any
 
-from morphserve.bench.validate_module1_bagel import load_bagel_pipeline
+from morphserve.bench.exactness import MIB, pil_sha256, read_shmem_kib
+from morphserve.models import bagel_ctx_nbytes, load_bagel_pipeline, pack_bagel_kv_context, unpack_bagel_kv_context
 from morphserve.router import (
     CPTGRequestSpec,
     ClusterTopologyProfile,
-    DirectNcclP2PChannel,
+    DirectNcclMesh,
     DualPathMorphRouter,
     HalfNodeH2DPacer,
-    NcclStateShipper,
-    SharedNumaMemfdMirror,
     WorkerState,
     find_free_tcp_port,
     probe_live_topology,
 )
-from morphserve.vmm import BagelExpertPager, TriPoolVMM
+from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, NumaMemfdMirror, TriPoolVMM
 
-MIB = 1024**2
 GIB = 1024**3
-
-
-def _pil_sha256(pil_img: Any) -> str:
-    import numpy as np
-
-    arr = np.ascontiguousarray(np.asarray(pil_img.convert("RGB"), dtype=np.uint8))
-    return hashlib.sha256(arr.tobytes()).hexdigest()
-
-
-def _read_shmem_kib() -> int:
-    with open("/proc/meminfo", "r", encoding="utf-8") as fh:
-        for line in fh:
-            if line.startswith("Shmem:"):
-                return int(line.split()[1])
-    return 0
 
 
 def _test1_worker(rank: int, world_size: int, master_port: int, payload_bytes: int, out_file: str) -> None:
@@ -56,7 +37,7 @@ def _test1_worker(rank: int, world_size: int, master_port: int, payload_bytes: i
     os.environ["MASTER_PORT"] = str(master_port)
     dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
 
-    mirror: SharedNumaMemfdMirror | None = None
+    mirror: NumaMemfdMirror | None = None
     try:
         topo = ClusterTopologyProfile.a100_pcie_8gpu_default()
         numa_node = topo.numa_node_of(rank)
@@ -64,12 +45,12 @@ def _test1_worker(rank: int, world_size: int, master_port: int, payload_bytes: i
         sentinel = f"NUMA{numa_node}_EXPERT_MIRROR_VERIFY_V1".encode("utf-8")
 
         dist.barrier()
-        shmem_before_kib = _read_shmem_kib() if rank == 0 else 0
+        shmem_before_kib = read_shmem_kib() if rank == 0 else 0
         dist.barrier()
 
         my_meta: dict[str, Any] | None = None
         if is_leader:
-            mirror = SharedNumaMemfdMirror.create(
+            mirror = NumaMemfdMirror.create(
                 nbytes=payload_bytes,
                 numa_node=numa_node,
                 name=f"morphserve_m2_numa{numa_node}",
@@ -83,7 +64,7 @@ def _test1_worker(rank: int, world_size: int, master_port: int, payload_bytes: i
 
         if not is_leader:
             lm = leader_map[numa_node]
-            mirror = SharedNumaMemfdMirror.attach_proc_fd(
+            mirror = NumaMemfdMirror.attach_proc_fd(
                 leader_pid=lm["pid"],
                 leader_fd=lm["fd"],
                 nbytes=payload_bytes,
@@ -96,7 +77,7 @@ def _test1_worker(rank: int, world_size: int, master_port: int, payload_bytes: i
         mirror.pin_cuda()
 
         dist.barrier()
-        shmem_after_kib = _read_shmem_kib() if rank == 0 else 0
+        shmem_after_kib = read_shmem_kib() if rank == 0 else 0
         dist.barrier()
 
         # Allocate GPU destination buffer for H2D streaming tests (4,480 MiB = 10 BAGEL layers)
@@ -275,22 +256,6 @@ def _run_bagel_dit(pipeline, main_ctx, cfg_text_ctx, cfg_img_ctx, prompt: str, s
     return out.output["payload"]["image"], (time.perf_counter() - t0) * 1000.0
 
 
-def _ctx_nbytes(ctx: dict[str, Any]) -> int:
-    pkv = ctx["past_key_values"]
-    num_layers = int(pkv.num_layers)
-    get_k = pkv.key_cache.get if isinstance(pkv.key_cache, dict) else (lambda i: pkv.key_cache[i])
-    get_v = pkv.value_cache.get if isinstance(pkv.value_cache, dict) else (lambda i: pkv.value_cache[i])
-    total = 0
-    for l in range(num_layers):
-        k = get_k(l)
-        v = get_v(l)
-        if k is not None:
-            total += int(k.numel() * k.element_size())
-        if v is not None:
-            total += int(v.numel() * v.element_size())
-    return total
-
-
 def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_dir_str: str, steps: int, out_file: str) -> None:
     import torch
     import torch.distributed as dist
@@ -300,14 +265,46 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
     device = torch.device(f"cuda:{rank}")
 
     pipeline = None
-    channel: DirectNcclP2PChannel | None = None
+    mesh: DirectNcclMesh | None = None
     pager = None
     vmm = None
     try:
         model_dir = Path(model_dir_str)
         pipeline = load_bagel_pipeline(model_dir, device_index=rank)
-        channel = DirectNcclP2PChannel(rank=rank, world_size=world_size, master_port=master_port)
-        shipper = NcclStateShipper(channel=channel)
+        store = dist.TCPStore("127.0.0.1", master_port, world_size, is_master=(rank == 0))
+        if rank == 0:
+            uid_bytes = DirectNcclMesh.generate_unique_id_bytes()
+            store.set("nccl_uid", uid_bytes)
+        else:
+            uid_bytes = bytes(store.get("nccl_uid"))
+        mesh = DirectNcclMesh(rank=rank, world_size=world_size, uid_bytes=uid_bytes, device_index=rank)
+        bar_seq = 0
+
+        def _barrier() -> None:
+            nonlocal bar_seq
+            bar_seq += 1
+            store.set(f"bar_{bar_seq}_{rank}", b"1")
+            for peer_r in range(world_size):
+                if peer_r != rank:
+                    store.get(f"bar_{bar_seq}_{peer_r}")
+
+        def _ship_ctx(ctx: dict[str, Any], dst_rank: int, tag: str) -> tuple[float, float]:
+            meta, flat_u8 = pack_bagel_kv_context(ctx, device=device)
+            store.set(f"meta_{tag}", json.dumps(meta).encode("utf-8"))
+            assert mesh is not None
+            ms = mesh.send_u8(flat_u8, dst_rank)
+            gbps = round((int(flat_u8.numel()) / 1e9) / max(ms / 1000.0, 1e-6), 2)
+            del flat_u8
+            return ms, gbps
+
+        def _recv_ctx(src_rank: int, tag: str) -> tuple[dict[str, Any], float, float]:
+            meta = json.loads(store.get(f"meta_{tag}").decode("utf-8"))
+            assert mesh is not None
+            flat_u8, ms = mesh.recv_u8(int(meta["total_bytes"]), src_rank)
+            gbps = round((int(flat_u8.numel()) / 1e9) / max(ms / 1000.0, 1e-6), 2)
+            out_ctx = unpack_bagel_kv_context(meta, flat_u8, NaiveCache)
+            del flat_u8
+            return out_ctx, ms, gbps
 
         prompt0 = "A serene wooden cabin beside an alpine lake at golden hour, realistic photography."
         edit_p = "Add a warm lantern near the cabin door and gentle ripples on the lake."
@@ -318,11 +315,11 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
 
         # Warmup DiT once on both ranks
         _ = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=2, seed=52, hw=512)
-        channel.barrier()
+        _barrier()
 
         if rank == 1:
             ref_t0_img, stock_t0_gen_ms = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=steps, seed=52, hw=512)
-            ref_t0_sha = _pil_sha256(ref_t0_img)
+            ref_t0_sha = pil_sha256(ref_t0_img)
 
         # Build genuine 3-turn (~18k tokens, ~1.92 GiB) BAGEL context on Rank 0 & Rank 1 reference
         ctx_long_main = deepcopy(ctx_t0_main)
@@ -341,56 +338,56 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
             ref_t3_img, stock_t3_gen_ms = _run_bagel_dit(
                 pipeline, ctx_long_main, ctx_long_text, ctx_long_img, f"{edit_p} (turn 3)", steps=steps, seed=61, hw=512
             )
-            ref_t3_sha = _pil_sha256(ref_t3_img)
+            ref_t3_sha = pil_sha256(ref_t3_img)
             del ref_t0_img, ref_t3_img
 
-        channel.barrier()
+        _barrier()
         # Rank 0 ships NCCL warmup tensor to Rank 1 so NCCL P2P buffers are pre-warmed
         if rank == 0:
-            _ = shipper.send_bagel_context(ctx_t0_main, dst_rank=1)
+            _ = _ship_ctx(ctx_t0_main, dst_rank=1, tag="warm")
         else:
-            _w_ctx, _ = shipper.recv_bagel_context(src_rank=0, naive_cache_cls=NaiveCache, device=device)
+            _w_ctx, _, _ = _recv_ctx(src_rank=0, tag="warm")
             del _w_ctx
 
-        # ---- Regime 1: Turn-0 Short KV (~2 MiB) Path A (NcclStateShipper) vs Path B (TriPool-VMM alpha=0.75) ----
-        channel.barrier()
+        # ---- Regime 1: Turn-0 Short KV (~2 MiB) Path A (DirectNcclMesh) vs Path B (TriPool-VMM alpha=0.75) ----
+        _barrier()
         if rank == 0:
-            t_a0 = time.perf_counter()
-            m_t0 = shipper.send_bagel_context(ctx_t0_main, dst_rank=1)
-            channel.barrier()  # Wait for Rank 1 finish timestamp barrier
-            path_a_t0_total_ms = (time.perf_counter() - t_a0) * 1000.0
+            m_t0_ms, m_t0_gbps = _ship_ctx(ctx_t0_main, dst_rank=1, tag="t0")
+            _barrier()
         else:
-            recv_t0_main, m_t0 = shipper.recv_bagel_context(src_rank=0, naive_cache_cls=NaiveCache, device=device)
+            recv_t0_main, m_t0_ms, m_t0_gbps = _recv_ctx(src_rank=0, tag="t0")
             img_a_t0, gen_a_t0_ms = _run_bagel_dit(pipeline, recv_t0_main, None, ctx_t0_img, prompt0, steps=steps, seed=52, hw=512)
-            sha_a_t0 = _pil_sha256(img_a_t0)
+            sha_a_t0 = pil_sha256(img_a_t0)
             del recv_t0_main, img_a_t0
-            channel.barrier()
+            _barrier()
 
-        # ---- Regime 2: Long 4-turn KV (~1.92 GiB) Path A (NcclStateShipper gamma=2 interleaved) ----
-        channel.barrier()
+        # ---- Regime 2: Long 4-turn KV (~1.92 GiB) Path A (DirectNcclMesh gamma=2 interleaved) ----
+        _barrier()
         if rank == 0:
-            m_long_fwd = shipper.send_bagel_context(ctx_long_main, dst_rank=1)
-            channel.barrier()  # Exclude Rank 1 DiT compute time from return-trip NCCL wire measurement
-            recv_back, m_long_back = shipper.recv_bagel_context(src_rank=1, naive_cache_cls=NaiveCache, device=device)
+            m_long_fwd_ms, m_long_fwd_gbps = _ship_ctx(ctx_long_main, dst_rank=1, tag="long_fwd")
+            _barrier()  # Exclude Rank 1 DiT compute time from return-trip NCCL wire measurement
+            recv_back, m_long_back_ms, _ = _recv_ctx(src_rank=1, tag="long_back")
             del recv_back
-            channel.barrier()
+            _barrier()
         else:
-            recv_long, m_long_fwd = shipper.recv_bagel_context(src_rank=0, naive_cache_cls=NaiveCache, device=device)
+            recv_long, m_long_fwd_ms, m_long_fwd_gbps = _recv_ctx(src_rank=0, tag="long_fwd")
             img_a_t3, gen_a_t3_ms = _run_bagel_dit(
                 pipeline, recv_long, ctx_long_text, ctx_long_img, f"{edit_p} (turn 3)", steps=steps, seed=61, hw=512
             )
-            sha_a_t3 = _pil_sha256(img_a_t3)
+            sha_a_t3 = pil_sha256(img_a_t3)
             del img_a_t3
-            channel.barrier()
-            m_long_back = shipper.send_bagel_context(recv_long, dst_rank=0)
+            _barrier()
+            m_long_back_ms, _ = _ship_ctx(recv_long, dst_rank=0, tag="long_back")
             del recv_long
-            channel.barrier()
+            _barrier()
 
         # ---- Path B Execution on Rank 0 using TriPool-VMM (`alpha = 0.75`) ----
         r0_results: dict[str, Any] = {}
         if rank == 0:
-            # Attach TriPool-VMM on Rank 0
-            pager = BagelExpertPager(pipeline, role="generation", numa_node=0, super_handle_mib=64, wrap_vae=True)
+            pager = LayerExpertPager(
+                ExpertPartitionSpec.for_bagel(pipeline, role="generation", super_handle_mib=64, wrap_vae=True),
+                numa_node=0,
+            )
             pager.offload_to_host_mirror()
             vmm = TriPoolVMM(
                 device=0,
@@ -413,7 +410,7 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
             torch.cuda.synchronize(device)
             with pager.generation_mode(prefetch_all=True):
                 img_b_t0, gen_b_t0_ms = _run_bagel_dit(pipeline, ctx_t0_main, None, ctx_t0_img, prompt0, steps=steps, seed=52, hw=512)
-            sha_b_t0 = _pil_sha256(img_b_t0)
+            sha_b_t0 = pil_sha256(img_b_t0)
             del img_b_t0
 
             # Long Turn-3 Path B (alpha=0.75)
@@ -423,7 +420,7 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 img_b_t3, gen_b_t3_ms = _run_bagel_dit(
                     pipeline, ctx_long_main, ctx_long_text, ctx_long_img, f"{edit_p} (turn 3)", steps=steps, seed=61, hw=512
                 )
-            sha_b_t3 = _pil_sha256(img_b_t3)
+            sha_b_t3 = pil_sha256(img_b_t3)
             del img_b_t3
 
             # Measure pure alpha=1.0 vs alpha=0.75 morph stall on Turn-3 + Turn-0
@@ -435,8 +432,8 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 )
 
             r0_results = {
-                "t0_ctx_mib": round(_ctx_nbytes(ctx_t0_main) / MIB, 2),
-                "long_ctx_mib": round(_ctx_nbytes(ctx_long_main) / MIB, 2),
+                "t0_ctx_mib": round(bagel_ctx_nbytes(ctx_t0_main) / MIB, 2),
+                "long_ctx_mib": round(bagel_ctx_nbytes(ctx_long_main) / MIB, 2),
                 "long_seq_len": int(ctx_long_main["past_key_values"].seq_lens),
                 "path_b_t0_gen_ms": round(gen_b_t0_ms, 2),
                 "path_b_t0_morph_overhead_ms": round(max(0.0, gen_b_t0_ms - gen_local_t0_ms), 2),
@@ -444,17 +441,17 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 "path_b_t3_gen_ms": round(gen_b_t3_ms, 2),
                 "path_b_t3_morph_overhead_ms": round(max(0.0, gen_b_t3_ms - gen_local_t3_ms), 2),
                 "path_b_t3_sha256": sha_b_t3,
-                "m_t0_ship_ms": m_t0.transfer_ms,
-                "m_t0_ship_gbps": m_t0.bandwidth_gbps,
-                "m_long_ship_fwd_ms": m_long_fwd.transfer_ms,
-                "m_long_ship_fwd_gbps": m_long_fwd.bandwidth_gbps,
-                "m_long_ship_back_ms": m_long_back.transfer_ms,
-                "m_long_ship_gamma2_ms": round(m_long_fwd.transfer_ms + m_long_back.transfer_ms, 2),
+                "m_t0_ship_ms": m_t0_ms,
+                "m_t0_ship_gbps": m_t0_gbps,
+                "m_long_ship_fwd_ms": m_long_fwd_ms,
+                "m_long_ship_fwd_gbps": m_long_fwd_gbps,
+                "m_long_ship_back_ms": m_long_back_ms,
+                "m_long_ship_gamma2_ms": round(m_long_fwd_ms + m_long_back_ms, 2),
             }
 
-        channel.barrier()
-        r1_info = (
-            {
+        _barrier()
+        if rank == 1:
+            r1_info = {
                 "ref_t0_sha": ref_t0_sha,
                 "ref_t3_sha": ref_t3_sha,
                 "sha_a_t0": sha_a_t0,
@@ -464,14 +461,10 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
                 "stock_t0_gen_ms": round(stock_t0_gen_ms, 2),
                 "stock_t3_gen_ms": round(stock_t3_gen_ms, 2),
             }
-            if rank == 1
-            else None
-        )
-        gathered = channel.exchange_json(r1_info if rank == 1 else r0_results)
-
-        if rank == 0:
-            r0 = gathered[0]
-            r1 = gathered[1]
+            store.set("r1_info", json.dumps(r1_info).encode("utf-8"))
+        else:
+            r0 = r0_results
+            r1 = json.loads(store.get("r1_info").decode("utf-8"))
             # Evaluate router decisions on live ClusterTopologyProfile
             topo = ClusterTopologyProfile.a100_pcie_8gpu_default()
             router = DualPathMorphRouter(topo)
@@ -530,16 +523,14 @@ def _test2_dualpath_worker(rank: int, world_size: int, master_port: int, model_d
             }
             Path(out_file).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-        channel.barrier()
+        _barrier()
     finally:
-        if channel is not None:
-            channel.close()
+        if mesh is not None:
+            mesh.close()
         if pager is not None:
             pager.close()
         if vmm is not None:
             vmm.shutdown()
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 def _test3_mixed_cptg_burst(topo: ClusterTopologyProfile) -> dict[str, Any]:

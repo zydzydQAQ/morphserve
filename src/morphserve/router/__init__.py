@@ -1,4 +1,4 @@
-"""MorphServe Module 2: Topology-Aware Dual-Path Morphing Router & Cross-GPU State Shipping."""
+"""MorphServe Module 2: Three-tier topology, OperatorLatencyProfile, DualPathMorphRouter & DirectNcclMesh."""
 
 from .cost_router import (
     CPTGRequestSpec,
@@ -7,16 +7,11 @@ from .cost_router import (
     RouteDecision,
     WorkerState,
 )
-from .nccl_state_shipper import (
-    DirectNcclMesh,
-    DirectNcclP2PChannel,
-    NcclStateShipper,
-    SharedNumaMemfdMirror,
-    ShipMetrics,
-    find_free_tcp_port,
-)
+from .nccl_state_shipper import DirectNcclMesh, find_free_tcp_port
 from .topology import (
     ClusterTopologyProfile,
+    DEFAULT_OPERATOR_PROFILE,
+    OperatorLatencyProfile,
     PcieHalfGroup,
     probe_live_topology,
 )
@@ -24,15 +19,13 @@ from .topology import (
 __all__ = [
     "CPTGRequestSpec",
     "ClusterTopologyProfile",
+    "DEFAULT_OPERATOR_PROFILE",
     "DirectNcclMesh",
-    "DirectNcclP2PChannel",
     "DualPathMorphRouter",
     "HalfNodeH2DPacer",
-    "NcclStateShipper",
+    "OperatorLatencyProfile",
     "PcieHalfGroup",
     "RouteDecision",
-    "SharedNumaMemfdMirror",
-    "ShipMetrics",
     "WorkerState",
     "find_free_tcp_port",
     "probe_live_topology",

@@ -1,8 +1,6 @@
-"""MorphServe unified AR+DiT worker and deterministic preemptive scheduler."""
+"""MorphServe Module 4: Unified AR+DiT Step & Layer-Chunk Preemptive Scheduler & Execution Interceptor."""
 
+from .bagel_interceptor import BagelExecutionInterceptor
 from .preemptive_scheduler import ArDecodeTask, UnifiedPreemptiveScheduler
 
-__all__ = [
-    "ArDecodeTask",
-    "UnifiedPreemptiveScheduler",
-]
+__all__ = ["ArDecodeTask", "BagelExecutionInterceptor", "UnifiedPreemptiveScheduler"]

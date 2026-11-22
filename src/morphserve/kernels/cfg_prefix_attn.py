@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import math
 from typing import Any
 
@@ -772,8 +773,8 @@ def _run_flash_prefix_cfg(
     return outputs
 
 
-def _should_use_flash_prefix_split(q_len: int, l_shared: int, num_shared_branches: int) -> bool:
-    """Gate two-pass FlashPrefix-CFG + LSE merge on compute-to-LSE-merge payoff."""
+def should_use_flash_prefix_split(q_len: int, l_shared: int, num_shared_branches: int) -> bool:
+    """Gate two-pass FlashPrefix-CFG + LSE merge on empirically calibrated arithmetic-intensity payoff."""
     if num_shared_branches < 2 or l_shared < 256:
         return False
     if q_len <= 2048:
@@ -804,107 +805,6 @@ def _get_cached_left_pad_meta(lens: tuple[int, ...], device: Any) -> Any:
     if meta is not None and len(_ATTN_META_CACHE) < 256:
         _ATTN_META_CACHE[key] = meta
     return meta
-
-
-def _fast_left_pad_kv_pair(k_tensors: list[Any], v_tensors: list[Any]) -> tuple[Any, Any, Any]:
-    """Pack K/V branch tensors without redundant full-buffer cudaMemsetAsync or mask allocations."""
-    import torch
-
-    lens = tuple(int(t.shape[0]) for t in k_tensors)
-    max_len = max(lens)
-    if all(ln == max_len for ln in lens):
-        return torch.stack(k_tensors, dim=0), torch.stack(v_tensors, dim=0), None
-    bsz = len(k_tensors)
-    shape = (bsz, max_len, *k_tensors[0].shape[1:])
-    k_out = torch.empty(shape, dtype=k_tensors[0].dtype, device=k_tensors[0].device)
-    v_out = torch.empty(shape, dtype=v_tensors[0].dtype, device=v_tensors[0].device)
-    for i, (kt, vt, ln) in enumerate(zip(k_tensors, v_tensors, lens)):
-        pad = max_len - ln
-        if pad > 0:
-            k_out[i, :pad].zero_()
-            v_out[i, :pad].zero_()
-        k_out[i, pad:] = kt
-        v_out[i, pad:] = vt
-    meta = _get_cached_left_pad_meta(lens, k_tensors[0].device)
-    return k_out, v_out, meta
-
-
-def _assemble_branch_kv(
-    num_branches: int,
-    shared_set: set[int],
-    l_shared: int,
-    k_prefix: Any | None,
-    v_prefix: Any | None,
-    k_suffix_list: list[Any | None],
-    v_suffix_list: list[Any | None],
-    k_loc_list: list[Any],
-    v_loc_list: list[Any],
-) -> tuple[list[Any], list[Any]]:
-    import torch
-
-    kb_list: list[Any] = []
-    vb_list: list[Any] = []
-    for b in range(num_branches):
-        k_parts: list[Any] = []
-        v_parts: list[Any] = []
-        if b in shared_set and l_shared > 0 and k_prefix is not None and v_prefix is not None:
-            k_parts.append(k_prefix)
-            v_parts.append(v_prefix)
-        ks, vs = k_suffix_list[b], v_suffix_list[b]
-        if ks is not None and vs is not None and ks.shape[0] > 0:
-            k_parts.append(ks)
-            v_parts.append(vs)
-        k_parts.append(k_loc_list[b])
-        v_parts.append(v_loc_list[b])
-        kb_list.append(k_parts[0] if len(k_parts) == 1 else torch.cat(k_parts, dim=0))
-        vb_list.append(v_parts[0] if len(v_parts) == 1 else torch.cat(v_parts, dim=0))
-    return kb_list, vb_list
-
-
-def _run_clustered_noncausal_cfg(
-    q_list: list[Any],
-    kb_list: list[Any],
-    vb_list: list[Any],
-    shared_branch_ids: list[int],
-    attn_noncausal: Any,
-) -> list[Any]:
-    """Batch equal/near-equal shared branches (B=2) while running short unshared `cfg_img` unpadded (B=1)."""
-    import torch
-
-    num_branches = len(q_list)
-    b_sh = list(shared_branch_ids)
-    shared_set = set(b_sh)
-    unshared_ids = [b for b in range(num_branches) if b not in shared_set]
-    outs: list[Any] = [None] * num_branches
-
-    if len(b_sh) >= 2:
-        q_sh = torch.stack([q_list[b] for b in b_sh], dim=0)
-        k_sh, v_sh, meta_sh = _fast_left_pad_kv_pair([kb_list[b] for b in b_sh], [vb_list[b] for b in b_sh])
-        o_sh = attn_noncausal(q_sh, k_sh, v_sh, meta_sh)
-        for idx_b, b in enumerate(b_sh):
-            outs[b] = o_sh[idx_b]
-    elif len(b_sh) == 1:
-        b = b_sh[0]
-        outs[b] = attn_noncausal(q_list[b].unsqueeze(0), kb_list[b].unsqueeze(0), vb_list[b].unsqueeze(0), None).squeeze(0)
-
-    for b in unshared_ids:
-        outs[b] = attn_noncausal(q_list[b].unsqueeze(0), kb_list[b].unsqueeze(0), vb_list[b].unsqueeze(0), None).squeeze(0)
-    return outs
-
-
-def _run_fast_batched_noncausal_cfg(
-    q_list: list[Any],
-    kb_list: list[Any],
-    vb_list: list[Any],
-    attn_noncausal: Any,
-) -> list[Any]:
-    """Single-launch batched `attn_noncausal` using cached mask metadata and zero-memset empty buffers."""
-    import torch
-
-    q_4d = torch.stack(q_list, dim=0)
-    k_4d, v_4d, meta = _fast_left_pad_kv_pair(kb_list, vb_list)
-    o_4d = attn_noncausal(q_4d, k_4d, v_4d, meta)
-    return [o_4d[b] for b in range(len(q_list))]
 
 
 def _run_direct_workspace_noncausal_cfg(
@@ -1116,7 +1016,7 @@ def shared_prefix_cfg_attention(
 
     # Preferred default: FlashPrefix-CFG when shared prefix compute outweighs LSE merge, else unpadded FA2 varlen.
     if backend == "flash_prefix" and q_list[0].is_cuda:
-        if _should_use_flash_prefix_split(q_len, l_shared, len(shared_branch_ids)):
+        if should_use_flash_prefix_split(q_len, l_shared, len(shared_branch_ids)):
             fp_out = _run_flash_prefix_cfg(
                 q_list=q_list,
                 k_loc_list=k_loc_list,
@@ -1227,8 +1127,38 @@ def shared_prefix_cfg_attention(
     return outputs
 
 
+_ACTIVE_CFG_PATCH: ContextVar["BagelSharedPrefixPatch | None"] = ContextVar("_ACTIVE_CFG_PATCH", default=None)
+_ORIG_NAIVE_MERGE: Any = None
+
+
+def _ensure_contextvar_naive_merge_hook() -> None:
+    """Install a single idempotent ContextVar-dispatched merge hook on `NaiveCache` (no cross-instance clobber)."""
+    global _ORIG_NAIVE_MERGE
+    if _ORIG_NAIVE_MERGE is not None:
+        return
+    from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
+
+    _ORIG_NAIVE_MERGE = NaiveCache.merge
+
+    def _dispatched_merge(caches):
+        patch = _ACTIVE_CFG_PATCH.get()
+        if patch is None or not patch.enabled or len(caches) < 2:
+            return _ORIG_NAIVE_MERGE(caches)
+        sp = SharedPrefixCache.from_branch_caches(
+            caches, min_shared_tokens=patch.min_shared_tokens, verify_all_layers=True
+        )
+        patch.merge_calls += 1
+        patch.last_shared_prefix_len = sp.shared_prefix_len
+        patch.last_unique_kv_tokens = sp.unique_kv_tokens
+        patch.last_naive_kv_tokens = sp.naive_kv_tokens
+        patch.last_padded_naive_kv_tokens = sp.padded_naive_kv_tokens
+        return sp
+
+    NaiveCache.merge = staticmethod(_dispatched_merge)
+
+
 class BagelSharedPrefixPatch:
-    """Toggleable monkey-patch wiring `SharedPrefixCache` + Triton CFG Attention into a live `BagelPipeline`."""
+    """ContextVar-scoped SharedPrefixCache + FlashPrefix-CFG attention hook for a `BagelPipeline`."""
 
     def __init__(self, pipeline: Any, min_shared_tokens: int = 32) -> None:
         self.pipeline = pipeline
@@ -1237,7 +1167,6 @@ class BagelSharedPrefixPatch:
         self.min_shared_tokens = int(min_shared_tokens)
         self.enabled = False
         self._installed = False
-        self._orig_naive_merge = None
         self._orig_forward_gens: list[tuple[Any, Any]] = []
         self.reset_telemetry()
 
@@ -1254,25 +1183,9 @@ class BagelSharedPrefixPatch:
         if self._installed:
             return
         import torch
-        from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 
+        _ensure_contextvar_naive_merge_hook()
         patch = self
-        self._orig_naive_merge = NaiveCache.merge
-
-        def _patched_merge(caches):
-            if not patch.enabled or len(caches) < 2:
-                return patch._orig_naive_merge(caches)
-            sp = SharedPrefixCache.from_branch_caches(
-                caches, min_shared_tokens=patch.min_shared_tokens, verify_all_layers=True
-            )
-            patch.merge_calls += 1
-            patch.last_shared_prefix_len = sp.shared_prefix_len
-            patch.last_unique_kv_tokens = sp.unique_kv_tokens
-            patch.last_naive_kv_tokens = sp.naive_kv_tokens
-            patch.last_padded_naive_kv_tokens = sp.padded_naive_kv_tokens
-            return sp
-
-        NaiveCache.merge = staticmethod(_patched_merge)
 
         for layer in self.layers:
             attn_mod = layer.self_attn
@@ -1289,8 +1202,10 @@ class BagelSharedPrefixPatch:
                     packed_text_indexes,
                     update_past_key_values=False,
                 ):
+                    active_patch = _ACTIVE_CFG_PATCH.get()
+                    use_patch = (active_patch is patch or (active_patch is None and patch.enabled)) and patch.enabled
                     if (
-                        not patch.enabled
+                        not use_patch
                         or not isinstance(past_key_values, SharedPrefixCache)
                         or update_past_key_values
                         or mod._is_sp_active()
@@ -1393,12 +1308,7 @@ class BagelSharedPrefixPatch:
     def uninstall(self) -> None:
         if not self._installed:
             return
-        from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
-
         self.enabled = False
-        if self._orig_naive_merge is not None:
-            NaiveCache.merge = self._orig_naive_merge
-            self._orig_naive_merge = None
         for attn_mod, orig_fn in self._orig_forward_gens:
             attn_mod._forward_gen = orig_fn
         self._orig_forward_gens.clear()
@@ -1410,12 +1320,14 @@ class BagelSharedPrefixPatch:
             self.install()
         if reset_stats:
             self.reset_telemetry()
-        prev = self.enabled
+        prev_enabled = self.enabled
+        tok = _ACTIVE_CFG_PATCH.set(self)
         self.enabled = True
         try:
             yield self
         finally:
-            self.enabled = prev
+            self.enabled = prev_enabled
+            _ACTIVE_CFG_PATCH.reset(tok)
 
 
 def install_shared_prefix_bagel_hooks(pipeline: Any, min_shared_tokens: int = 32) -> BagelSharedPrefixPatch:

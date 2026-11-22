@@ -1,12 +1,12 @@
-"""MorphServe Module 3: Exact Shared-Prefix CFG Attention, LECP CoW Cache, and GPU In-Place Loopback."""
+"""MorphServe Module 3: Zero-Approximation Shared-Prefix CFG Attention, LECP CoW Cache & GPU Loopback."""
 
 from .cfg_prefix_attn import (
     BagelSharedPrefixPatch,
-    _should_use_flash_prefix_split,
     get_fa2_backend_status,
     install_shared_prefix_bagel_hooks,
     shared_prefix_cfg_attention,
     shared_prefix_cfg_attention_ref,
+    should_use_flash_prefix_split,
 )
 from .gpu_loopback import (
     GpuInPlaceLoopback,
@@ -27,7 +27,6 @@ __all__ = [
     "CoWBranchSpec",
     "GpuInPlaceLoopback",
     "SharedPrefixCache",
-    "_should_use_flash_prefix_split",
     "cow_fork_context",
     "decode_latent_to_u8_gpu",
     "detect_lecp_prefix_len",
@@ -38,4 +37,5 @@ __all__ = [
     "rebind_cow_prefix",
     "shared_prefix_cfg_attention",
     "shared_prefix_cfg_attention_ref",
+    "should_use_flash_prefix_split",
 ]

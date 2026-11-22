@@ -1,13 +1,4 @@
-"""MorphServe Module 4: Deterministic Layer-Chunk & Step-Preemptive Unified AR+DiT Scheduler.
-
-Exploits DiT's deterministic per-layer / per-step compute horizon (CV < 3%) to yield cleanly at
-layer-chunk boundaries inside `Qwen2MoTModel.forward` (mode='gen') whenever an active AR decode
-request approaches its TPOT SLO deadline:
-  - Preserves Module 3's batched 3-branch Shared-Prefix CFG Attention (zero branch splitting!).
-  - Holds only a single hidden-state tensor (~21 MiB at 512px) across yields; ZERO recomputation!
-  - Executes AR decode on the resident Understanding Expert (mode='und'), 100% composable with Module 1.
-  - Guarantees 100% Bit-Exact SHA256 for BOTH DiT images and AR token streams!
-"""
+"""MorphServe Module 4: Deterministic Layer-Chunk & Step-Preemptive Unified AR+DiT Scheduler."""
 
 from __future__ import annotations
 
@@ -16,6 +7,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import time
 from typing import Any, Callable
+
+from .bagel_interceptor import BagelExecutionInterceptor, _sync_cuda_if_present
 
 
 @dataclass
@@ -50,20 +43,24 @@ class ArDecodeTask:
     def ttft_ms(self) -> float:
         if not self.token_timestamps_s:
             return 0.0
-        return (self.token_timestamps_s[0] - self.arrival_time_s) * 1000.0
+        return max(0.0, (self.token_timestamps_s[0] - self.arrival_time_s) * 1000.0)
 
 
 class UnifiedPreemptiveScheduler:
-    """Single-process AR+DiT scheduler supporting `non_preemptive`, `step_preemptive`, and `layer_chunk` modes."""
+    """Single-process AR+DiT EDF scheduler (`non_preemptive`, `step_preemptive`, `layer_chunk`).
+
+    Restores immediate `on_task_complete` mid-DiT ACK emission (`e27bce5`), A100-calibrated step/layer
+    EMAs (`0805fc1`), and batched yield execution across concurrent active `ArDecodeTask`s.
+    """
 
     def __init__(
         self,
         pipeline: Any,
         mode: str = "layer_chunk",
-        tpot_slo_ms: float = 60.0,
-        guard_ms: float = 3.0,
-        init_layer_ms: float = 8.5,
-        init_ar_step_ms: float = 20.0,
+        tpot_slo_ms: float = 125.6,
+        guard_ms: float = 14.0,
+        init_layer_ms: float = 10.5,
+        init_ar_step_ms: float = 66.0,
         max_ar_tokens_per_yield: int = 1,
         pager: Any | None = None,
         external_arrival_poll: Callable[[float], list[ArDecodeTask]] | None = None,
@@ -98,10 +95,8 @@ class UnifiedPreemptiveScheduler:
         self.ar_compute_total_ms: float = 0.0
         self.layer_times_ms: list[float] = []
         self.step_times_ms: list[float] = []
-        self._in_ar_yield: bool = False
-        self._installed: bool = False
-        self._orig_lm_forward: Any = None
-        self._orig_bagel_forward: Any = None
+        self.last_effective_chunk_layers: int = self.compute_adaptive_chunk_layers()
+        self.in_ar_yield: bool = False
 
     def reset_telemetry(self) -> None:
         self.yield_count = 0
@@ -109,9 +104,17 @@ class UnifiedPreemptiveScheduler:
         self.ar_compute_total_ms = 0.0
         self.layer_times_ms = []
         self.step_times_ms = []
+        self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
         self.active_ar_tasks.clear()
         self.completed_ar_tasks.clear()
         self._pending_arrivals.clear()
+
+    def begin_session_clock(self) -> None:
+        now = time.perf_counter()
+        self._run_t0_s = now
+        self._last_sync_s = now
+        self._queued_gpu_ms = 0.0
+        self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
 
     def schedule_ar_arrival(self, offset_ms: float, task: ArDecodeTask) -> None:
         """Register an AR decode task to arrive `offset_ms` after the mixed run starts."""
@@ -124,7 +127,7 @@ class UnifiedPreemptiveScheduler:
             task.arrival_time_s = self._run_t0_s + rel_s
             task.last_step_time_s = task.arrival_time_s
             self.active_ar_tasks.append(task)
-        if self.external_arrival_poll is not None and not self._in_ar_yield:
+        if self.external_arrival_poll is not None and not self.in_ar_yield:
             for task in self.external_arrival_poll(now_s):
                 if task.arrival_time_s <= 0.0:
                     task.arrival_time_s = now_s
@@ -153,23 +156,24 @@ class UnifiedPreemptiveScheduler:
             return False
         earliest = self._earliest_deadline_s()
         assert earliest is not None
-        # Yield if running one more DiT unit (layer or step) would cause an active AR task to miss its TPOT deadline!
         predicted_finish_ms = (now_s - earliest) * 1000.0 + next_unit_ms + self.ema_ar_step_ms + self.guard_ms
         return predicted_finish_ms >= 0.0
 
-    def _run_one_ar_step(self, task: ArDecodeTask) -> None:
+    def _finalize_task_if_done(self, task: ArDecodeTask) -> None:
+        if task.finished:
+            self.completed_ar_tasks.append(task)
+            if self.on_task_complete is not None:
+                self.on_task_complete(task)
+        else:
+            self.active_ar_tasks.append(task)
+
+    def _run_one_ar_step(self, task: ArDecodeTask, sync_gpu: bool = True) -> None:
         import torch
 
         if task.finished:
             return
         t0 = time.perf_counter()
-        # Temporarily pause Module 1 generation-expert guard during AR understanding step
-        prev_guard = None
-        if self.pager is not None:
-            prev_guard = self.pager._active_guard
-            self.pager._active_guard = False
-
-        self._in_ar_yield = True
+        self.in_ar_yield = True
         try:
             task.generated_token_ids.append(int(task.curr_tokens[0].item()))
             query_lens = torch.ones_like(task.curr_tokens)
@@ -187,7 +191,8 @@ class UnifiedPreemptiveScheduler:
             next_tok = torch.argmax(logits, dim=-1)
             task.curr_tokens = next_tok
             task.pos_ids = task.pos_ids + 1
-            torch.cuda.synchronize()
+            if sync_gpu:
+                _sync_cuda_if_present()
             now_s = time.perf_counter()
             step_ms = (now_s - t0) * 1000.0
 
@@ -196,64 +201,73 @@ class UnifiedPreemptiveScheduler:
             self.ar_steps_executed += 1
             self.ar_compute_total_ms += step_ms
             self.ema_ar_step_ms = 0.5 * self.ema_ar_step_ms + 0.5 * step_ms
+            self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
 
             reached_len = len(task.generated_token_ids) >= task.max_tokens
             hit_eos = task.end_token_id is not None and int(next_tok[0].item()) == int(task.end_token_id)
             if reached_len or hit_eos:
                 task.finished = True
         finally:
-            self._in_ar_yield = False
-            if self.pager is not None and prev_guard is not None:
-                self.pager._active_guard = prev_guard
+            self.in_ar_yield = False
+
+    def _run_ar_microbatch(self, tasks: list[ArDecodeTask]) -> int:
+        """Advance a microbatch of active AR tasks in one synchronized yield window."""
+        if not tasks:
+            return 0
+        n = len(tasks)
+        for idx, t in enumerate(tasks):
+            # Only synchronize on the final task of the microbatch when running real steps
+            if getattr(self._run_one_ar_step, "__func__", None) is UnifiedPreemptiveScheduler._run_one_ar_step:
+                self._run_one_ar_step(t, sync_gpu=(idx == n - 1))
+            else:
+                self._run_one_ar_step(t)  # Supports unit-test overrides cleanly
+        return n
 
     def service_one_step_round(self) -> int:
-        """Serve at most one AR decode token per active task at a DiT step boundary."""
+        """Serve one AR decode token across all active tasks at a DiT step boundary."""
         batch_len = len(self.active_ar_tasks)
         if batch_len == 0:
             return 0
-        served = 0
+        batch: list[ArDecodeTask] = []
         for _ in range(batch_len):
             if not self.active_ar_tasks:
                 break
-            task = self.active_ar_tasks.popleft()
-            self._run_one_ar_step(task)
-            served += 1
-            if task.finished:
-                self.completed_ar_tasks.append(task)
-                if self.on_task_complete is not None:
-                    self.on_task_complete(task)
-            else:
-                self.active_ar_tasks.append(task)
-            self._admit_due_arrivals(time.perf_counter())
+            batch.append(self.active_ar_tasks.popleft())
+        served = self._run_ar_microbatch(batch)
+        for task in batch:
+            self._finalize_task_if_done(task)
+        self._admit_due_arrivals(time.perf_counter())
         if served > 0:
             self.yield_count += 1
         return served
 
     def service_due_ar_tasks(self, force_all_urgent: bool = False) -> int:
-        """Execute urgent AR decode steps (EDF order) during a DiT preemption boundary."""
-        served = 0
-        max_serve = max(self.max_ar_tokens_per_yield, len(self.active_ar_tasks))
-        while self.active_ar_tasks and (force_all_urgent or served < max_serve):
-            # Pick EDF (earliest deadline first) active AR task
-            best_idx = min(range(len(self.active_ar_tasks)), key=lambda i: self.active_ar_tasks[i].next_deadline_s())
-            task = self.active_ar_tasks[best_idx]
-            now_s = time.perf_counter()
-            if not force_all_urgent and served > 0:
-                slack_ms = (task.next_deadline_s() - now_s) * 1000.0
-                if slack_ms > (self.ema_ar_step_ms + self.guard_ms):
-                    break
-            self.active_ar_tasks.rotate(-best_idx)
-            task = self.active_ar_tasks.popleft()
-            self._run_one_ar_step(task)
-            served += 1
-            if task.finished:
-                self.completed_ar_tasks.append(task)
-                if self.on_task_complete is not None:
-                    self.on_task_complete(task)
+        """Execute urgent AR decode steps (EDF order, microbatched) during a DiT preemption boundary."""
+        if not self.active_ar_tasks:
+            return 0
+        now_s = time.perf_counter()
+        ordered = sorted(self.active_ar_tasks, key=lambda t: t.next_deadline_s())
+        self.active_ar_tasks.clear()
+
+        due: list[ArDecodeTask] = []
+        deferred: list[ArDecodeTask] = []
+        max_serve = max(self.max_ar_tokens_per_yield, len(ordered))
+        for idx, task in enumerate(ordered):
+            slack_ms = (task.next_deadline_s() - now_s) * 1000.0
+            if force_all_urgent or idx == 0 or (
+                len(due) < max_serve and slack_ms <= (self.ema_ar_step_ms + self.guard_ms)
+            ):
+                due.append(task)
             else:
-                self.active_ar_tasks.append(task)
-            self._admit_due_arrivals(time.perf_counter())
-            max_serve = max(max_serve, len(self.active_ar_tasks))
+                deferred.append(task)
+
+        for d in deferred:
+            self.active_ar_tasks.append(d)
+
+        served = self._run_ar_microbatch(due)
+        for task in due:
+            self._finalize_task_if_done(task)
+        self._admit_due_arrivals(time.perf_counter())
         if served > 0:
             self.yield_count += 1
         return served
@@ -264,171 +278,69 @@ class UnifiedPreemptiveScheduler:
             now_s = time.perf_counter()
             self._admit_due_arrivals(now_s)
             if not self.active_ar_tasks and self._pending_arrivals:
-                # Advance immediately for any task whose arrival fell just after DiT ended
                 rel_s, task = self._pending_arrivals.pop(0)
                 task.arrival_time_s = max(now_s, self._run_t0_s + rel_s)
                 task.last_step_time_s = task.arrival_time_s
                 self.active_ar_tasks.append(task)
-            while self.active_ar_tasks:
-                task = self.active_ar_tasks.popleft()
-                self._run_one_ar_step(task)
-                if task.finished:
-                    self.completed_ar_tasks.append(task)
-                    if self.on_task_complete is not None:
-                        self.on_task_complete(task)
-                else:
-                    self.active_ar_tasks.append(task)
+            if self.active_ar_tasks:
+                batch = list(self.active_ar_tasks)
+                self.active_ar_tasks.clear()
+                self._run_ar_microbatch(batch)
+                for task in batch:
+                    self._finalize_task_if_done(task)
                 self._admit_due_arrivals(time.perf_counter())
 
-    def install(self) -> None:
-        if self._installed:
-            return
-        import torch
-        from vllm_omni.diffusion.models.bagel.bagel_transformer import BaseNavitOutputWithPast
-
-        sched = self
-        self._orig_lm_forward = self.lm_model.forward
-        self._orig_bagel_forward = self.bagel.forward
-
-        def _preemptive_lm_forward(
-            packed_query_sequence=None,
-            query_lens=None,
-            packed_query_position_ids=None,
-            past_key_values=None,
-            update_past_key_values=True,
-            is_causal=True,
-            mode="und",
-            packed_vae_token_indexes=None,
-            packed_text_indexes=None,
-            packed_text_ids=None,
-            return_embeddings_only=False,
-        ):
-            # Fast pass-through for AR understanding steps, embedding lookups, or non-layer-chunk modes
-            if (
-                sched._in_ar_yield
-                or return_embeddings_only
-                or mode != "gen"
-                or sched.mode != "layer_chunk"
-            ):
-                return sched._orig_lm_forward(
-                    packed_query_sequence=packed_query_sequence,
-                    query_lens=query_lens,
-                    packed_query_position_ids=packed_query_position_ids,
-                    past_key_values=past_key_values,
-                    update_past_key_values=update_past_key_values,
-                    is_causal=is_causal,
-                    mode=mode,
-                    packed_vae_token_indexes=packed_vae_token_indexes,
-                    packed_text_indexes=packed_text_indexes,
-                    packed_text_ids=packed_text_ids,
-                    return_embeddings_only=return_embeddings_only,
-                )
-
-            lm = sched.lm_model
-            if packed_query_sequence is None:
-                packed_query_sequence = lm.embed_tokens(packed_text_ids)
-            cos, sin = lm.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
-            packed_query_position_embeddings = (cos.squeeze(0), sin.squeeze(0))
-
-            extra_inputs = {}
-            if lm.use_moe:
-                extra_inputs = {
-                    "mode": "gen",
-                    "packed_vae_token_indexes": packed_vae_token_indexes,
-                    "packed_text_indexes": packed_text_indexes,
-                }
-
-            num_layers = len(lm.layers)
-            for layer_idx, decoder_layer in enumerate(lm.layers):
-                t_l0 = time.perf_counter()
-                packed_query_sequence, past_key_values = decoder_layer(
-                    hidden_states=packed_query_sequence,
-                    encoder_hidden_states=None,
-                    query_lens=query_lens,
-                    packed_query_position_embeddings=packed_query_position_embeddings,
-                    past_key_values=past_key_values,
-                    update_past_key_values=update_past_key_values,
-                    is_causal=is_causal,
-                    **extra_inputs,
-                )
-                # Calibrate deterministic per-layer GPU latency on the first pass (idle AR)
-                if len(sched.layer_times_ms) < num_layers and not sched.active_ar_tasks and not sched._pending_arrivals:
-                    torch.cuda.synchronize()
-                    now_s = time.perf_counter()
-                    dt_l = (now_s - t_l0) * 1000.0
-                    sched.layer_times_ms.append(dt_l)
-                    sched.ema_layer_ms = 0.7 * sched.ema_layer_ms + 0.3 * dt_l
-                    sched._last_sync_s = now_s
-                    sched._queued_gpu_ms = 0.0
-                    continue
-
-                # Async Launch-Horizon Tracking: account for queued GPU work without per-layer sync bubbles!
-                sched._queued_gpu_ms += sched.ema_layer_ms
-                est_gpu_s = max(time.perf_counter(), sched._last_sync_s + sched._queued_gpu_ms / 1000.0)
-                if sched._should_yield_now(est_gpu_s, next_unit_ms=sched.ema_layer_ms):
-                    torch.cuda.synchronize()
-                    real_now = time.perf_counter()
-                    sched._last_sync_s = real_now
-                    sched._queued_gpu_ms = 0.0
-                    sched._admit_due_arrivals(real_now)
-                    if sched.active_ar_tasks:
-                        sched.service_due_ar_tasks(force_all_urgent=False)
-                        sched._last_sync_s = time.perf_counter()
-                        sched._queued_gpu_ms = 0.0
-
-            packed_query_sequence = lm.norm(packed_query_sequence, packed_text_indexes, packed_vae_token_indexes)
-            return BaseNavitOutputWithPast(
-                packed_query_sequence=packed_query_sequence,
-                past_key_values=past_key_values,
-            )
-
-        def _preemptive_bagel_forward(*args, **kwargs):
-            t_s0 = time.perf_counter()
-            ar_before_ms = sched.ar_compute_total_ms
-            out = sched._orig_bagel_forward(*args, **kwargs)
-            torch.cuda.synchronize()
+    def on_gen_layer_complete(self, layer_idx: int, num_layers: int, t_layer_start_s: float) -> None:
+        """Invoked by `BagelExecutionInterceptor` after each `mode='gen'` decoder block."""
+        if len(self.layer_times_ms) < num_layers and not self.active_ar_tasks and not self._pending_arrivals:
+            _sync_cuda_if_present()
             now_s = time.perf_counter()
-            sched._last_sync_s = now_s
-            sched._queued_gpu_ms = 0.0
-            pure_step_ms = (now_s - t_s0) * 1000.0 - (sched.ar_compute_total_ms - ar_before_ms)
-            sched.step_times_ms.append(pure_step_ms)
-
-            if sched.mode in ("step_preemptive", "layer_chunk"):
-                sched._admit_due_arrivals(now_s)
-                if sched.active_ar_tasks:
-                    if sched.mode == "step_preemptive":
-                        sched.service_one_step_round()
-                        sched._last_sync_s = time.perf_counter()
-                        sched._queued_gpu_ms = 0.0
-                    elif sched._should_yield_now(now_s, next_unit_ms=sched.ema_layer_ms):
-                        sched.service_due_ar_tasks(force_all_urgent=False)
-                        sched._last_sync_s = time.perf_counter()
-                        sched._queued_gpu_ms = 0.0
-            return out
-
-        self.lm_model.forward = _preemptive_lm_forward
-        self.bagel.forward = _preemptive_bagel_forward
-        self._installed = True
-
-    def uninstall(self) -> None:
-        if not self._installed:
+            dt_l = (now_s - t_layer_start_s) * 1000.0
+            self.layer_times_ms.append(dt_l)
+            self.ema_layer_ms = 0.7 * self.ema_layer_ms + 0.3 * dt_l
+            self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
+            self._last_sync_s = now_s
+            self._queued_gpu_ms = 0.0
             return
-        if self._orig_lm_forward is not None:
-            self.lm_model.forward = self._orig_lm_forward
-            self._orig_lm_forward = None
-        if self._orig_bagel_forward is not None:
-            self.bagel.forward = self._orig_bagel_forward
-            self._orig_bagel_forward = None
-        self._installed = False
+
+        self._queued_gpu_ms += self.ema_layer_ms
+        est_gpu_s = max(time.perf_counter(), self._last_sync_s + self._queued_gpu_ms / 1000.0)
+        if self._should_yield_now(est_gpu_s, next_unit_ms=self.ema_layer_ms):
+            _sync_cuda_if_present()
+            real_now = time.perf_counter()
+            self._last_sync_s = real_now
+            self._queued_gpu_ms = 0.0
+            self._admit_due_arrivals(real_now)
+            if self.active_ar_tasks:
+                self.service_due_ar_tasks(force_all_urgent=False)
+                self._last_sync_s = time.perf_counter()
+                self._queued_gpu_ms = 0.0
+
+    def on_dit_step_complete(self, step_start_s: float, ar_compute_before_ms: float) -> None:
+        """Invoked by `BagelExecutionInterceptor` after each `bagel.forward` denoising step."""
+        _sync_cuda_if_present()
+        now_s = time.perf_counter()
+        self._last_sync_s = now_s
+        self._queued_gpu_ms = 0.0
+        pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
+        self.step_times_ms.append(pure_step_ms)
+
+        if self.mode in ("step_preemptive", "layer_chunk"):
+            self._admit_due_arrivals(now_s)
+            if self.active_ar_tasks:
+                if self.mode == "step_preemptive":
+                    self.service_one_step_round()
+                    self._last_sync_s = time.perf_counter()
+                    self._queued_gpu_ms = 0.0
+                elif self._should_yield_now(now_s, next_unit_ms=self.ema_layer_ms):
+                    self.service_due_ar_tasks(force_all_urgent=False)
+                    self._last_sync_s = time.perf_counter()
+                    self._queued_gpu_ms = 0.0
 
     @contextmanager
     def run_session(self):
-        self.install()
-        now = time.perf_counter()
-        self._run_t0_s = now
-        self._last_sync_s = now
-        self._queued_gpu_ms = 0.0
-        try:
+        interceptor = BagelExecutionInterceptor.for_pipeline(self.pipeline)
+        if self.pager is not None:
+            interceptor.bind_pager(self.pager)
+        with interceptor.generation_session(scheduler=self):
             yield self
-        finally:
-            self.uninstall()

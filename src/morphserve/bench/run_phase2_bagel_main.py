@@ -6,7 +6,6 @@ import argparse
 from collections import defaultdict
 from dataclasses import replace
 import gc
-import hashlib
 import json
 import math
 from pathlib import Path
@@ -14,6 +13,7 @@ import shutil
 import time
 from typing import Any
 
+from morphserve.bench.exactness import ExactnessEvaluator, image_pair_metrics
 from morphserve.bench.interleaved_bench import (
     InterleavedSession,
     WorkloadSuite,
@@ -60,52 +60,6 @@ def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
         base_qps=suite.base_qps,
         sessions=picked,
     )
-
-
-def _compute_image_pair_metrics(path_a: Path, path_b: Path) -> dict[str, Any]:
-    import numpy as np
-    from PIL import Image
-
-    sha_a = hashlib.sha256(path_a.read_bytes()).hexdigest()
-    sha_b = hashlib.sha256(path_b.read_bytes()).hexdigest()
-    with Image.open(path_a) as ia, Image.open(path_b) as ib:
-        arr_a = np.asarray(ia.convert("RGB"), dtype=np.float64)
-        arr_b = np.asarray(ib.convert("RGB"), dtype=np.float64)
-    if arr_a.shape != arr_b.shape:
-        return {
-            "sha256_equal": False,
-            "ssim": 0.0,
-            "psnr_db": 0.0,
-            "mae_u8": 255.0,
-            "sha256_a": sha_a[:16],
-            "sha256_b": sha_b[:16],
-        }
-    diff = np.abs(arr_a - arr_b)
-    mae = float(diff.mean())
-    mse = float(((arr_a - arr_b) ** 2).mean())
-    psnr = 99.0 if mse < 1e-10 else float(10.0 * math.log10((255.0**2) / mse))
-
-    h, w, c = arr_a.shape
-    bh = (h // 8) * 8
-    bw = (w // 8) * 8
-    ab = arr_a[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
-    bb = arr_b[:bh, :bw].reshape(bh // 8, 8, bw // 8, 8, c).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
-    c1 = (0.01 * 255.0) ** 2
-    c2 = (0.03 * 255.0) ** 2
-    mu_a = ab.mean(axis=1)
-    mu_b = bb.mean(axis=1)
-    var_a = ab.var(axis=1)
-    var_b = bb.var(axis=1)
-    cov = ((ab - mu_a[:, None]) * (bb - mu_b[:, None])).mean(axis=1)
-    ssim = float((((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2))).mean())
-    return {
-        "sha256_equal": sha_a == sha_b,
-        "ssim": round(ssim, 6),
-        "psnr_db": round(psnr, 2),
-        "mae_u8": round(mae, 4),
-        "sha256_a": sha_a[:16],
-        "sha256_b": sha_b[:16],
-    }
 
 
 def build_ablation_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolicyConfig]]:
@@ -310,39 +264,29 @@ def run_suite_b_skews_and_parity(
                 eng.shutdown()
                 gc.collect()
 
-        mmvet_total = 0
-        mmvet_exact = 0
+        evaluator = ExactnessEvaluator()
+        parity_eval = evaluator.evaluate_parity_and_quality(
+            acc_suite.sessions,
+            list(parity_runs["monolithic_dp"].values()),
+            list(parity_runs["morphserve"].values()),
+        )
         geneval_metrics: list[dict[str, Any]] = []
         for s in acc_suite.sessions:
             sid = s.session_id
             ref_s = parity_runs["monolithic_dp"][sid]
             ms_s = parity_runs["morphserve"][sid]
-            if s.quadrant == "multi_image_vqa":
-                mmvet_total += 1
-                if ref_s.get("ar_texts") == ms_s.get("ar_texts"):
-                    mmvet_exact += 1
-            elif s.quadrant == "highres_t2i":
-                ref_imgs = ref_s.get("image_paths_out") or []
-                ms_imgs = ms_s.get("image_paths_out") or []
-                if ref_imgs and ms_imgs and Path(ref_imgs[0]).is_file() and Path(ms_imgs[0]).is_file():
-                    m = _compute_image_pair_metrics(Path(ref_imgs[0]), Path(ms_imgs[0]))
-                    m["session_id"] = sid
-                    geneval_metrics.append(m)
+            ref_imgs = ref_s.get("image_paths_out") or []
+            ms_imgs = ms_s.get("image_paths_out") or []
+            if ref_imgs and ms_imgs and Path(ref_imgs[0]).is_file() and Path(ms_imgs[0]).is_file():
+                m = image_pair_metrics(Path(ref_imgs[0]), Path(ms_imgs[0]))
+                m["session_id"] = sid
+                geneval_metrics.append(m)
 
-        mmvet_exact_pct = round(100.0 * mmvet_exact / max(1, len(geneval_metrics) and mmvet_total or mmvet_total), 2) if mmvet_total else 0.0
-        mean_ssim = round(sum(m["ssim"] for m in geneval_metrics) / max(1, len(geneval_metrics)), 6)
-        min_ssim = round(min((m["ssim"] for m in geneval_metrics), default=0.0), 6)
-        sha_exact_cnt = sum(1 for m in geneval_metrics if m["sha256_equal"])
         parity_summary = {
-            "mmvet_sessions": mmvet_total,
-            "mmvet_greedy_exact_matches": mmvet_exact,
-            "mmvet_greedy_exact_match_pct": mmvet_exact_pct,
+            **parity_eval,
             "geneval_sessions": len(geneval_metrics),
-            "geneval_sha256_exact_count": sha_exact_cnt,
-            "geneval_mean_ssim": mean_ssim,
-            "geneval_min_ssim": min_ssim,
+            "geneval_sha256_exact_count": sum(1 for m in geneval_metrics if m["sha256_equal"]),
             "geneval_pairs": geneval_metrics,
-            "lossless_pass": mmvet_exact_pct == 100.0 and min_ssim >= 0.99,
         }
     finally:
         shutil.rmtree(tmp_acc_root, ignore_errors=True)

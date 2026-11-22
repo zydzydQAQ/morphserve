@@ -1,15 +1,15 @@
-"""PCIe/NUMA topology-aware Dual-Path Morphing Router and Half-Node H2D Pacer."""
+"""Stateful Three-Tier PCIe/Socket/RDMA Dual-Path Morphing Router and Half-Node H2D Pacer."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import threading
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from .topology import ClusterTopologyProfile
+from .topology import ClusterTopologyProfile, DEFAULT_OPERATOR_PROFILE, OperatorLatencyProfile
 
 MIB = 1024**2
 GIB = 1024**3
@@ -17,21 +17,15 @@ GIB = 1024**3
 
 @dataclass
 class CPTGRequestSpec:
-    """Unified Cross-Paradigm Transition Graph (CPTG) request specification.
-
-    Supports both tightly-coupled Mixture-of-Transformers models (`architecture="tight_mot"`,
-    e.g., BAGEL-7B-MoT / Show-o2 where cross-paradigm state is multi-turn KV cache) and
-    bridge-coupled models (`architecture="bridge_mllm_dit"`, e.g., InternVL-U / Ming-Lite-Uni
-    where only compact conditioning hidden states cross to the MMDiT head).
-    """
+    """Unified Cross-Paradigm Transition Graph (CPTG) request specification."""
 
     req_id: str
     src_gpu: int
-    architecture: str = "tight_mot"
+    architecture: str = "tight_mot"  # "tight_mot" | "bridge_mllm_dit"
     kv_bytes: int = 0
     bridge_bytes: int = 0
-    gen_expert_bytes: int = 12_446 * MIB
-    dit_step1_ms: float = 287.0
+    gen_expert_bytes: int = DEFAULT_OPERATOR_PROFILE.bagel_expert_bytes
+    dit_step1_ms: float = DEFAULT_OPERATOR_PROFILE.bagel_dit_512_step_ms
     dit_total_steps: int = 20
     resolution: int = 512
     interleaved_roundtrip_gamma: int = 1
@@ -50,7 +44,7 @@ class WorkerState:
 
     gpu_id: int
     role: str = "hybrid"  # "und" | "gen" | "hybrid"
-    expert_alpha: float = 0.50
+    expert_alpha: float = 1.0
     queue_wait_ms: float = 0.0
     active_h2d_transfers: int = 0
     kv_free_bytes: int = 12 * GIB
@@ -71,16 +65,11 @@ class RouteDecision:
     selected_bw_gbps: float
     effective_state_mib: float
     reason: str
+    hop_tier: str = "in_place"
 
 
 class HalfNodeH2DPacer:
-    """Serializes heavy expert H2D DMA per PCIe root half-node to avoid uplink collapse.
-
-    Job 0c proved 4-GPU simultaneous intra-half H2D collapses per-GPU bandwidth from
-    ~8.75 GB/s to 2.58 GB/s (10.35 GB/s shared root limit). Pacing to 1 heavy DMA per
-    half-node preserves full ~8.7 GB/s per transfer and enables cross-half parallelism
-    across NUMA sockets (~17.4 GB/s aggregate).
-    """
+    """Serializes heavy expert H2D DMA per PCIe root half-node to avoid uplink collapse."""
 
     def __init__(
         self,
@@ -146,25 +135,301 @@ class HalfNodeH2DPacer:
 
 
 class DualPathMorphRouter:
-    """Topology- and cost-aware AR->DiT router selecting between State-Shipping (Path A)
-    and TriPool-VMM Step-1 In-Place Morphing (Path B).
+    """Stateful placement, queue reservation, and Dual-Path AR->DiT router.
+
+    Consolidates initial GPU admission, static-fission rank pairing, atomic pre-ship `queue_wait_ms`
+    and `HalfNodeH2DPacer` reservations, and three-tier analytical Path-A (`state_ship`) vs.
+    Path-B (`in_place_morph`) cost selection across live `MorphServeClusterEngine` and `cluster_simulator.py`.
     """
 
     def __init__(
         self,
         topology: ClusterTopologyProfile,
         pacer: HalfNodeH2DPacer | None = None,
-        state_handoff_ms: float = 3.0,
+        operator_profile: OperatorLatencyProfile = DEFAULT_OPERATOR_PROFILE,
+        state_handoff_ms: float | None = None,
         map_overhead_ms_full: float = 12.0,
         overlap_efficiency: float = 0.90,
         allow_cross_half_state_ship: bool = True,
+        allow_inter_node_state_ship: bool = True,
+        max_inter_node_state_bytes: int = 128 * MIB,
     ) -> None:
         self.topology = topology
         self.pacer = pacer if pacer is not None else HalfNodeH2DPacer(topology)
-        self.state_handoff_ms = float(state_handoff_ms)
+        self.operator_profile = operator_profile
+        self.state_handoff_ms = state_handoff_ms
         self.map_overhead_ms_full = float(map_overhead_ms_full)
         self.overlap_efficiency = float(overlap_efficiency)
         self.allow_cross_half_state_ship = bool(allow_cross_half_state_ship)
+        self.allow_inter_node_state_ship = bool(allow_inter_node_state_ship)
+        self.max_inter_node_state_bytes = int(max_inter_node_state_bytes)
+
+        self.worker_states: dict[int, WorkerState] = {}
+        self.rr_cursor: int = 0
+        self._mu = threading.Lock()
+
+    def init_workers(
+        self,
+        num_gpus: int,
+        role_of: Callable[[int], str],
+        initial_alphas: Mapping[int, float],
+        kv_free_bytes: int = 16 * GIB,
+    ) -> dict[int, WorkerState]:
+        """Initialize the router's authoritative `WorkerState` ledger."""
+        self.worker_states = {
+            g: WorkerState(
+                gpu_id=g,
+                role=role_of(g),
+                expert_alpha=float(initial_alphas.get(g, 1.0)),
+                queue_wait_ms=0.0,
+                kv_free_bytes=int(kv_free_bytes),
+            )
+            for g in range(int(num_gpus))
+        }
+        self.rr_cursor = 0
+        return self.worker_states
+
+    # --- Stateful Placement & Reservation Authority (replaces shallow ClusterPolicyCore) ---
+
+    def select_initial_gpu(
+        self,
+        *,
+        num_gpus: int,
+        routing_mode: str,
+        preemption_mode: str,
+        static_und_ranks: Sequence[int],
+        modality_plan: str,
+        workers: Mapping[int, WorkerState] | None = None,
+        gpu_busy: Mapping[int, bool] | None = None,
+        active_dit_ranks: Mapping[int, int] | None = None,
+        active_preemptions: Mapping[int, int] | None = None,
+        max_preemptions_per_gpu: int = 2,
+    ) -> int:
+        """Select initial GPU rank while preserving `e27bce5` queue, preemption-cap, and alpha invariants."""
+        w_map = workers if workers is not None else self.worker_states
+        busy = gpu_busy or {}
+        dit_map = active_dit_ranks or {}
+        pre_map = active_preemptions or {}
+        n = int(num_gpus)
+
+        with self._mu:
+            cur = self.rr_cursor
+            if routing_mode in ("twostage_shm", "static_nccl_fission") and static_und_ranks:
+                cands = list(static_und_ranks)
+                cands.sort(
+                    key=lambda g: (
+                        w_map[g].queue_wait_ms,
+                        bool(busy.get(g, False)),
+                        (g - cur) % n,
+                    )
+                )
+                chosen = cands[0]
+                self.rr_cursor = (chosen + 1) % n
+                return chosen
+
+            if modality_plan == "ar_only":
+                idle = [
+                    g for g in range(n) if (not bool(busy.get(g, False))) and w_map[g].queue_wait_ms <= 1.0
+                ]
+                if idle:
+                    idle.sort(key=lambda g: (w_map[g].expert_alpha, (g - cur) % n))
+                    chosen = idle[0]
+                    self.rr_cursor = (chosen + 1) % n
+                    return chosen
+                if preemption_mode != "non_preemptive":
+                    elig = [g for g in range(n) if pre_map.get(g, 0) < max_preemptions_per_gpu]
+                    if elig:
+                        elig.sort(
+                            key=lambda g: (
+                                pre_map.get(g, 0),
+                                0 if dit_map.get(g, 0) > 0 else 1,
+                                w_map[g].expert_alpha,
+                                (g - cur) % n,
+                            )
+                        )
+                        chosen = elig[0]
+                        self.rr_cursor = (chosen + 1) % n
+                        return chosen
+
+            if modality_plan == "cot_then_dit":
+                idle = [
+                    g for g in range(n) if (not bool(busy.get(g, False))) and w_map[g].queue_wait_ms <= 1.0
+                ]
+                if idle:
+                    idle.sort(key=lambda g: ((g - cur) % n, w_map[g].expert_alpha))
+                    chosen = idle[0]
+                    self.rr_cursor = (chosen + 1) % n
+                    return chosen
+                if preemption_mode != "non_preemptive":
+                    elig = [g for g in range(n) if pre_map.get(g, 0) < max_preemptions_per_gpu]
+                    if elig:
+                        elig.sort(
+                            key=lambda g: (
+                                pre_map.get(g, 0),
+                                w_map[g].queue_wait_ms,
+                                (g - cur) % n,
+                            )
+                        )
+                        chosen = elig[0]
+                        self.rr_cursor = (chosen + 1) % n
+                        return chosen
+
+            cands = list(range(n))
+            cands.sort(
+                key=lambda g: (
+                    w_map[g].queue_wait_ms,
+                    bool(busy.get(g, False)),
+                    -w_map[g].expert_alpha if routing_mode == "dual_path" else 0.0,
+                    (g - cur) % n,
+                )
+            )
+            chosen = cands[0]
+            self.rr_cursor = (chosen + 1) % n
+            return chosen
+
+    def select_static_gen_gpu(
+        self,
+        *,
+        routing_mode: str,
+        static_und_ranks: Sequence[int],
+        static_gen_ranks: Sequence[int],
+        src_und_gpu: int,
+        workers: Mapping[int, WorkerState] | None = None,
+        gpu_busy: Mapping[int, bool] | None = None,
+    ) -> int:
+        """Select destination generation rank for `twostage_shm` or `static_nccl_fission`."""
+        w_map = workers if workers is not None else self.worker_states
+        busy = gpu_busy or {}
+        if routing_mode == "twostage_shm":
+            idx = list(static_und_ranks).index(src_und_gpu)
+            return static_gen_ranks[idx % len(static_gen_ranks)]
+
+        tier_order = {"intra_half": 0, "inter_socket": 1, "inter_node": 2}
+        cands = list(static_gen_ranks)
+        cands.sort(
+            key=lambda g: (
+                tier_order.get(self.topology.fabric_tier(src_und_gpu, g), 3),
+                w_map[g].queue_wait_ms,
+                bool(busy.get(g, False)),
+                g,
+            )
+        )
+        return cands[0]
+
+    def plan_and_reserve_transition(
+        self,
+        *,
+        routing_mode: str,
+        static_und_ranks: Sequence[int],
+        static_gen_ranks: Sequence[int],
+        req: CPTGRequestSpec,
+        est_dit_ms: float,
+        workers: dict[int, WorkerState] | None = None,
+        gpu_busy: Mapping[int, bool] | None = None,
+        use_pacer: bool = True,
+        now_ms: float = 0.0,
+    ) -> tuple[RouteDecision, str]:
+        """Atomically route AR/Prefill -> DiT AND reserve `queue_wait_ms` + `HalfNodeH2DPacer` before async shipping."""
+        w_map = workers if workers is not None else self.worker_states
+        with self._mu:
+            if routing_mode == "dual_path":
+                dec = self.decide(req, w_map, now_ms=now_ms)
+                dst_gpu = dec.dst_gpu
+                ship_mode = "nccl_dual" if (dec.path == "state_ship" and dst_gpu != req.src_gpu) else "none"
+                if dec.path == "in_place_morph" and use_pacer:
+                    alpha = w_map[dst_gpu].expert_alpha
+                    missing = (1.0 - alpha) * float(req.gen_expert_bytes)
+                    if missing > 0.0:
+                        bw = max(1.0, dec.selected_bw_gbps)
+                        dma_ms = (missing / 1e9) / bw * 1000.0
+                        self.pacer.reserve_slot(dst_gpu, dma_ms, now_ms=now_ms + w_map[dst_gpu].queue_wait_ms)
+            elif routing_mode in ("static_nccl_fission", "twostage_shm"):
+                dst_gpu = self.select_static_gen_gpu(
+                    routing_mode=routing_mode,
+                    static_und_ranks=static_und_ranks,
+                    static_gen_ranks=static_gen_ranks,
+                    src_und_gpu=req.src_gpu,
+                    workers=w_map,
+                    gpu_busy=gpu_busy,
+                )
+                ship_mode = "nccl_static" if routing_mode == "static_nccl_fission" else "shm_static"
+                bw = self.topology.effective_p2p_gbps(req.src_gpu, dst_gpu)
+                t_ship = (req.effective_state_bytes() / 1e9) / max(0.5, bw) * 1000.0 + self.topology.handoff_ms(
+                    req.src_gpu, dst_gpu
+                )
+                dec = RouteDecision(
+                    req_id=req.req_id,
+                    path="state_ship",
+                    src_gpu=req.src_gpu,
+                    dst_gpu=dst_gpu,
+                    t_ship_ms=round(t_ship, 3),
+                    t_morph_ms=float("inf"),
+                    chosen_cost_ms=round(t_ship, 3),
+                    selected_bw_gbps=round(bw, 3),
+                    effective_state_mib=round(req.effective_state_bytes() / MIB, 2),
+                    reason=f"static {routing_mode} {req.src_gpu}->{dst_gpu}",
+                    hop_tier=self.topology.fabric_tier(req.src_gpu, dst_gpu),
+                )
+            else:
+                dst_gpu = req.src_gpu
+                ship_mode = "none"
+                dec = RouteDecision(
+                    req_id=req.req_id,
+                    path="in_place_morph",
+                    src_gpu=req.src_gpu,
+                    dst_gpu=dst_gpu,
+                    t_ship_ms=-1.0,
+                    t_morph_ms=round(w_map[dst_gpu].queue_wait_ms, 3),
+                    chosen_cost_ms=round(w_map[dst_gpu].queue_wait_ms, 3),
+                    selected_bw_gbps=self.topology.solo_h2d_gbps(dst_gpu),
+                    effective_state_mib=round(req.effective_state_bytes() / MIB, 2),
+                    reason=f"sticky {routing_mode} on gpu {dst_gpu}",
+                    hop_tier="in_place",
+                )
+
+            w_map[dst_gpu].queue_wait_ms += max(0.0, float(est_dit_ms))
+            return dec, ship_mode
+
+    def release_dit_reservation(
+        self,
+        gpu_id: int,
+        est_dit_ms: float,
+        workers: dict[int, WorkerState] | None = None,
+    ) -> None:
+        w_map = workers if workers is not None else self.worker_states
+        with self._mu:
+            w_map[gpu_id].queue_wait_ms = max(0.0, w_map[gpu_id].queue_wait_ms - max(0.0, float(est_dit_ms)))
+
+    # --- Analytical Dual-Path Cost Model ---
+
+    def analytical_crossover_kv_mib(
+        self,
+        alpha: float = 0.50,
+        gen_expert_bytes: int = DEFAULT_OPERATOR_PROFILE.bagel_expert_bytes,
+        dit_step1_ms: float = DEFAULT_OPERATOR_PROFILE.bagel_dit_512_step_ms,
+        src_gpu: int = 0,
+        dst_gpu: int = 1,
+    ) -> float:
+        """Closed-form intra-half KV crossover size (MiB) where Path A `t_ship` equals Path B `t_morph`."""
+        w_src = WorkerState(gpu_id=src_gpu, role="hybrid", expert_alpha=alpha, queue_wait_ms=0.0)
+        req_probe = CPTGRequestSpec(
+            req_id="crossover_probe",
+            src_gpu=src_gpu,
+            architecture="tight_mot",
+            kv_bytes=0,
+            gen_expert_bytes=gen_expert_bytes,
+            dit_step1_ms=dit_step1_ms,
+        )
+        t_morph_ms, _ = self.evaluate_path_b_morph_ms(req_probe, w_src, now_ms=0.0)
+        handoff = (
+            float(self.state_handoff_ms)
+            if self.state_handoff_ms is not None
+            else self.topology.handoff_ms(src_gpu, dst_gpu)
+        )
+        net_budget_ms = max(0.0, t_morph_ms - handoff)
+        bw_p2p = self.topology.effective_p2p_gbps(src_gpu, dst_gpu)
+        kv_bytes = (net_budget_ms / 1000.0) * bw_p2p * 1e9
+        return round(kv_bytes / MIB, 1)
 
     def evaluate_path_b_morph_ms(
         self,
@@ -178,8 +443,6 @@ class DualPathMorphRouter:
         if missing_bytes <= 0.0:
             return float(src_worker.queue_wait_ms), self.topology.solo_h2d_gbps(src_worker.gpu_id)
 
-        # Under H2D pacing, this transfer waits for any busy slot on its half-node,
-        # then executes at full solo H2D bandwidth instead of contended ~2.58 GB/s!
         h2d_wait_ms = self.pacer.predicted_wait_ms(src_worker.gpu_id, now_ms=now_ms)
         active = 1 if self.pacer.max_concurrent_per_half == 1 else max(1, src_worker.active_h2d_transfers + 1)
         bw_h2d_gbps = self.topology.effective_h2d_gbps(src_worker.gpu_id, active_h2d_same_half=active)
@@ -195,6 +458,7 @@ class DualPathMorphRouter:
         req: CPTGRequestSpec,
         src_worker: WorkerState,
         dst_worker: WorkerState,
+        now_ms: float = 0.0,
     ) -> tuple[float, float]:
         """Return `(t_ship_ms, effective_p2p_gbps)` for shipping CPTG state from `src` to `dst`."""
         state_bytes = float(req.effective_state_bytes())
@@ -202,30 +466,45 @@ class DualPathMorphRouter:
             return float("inf"), 0.0
         if dst_worker.kv_free_bytes < state_bytes:
             return float("inf"), 0.0
-        same = self.topology.same_half(src_worker.gpu_id, dst_worker.gpu_id)
-        if not self.allow_cross_half_state_ship and not same:
+
+        tier = self.topology.fabric_tier(src_worker.gpu_id, dst_worker.gpu_id)
+        if tier == "inter_socket" and not self.allow_cross_half_state_ship:
             return float("inf"), 0.0
+        if tier == "inter_node":
+            if not self.allow_inter_node_state_ship:
+                return float("inf"), 0.0
+            if state_bytes > float(self.max_inter_node_state_bytes):
+                return float("inf"), 0.0
 
         concurrent = max(1, min(src_worker.p2p_concurrent_links, dst_worker.p2p_concurrent_links))
         bw_p2p_gbps = self.topology.effective_p2p_gbps(
             src_worker.gpu_id,
             dst_worker.gpu_id,
-            concurrent_intra_half=concurrent if same else 1,
-            concurrent_cross_half=concurrent if not same else 1,
+            concurrent_intra_half=concurrent if tier == "intra_half" else 1,
+            concurrent_cross_half=concurrent if tier == "inter_socket" else 1,
+            concurrent_inter_node=concurrent if tier == "inter_node" else 1,
         )
         gamma = max(1, int(req.interleaved_roundtrip_gamma))
-        ship_xfer_ms = (gamma * state_bytes / 1e9) / bw_p2p_gbps * 1000.0 + self.state_handoff_ms
+        handoff = (
+            float(self.state_handoff_ms)
+            if self.state_handoff_ms is not None
+            else self.topology.handoff_ms(src_worker.gpu_id, dst_worker.gpu_id)
+        )
+        ship_xfer_ms = (gamma * state_bytes / 1e9) / bw_p2p_gbps * 1000.0 + handoff
 
-        # If destination peer is missing some generation expert weights, include its incremental morph stall!
         dst_morph_ms = 0.0
         if dst_worker.expert_alpha < 1.0:
-            dst_morph_only, _ = self.evaluate_path_b_morph_ms(req, WorkerState(
-                gpu_id=dst_worker.gpu_id,
-                role=dst_worker.role,
-                expert_alpha=dst_worker.expert_alpha,
-                queue_wait_ms=0.0,
-                active_h2d_transfers=dst_worker.active_h2d_transfers,
-            ))
+            dst_morph_only, _ = self.evaluate_path_b_morph_ms(
+                req,
+                WorkerState(
+                    gpu_id=dst_worker.gpu_id,
+                    role=dst_worker.role,
+                    expert_alpha=dst_worker.expert_alpha,
+                    queue_wait_ms=0.0,
+                    active_h2d_transfers=dst_worker.active_h2d_transfers,
+                ),
+                now_ms=now_ms,
+            )
             dst_morph_ms = dst_morph_only
 
         t_ship = ship_xfer_ms + float(dst_worker.queue_wait_ms) + dst_morph_ms
@@ -234,11 +513,12 @@ class DualPathMorphRouter:
     def decide(
         self,
         req: CPTGRequestSpec,
-        workers: dict[int, WorkerState],
+        workers: Mapping[int, WorkerState] | None = None,
         now_ms: float = 0.0,
     ) -> RouteDecision:
-        """Select optimal AR->DiT execution path via analytical topology + residency cost model."""
-        src_w = workers[req.src_gpu]
+        """Select optimal AR->DiT execution path via 3-tier topology + residency cost model."""
+        w_map = workers if workers is not None else self.worker_states
+        src_w = w_map[req.src_gpu]
         t_morph_ms, h2d_bw = self.evaluate_path_b_morph_ms(req, src_w, now_ms=now_ms)
 
         best_dst = req.src_gpu
@@ -246,10 +526,10 @@ class DualPathMorphRouter:
         best_p2p_bw = 0.0
 
         for cand_id in self.topology.peer_candidates(req.src_gpu, prefer_same_half=True):
-            if cand_id not in workers:
+            if cand_id not in w_map:
                 continue
-            cand_w = workers[cand_id]
-            t_ship, bw_p2p = self.evaluate_path_a_ship_ms(req, src_w, cand_w)
+            cand_w = w_map[cand_id]
+            t_ship, bw_p2p = self.evaluate_path_a_ship_ms(req, src_w, cand_w, now_ms=now_ms)
             if t_ship < best_ship_ms:
                 best_ship_ms = t_ship
                 best_dst = cand_id
@@ -257,8 +537,8 @@ class DualPathMorphRouter:
 
         state_mib = round(req.effective_state_bytes() / MIB, 2)
         if best_ship_ms < t_morph_ms:
-            same = self.topology.same_half(req.src_gpu, best_dst)
-            hop = "same_half" if same else "cross_half"
+            tier = self.topology.fabric_tier(req.src_gpu, best_dst)
+            hop_label = "same_half" if tier == "intra_half" else tier
             return RouteDecision(
                 req_id=req.req_id,
                 path="state_ship",
@@ -269,7 +549,8 @@ class DualPathMorphRouter:
                 chosen_cost_ms=best_ship_ms,
                 selected_bw_gbps=best_p2p_bw,
                 effective_state_mib=state_mib,
-                reason=f"{req.architecture}: {hop} state_ship({state_mib}MiB) {best_ship_ms:.1f}ms < morph {t_morph_ms:.1f}ms",
+                reason=f"{req.architecture}: {hop_label} state_ship({state_mib}MiB) {best_ship_ms:.1f}ms < morph {t_morph_ms:.1f}ms",
+                hop_tier=tier,
             )
 
         return RouteDecision(
@@ -283,12 +564,13 @@ class DualPathMorphRouter:
             selected_bw_gbps=h2d_bw,
             effective_state_mib=state_mib,
             reason=f"{req.architecture}: in_place_morph(alpha={src_w.expert_alpha:.2f}) {t_morph_ms:.1f}ms <= ship {best_ship_ms:.1f}ms",
+            hop_tier="in_place",
         )
 
     def route_batch(
         self,
         requests: list[CPTGRequestSpec],
-        workers: dict[int, WorkerState],
+        workers: Mapping[int, WorkerState],
         now_ms: float = 0.0,
     ) -> list[RouteDecision]:
         """Greedy online routing for a burst of CPTG transitions, updating queue and H2D reservations."""

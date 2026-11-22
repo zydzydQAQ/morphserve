@@ -44,7 +44,7 @@ def run_smoke_validation(
             policy=policy,
             model_dir=model_dir,
             bench_root=bench_root,
-            tmp_root=Path(f"/tmp/morphserve_smoke_{preset}"),
+            tmp_root=output_dir / f"_tmp_smoke_{preset}",
         )
         t0 = time.perf_counter()
         try:

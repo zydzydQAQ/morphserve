@@ -11,7 +11,7 @@ import math
 from pathlib import Path
 import time
 
-from morphserve.bench.validate_module1_bagel import load_bagel_pipeline
+from morphserve.bench.exactness import MIB, compute_ssim_rgb as _compute_ssim_rgb
 from morphserve.kernels import (
     GpuInPlaceLoopback,
     SharedPrefixCache,
@@ -25,40 +25,7 @@ from morphserve.kernels import (
     shared_prefix_cfg_attention,
     shared_prefix_cfg_attention_ref,
 )
-
-MIB = 1024**2
-
-
-def _compute_ssim_rgb(img_a, img_b) -> dict[str, float]:
-    import numpy as np
-
-    a = np.asarray(img_a.convert("RGB"), dtype=np.float64)
-    b = np.asarray(img_b.convert("RGB"), dtype=np.float64)
-    diff = np.abs(a - b)
-    mae = float(diff.mean())
-    max_diff = float(diff.max())
-    mse = float(((a - b) ** 2).mean())
-    psnr = 99.99 if mse == 0.0 else float(10.0 * math.log10((255.0**2) / mse))
-
-    # Standard global + 8x8 windowed SSIM on luminance/RGB
-    c1 = (0.01 * 255.0) ** 2
-    c2 = (0.03 * 255.0) ** 2
-    H, W, C = a.shape
-    bh, bw = H // 8, W // 8
-    a_blk = a[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8, C).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
-    b_blk = b[: bh * 8, : bw * 8].reshape(bh, 8, bw, 8, C).transpose(0, 2, 4, 1, 3).reshape(-1, 64)
-    mu_a = a_blk.mean(axis=1)
-    mu_b = b_blk.mean(axis=1)
-    var_a = a_blk.var(axis=1)
-    var_b = b_blk.var(axis=1)
-    cov = ((a_blk - mu_a[:, None]) * (b_blk - mu_b[:, None])).mean(axis=1)
-    ssim_map = ((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a**2 + mu_b**2 + c1) * (var_a + var_b + c2))
-    return {
-        "ssim": round(float(ssim_map.mean()), 6),
-        "psnr_db": round(psnr, 2),
-        "mae_u8": round(mae, 4),
-        "max_abs_diff_u8": int(max_diff),
-    }
+from morphserve.models import load_bagel_pipeline
 
 
 def _left_pad_stack_stock(tensors):

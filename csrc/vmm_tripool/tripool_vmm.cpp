@@ -53,6 +53,13 @@ struct PrefetchJob {
     int layer_idx = -1;
 };
 
+struct KvRegion {
+    CUdeviceptr va_base = 0;
+    size_t cap_bytes = 0;
+    std::vector<CUmemGenericAllocationHandle> handles;
+    bool active = false;
+};
+
 class UnifiedTriPoolVMM {
 public:
     static UnifiedTriPoolVMM& instance() {
@@ -217,6 +224,24 @@ public:
                 transient_va_ = 0;
             }
 
+            // Tear down Arena 1 contiguous KV regions
+            for (auto& reg : kv_regions_) {
+                if (reg.active) {
+                    if (!reg.handles.empty()) {
+                        drv.cuMemUnmap(reg.va_base, reg.handles.size() * min_gran_);
+                        for (auto h : reg.handles) free_fine_handles_.push_back(h);
+                        reg.handles.clear();
+                    }
+                    if (reg.va_base) {
+                        drv.cuMemAddressFree(reg.va_base, reg.cap_bytes);
+                        reg.va_base = 0;
+                    }
+                    reg.active = false;
+                }
+            }
+            kv_regions_.clear();
+            kv_free_regions_.clear();
+
             // Tear down Arena 1 (KV)
             for (size_t s = 0; s < kv_va_slots_; ++s) {
                 if (kv_slot_handles_[s]) {
@@ -358,11 +383,156 @@ public:
         }
     }
 
-    // ==================== Arena 1: Persistent KV (2 MiB Pages) ====================
+    // ==================== Arena 1: Persistent KV (2 MiB Pages & Contiguous Regions) ====================
+
+    CUmemGenericAllocationHandle pop_fine_handle_locked(void* stream) {
+        if (free_fine_handles_.empty()) {
+            CUmemGenericAllocationHandle super_h = pop_super_handle_locked(stream, /*for_kv=*/true);
+            auto& drv = CudaDriver::instance();
+            drv.check(drv.cuMemRelease(super_h), "carve cuMemRelease(super)");
+            --super_pool_total_;
+            const size_t sub_pages = super_bytes_ / min_gran_;
+            for (size_t i = 0; i < sub_pages; ++i) {
+                CUmemGenericAllocationHandle fh = 0;
+                drv.check(drv.cuMemCreate(&fh, min_gran_, &prop_, 0), "carve cuMemCreate(fine)");
+                free_fine_handles_.push_back(fh);
+                ++fine_pool_total_;
+            }
+            ++super_to_fine_carves_;
+        }
+        CUmemGenericAllocationHandle fh = free_fine_handles_.back();
+        free_fine_handles_.pop_back();
+        return fh;
+    }
 
     uint64_t kv_va_base() {
         std::lock_guard<std::mutex> lock(mu_);
         return static_cast<uint64_t>(kv_va_);
+    }
+
+    int32_t kv_region_alloc(size_t max_va_bytes) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_) return -1;
+        try {
+            ensure_ctx_locked();
+            const size_t req = (max_va_bytes > min_gran_) ? max_va_bytes : min_gran_;
+            const size_t cap = ((req + min_gran_ - 1) / min_gran_) * min_gran_;
+            CUdeviceptr va = 0;
+            auto& drv = CudaDriver::instance();
+            drv.check(drv.cuMemAddressReserve(&va, cap, min_gran_, 0, 0), "kv_region cuMemAddressReserve");
+
+            int32_t rid = -1;
+            if (!kv_free_regions_.empty()) {
+                rid = kv_free_regions_.back();
+                kv_free_regions_.pop_back();
+                kv_regions_[rid] = KvRegion{va, cap, {}, true};
+            } else {
+                rid = static_cast<int32_t>(kv_regions_.size());
+                kv_regions_.push_back(KvRegion{va, cap, {}, true});
+            }
+            return rid;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[tripool_vmm] kv_region_alloc error: %s\n", e.what());
+            return -2;
+        }
+    }
+
+    uint64_t kv_region_ensure(int32_t region_id, size_t needed_bytes, void* stream) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_) return 0;
+        if (region_id < 0 || static_cast<size_t>(region_id) >= kv_regions_.size()) return 0;
+        auto& reg = kv_regions_[region_id];
+        if (!reg.active) return 0;
+
+        const size_t eff_bytes = (needed_bytes > 0) ? needed_bytes : 1;
+        const size_t needed_pages = (eff_bytes + min_gran_ - 1) / min_gran_;
+        if (needed_pages * min_gran_ > reg.cap_bytes) {
+            std::fprintf(stderr, "[tripool_vmm] kv_region_ensure(%d) exceeds cap_bytes=%zu\n",
+                         region_id, reg.cap_bytes);
+            return 0;
+        }
+        const size_t old_pages = reg.handles.size();
+        if (needed_pages <= old_pages) {
+            return static_cast<uint64_t>(reg.va_base);
+        }
+
+        std::vector<CUmemGenericAllocationHandle> staged;
+        size_t mapped_now = 0;
+        auto& drv = CudaDriver::instance();
+        try {
+            ensure_ctx_locked();
+            const size_t delta = needed_pages - old_pages;
+            staged.reserve(delta);
+            for (size_t i = 0; i < delta; ++i) {
+                staged.push_back(pop_fine_handle_locked(stream));
+            }
+            for (size_t i = 0; i < delta; ++i) {
+                CUdeviceptr addr = reg.va_base + (old_pages + i) * min_gran_;
+                drv.check(drv.cuMemMap(addr, min_gran_, 0, staged[i], 0), "kv_region cuMemMap");
+                ++mapped_now;
+            }
+            drv.check(
+                drv.cuMemSetAccess(reg.va_base + old_pages * min_gran_, delta * min_gran_, &access_, 1),
+                "kv_region cuMemSetAccess");
+            for (auto h : staged) reg.handles.push_back(h);
+            kv_mapped_pages_ += delta;
+            kv_mapped_pages_peak_ = std::max(kv_mapped_pages_peak_, kv_mapped_pages_);
+            return static_cast<uint64_t>(reg.va_base);
+        } catch (const std::exception& e) {
+            if (mapped_now > 0) {
+                drv.cuMemUnmap(reg.va_base + old_pages * min_gran_, mapped_now * min_gran_);
+            }
+            for (auto h : staged) free_fine_handles_.push_back(h);
+            std::fprintf(stderr, "[tripool_vmm] kv_region_ensure error: %s\n", e.what());
+            return 0;
+        }
+    }
+
+    uint64_t kv_region_va(int32_t region_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || region_id < 0 || static_cast<size_t>(region_id) >= kv_regions_.size()) return 0;
+        const auto& reg = kv_regions_[region_id];
+        return reg.active ? static_cast<uint64_t>(reg.va_base) : 0;
+    }
+
+    size_t kv_region_mapped_bytes(int32_t region_id) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_ || region_id < 0 || static_cast<size_t>(region_id) >= kv_regions_.size()) return 0;
+        const auto& reg = kv_regions_[region_id];
+        return reg.active ? (reg.handles.size() * min_gran_) : 0;
+    }
+
+    int kv_region_free(int32_t region_id, void* stream) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (!initialized_) return -1;
+        if (region_id < 0 || static_cast<size_t>(region_id) >= kv_regions_.size()) return -2;
+        auto& reg = kv_regions_[region_id];
+        if (!reg.active) return 0;
+        try {
+            ensure_ctx_locked();
+            auto& drv = CudaDriver::instance();
+            if (stream && !reg.handles.empty()) {
+                drv.check(drv.cuStreamSynchronize(reinterpret_cast<CUstream>(stream)), "kv_region sync");
+            }
+            if (!reg.handles.empty()) {
+                const size_t n = reg.handles.size();
+                drv.check(drv.cuMemUnmap(reg.va_base, n * min_gran_), "kv_region cuMemUnmap");
+                for (auto h : reg.handles) free_fine_handles_.push_back(h);
+                reg.handles.clear();
+                kv_mapped_pages_ = (kv_mapped_pages_ >= n) ? (kv_mapped_pages_ - n) : 0;
+            }
+            if (reg.va_base) {
+                drv.check(drv.cuMemAddressFree(reg.va_base, reg.cap_bytes), "kv_region cuMemAddressFree");
+                reg.va_base = 0;
+            }
+            reg.cap_bytes = 0;
+            reg.active = false;
+            kv_free_regions_.push_back(region_id);
+            return 0;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[tripool_vmm] kv_region_free error: %s\n", e.what());
+            return -3;
+        }
     }
 
     int32_t kv_alloc_page() {
@@ -372,27 +542,9 @@ public:
             ensure_ctx_locked();
             if (kv_free_slots_.empty()) return -2;
 
-            // If fine 2 MiB pool is empty, carve 1 super-handle (64 MiB -> 32 x 2 MiB fine pages),
-            // auto-evicting an unpinned tail expert layer if needed!
-            if (free_fine_handles_.empty()) {
-                CUmemGenericAllocationHandle super_h = pop_super_handle_locked(nullptr, /*for_kv=*/true);
-                auto& drv = CudaDriver::instance();
-                drv.check(drv.cuMemRelease(super_h), "carve cuMemRelease(super)");
-                --super_pool_total_;
-                const size_t sub_pages = super_bytes_ / min_gran_;
-                for (size_t i = 0; i < sub_pages; ++i) {
-                    CUmemGenericAllocationHandle fh = 0;
-                    drv.check(drv.cuMemCreate(&fh, min_gran_, &prop_, 0), "carve cuMemCreate(fine)");
-                    free_fine_handles_.push_back(fh);
-                    ++fine_pool_total_;
-                }
-                ++super_to_fine_carves_;
-            }
-
+            CUmemGenericAllocationHandle fh = pop_fine_handle_locked(nullptr);
             int32_t slot = kv_free_slots_.back();
             kv_free_slots_.pop_back();
-            CUmemGenericAllocationHandle fh = free_fine_handles_.back();
-            free_fine_handles_.pop_back();
 
             auto& drv = CudaDriver::instance();
             CUdeviceptr addr = kv_va_ + static_cast<size_t>(slot) * min_gran_;
@@ -1060,6 +1212,8 @@ private:
     size_t kv_va_slots_ = 0;
     std::vector<CUmemGenericAllocationHandle> kv_slot_handles_;
     std::vector<int32_t> kv_free_slots_;
+    std::vector<KvRegion> kv_regions_;
+    std::vector<int32_t> kv_free_regions_;
     uint64_t kv_mapped_pages_ = 0;
     uint64_t kv_mapped_pages_peak_ = 0;
     uint64_t super_to_fine_carves_ = 0;
@@ -1147,6 +1301,26 @@ int32_t tripool_kv_alloc_page() {
 
 int tripool_kv_free_page(int32_t slot_idx, void* stream) {
     return UnifiedTriPoolVMM::instance().kv_free_page(slot_idx, stream);
+}
+
+int32_t tripool_kv_region_alloc(size_t max_va_bytes) {
+    return UnifiedTriPoolVMM::instance().kv_region_alloc(max_va_bytes);
+}
+
+uint64_t tripool_kv_region_ensure(int32_t region_id, size_t needed_bytes, void* stream) {
+    return UnifiedTriPoolVMM::instance().kv_region_ensure(region_id, needed_bytes, stream);
+}
+
+uint64_t tripool_kv_region_va(int32_t region_id) {
+    return UnifiedTriPoolVMM::instance().kv_region_va(region_id);
+}
+
+size_t tripool_kv_region_mapped_bytes(int32_t region_id) {
+    return UnifiedTriPoolVMM::instance().kv_region_mapped_bytes(region_id);
+}
+
+int tripool_kv_region_free(int32_t region_id, void* stream) {
+    return UnifiedTriPoolVMM::instance().kv_region_free(region_id, stream);
 }
 
 int tripool_expert_register(

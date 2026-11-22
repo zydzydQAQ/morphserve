@@ -12,9 +12,8 @@ SRC_DIR = REPO_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from morphserve.kernels import _should_use_flash_prefix_split  # noqa: E402
+from morphserve.kernels import SharedPrefixCache, cow_fork_context, should_use_flash_prefix_split  # noqa: E402
 from morphserve.kernels.gpu_loopback import _extract_target_hw, pil_bicubic_resize_gpu  # noqa: E402
-from morphserve.kernels.lecp_cache import SharedPrefixCache, cow_fork_context  # noqa: E402
 
 
 class _MockTensor:
@@ -112,11 +111,11 @@ class TestModule3Offline(unittest.TestCase):
         self.assertLessEqual(max_diff, 1)
 
     def test_flash_prefix_split_arithmetic_intensity_gate(self) -> None:
-        self.assertTrue(_should_use_flash_prefix_split(1026, 2048, 2))
-        self.assertTrue(_should_use_flash_prefix_split(1026, 16384, 2))
-        self.assertFalse(_should_use_flash_prefix_split(4098, 8192, 2))
-        self.assertTrue(_should_use_flash_prefix_split(4098, 16392, 2))
-        self.assertFalse(_should_use_flash_prefix_split(1026, 128, 2))
+        self.assertTrue(should_use_flash_prefix_split(1026, 2048, 2))
+        self.assertTrue(should_use_flash_prefix_split(1026, 16384, 2))
+        self.assertFalse(should_use_flash_prefix_split(4098, 8192, 2))
+        self.assertTrue(should_use_flash_prefix_split(4098, 16392, 2))
+        self.assertFalse(should_use_flash_prefix_split(1026, 128, 2))
 
     def test_module3_script_syntax_and_imports(self) -> None:
         script = REPO_ROOT / "deploy/kairos/scripts/05_phase1_module3_validate.sh"

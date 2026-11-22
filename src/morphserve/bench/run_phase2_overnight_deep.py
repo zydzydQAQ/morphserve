@@ -18,16 +18,7 @@ from morphserve.bench.interleaved_bench import (
 )
 from morphserve.bench.run_phase2_bagel_main import stratify_suite
 from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine
-
-
-def _pct(vals: list[float], p: float) -> float:
-    if not vals:
-        return 0.0
-    s = sorted(vals)
-    idx = (len(s) - 1) * (p / 100.0)
-    lo = int(math.floor(idx))
-    hi = min(len(s) - 1, int(math.ceil(idx)))
-    return round(float(s[lo] + (s[hi] - s[lo]) * (idx - lo)), 2)
+from morphserve.telemetry import percentile as _pct
 
 
 def _quadrant_breakdown(sessions_raw: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

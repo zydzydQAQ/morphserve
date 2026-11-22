@@ -109,17 +109,23 @@ def _compute_image_pair_metrics(path_a: Path, path_b: Path) -> dict[str, Any]:
 
 
 def build_ablation_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolicyConfig]]:
-    """Construct the 5-step M1-M4 ablation ladder on BAGEL-7B-MoT."""
+    """Construct the cumulative 5-step M1-M4 ablation ladder on BAGEL-7B-MoT."""
     base_ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=num_gpus)
+    no_m4 = replace(base_ms, policy_name="no_m4_layer_chunk", preemption_mode="non_preemptive")
+    no_m3 = replace(no_m4, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)
+    no_m2 = replace(
+        no_m3,
+        policy_name="no_m2_dual_path",
+        routing_mode="sticky_least_loaded",
+        use_h2d_pacer=False,
+        use_shared_numa_mirror=False,
+    )
     base_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=num_gpus)
     return [
         ("full_morphserve", base_ms),
-        ("no_m4_layer_chunk", replace(base_ms, policy_name="no_m4_layer_chunk", preemption_mode="non_preemptive")),
-        ("no_m3_cow_loopback", replace(base_ms, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)),
-        (
-            "no_m2_dual_path",
-            replace(base_ms, policy_name="no_m2_dual_path", routing_mode="sticky_least_loaded", adaptive_alpha_rebalance=False),
-        ),
+        ("no_m4_layer_chunk", no_m4),
+        ("no_m3_cow_loopback", no_m3),
+        ("no_m2_dual_path", no_m2),
         ("no_m1_tripool_vmm", replace(base_mono, policy_name="no_m1_tripool_vmm")),
     ]
 

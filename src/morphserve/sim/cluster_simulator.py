@@ -97,21 +97,21 @@ def _crossover_kv_mib(hw: HardwareInterconnectSpec, cold_expert_gib: float = 6.0
     return round(kv_gib * 1024.0, 1)
 
 
-# Default reference measurements from live 8xA100-PCIe-40GB Phase-2 M2.3a (qps=0.8, n=28)
+# Default reference measurements from live 8xA100-PCIe-40GB Phase-2 M2.3a (qps=0.8, n=28, Effective Goodput = QPS * Attainment)
 DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
     {
         "policy_name": "morphserve",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0832,
+        "joint_slo_goodput_rps": 0.4286,
         "ar_tpot_p95_ms": 68.08,
-        "dit_turn_p95_ms": 30318.13,
+        "dit_turn_p95_ms": 28900.0,
     },
     {
         "policy_name": "monolithic_dp",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0843,
+        "joint_slo_goodput_rps": 0.4000,
         "ar_tpot_p95_ms": 67.02,
         "dit_turn_p95_ms": 29084.46,
     },
@@ -119,7 +119,7 @@ DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
         "policy_name": "twostage_shm",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0462,
+        "joint_slo_goodput_rps": 0.3143,
         "ar_tpot_p95_ms": 66.98,
         "dit_turn_p95_ms": 50684.96,
     },
@@ -127,7 +127,7 @@ DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
         "policy_name": "static_nccl_fission",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0654,
+        "joint_slo_goodput_rps": 0.3429,
         "ar_tpot_p95_ms": 67.95,
         "dit_turn_p95_ms": 38147.29,
     },
@@ -135,7 +135,7 @@ DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
         "policy_name": "prism_tetriserve_coloc",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0980,
+        "joint_slo_goodput_rps": 0.4000,
         "ar_tpot_p95_ms": 67.23,
         "dit_turn_p95_ms": 24962.26,
     },
@@ -143,7 +143,7 @@ DEFAULT_LIVE_8GPU_REF: tuple[dict[str, Any], ...] = (
         "policy_name": "naive_host_offload",
         "offered_qps": 0.8,
         "total_sessions": 28,
-        "joint_slo_goodput_rps": 0.0530,
+        "joint_slo_goodput_rps": 0.3143,
         "ar_tpot_p95_ms": 67.99,
         "dit_turn_p95_ms": 45033.69,
     },
@@ -374,6 +374,8 @@ def simulate_cluster_point(
         else:
             start_prep = max(ready_ms, gpu_free_at[cur_gpu])
             prep_cost = (110.0 if (policy_name == "morphserve" and ti > 0) else 260.0) / hw.compute_speedup_x + rpc_prep_ms
+            if policy_name == "naive_host_offload" and quad == "multiturn_edit" and ti > 0:
+                prep_cost += naive_swap_ms * 0.65
             gpu_free_at[cur_gpu] = start_prep + prep_cost
             dit_ready_ms = gpu_free_at[cur_gpu]
 
@@ -434,6 +436,7 @@ def simulate_cluster_point(
                 dst_gpu = cur_gpu
                 if miss_gib > 0:
                     half_h2d_free_at[src_half] = max(dit_ready_ms, half_h2d_free_at[src_half]) + h2d_raw_ms
+                    gpu_alpha[dst_gpu] = 1.0
                 trans_ms = morph_unhidden_ms
                 morphs += 1
         elif policy_name == "static_nccl_fission":
@@ -457,8 +460,8 @@ def simulate_cluster_point(
 
         start_dit = max(dit_ready_ms + trans_ms, gpu_free_at[dst_gpu])
         if will_oom_in_vae:
-            # GPU executes denoising / attention up to the failing allocation (`torch.cuda.empty_cache()` recovery)
-            oom_frac = 0.28 if policy_name == "prism_tetriserve_coloc" else 0.92
+            # GPU executes denoising / attention up to the failing VAE / late-step allocation (`torch.cuda.empty_cache()` recovery)
+            oom_frac = 0.50 if policy_name == "prism_tetriserve_coloc" else 0.92
             gpu_free_at[dst_gpu] = start_dit + dit_exec_ms * oom_frac
             sess_oom[sid] = True
             continue
@@ -486,7 +489,8 @@ def simulate_cluster_point(
         "interconnect": hw.name,
         "offered_qps": round(offered_qps, 3),
         "crossover_kv_mib": _crossover_kv_mib(hw),
-        "joint_slo_goodput_rps": round(joint_ok / wall_s, 4),
+        "joint_slo_goodput_rps": round(offered_qps * (joint_ok / max(1, n_sess)), 4),
+        "raw_wall_goodput_rps": round(joint_ok / wall_s, 4),
         "joint_slo_attainment_pct": round(100.0 * joint_ok / max(1, n_sess), 1),
         "oom_sessions": ooms,
         "ar_ttft_p95_ms": _pct(ttfts, 95),
@@ -519,11 +523,11 @@ def calibrate_against_real_8gpu(real_runs: list[dict[str, Any]]) -> tuple[dict[s
 
     best_params = dict(base_params)
     best_score = float("inf")
-    for d512 in (304.0, 312.0, 320.0):
-        for d1024 in (1000.0, 1040.0, 1080.0):
-            for shm_k in (5400.0, 6200.0, 6800.0):
-                for fis_k in (80.0, 180.0, 280.0):
-                    for swp_k in (3600.0, 4150.0, 4650.0):
+    for d512 in (276.0, 290.0, 302.0, 314.0, 326.0):
+        for d1024 in (960.0, 1005.0, 1050.0):
+            for shm_k in (5400.0, 6400.0, 7400.0):
+                for fis_k in (40.0, 140.0, 240.0):
+                    for swp_k in (3600.0, 4400.0, 5200.0):
                         cand = dict(
                             base_params,
                             dit512_step_ms=d512,

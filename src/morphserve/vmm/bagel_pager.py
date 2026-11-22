@@ -122,6 +122,7 @@ class BagelExpertPager:
         self.layer_hook_calls: int = 0
         self.hook_methods_triggered: set[str] = set()
         self._active_guard = False
+        self._gen_mode_depth = 0
         self._orig_vae_decode = None
         self._orig_vae_encode = None
         self._packed_params_count = 0
@@ -273,14 +274,14 @@ class BagelExpertPager:
 
         def _wrapped_decode(*args, **kwargs):
             was_active = self._active_guard
-            prev_res = vmm.expert_resident_count(self.expert_id)
             self._active_guard = False
             vmm.set_expert_pinned(self.expert_id, False)
             try:
                 return vmm.run_in_transient_scope(self._orig_vae_decode, *args, **kwargs)
             finally:
-                if vmm.expert_resident_count(self.expert_id) < prev_res:
-                    vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                # Leave any borrowed tail expert layers unmapped after VAE decode;
+                # the next DiT turn's generation_mode(prefetch_all=True) reloads them
+                # asynchronously overlapped with Step-1 compute (zero sync H2D stall).
                 self._active_guard = was_active
                 if was_active:
                     vmm.set_expert_pinned(self.expert_id, True)
@@ -294,7 +295,10 @@ class BagelExpertPager:
                 return vmm.run_in_transient_scope(self._orig_vae_encode, *args, **kwargs)
             finally:
                 if vmm.expert_resident_count(self.expert_id) < prev_res:
-                    vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                    if was_active:
+                        vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
+                    else:
+                        vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
                 self._active_guard = was_active
                 if was_active:
                     vmm.set_expert_pinned(self.expert_id, True)
@@ -320,15 +324,20 @@ class BagelExpertPager:
     @contextmanager
     def generation_mode(self, prefetch_all: bool = True):
         assert self.vmm is not None
-        self.vmm.set_expert_pinned(self.expert_id, True)
-        self._active_guard = True
-        if prefetch_all:
-            self.vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
+        outer = self._gen_mode_depth == 0
+        self._gen_mode_depth += 1
+        if outer:
+            self.vmm.set_expert_pinned(self.expert_id, True)
+            self._active_guard = True
+            if prefetch_all:
+                self.vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
         try:
             yield
         finally:
-            self._active_guard = False
-            self.vmm.set_expert_pinned(self.expert_id, False)
+            self._gen_mode_depth = max(0, self._gen_mode_depth - 1)
+            if self._gen_mode_depth == 0:
+                self._active_guard = False
+                self.vmm.set_expert_pinned(self.expert_id, False)
 
     def unbind_vmm_keep_mirror(self) -> None:
         """Detach hooks and VA views while keeping host mirror ready for rebinding to a new VMM instance."""

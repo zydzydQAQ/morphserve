@@ -256,6 +256,105 @@ def run_worker_process(
         res = float(torch.cuda.memory_reserved(device) / MIB)
         max_reserved_mib = max(max_reserved_mib, res)
 
+    def _current_alpha() -> float:
+        if pager is not None and vmm is not None:
+            return round(vmm.expert_resident_count(pager.expert_id) / float(pager.num_layers), 3)
+        return float(policy.initial_alphas.get(rank, 1.0))
+
+    def _move_cache_device(pkv: Any, target_dev: Any) -> None:
+        if pkv is None:
+            return
+        num_layers = int(pkv.num_layers)
+        is_dict_k = isinstance(pkv.key_cache, dict)
+        is_dict_v = isinstance(pkv.value_cache, dict)
+        for l in range(num_layers):
+            k = pkv.key_cache.get(l) if is_dict_k else pkv.key_cache[l]
+            v = pkv.value_cache.get(l) if is_dict_v else pkv.value_cache[l]
+            if k is not None and k.device != target_dev:
+                nk = k.to(target_dev, non_blocking=(target_dev != torch.device("cpu")))
+                if is_dict_k:
+                    pkv.key_cache[l] = nk
+                else:
+                    pkv.key_cache[l] = nk
+            if v is not None and v.device != target_dev:
+                nv = v.to(target_dev, non_blocking=(target_dev != torch.device("cpu")))
+                if is_dict_v:
+                    pkv.value_cache[l] = nv
+                else:
+                    pkv.value_cache[l] = nv
+
+    def _park_entry_to_cpu(entry: dict[str, Any]) -> int:
+        if entry.get("parked_cpu"):
+            return 0
+        freed = _entry_nbytes(entry)
+        cpu_dev = torch.device("cpu")
+        prefix_len = int(entry.get("cfg_text_prefix_len", 0))
+        ct = entry.get("cfg_text_ctx")
+        can_rebuild_slice = False
+        if (
+            policy.use_module3_cow_loopback
+            and ct is not None
+            and prefix_len > 0
+            and ct["past_key_values"].key_cache[0] is not None
+            and int(ct["past_key_values"].key_cache[0].shape[0]) == prefix_len
+        ):
+            can_rebuild_slice = True
+            entry["cfg_text_ctx"] = None
+        entry["_rebuild_cfg_slice"] = can_rebuild_slice
+        _move_cache_device(entry["main_ctx"]["past_key_values"], cpu_dev)
+        if not can_rebuild_slice and ct is not None:
+            _move_cache_device(ct["past_key_values"], cpu_dev)
+        if entry.get("cfg_img_ctx") is not None:
+            _move_cache_device(entry["cfg_img_ctx"]["past_key_values"], cpu_dev)
+        if torch.is_tensor(entry.get("last_img_u8")) and entry["last_img_u8"].is_cuda:
+            entry["last_img_u8"] = entry["last_img_u8"].cpu()
+        entry["parked_cpu"] = True
+        return freed
+
+    def _ensure_unparked(ctx_id: str) -> None:
+        entry = ctx_store.get(ctx_id)
+        if entry is None or not entry.get("parked_cpu"):
+            return
+        _move_cache_device(entry["main_ctx"]["past_key_values"], device)
+        if entry.pop("_rebuild_cfg_slice", False) and int(entry.get("cfg_text_prefix_len", 0)) > 0:
+            entry["cfg_text_ctx"] = _slice_prefix_ctx(
+                entry["main_ctx"], int(entry["cfg_text_prefix_len"]), NaiveCache
+            )
+        elif entry.get("cfg_text_ctx") is not None:
+            _move_cache_device(entry["cfg_text_ctx"]["past_key_values"], device)
+            if policy.use_module3_cow_loopback and int(entry.get("cfg_text_prefix_len", 0)) > 0:
+                rebind_cow_prefix(entry["main_ctx"]["past_key_values"], entry["cfg_text_ctx"]["past_key_values"])
+        if entry.get("cfg_img_ctx") is not None:
+            _move_cache_device(entry["cfg_img_ctx"]["past_key_values"], device)
+        if torch.is_tensor(entry.get("last_img_u8")) and not entry["last_img_u8"].is_cuda:
+            entry["last_img_u8"] = entry["last_img_u8"].to(device, non_blocking=True)
+        torch.cuda.synchronize(device)
+        entry["parked_cpu"] = False
+
+    def _avail_pytorch_bytes() -> tuple[int, int]:
+        free_drv, _ = torch.cuda.mem_get_info(device)
+        cached_free = max(0, int(torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)))
+        return int(free_drv) + cached_free, int(free_drv)
+
+    def _maybe_guard_hbm(protected_ctx_ids: set[str], need_mib: int | None = None) -> None:
+        if not policy.park_idle_kv_on_cpu:
+            return
+        target_bytes = int(need_mib if need_mib is not None else policy.hbm_watermark_free_mib) * MIB
+        avail, free_drv = _avail_pytorch_bytes()
+        if avail >= target_bytes and free_drv >= 2560 * MIB:
+            return
+        freed_any = False
+        for other_cid, other_ent in list(ctx_store.items()):
+            if other_cid in protected_ctx_ids or other_ent.get("parked_cpu"):
+                continue
+            if _park_entry_to_cpu(other_ent) > 0:
+                freed_any = True
+            avail, free_drv = _avail_pytorch_bytes()
+            if avail >= target_bytes:
+                break
+        if freed_any or free_drv < 3072 * MIB:
+            torch.cuda.empty_cache()
+
     def _alloc_kv_vmm_if_needed(ctx_id: str, ctx: dict[str, Any]) -> None:
         if vmm is None or not policy.kv_vmm_only:
             return
@@ -294,10 +393,6 @@ def run_worker_process(
         ctx["kv_lens"], ctx["ropes"] = nl, nr
 
     def _ensure_gen_weights_for_vae() -> bool:
-        if pager is not None and vmm is not None:
-            if vmm.expert_resident_count(pager.expert_id) < pager.num_layers:
-                vmm.load_expert_layers_sync(pager.expert_id, 0, pager.num_layers)
-            return False
         if policy.use_naive_offload and cpu_naive_weights:
             for layer in pipeline.bagel.language_model.model.layers:
                 for pname, p in layer.named_parameters():
@@ -324,6 +419,14 @@ def run_worker_process(
         update_vit: bool = True,
     ) -> None:
         swapped = _ensure_gen_weights_for_vae() if update_vae else False
+        pacer_slot = None
+        gen_cm = None
+        if update_vae and pager is not None and vmm is not None:
+            if pacer is not None and vmm.expert_resident_count(pager.expert_id) < pager.num_layers:
+                pacer_slot = pacer.acquire_process_slot(rank)
+                pacer_slot.__enter__()
+            gen_cm = pager.generation_mode(prefetch_all=True)
+            gen_cm.__enter__()
         try:
             if torch.is_tensor(img_or_u8) and loopback is not None:
                 loopback.update_context_from_u8_gpu(ctx, img_or_u8, update_vae=update_vae, update_vit=update_vit)
@@ -365,6 +468,14 @@ def run_worker_process(
                     ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vit(ctx["past_key_values"], **vti)
                     ctx["kv_lens"], ctx["ropes"] = nlv, nrv
         finally:
+            if gen_cm is not None:
+                torch.cuda.synchronize(device)
+                gen_cm.__exit__(None, None, None)
+            if pacer_slot is not None:
+                try:
+                    pacer_slot.__exit__(None, None, None)
+                except Exception:
+                    pass
             if swapped:
                 _drop_naive_gen_weights()
 
@@ -422,8 +533,11 @@ def run_worker_process(
             "tpots_ms": [round(x, 2) for x in tpots_ms],
         }
 
-    def _prepare_entry_for_cmd(cmd: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_entry_for_cmd(cmd: dict[str, Any], protected_extra: set[str] | None = None) -> dict[str, Any]:
         ctx_id = cmd["ctx_id"]
+        _ensure_unparked(ctx_id)
+        prot = {ctx_id} if protected_extra is None else ({ctx_id} | protected_extra)
+        _maybe_guard_hbm(prot)
         num_layers = pipeline.bagel.config.llm_config.num_hidden_layers
         entry = ctx_store.get(ctx_id)
         if entry is None:
@@ -441,8 +555,21 @@ def run_worker_process(
         main_ctx = entry["main_ctx"]
         prep_dit = bool(cmd.get("prepare_for_dit", False))
         # Pure VQA (`prep_dit=False`) only needs ViT (`mode='und'`).
-        # On static `und` ranks (which dropped `gen` weights), defer VAE latent encode to the `gen` rank!
-        can_run_vae_here = prep_dit and not (policy.routing_mode == "static_nccl_fission" and role == "und")
+        # Defer VAE latent encode to the DiT phase whenever this worker dropped gen weights
+        # (static fission `und` ranks OR dual_path workers with `alpha < 1.0`), avoiding
+        # premature H2D weight loads before DualPathMorphRouter chooses Path A vs Path B!
+        partial_gen = (
+            pager is not None
+            and vmm is not None
+            and policy.routing_mode == "dual_path"
+            and vmm.expert_resident_count(pager.expert_id) < pager.num_layers
+            and not cmd.get("use_prev_image")
+        )
+        can_run_vae_here = (
+            prep_dit
+            and not (policy.routing_mode == "static_nccl_fission" and role == "und")
+            and not partial_gen
+        )
 
         if cmd.get("use_prev_image"):
             if cmd.get("prev_image_path"):
@@ -497,6 +624,10 @@ def run_worker_process(
 
     def _run_dit_exec(cmd: dict[str, Any]) -> dict[str, Any]:
         ctx_id = cmd["ctx_id"]
+        _ensure_unparked(ctx_id)
+        height = int(cmd.get("height", 512))
+        width = int(cmd.get("width", 512))
+        _maybe_guard_hbm({ctx_id}, need_mib=7680 if height >= 1024 else 5120)
         entry = ctx_store[ctx_id]
         main_ctx = entry["main_ctx"]
         cfg_text_ctx = entry.get("cfg_text_ctx")
@@ -506,8 +637,6 @@ def run_worker_process(
             _update_image_ctx(main_ctx, pil_v, update_vae=True, update_vit=False)
             if cfg_text_ctx is not None:
                 _update_image_ctx(cfg_text_ctx, pil_v, update_vae=True, update_vit=False)
-        height = int(cmd.get("height", 512))
-        width = int(cmd.get("width", 512))
         steps = int(cmd.get("dit_steps", 20))
         seed = int(cmd.get("seed", 52))
         prompt = cmd.get("prompt", "")
@@ -585,7 +714,8 @@ def run_worker_process(
                         ar_msg = ar_preempt_q.get_nowait()
                     except queue.Empty:
                         break
-                    ar_entry = _prepare_entry_for_cmd(ar_msg)
+                    prot_ids = {ctx_id} | {m[1] for m in inflight_ar_meta.values()}
+                    ar_entry = _prepare_entry_for_cmd(ar_msg, protected_extra=prot_ids)
                     ar_ctx = ar_entry["main_ctx"]
                     st = pipeline.bagel.prepare_start_tokens(
                         ar_ctx["kv_lens"], ar_ctx["ropes"], pipeline.new_token_ids
@@ -639,6 +769,7 @@ def run_worker_process(
                         "ttft_ms": round(t.ttft_ms(), 2),
                         "tpots_ms": [round(x, 2) for x in t.inter_token_latencies_ms()],
                         "kv_bytes": _entry_nbytes(ar_entry),
+                        "resident_alpha": _current_alpha(),
                         "preempted_mid_dit": True,
                     }
                 )
@@ -646,9 +777,12 @@ def run_worker_process(
         if sched is not None:
             sched.reset_telemetry()
             sched.external_arrival_poll = _poll_external_ar
+            sched.on_task_complete = lambda _t: _flush_completed_ar()
 
         torch.cuda.synchronize(device)
         t0 = time.perf_counter()
+        latents = None
+        img_shape = None
         try:
             with torch.inference_mode():
                 prep = pipeline._forward_single(
@@ -689,25 +823,6 @@ def run_worker_process(
                             scheduler=pipeline.scheduler,
                             scheduler_kwargs=pipeline.scheduler_kwargs,
                         )
-                    if policy.use_module3_cow_loopback:
-                        img_u8 = decode_latent_to_u8_gpu(pipeline.bagel, pipeline.vae, latents[0], img_shape)
-                        entry["last_img_u8"] = img_u8
-                        if want_pil or save_tmp_path:
-                            pil_img = Image.fromarray(
-                                img_u8.permute(1, 2, 0).contiguous().cpu().numpy()
-                            )
-                            entry["last_img_pil"] = pil_img
-                            if save_tmp_path:
-                                Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
-                                pil_img.save(save_tmp_path, format="PNG")
-                    else:
-                        pil_img = pipeline._decode_image_from_latent(
-                            pipeline.bagel, pipeline.vae, latents[0], img_shape
-                        )
-                        entry["last_img_pil"] = pil_img
-                        if save_tmp_path:
-                            Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
-                            pil_img.save(save_tmp_path, format="PNG")
                 finally:
                     if cm_sched is not None:
                         try:
@@ -741,6 +856,30 @@ def run_worker_process(
                         cm_cfg.__exit__(None, None, None)
                     if cm_pager is not None:
                         cm_pager.__exit__(None, None, None)
+
+                # Decode VAE outside generation_mode() so scoped transient pool can borrow
+                # unpinned tail expert handles without triggering any post-VAE sync reload.
+                assert latents is not None and img_shape is not None
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    if policy.use_module3_cow_loopback:
+                        img_u8 = decode_latent_to_u8_gpu(pipeline.bagel, pipeline.vae, latents[0], img_shape)
+                        entry["last_img_u8"] = img_u8
+                        if want_pil or save_tmp_path:
+                            pil_img = Image.fromarray(
+                                img_u8.permute(1, 2, 0).contiguous().cpu().numpy()
+                            )
+                            entry["last_img_pil"] = pil_img
+                            if save_tmp_path:
+                                Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+                                pil_img.save(save_tmp_path, format="PNG")
+                    else:
+                        pil_img = pipeline._decode_image_from_latent(
+                            pipeline.bagel, pipeline.vae, latents[0], img_shape
+                        )
+                        entry["last_img_pil"] = pil_img
+                        if save_tmp_path:
+                            Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+                            pil_img.save(save_tmp_path, format="PNG")
         finally:
             if orig_fwd_for_pacer is not None:
                 pipeline.bagel.forward = orig_fwd_for_pacer
@@ -751,6 +890,7 @@ def run_worker_process(
                     pass
             if sched is not None:
                 sched.external_arrival_poll = None
+                sched.on_task_complete = None
 
         torch.cuda.synchronize(device)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -887,6 +1027,7 @@ def run_worker_process(
                 guard_ms=4.0,
                 init_layer_ms=10.5,
                 init_ar_step_ms=22.0,
+                pager=pager,
             )
 
         # Warm up kernels & scheduler on non-gen / non-und capabilities safely
@@ -938,8 +1079,13 @@ def run_worker_process(
             if not ar_preempt_q.empty():
                 ar_msg = ar_preempt_q.get_nowait()
                 try:
+                    q_wait_ms = max(
+                        0.0,
+                        (time.perf_counter() - float(ar_msg.get("enqueue_time_s", time.perf_counter()))) * 1000.0,
+                    )
                     ar_entry = _prepare_entry_for_cmd(ar_msg)
                     ar_res = _run_ar_direct(ar_entry["main_ctx"], int(ar_msg.get("max_ar_tokens", 32)))
+                    ar_res["ttft_ms"] = round(q_wait_ms + float(ar_res.get("ttft_ms", 0.0)), 2)
                     _update_mem_hwm()
                     ack_q.put(
                         {
@@ -948,6 +1094,7 @@ def run_worker_process(
                             "status": "ok",
                             "ctx_id": ar_msg["ctx_id"],
                             "kv_bytes": _entry_nbytes(ar_entry),
+                            "resident_alpha": _current_alpha(),
                             "preempted_mid_dit": False,
                             **ar_res,
                         }
@@ -990,6 +1137,7 @@ def run_worker_process(
                             "status": "ok",
                             "ctx_id": cmd["ctx_id"],
                             "kv_bytes": _entry_nbytes(entry),
+                            "resident_alpha": _current_alpha(),
                             **ar_res,
                         }
                     )
@@ -1003,6 +1151,7 @@ def run_worker_process(
                             "status": "ok",
                             "ctx_id": cmd["ctx_id"],
                             "kv_bytes": _entry_nbytes(entry),
+                            "resident_alpha": _current_alpha(),
                         }
                     )
                 elif op == "EXEC_DIT":
@@ -1010,6 +1159,7 @@ def run_worker_process(
                     ack_q.put({"cmd_id": cmd_id, "rank": rank, **dit_res})
                 elif op == "PACK_CTX":
                     ctx_id = cmd["ctx_id"]
+                    _ensure_unparked(ctx_id)
                     entry = ctx_store[ctx_id]
                     meta, flat = _pack_multi_ctx(
                         entry["main_ctx"],
@@ -1032,13 +1182,14 @@ def run_worker_process(
                     ack_q.put({"cmd_id": cmd_id, "rank": rank, "status": "ok", "ship_ms": ship_ms, "bytes": nbytes})
                 elif op == "RECV_NCCL":
                     assert nccl_mesh is not None
+                    new_ctx_id = cmd["new_ctx_id"]
+                    _maybe_guard_hbm({new_ctx_id})
                     meta = cmd["meta"]
                     flat, ship_ms = nccl_mesh.recv_u8(int(meta["total_bytes"]), src_rank=int(cmd["src_rank"]))
                     entry = _unpack_multi_ctx(
                         meta, flat, NaiveCache, use_cow_rebind=policy.use_module3_cow_loopback
                     )
                     del flat
-                    new_ctx_id = cmd["new_ctx_id"]
                     ctx_store[new_ctx_id] = entry
                     _alloc_kv_vmm_if_needed(new_ctx_id, entry["main_ctx"])
                     _update_mem_hwm()
@@ -1052,6 +1203,7 @@ def run_worker_process(
                         }
                     )
                 elif op == "SEND_SHM":
+                    _ensure_unparked(cmd["ctx_id"])
                     entry = ctx_store[cmd["ctx_id"]]
                     t_s0 = time.perf_counter()
                     meta, flat = _pack_multi_ctx(

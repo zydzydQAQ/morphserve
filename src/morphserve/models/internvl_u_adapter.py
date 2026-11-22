@@ -132,6 +132,55 @@ def load_internvlu_pipeline(
             cls_m.__init__ = _make_patched_init(orig_init)
             cls_m._ms_post_init_patched = True
 
+    if not getattr(InternVLUProcessor, "_ms_proc_patched", False):
+        from internvlu.vlm.constants import IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN
+
+        def _patched_proc_init(
+            self,
+            image_processor=None,
+            image_gen_processor=None,
+            tokenizer=None,
+            video_processor=None,
+            image_seq_length: int = 256,
+            chat_template: str | None = None,
+            blank_messages: dict | None = None,
+            **kwargs,
+        ) -> None:
+            if blank_messages is None:
+                blank_messages = {
+                    "text_blank_message": "Generate an image based on reference images.",
+                    "pure_blank_message": "Here is a random image <img_uncond>:",
+                }
+            self.image_seq_length = image_seq_length
+            self.start_image_token = IMG_START_TOKEN
+            self.end_image_token = IMG_END_TOKEN
+            self.image_token = IMG_CONTEXT_TOKEN
+            self.image_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
+            self.blank_messages = blank_messages
+            self.image_processor = image_processor
+            self.image_gen_processor = image_gen_processor
+            self.tokenizer = tokenizer
+            self.video_processor = video_processor
+            self.chat_template = chat_template
+            self.template_name = "qwen2_5-chat-v3"
+
+        def _patched_merge_kwargs(self, processing_kwargs_cls=None, tokenizer_init_kwargs=None, **kwargs):
+            if getattr(self, "tokenizer", None) is not None:
+                self.tokenizer.padding_side = kwargs.get("padding_side", "left")
+            text_kw = {
+                k: v
+                for k, v in kwargs.items()
+                if k in ("padding", "truncation", "max_length", "return_tensors", "add_special_tokens")
+            }
+            img_kw: dict[str, Any] = {"crop_to_patches": False}
+            if "return_tensors" in kwargs:
+                img_kw["return_tensors"] = kwargs["return_tensors"]
+            return {"text_kwargs": text_kw, "images_kwargs": img_kw, "videos_kwargs": {}}
+
+        InternVLUProcessor.__init__ = _patched_proc_init
+        InternVLUProcessor._merge_kwargs = _patched_merge_kwargs
+        InternVLUProcessor._ms_proc_patched = True
+
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")
 
@@ -155,6 +204,19 @@ def load_internvlu_pipeline(
         str(model_dir / "scheduler"),
         local_files_only=True,
     )
+
+    class _MutableConfigDict(dict):
+        def __getattr__(self, name: str) -> Any:
+            try:
+                return self[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            self[name] = value
+
+    scheduler._internal_dict = _MutableConfigDict(dict(scheduler.config))
+
     processor = InternVLUProcessor.from_pretrained(
         str(model_dir / "processor"),
         local_files_only=True,
@@ -165,13 +227,14 @@ def load_internvlu_pipeline(
     if lm is not None and hasattr(lm, "forward"):
         orig_lm_fwd = lm.forward
         sig_params = inspect.signature(orig_lm_fwd).parameters
-        has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
-        if "padding_type" not in sig_params and not has_var_kw:
+        if "padding_type" not in sig_params:
             def _safe_lm_fwd(*a, **kw):
                 kw.pop("padding_type", None)
                 return orig_lm_fwd(*a, **kw)
 
             lm.forward = _safe_lm_fwd
+        if getattr(lm, "generation_config", None) is not None and lm.generation_config.pad_token_id is None:
+            lm.generation_config.pad_token_id = processor.tokenizer.eos_token_id
 
     pipe = InternVLUPipeline(
         vlm=vlm,
@@ -299,14 +362,11 @@ class InternVLUDecoderPager:
 
             def _wrapped_decode(*a, **kw):
                 was_pinned = self._is_pinned
-                prev_res = vmm.expert_resident_count(self.expert_id)
                 self._is_pinned = False
                 vmm.set_expert_pinned(self.expert_id, False)
                 try:
                     return vmm.run_in_transient_scope(orig_dec, *a, **kw)
                 finally:
-                    if vmm.expert_resident_count(self.expert_id) < prev_res:
-                        vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
                     self._is_pinned = was_pinned
                     if was_pinned:
                         vmm.set_expert_pinned(self.expert_id, True)

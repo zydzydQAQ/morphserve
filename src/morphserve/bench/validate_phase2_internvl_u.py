@@ -131,7 +131,15 @@ def _internvlu_worker_proc(
                     int(inf["pid"]), int(inf["fd"]), int(inf["nbytes"]), numa_node=numa
                 )
                 pager.offload_to_shared_mirror(mirror, populate=False)
-            vmm = TriPoolVMM(device=rank, super_pool_mib=4608, fine_kv_pool_mib=512, super_handle_mib=64, transient_va_gib=4, kv_va_gib=4)
+            pool_mib = max(4608, int(pager.num_layers * pager.layer_stride_mib + 256))
+            vmm = TriPoolVMM(
+                device=rank,
+                super_pool_mib=pool_mib,
+                fine_kv_pool_mib=512,
+                super_handle_mib=64,
+                transient_va_gib=4,
+                kv_va_gib=4,
+            )
             init_alpha = 1.0 if (rank % 2 == 1) else 0.0
             pager.bind_vmm(vmm, initial_alpha=init_alpha)
 
@@ -253,8 +261,6 @@ def _internvlu_worker_proc(
                                     width=gw,
                                     generator=gen,
                                 ).images
-                            if rank % 2 == 0:
-                                pager.set_residency_alpha(0.0)
                         else:
                             imgs_t = pipe.image_pipeline(
                                 **diff_inp,
@@ -317,6 +323,7 @@ def run_internvlu_generality_validation(
     vendor_dir: Path,
     output_dir: Path,
     num_gpus: int = 8,
+    smoke_1gpu: bool = False,
 ) -> dict[str, Any]:
     """Validate `InternVL-U` (`bridge_mllm_dit`) lossless VMM paging + 8-GPU serving comparison."""
     from PIL import Image
@@ -343,8 +350,12 @@ def run_internvlu_generality_validation(
         ("t2i", "A cozy reading alcove overlooking snowy alpine peaks at dusk."),
         ("t2i", "Sunlight filtering through bamboo stalks onto a stone footpath."),
     ]
-
-    policies = ("morphserve", "monolithic_dp", "static_nccl_fission", "naive_host_offload")
+    if smoke_1gpu or num_gpus == 1:
+        num_gpus = 1
+        prompts = prompts[:4]
+        policies = ("morphserve", "monolithic_dp")
+    else:
+        policies = ("morphserve", "monolithic_dp", "static_nccl_fission", "naive_host_offload")
     policy_reports: list[dict[str, Any]] = []
     parity_imgs: dict[str, Path] = {}
 
@@ -413,7 +424,7 @@ def run_internvlu_generality_validation(
             # Deterministic lossless parity image on first T2I prompt (`morphserve` vs `monolithic_dp`)
             if pol in ("morphserve", "monolithic_dp"):
                 p_img = Path(f"/tmp/ivlu_parity_{pol}.png")
-                rk_p = 1 if pol == "morphserve" else 0
+                rk_p = (1 if num_gpus >= 2 else 0) if pol == "morphserve" else 0
                 b_res = _rpc_sync(0, {"op": "VLM_BRIDGE", "bridge_id": "par_0", "prompt": prompts[1][1], "height": 512, "width": 512})
                 if rk_p != 0:
                     cmd_qs[0].put({"op": "SEND_BRIDGE", "cmd_id": "ps", "bridge_id": "par_0", "dst_rank": rk_p})
@@ -469,16 +480,17 @@ def run_internvlu_generality_validation(
             # Stage 2: Route compact conditioning bridge (`state_ship` vs `in_place_morph`) & run concurrent DiT decoders!
             dec_pending: dict[str, float] = {}
             dit_assign_load = {g: 0.0 for g in range(num_gpus)}
+            rank_alphas = {g: (1.0 if (g % 2 == 1) else 0.0) for g in range(num_gpus)}
             for idx, src_g, b_msg in vlm_done:
                 bid = f"b_{idx}"
                 b_bytes = int(b_msg["bridge_bytes"])
                 dst_g = src_g
-                if pol == "morphserve":
+                if pol == "morphserve" and num_gpus >= 2:
                     states = {
                         g: WorkerState(
                             gpu_id=g,
                             role="gen" if (g % 2 == 1) else "hybrid",
-                            expert_alpha=1.0 if (g % 2 == 1) else 0.0,
+                            expert_alpha=rank_alphas[g],
                             queue_wait_ms=dit_assign_load[g],
                             kv_free_bytes=24 * GIB,
                         )
@@ -512,7 +524,11 @@ def run_internvlu_generality_validation(
                                     ship_ms_samples.append(float(m2["ship_ms"]))
                         ships += 1
                     else:
+                        rank_alphas[dst_g] = 1.0
                         morphs += 1
+                elif pol == "morphserve":
+                    rank_alphas[dst_g] = 1.0
+                    morphs += 1
                 elif pol == "static_nccl_fission":
                     dst_g = min(gen_cands, key=lambda g: dit_assign_load[g])
                     seq += 1
@@ -581,18 +597,25 @@ def run_internvlu_generality_validation(
 
     by_pol = {r["policy_name"]: r for r in policy_reports}
     ms_r = by_pol["morphserve"]
-    ok = (
-        parity_ssim >= 0.995
-        and ms_r["path_a_ships"] > 0
-        and ms_r["throughput_rps"] >= by_pol["naive_host_offload"]["throughput_rps"]
-        and ms_r["hybrid_idle_reserved_mib"] < by_pol["monolithic_dp"]["hybrid_idle_reserved_mib"] - 2500.0
-    )
+    if smoke_1gpu or num_gpus == 1:
+        ok = (
+            parity_ssim >= 0.995
+            and ms_r["hybrid_idle_reserved_mib"] < by_pol["monolithic_dp"]["hybrid_idle_reserved_mib"] - 2500.0
+        )
+    else:
+        ok = (
+            parity_ssim >= 0.995
+            and ms_r["path_a_ships"] > 0
+            and ms_r["throughput_rps"] >= by_pol["naive_host_offload"]["throughput_rps"]
+            and ms_r["hybrid_idle_reserved_mib"] < by_pol["monolithic_dp"]["hybrid_idle_reserved_mib"] - 2500.0
+        )
     report = {
         "schema": "morphserve.phase2.m24_internvlu.v1",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "architecture": "bridge_mllm_dit",
         "model_repo": "InternVL-U/InternVL-U",
         "num_gpus": num_gpus,
+        "smoke_1gpu": bool(smoke_1gpu or num_gpus == 1),
         "vmm_lossless_parity_ssim": parity_ssim,
         "hybrid_hbm_saved_mib": round(by_pol["monolithic_dp"]["hybrid_idle_reserved_mib"] - ms_r["hybrid_idle_reserved_mib"], 1),
         "results": policy_reports,
@@ -610,8 +633,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--vendor-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--smoke-1gpu", action="store_true")
     args = parser.parse_args(argv)
-    rep = run_internvlu_generality_validation(args.model_dir, args.vendor_dir, args.output_dir, num_gpus=args.num_gpus)
+    rep = run_internvlu_generality_validation(
+        args.model_dir,
+        args.vendor_dir,
+        args.output_dir,
+        num_gpus=args.num_gpus,
+        smoke_1gpu=args.smoke_1gpu,
+    )
     return 0 if rep.get("status") == "ok" else 2
 
 

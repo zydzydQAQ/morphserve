@@ -116,6 +116,7 @@ class ClusterRunReport:
     total_yields: int
     worker_oom_count: int
     status: str = "ok"
+    raw_wall_goodput_rps: float = 0.0
     sessions: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -303,29 +304,61 @@ class MorphServeClusterEngine:
         n = self.policy.num_gpus
         if self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
             cands = list(self.policy.static_und_ranks)
-            cands.sort(key=lambda g: (self._gpu_locks[g].locked(), self.worker_states[g].queue_wait_ms, (g - self._rr_cursor) % n))
+            cands.sort(key=lambda g: (self.worker_states[g].queue_wait_ms, self._gpu_locks[g].locked(), (g - self._rr_cursor) % n))
             self._rr_cursor = (cands[0] + 1) % n
             return cands[0]
 
-        if modality_plan in ("ar_only", "cot_then_dit"):
-            idle = [g for g in range(n) if not self._gpu_locks[g].locked()]
+        if modality_plan == "ar_only":
+            idle = [
+                g for g in range(n)
+                if (not self._gpu_locks[g].locked()) and self.worker_states[g].queue_wait_ms <= 1.0
+            ]
             if idle:
                 idle.sort(key=lambda g: (self.worker_states[g].expert_alpha, (g - self._rr_cursor) % n))
                 self._rr_cursor = (idle[0] + 1) % n
                 return idle[0]
-            # When all GPUs are busy and preemption is allowed, target an active DiT GPU with fewest preemptions!
             if self.policy.preemption_mode != "non_preemptive":
-                active_dit = [g for g in range(n) if self._active_dit_ranks.get(g, 0) > 0]
-                if active_dit:
-                    active_dit.sort(key=lambda g: (self._active_preemptions.get(g, 0), self.worker_states[g].expert_alpha, g))
-                    return active_dit[0]
+                elig = [g for g in range(n) if self._active_preemptions.get(g, 0) < 2]
+                if elig:
+                    elig.sort(
+                        key=lambda g: (
+                            self._active_preemptions.get(g, 0),
+                            0 if self._active_dit_ranks.get(g, 0) > 0 else 1,
+                            self.worker_states[g].expert_alpha,
+                            (g - self._rr_cursor) % n,
+                        )
+                    )
+                    self._rr_cursor = (elig[0] + 1) % n
+                    return elig[0]
 
-        # DiT-heavy requests prefer higher resident alpha and lower queue wait
+        if modality_plan == "cot_then_dit":
+            idle = [
+                g for g in range(n)
+                if (not self._gpu_locks[g].locked()) and self.worker_states[g].queue_wait_ms <= 1.0
+            ]
+            if idle:
+                idle.sort(key=lambda g: ((g - self._rr_cursor) % n, self.worker_states[g].expert_alpha))
+                self._rr_cursor = (idle[0] + 1) % n
+                return idle[0]
+            if self.policy.preemption_mode != "non_preemptive":
+                elig = [g for g in range(n) if self._active_preemptions.get(g, 0) < 2]
+                if elig:
+                    elig.sort(
+                        key=lambda g: (
+                            self._active_preemptions.get(g, 0),
+                            self.worker_states[g].queue_wait_ms,
+                            (g - self._rr_cursor) % n,
+                        )
+                    )
+                    self._rr_cursor = (elig[0] + 1) % n
+                    return elig[0]
+
+        # DiT-heavy requests prioritize lowest reserved queue_wait_ms, then warm resident alpha
         cands = list(range(n))
         cands.sort(
             key=lambda g: (
-                self._gpu_locks[g].locked(),
                 self.worker_states[g].queue_wait_ms,
+                self._gpu_locks[g].locked(),
                 -self.worker_states[g].expert_alpha,
                 (g - self._rr_cursor) % n,
             )
@@ -440,7 +473,11 @@ class MorphServeClusterEngine:
                     try:
                         can_preempt = (
                             self.policy.preemption_mode != "non_preemptive"
-                            and self._active_dit_ranks.get(resident_gpu, 0) > 0
+                            and (
+                                self._gpu_locks[resident_gpu].locked()
+                                or self._active_dit_ranks.get(resident_gpu, 0) > 0
+                            )
+                            and self._active_preemptions.get(resident_gpu, 0) < 2
                         )
                         if can_preempt:
                             self._active_preemptions[resident_gpu] += 1
@@ -460,7 +497,8 @@ class MorphServeClusterEngine:
                                 )
                             finally:
                                 self._active_preemptions[resident_gpu] -= 1
-                            preempted_ar_turns += 1
+                            if ar_res.get("preempted_mid_dit", True):
+                                preempted_ar_turns += 1
                         else:
                             t_enq = time.perf_counter()
                             est_ar_ms = 22.0 * max(1, turn.max_ar_tokens)
@@ -498,6 +536,8 @@ class MorphServeClusterEngine:
                             dit_turns_ms=dit_turns,
                             error=ar_res.get("error", "oom"),
                         )
+                    if "resident_alpha" in ar_res:
+                        self.worker_states[resident_gpu].expert_alpha = float(ar_res["resident_alpha"])
                     kv_bytes = int(ar_res.get("kv_bytes", kv_bytes))
                     ar_ttfts.append(float(ar_res.get("ttft_ms", 0.0)))
                     ar_tpots.extend(float(x) for x in ar_res.get("tpots_ms", []))
@@ -511,7 +551,11 @@ class MorphServeClusterEngine:
                     try:
                         can_preempt = (
                             self.policy.preemption_mode != "non_preemptive"
-                            and self._active_dit_ranks.get(resident_gpu, 0) > 0
+                            and (
+                                self._gpu_locks[resident_gpu].locked()
+                                or self._active_dit_ranks.get(resident_gpu, 0) > 0
+                            )
+                            and self._active_preemptions.get(resident_gpu, 0) < 2
                         )
                         if can_preempt:
                             self._active_preemptions[resident_gpu] += 1
@@ -531,7 +575,8 @@ class MorphServeClusterEngine:
                                 )
                             finally:
                                 self._active_preemptions[resident_gpu] -= 1
-                            preempted_ar_turns += 1
+                            if cot_res.get("preempted_mid_dit", True):
+                                preempted_ar_turns += 1
                         else:
                             t_enq = time.perf_counter()
                             est_ar_ms = 22.0 * max(1, turn.max_ar_tokens)
@@ -565,24 +610,33 @@ class MorphServeClusterEngine:
                             e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
                             error=cot_res.get("error", "oom"),
                         )
+                    if "resident_alpha" in cot_res:
+                        self.worker_states[resident_gpu].expert_alpha = float(cot_res["resident_alpha"])
                     kv_bytes = int(cot_res.get("kv_bytes", kv_bytes))
                     ar_ttfts.append(float(cot_res.get("ttft_ms", 0.0)))
                     ar_tpots.extend(float(x) for x in cot_res.get("tpots_ms", []))
                     ar_texts.append(str(cot_res.get("text", "")))
                 else:
                     # dit_edit or dit_t2i prefill
-                    async with self._gpu_locks[resident_gpu]:
-                        prep_res = await self._rpc(
-                            resident_gpu,
-                            {
-                                "op": "PREP_DIT",
-                                "ctx_id": ctx_id,
-                                "prompt": turn.prompt,
-                                "image_paths": turn.image_paths if (ti == 0) else [],
-                                "use_prev_image": is_edit_followup,
-                                "prev_image_path": prev_tmp_img,
-                                "prepare_for_dit": True,
-                            },
+                    est_prep_ms = 250.0
+                    self.worker_states[resident_gpu].queue_wait_ms += est_prep_ms
+                    try:
+                        async with self._gpu_locks[resident_gpu]:
+                            prep_res = await self._rpc(
+                                resident_gpu,
+                                {
+                                    "op": "PREP_DIT",
+                                    "ctx_id": ctx_id,
+                                    "prompt": turn.prompt,
+                                    "image_paths": turn.image_paths if (ti == 0) else [],
+                                    "use_prev_image": is_edit_followup,
+                                    "prev_image_path": prev_tmp_img,
+                                    "prepare_for_dit": True,
+                                },
+                            )
+                    finally:
+                        self.worker_states[resident_gpu].queue_wait_ms = max(
+                            0.0, self.worker_states[resident_gpu].queue_wait_ms - est_prep_ms
                         )
                     if prep_res["status"] == "oom":
                         return SessionOutcome(
@@ -592,25 +646,44 @@ class MorphServeClusterEngine:
                             e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
                             error=prep_res.get("error", "oom"),
                         )
+                    if "resident_alpha" in prep_res:
+                        self.worker_states[resident_gpu].expert_alpha = float(prep_res["resident_alpha"])
                     kv_bytes = int(prep_res.get("kv_bytes", kv_bytes))
 
-                # Route cross-paradigm transition AR/Prefill -> DiT
+                # Route cross-paradigm transition AR/Prefill -> DiT & reserve dst_gpu queue immediately
+                est_dit_ms = (1040.0 if turn.height >= 1024 else 285.0) * turn.dit_steps
                 dst_gpu = resident_gpu
+                do_ship = "none"
                 if self.policy.routing_mode == "dual_path":
                     req = CPTGRequestSpec(
                         req_id=f"{sess.session_id}_t{ti}",
                         src_gpu=resident_gpu,
                         architecture="tight_mot",
                         kv_bytes=max(kv_bytes, 1 * MIB),
-                        dit_step1_ms=1650.0 if turn.height >= 1024 else 287.0,
+                        dit_step1_ms=1040.0 if turn.height >= 1024 else 287.0,
                         dit_total_steps=turn.dit_steps,
                         resolution=turn.height,
                         interleaved_roundtrip_gamma=2 if (plan == "dit_edit" and has_more_edits) else 1,
                     )
                     dec = self.router.decide(req, self.worker_states)
                     if dec.path == "state_ship" and dec.dst_gpu != resident_gpu:
+                        dst_gpu = dec.dst_gpu
+                        do_ship = "nccl_dual"
+                    else:
+                        path_b_morphs += 1
+                elif self.policy.routing_mode == "static_nccl_fission":
+                    dst_gpu = self._pick_static_gen_gpu(resident_gpu)
+                    do_ship = "nccl_static"
+                elif self.policy.routing_mode == "twostage_shm":
+                    dst_gpu = self._pick_static_gen_gpu(resident_gpu)
+                    do_ship = "shm_static"
+
+                # Reserve dst_gpu backlog BEFORE async shipping to prevent concurrent coroutine stampede!
+                self.worker_states[dst_gpu].queue_wait_ms += est_dit_ms
+                try:
+                    if do_ship == "nccl_dual":
                         ship = await self._ship_nccl(
-                            resident_gpu, dec.dst_gpu, ctx_id, ctx_id, include_cfg_dup=False
+                            resident_gpu, dst_gpu, ctx_id, ctx_id, include_cfg_dup=False
                         )
                         if ship["status"] != "ok":
                             return SessionOutcome(
@@ -620,51 +693,43 @@ class MorphServeClusterEngine:
                                 e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
                                 error="nccl_ship_oom",
                             )
-                        dst_gpu = dec.dst_gpu
                         resident_gpu = dst_gpu
                         path_a_ships += 1
-                    else:
-                        path_b_morphs += 1
-                elif self.policy.routing_mode == "static_nccl_fission":
-                    dst_gpu = self._pick_static_gen_gpu(resident_gpu)
-                    gen_ctx_id = f"{ctx_id}_gen_t{ti}"
-                    ship = await self._ship_nccl(resident_gpu, dst_gpu, ctx_id, gen_ctx_id, include_cfg_dup=True)
-                    if ship["status"] != "ok":
-                        return SessionOutcome(
-                            session_id=sess.session_id,
-                            quadrant=sess.quadrant,
-                            status="oom",
-                            e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
-                            error="static_ship_oom",
-                        )
-                    ctx_id = gen_ctx_id
-                    path_a_ships += 1
-                elif self.policy.routing_mode == "twostage_shm":
-                    dst_gpu = self._pick_static_gen_gpu(resident_gpu)
-                    gen_ctx_id = f"{ctx_id}_gen_t{ti}"
-                    ship = await self._ship_shm(resident_gpu, dst_gpu, ctx_id, gen_ctx_id)
-                    if ship["status"] != "ok":
-                        return SessionOutcome(
-                            session_id=sess.session_id,
-                            quadrant=sess.quadrant,
-                            status="oom",
-                            e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
-                            error="shm_ship_oom",
-                        )
-                    ctx_id = gen_ctx_id
-                    path_a_ships += 1
+                    elif do_ship == "nccl_static":
+                        gen_ctx_id = f"{ctx_id}_gen_t{ti}"
+                        ship = await self._ship_nccl(resident_gpu, dst_gpu, ctx_id, gen_ctx_id, include_cfg_dup=True)
+                        if ship["status"] != "ok":
+                            return SessionOutcome(
+                                session_id=sess.session_id,
+                                quadrant=sess.quadrant,
+                                status="oom",
+                                e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
+                                error="static_ship_oom",
+                            )
+                        ctx_id = gen_ctx_id
+                        path_a_ships += 1
+                    elif do_ship == "shm_static":
+                        gen_ctx_id = f"{ctx_id}_gen_t{ti}"
+                        ship = await self._ship_shm(resident_gpu, dst_gpu, ctx_id, gen_ctx_id)
+                        if ship["status"] != "ok":
+                            return SessionOutcome(
+                                session_id=sess.session_id,
+                                quadrant=sess.quadrant,
+                                status="oom",
+                                e2e_ms=(time.perf_counter() - t_sess0) * 1000.0,
+                                error="shm_ship_oom",
+                            )
+                        ctx_id = gen_ctx_id
+                        path_a_ships += 1
 
-                save_tmp = None
-                if save_outputs_dir is not None:
-                    save_tmp = str(save_outputs_dir / f"{sess.session_id}_t{ti}.png")
-                    prev_tmp_owned = False
-                elif has_more_edits and self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
-                    save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
-                    prev_tmp_owned = True
+                    save_tmp = None
+                    if save_outputs_dir is not None:
+                        save_tmp = str(save_outputs_dir / f"{sess.session_id}_t{ti}.png")
+                        prev_tmp_owned = False
+                    elif has_more_edits and self.policy.routing_mode in ("twostage_shm", "static_nccl_fission"):
+                        save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
+                        prev_tmp_owned = True
 
-                est_dit_ms = (1500.0 if turn.height >= 1024 else 285.0) * turn.dit_steps
-                self.worker_states[dst_gpu].queue_wait_ms += est_dit_ms
-                try:
                     async with self._gpu_locks[dst_gpu]:
                         self._active_dit_ranks[dst_gpu] += 1
                         try:
@@ -681,20 +746,6 @@ class MorphServeClusterEngine:
                                     "save_tmp_image_path": save_tmp,
                                 },
                             )
-                            # Elastic soft-biased alpha rebalance on hybrid ranks (even GPUs)
-                            if (
-                                dit_res.get("status") == "ok"
-                                and self.policy.adaptive_alpha_rebalance
-                                and self.policy.use_expert_pager
-                                and self.policy.num_gpus >= 2
-                                and (dst_gpu % 2 == 0)
-                            ):
-                                active_dit_tot = sum(self._active_dit_ranks.values()) - 1
-                                target_alpha = 0.25 if self._active_ar_count > active_dit_tot else 0.50
-                                alpha_res = await self._rpc(dst_gpu, {"op": "SET_ALPHA", "alpha": target_alpha})
-                                dit_res["resident_alpha"] = round(
-                                    float(alpha_res.get("resident_layers", 14)) / 28.0, 3
-                                )
                         finally:
                             self._active_dit_ranks[dst_gpu] -= 1
                 finally:
@@ -816,7 +867,7 @@ class MorphServeClusterEngine:
             completed_sessions=len(completed),
             oom_sessions=oom_sess,
             error_sessions=err_sess,
-            joint_slo_goodput_rps=round(len(joint_ok) / wall_s, 4),
+            joint_slo_goodput_rps=round(eff_qps * (len(joint_ok) / n_tot), 4),
             joint_slo_attainment_pct=round(100.0 * len(joint_ok) / n_tot, 1),
             ar_slo_attainment_pct=round(100.0 * ar_ok_cnt / n_tot, 1),
             dit_slo_attainment_pct=round(100.0 * dit_ok_cnt / n_tot, 1),
@@ -838,6 +889,7 @@ class MorphServeClusterEngine:
             total_yields=sum(o.total_yields for o in outcomes),
             worker_oom_count=worker_ooms,
             status="ok" if err_sess == 0 else "check_failed",
+            raw_wall_goodput_rps=round(len(joint_ok) / wall_s, 4),
             sessions=[asdict(o) for o in outcomes],
         )
 

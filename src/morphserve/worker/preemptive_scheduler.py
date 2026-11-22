@@ -67,6 +67,7 @@ class UnifiedPreemptiveScheduler:
         max_ar_tokens_per_yield: int = 1,
         pager: Any | None = None,
         external_arrival_poll: Callable[[float], list[ArDecodeTask]] | None = None,
+        on_task_complete: Callable[[ArDecodeTask], None] | None = None,
     ) -> None:
         if mode not in ("non_preemptive", "step_preemptive", "layer_chunk"):
             raise ValueError(f"unsupported scheduler mode: {mode}")
@@ -82,6 +83,7 @@ class UnifiedPreemptiveScheduler:
         self.max_ar_tokens_per_yield = int(max_ar_tokens_per_yield)
         self.pager = pager
         self.external_arrival_poll = external_arrival_poll
+        self.on_task_complete = on_task_complete
 
         self.active_ar_tasks: deque[ArDecodeTask] = deque()
         self.completed_ar_tasks: list[ArDecodeTask] = []
@@ -218,6 +220,8 @@ class UnifiedPreemptiveScheduler:
             served += 1
             if task.finished:
                 self.completed_ar_tasks.append(task)
+                if self.on_task_complete is not None:
+                    self.on_task_complete(task)
             else:
                 self.active_ar_tasks.append(task)
             self._admit_due_arrivals(time.perf_counter())
@@ -244,6 +248,8 @@ class UnifiedPreemptiveScheduler:
             served += 1
             if task.finished:
                 self.completed_ar_tasks.append(task)
+                if self.on_task_complete is not None:
+                    self.on_task_complete(task)
             else:
                 self.active_ar_tasks.append(task)
             self._admit_due_arrivals(time.perf_counter())
@@ -268,6 +274,8 @@ class UnifiedPreemptiveScheduler:
                 self._run_one_ar_step(task)
                 if task.finished:
                     self.completed_ar_tasks.append(task)
+                    if self.on_task_complete is not None:
+                        self.on_task_complete(task)
                 else:
                     self.active_ar_tasks.append(task)
                 self._admit_due_arrivals(time.perf_counter())

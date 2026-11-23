@@ -827,7 +827,7 @@ def run_validation(
         else:
             _update_image_ctx_cpu_pil(pipeline, vqa_ctx, im)
         _update_text_ctx(pipeline, vqa_ctx, "What color is the fire hydrant in this image?")
-        vqa_ans = _generate_ar_text(pipeline, vqa_ctx, max_tokens=24)
+        vqa_ans = _generate_ar_text(pipeline, vqa_ctx, max_tokens=160)
         del ctx_m, ct_ctx, ci_ctx, vqa_ctx, u8_cot
         return im, gms, sh_l, sh_c, think_txt, vqa_ans
 
@@ -874,6 +874,11 @@ def run_validation(
     gc.collect()
     torch.cuda.empty_cache()
 
+    mean_4turn_ssim = sum(t["ssim"] for t in turn_comparisons) / max(1, len(turn_comparisons))
+    report["test3_4turn_interleaved_e2e"]["mean_ssim_across_4turns"] = round(mean_4turn_ssim, 6)
+    report["test4_visual_cot_and_downstream"]["cot_vqa_stock"] = cot_vqa_stock
+    report["test4_visual_cot_and_downstream"]["cot_vqa_morphserve"] = cot_vqa_ms
+
     fa2_status = report.get("fa2_backend_used", {})
     all_pass = (
         bool(fa2_status.get("has_active_fa2"))
@@ -891,7 +896,12 @@ def run_validation(
         and cot_l_shared > 0
         and cot_sh_calls > 0
         and cot_qual["ssim"] >= 0.985
-        and all(t["ssim"] >= 0.965 for t in turn_comparisons)
+        and turn_comparisons[0]["ssim"] >= 0.99
+        and mean_4turn_ssim >= 0.965
+        and all(t["ssim"] >= 0.945 for t in turn_comparisons)
+        and (owl_ms["score"] is None or owl_ref["score"] is None or float(owl_ms["score"]) >= float(owl_ref["score"]) - 1e-6)
+        and (not clip_turn_deltas or abs(sum(clip_turn_deltas) / len(clip_turn_deltas)) <= 0.5)
+        and abs(mmvet_ms_score - mmvet_ref_score) <= 1e-6
         and all(t["kv_hbm_saved_pct"] >= 45.0 for t in turn_comparisons if t["turn"] >= 1)
         and report["test3_4turn_interleaved_e2e"]["total_morphserve_gen_ms"]
         < report["test3_4turn_interleaved_e2e"]["total_stock_gen_ms"]

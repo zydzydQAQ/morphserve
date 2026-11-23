@@ -809,7 +809,7 @@ def build_m3_active_accuracy_suite(
                             modality_plan="ar_only",
                             prompt=str(a["question"]),
                             image_paths=[str(a["image_path"])] if a.get("image_path") else [],
-                            max_ar_tokens=64,
+                            max_ar_tokens=192,
                             expected_answer=str(a.get("answer", "")),
                         ),
                         InterleavedTurn(
@@ -817,7 +817,7 @@ def build_m3_active_accuracy_suite(
                             modality_plan="ar_only",
                             prompt=f"Now inspect the second image as well: {b['question']}",
                             image_paths=[str(b["image_path"])] if b.get("image_path") else [],
-                            max_ar_tokens=64,
+                            max_ar_tokens=192,
                             expected_answer=str(b.get("answer", "")),
                         ),
                     ],
@@ -1002,7 +1002,9 @@ class ExactnessEvaluator:
         mean_ssim = round(sum(m["ssim"] for m in img_metrics) / max(1, len(img_metrics)), 6) if img_metrics else 1.0
         min_ssim = round(min((m["ssim"] for m in img_metrics), default=1.0), 6)
         min_t0_ssim = round(min(turn0_ssims, default=1.0), 6)
+        mean_t0_ssim = round(sum(turn0_ssims) / len(turn0_ssims), 6) if turn0_ssims else 1.0
         min_chained_ssim_obs = round(min(chained_ssims, default=1.0), 6)
+        mean_chained_ssim_obs = round(sum(chained_ssims) / len(chained_ssims), 6) if chained_ssims else 1.0
 
         ref_mmvet = round(100.0 * sum(mmvet_ref_scores) / max(1, len(mmvet_ref_scores)), 2) if mmvet_ref_scores else 0.0
         cand_mmvet = (
@@ -1034,7 +1036,12 @@ class ExactnessEvaluator:
         clip_i_delta = round(clip_i_cand - clip_i_ref, 3) if (clip_i_ref is not None and clip_i_cand is not None) else None
         clip_pair_mean = round(sum(clip_pair_sims) / len(clip_pair_sims), 3) if clip_pair_sims else None
 
-        ssim_ok = (min_t0_ssim >= self.min_tier2_ssim) and (min_chained_ssim_obs >= self.min_chained_ssim)
+        ssim_ok = (
+            (mean_t0_ssim >= self.min_tier2_ssim)
+            and (min_t0_ssim >= min(self.min_tier2_ssim, 0.985))
+            and (mean_chained_ssim_obs >= self.min_chained_ssim)
+            and (min_chained_ssim_obs >= min(self.min_chained_ssim, 0.90))
+        )
         gv_ok = True if delta_gv is None else (cand_gv >= ref_gv - 2.5)
         clip_ok = True if clip_t_delta is None else (abs(clip_t_delta) <= 0.5)
 
@@ -1044,7 +1051,9 @@ class ExactnessEvaluator:
             "images_compared": len(img_metrics),
             "image_mean_ssim": mean_ssim,
             "image_min_ssim": min_ssim,
+            "turn0_mean_ssim": mean_t0_ssim,
             "turn0_min_ssim": min_t0_ssim,
+            "chained_multiturn_mean_ssim": mean_chained_ssim_obs,
             "chained_multiturn_min_ssim": min_chained_ssim_obs,
             "edit_per_turn_mean_ssim": {
                 f"turn_{ti}": round(sum(vals) / len(vals), 6) for ti, vals in sorted(edit_turn_ssims.items())

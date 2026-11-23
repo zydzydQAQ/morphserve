@@ -1,0 +1,82 @@
+#pragma once
+
+#include "morphserve/control/topology.hpp"
+
+#include <nlohmann/json.hpp>
+
+#include <array>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
+
+namespace morphserve::control {
+
+inline constexpr std::array<const char*, 6> kValidPolicies = {
+    "morphserve",
+    "monolithic_dp",
+    "twostage_shm",
+    "static_nccl_fission",
+    "prism_tetriserve_coloc",
+    "naive_host_offload",
+};
+
+bool is_valid_policy_name(const std::string& policy_name) noexcept;
+
+struct PolicyConfig {
+    std::string policy_name = "morphserve";
+    int num_gpus = 8;
+    std::string model_family = "bagel";  // "bagel" | "internvl_u" | "synthetic"
+    std::optional<std::string> cptg_arch_override;
+    std::optional<std::string> vendor_dir;
+    std::string routing_mode = "dual_path";
+    bool use_tripool_vmm = true;
+    bool use_expert_pager = true;
+    bool use_scoped_vae = true;
+    bool use_shared_numa_mirror = true;
+    bool use_h2d_pacer = true;
+    bool use_module3_cow_loopback = true;
+    bool use_naive_offload = false;
+    bool kv_vmm_only = false;
+    std::string preemption_mode = "layer_chunk";
+    std::vector<int> static_und_ranks;
+    std::vector<int> static_gen_ranks;
+    std::map<int, double> initial_alphas;
+
+    double slo_scale_k = 2.0;
+    double ar_tpot_slo_ms = 125.64;
+    double ar_ttft_slo_ms = 1500.0;
+    double dit_512_slo_ms = 12240.0;
+    double dit_1024_slo_ms = 43440.0;
+    std::optional<double> dit_turn_slo_override_ms;
+    int max_oom_retries = 1;
+    std::pair<double, double> inter_turn_think_s_range = {3.0, 8.0};
+    double steady_state_trim_frac = 0.15;
+    std::optional<double> gpu_memory_fraction;
+    std::optional<double> gpu_memory_quota_mib;
+
+    int super_pool_mib = 14336;
+    int fine_kv_pool_mib = 256;
+    int super_handle_mib = 64;
+    int transient_va_gib = 16;
+    int kv_va_gib = 16;
+    bool allow_vmm_overflow = true;
+
+    std::string cptg_architecture() const;
+    std::string role_of(int rank) const;
+    double dit_turn_slo_for(int height, int steps = 20, std::optional<double> k_opt = std::nullopt) const;
+
+    nlohmann::json to_json() const;
+    static PolicyConfig from_json(const nlohmann::json& j);
+    static PolicyConfig from_preset(
+        const std::string& policy_name,
+        int num_gpus = 8,
+        const nlohmann::json& overrides = nlohmann::json::object());
+};
+
+// Static split-ratio sensitivity (`2:6`, `4:4`, `6:2`) & 5-step ablation ladder.
+std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(int num_gpus = 8);
+std::vector<std::pair<std::string, PolicyConfig>> build_static_split_configs(int num_gpus = 8);
+
+}  // namespace morphserve::control

@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "morphserve"
-version = "0.1.0"
-description = "MorphServe: Exact Paradigm-Aware Serving for Native Unified Multimodal (Interleaved AR + DiT) Models"
+version = "0.2.0"
+description = "MorphServe: C++17 Control & VMM Engine with Python Tensor Data Engine for Interleaved Multimodal Serving"
 requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["python"]

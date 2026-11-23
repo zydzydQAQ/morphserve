@@ -223,7 +223,7 @@ if python3 -c "import pytest" >/dev/null 2>&1; then
     "${PYTEST_WS}/tests" 2>&1 | tee "${RUN_DIR}/pytest-a100.txt"
 else
   echo "== [Stage 1 / Step c] pytest not installed; falling back to python3 -m unittest discover"
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${PYTEST_WS}/src${PYTHONPATH:+:$PYTHONPATH}" \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${PYTEST_WS}/python:${PYTEST_WS}/src${PYTHONPATH:+:$PYTHONPATH}" \
     python3 -m unittest discover -s "${PYTEST_WS}/tests" -p "test_*.py" -v \
     2>&1 | tee "${RUN_DIR}/pytest-a100.txt"
 fi

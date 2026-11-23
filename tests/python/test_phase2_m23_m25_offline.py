@@ -913,6 +913,26 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             finally:
                 eng.shutdown()
 
+        # 4. `_truncate_bagel_cache` atomically rolls back partial-layer OOM appends (`47346 != 47364` fix)
+        from morphserve.models.bagel_adapter import _truncate_bagel_cache
+
+        class _PartialNaiveCache:
+            def __init__(self, n: int) -> None:
+                self.num_layers = n
+                self.key_cache = {
+                    l: np.zeros((23673 if l < 15 else 23655, 4, 8), dtype=np.uint8) for l in range(n)
+                }
+                self.value_cache = {
+                    l: np.zeros((23673 if l < 15 else 23655, 4, 8), dtype=np.uint8) for l in range(n)
+                }
+
+        p_cache = _PartialNaiveCache(28)
+        _truncate_bagel_cache(p_cache, 23655)
+        assert all(p_cache.key_cache[l].shape[0] == 23655 for l in range(28))
+        assert all(p_cache.value_cache[l].shape[0] == 23655 for l in range(28))
+        _truncate_bagel_cache(p_cache, 0)
+        assert all(p_cache.key_cache[l] is None for l in range(28))
+
 
 if __name__ == "__main__":
     unittest.main()

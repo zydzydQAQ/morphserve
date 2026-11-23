@@ -125,6 +125,24 @@ def _peek_cache_slot(slot_map: Any, layer_idx: int) -> Any:
     return slot_map[layer_idx]
 
 
+def _truncate_bagel_cache(pkv: Any, target_seq_len: int) -> None:
+    """Roll back a partially updated `NaiveCache` or `VmmNaiveCache` so all layers match `target_seq_len`."""
+    if pkv is None:
+        return
+    if callable(getattr(pkv, "truncate", None)):
+        pkv.truncate(target_seq_len)
+        return
+    target = max(0, int(target_seq_len))
+    num_layers = int(pkv.num_layers)
+    for l in range(num_layers):
+        for slot_map in (pkv.key_cache, pkv.value_cache):
+            cur = _peek_cache_slot(slot_map, l)
+            if target == 0:
+                slot_map[l] = None
+            elif cur is not None and int(cur.shape[0]) > target:
+                slot_map[l] = cur[:target]
+
+
 def bagel_ctx_nbytes(ctx: dict[str, Any] | None) -> int:
     """Compute deduplicated logical GPU bytes occupied by one BAGEL KV context."""
     if ctx is None:
@@ -841,6 +859,11 @@ class BagelCPTGAdapter(CPTGModelAdapter):
             if self.available_kv_bytes(for_dit=for_dit) >= int(target_free_bytes):
                 break
             evicted_total += self._swap_out_ctx_to_host(cid, ent)
+        if evicted_total > 0 and self.vmm is None:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return evicted_total
 
     def _ensure_ctx_resident(self, ctx_id: str, extra_needed_bytes: int = 0) -> dict[str, Any]:
@@ -1229,21 +1252,52 @@ class BagelCPTGAdapter(CPTGModelAdapter):
             return bagel_entry_nbytes(entry) + max(1, n_pending_imgs) * (192 * MIB)
 
         can_run_vae_here = prep_dit and (not is_fission_und) and (not pager_partial)
-        self._apply_dit_turn_images_and_prompt(
-            entry,
-            cmd,
-            can_run_vae=can_run_vae_here,
-            prep_dit=prep_dit,
-        )
+        main_ctx = entry["main_ctx"]
+        k0_init = _peek_cache_slot(main_ctx["past_key_values"].key_cache, 0)
+        orig_seq_len = int(k0_init.shape[0]) if k0_init is not None else 0
+        orig_kv_lens = list(main_ctx["kv_lens"])
+        orig_ropes = list(main_ctx["ropes"])
+        orig_pending_vae_paths = list(entry.get("pending_vae_paths", []))
+        orig_pending_vae_u8 = bool(entry.get("pending_vae_u8", False))
+        orig_pending_vae_pil = bool(entry.get("pending_vae_pil", False))
+        orig_pending_dit_turn = entry.get("pending_dit_turn")
+        try:
+            self._apply_dit_turn_images_and_prompt(
+                entry,
+                cmd,
+                can_run_vae=can_run_vae_here,
+                prep_dit=prep_dit,
+            )
+        except BaseException:
+            _close_ctx_vmm_if_any(entry.get("cfg_text_ctx"))
+            _close_ctx_vmm_if_any(entry.get("cfg_img_ctx"))
+            entry["cfg_text_ctx"] = None
+            entry["cfg_img_ctx"] = None
+            entry["cfg_text_prefix_len"] = 0
+            _truncate_bagel_cache(main_ctx["past_key_values"], orig_seq_len)
+            main_ctx["kv_lens"] = orig_kv_lens
+            main_ctx["ropes"] = orig_ropes
+            entry["pending_vae_paths"] = orig_pending_vae_paths
+            entry["pending_vae_u8"] = orig_pending_vae_u8
+            entry["pending_vae_pil"] = orig_pending_vae_pil
+            entry["pending_dit_turn"] = orig_pending_dit_turn
+            raise
 
         self._update_hwm()
         return bagel_entry_nbytes(entry)
 
     def prepare_turn(self, ctx_id: str, cmd: dict[str, Any]) -> int:
+        had_entry = ctx_id in self._ctx_store
         with self._pinned_ctx(ctx_id):
             try:
                 return self._prepare_turn_inner(ctx_id, cmd)
             except BaseException as exc:
+                if not had_entry:
+                    partial = self._ctx_store.pop(ctx_id, None)
+                    if partial is not None:
+                        _close_ctx_vmm_if_any(partial.get("main_ctx"))
+                        _close_ctx_vmm_if_any(partial.get("cfg_text_ctx"))
+                        _close_ctx_vmm_if_any(partial.get("cfg_img_ctx"))
                 if is_oom_exception(exc):
                     freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
                     if freed > 0:
@@ -1305,6 +1359,12 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                     for st in active:
                         st["gen_ids"].append(st["curr_tok_id"])
 
+                    prev_ar_lens = [
+                        int(k0.shape[0])
+                        if (k0 := _peek_cache_slot(st["ctx"]["past_key_values"].key_cache, 0)) is not None
+                        else 0
+                        for st in active
+                    ]
                     try:
                         next_tokens, updated_caches = self.interceptor.forward_ar_step_batch(
                             [st["curr_tokens"] for st in active],
@@ -1312,6 +1372,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                             [st["ctx"]["past_key_values"] for st in active],
                         )
                     except BaseException as exc:
+                        for st, plen in zip(active, prev_ar_lens):
+                            _truncate_bagel_cache(st["ctx"]["past_key_values"], plen)
                         if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0:
                             next_tokens, updated_caches = self.interceptor.forward_ar_step_batch(
                                 [st["curr_tokens"] for st in active],
@@ -1319,6 +1381,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                                 [st["ctx"]["past_key_values"] for st in active],
                             )
                         else:
+                            for st in active:
+                                st["gen_ids"].pop()
                             raise
 
                     # Single [B] int64 D2H readback synchronizes CUDA stream for the whole packed GEMM step

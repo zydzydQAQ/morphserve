@@ -1,0 +1,12 @@
+{
+  "schema": "kairos.cluster-build.v1",
+  "project": "MORPHSERVE",
+  "commit": "2e0fc31fbb4cb338429a2a03c909dd6e818736b6",
+  "short_commit": "2e0fc31",
+  "subject": "Preserve install/src->python alias while linking PYTEST_WS/src to C++17 sources",
+  "built_utc": "2026-11-23T12:53:13+00:00",
+  "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "build_cmd": "bash \"$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"",
+  "files": 319,
+  "bytes": 8930071
+}

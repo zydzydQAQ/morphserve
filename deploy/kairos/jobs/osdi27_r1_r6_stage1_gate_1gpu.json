@@ -1,0 +1,30 @@
+{
+  "name": "morphserve-osdi27-r1-gate1g-20261123-r6",
+  "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "workers": 1,
+  "gpus_per_worker": 1,
+  "mount_shared": true,
+  "command": "bash /shared/data/MORPHSERVE/scripts/16_osdi27_stage1_1gpu_gate.sh",
+  "env": [
+    {
+      "name": "KAIROS_PROJECT",
+      "value": "MORPHSERVE"
+    },
+    {
+      "name": "KAIROS_RUN_ID",
+      "value": "morphserve-osdi27-r1-gate1g-20261123-r6"
+    },
+    {
+      "name": "KAIROS_BUILD",
+      "value": "5398b53"
+    },
+    {
+      "name": "KAIROS_REQUIRE_BUILD",
+      "value": "1"
+    },
+    {
+      "name": "KAIROS_EXECUTION_IMAGE",
+      "value": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2"
+    }
+  ]
+}

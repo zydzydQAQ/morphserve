@@ -131,13 +131,17 @@ def run_overnight_deep(
                     gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
+                err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+                if err_samples:
+                    d["error_samples"] = err_samples
                 d["per_quadrant"] = _quadrant_breakdown(rep.sessions)
                 d.pop("sessions", None)
                 full_results.append(d)
                 print(
                     f"[DEEP-MAIN] policy={pol_name} n={len(full_suite.sessions)} qps={qps} "
                     f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
-                    f"steady_slo={rep.steady_state_attainment_pct}% oom={rep.oom_sessions}",
+                    f"steady_slo={rep.steady_state_attainment_pct}% oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
                     flush=True,
                 )
         finally:
@@ -171,6 +175,9 @@ def run_overnight_deep(
                     gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
+                err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+                if err_samples:
+                    d["error_samples"] = err_samples
                 d.pop("sessions", None)
                 d["split_config"] = cfg_label
                 d["skew_tag"] = sk_tag
@@ -178,7 +185,8 @@ def run_overnight_deep(
                 print(
                     f"[DEEP-RATIO] cfg={cfg_label} skew={sk_tag} n={len(sk_suite.sessions)} "
                     f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
-                    f"steady_slo={rep.steady_state_attainment_pct}%",
+                    f"steady_slo={rep.steady_state_attainment_pct}% oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
                     flush=True,
                 )
         finally:

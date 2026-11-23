@@ -471,19 +471,32 @@ class LayerExpertPager:
             prev_res = vmm.expert_resident_count(self.expert_id)
             self._generation_active = False
             vmm.set_expert_pinned(self.expert_id, False)
+            completed_ok = False
             try:
-                return vmm.run_in_transient_scope(orig_fn, *args, **kwargs)
+                out = vmm.run_in_transient_scope(orig_fn, *args, **kwargs)
+                completed_ok = True
+                return out
             finally:
                 # Asymmetric lazy residency (`e27bce5`):
                 # - After `vae.decode`, leave borrowed tail expert slices unmapped so `expert_alpha`
                 #   naturally reflects demand-driven HBM pressure; the next DiT turn's
                 #   `generation_mode(prefetch_all=True)` reloads them asynchronously during Step-1.
-                # - After `vae.encode` mid-generation, queue async background prefetch without blocking.
-                if (not is_decode) and was_gen_active and vmm.expert_resident_count(self.expert_id) < prev_res:
-                    vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
-                self._generation_active = was_gen_active
-                if was_gen_active:
-                    vmm.set_expert_pinned(self.expert_id, True)
+                # - After `vae.encode`: when inside `generation_mode`, queue async background prefetch;
+                #   when outside `generation_mode` (e.g. `forward_cache_update_vae` right before
+                #   `language_model(mode="gen")` runs without wait hooks), reload evicted layers
+                #   synchronously now that `run_in_transient_scope` has released Arena-2 handles!
+                try:
+                    if completed_ok and (not is_decode) and vmm.expert_resident_count(self.expert_id) < prev_res:
+                        if was_gen_active:
+                            vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
+                        else:
+                            missing = prev_res - vmm.expert_resident_count(self.expert_id)
+                            self._ensure_expert_headroom(missing)
+                            vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                finally:
+                    self._generation_active = was_gen_active
+                    if was_gen_active:
+                        vmm.set_expert_pinned(self.expert_id, True)
 
         return _wrapped
 

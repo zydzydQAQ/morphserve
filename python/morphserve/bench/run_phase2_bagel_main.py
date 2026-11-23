@@ -267,6 +267,9 @@ def run_suite_a_qps_and_ablations(
                     gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
+                err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+                if err_samples:
+                    d["error_samples"] = err_samples
                 d.pop("sessions", None)
                 d["host_shmem_delta_gib"] = init_info.get("host_shmem_delta_gib", rep.host_shmem_delta_gib)
                 qps_sweep_results.append(d)
@@ -274,7 +277,8 @@ def run_suite_a_qps_and_ablations(
                     f"[M2.3-QPS] policy={preset} n={len(suite.sessions)} qps={qps} "
                     f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
                     f"steady_slo={rep.steady_state_attainment_pct}% ar_tpot_p95={rep.ar_tpot_p95_ms}ms "
-                    f"dit_p95={rep.dit_turn_p95_ms}ms oom={rep.oom_sessions}",
+                    f"dit_p95={rep.dit_turn_p95_ms}ms oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
                     flush=True,
                 )
         finally:
@@ -298,6 +302,9 @@ def run_suite_a_qps_and_ablations(
                 gentd26_deltas=gentd_deltas,
             )
             d = rep.to_dict()
+            err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+            if err_samples:
+                d["error_samples"] = err_samples
             d.pop("sessions", None)
             d["ablation_name"] = ab_name
             ablation_results.append(d)
@@ -305,7 +312,8 @@ def run_suite_a_qps_and_ablations(
                 f"[M2.3-ABLATION] {ab_name} n={len(ablation_suite.sessions)} qps={ablation_qps} "
                 f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
                 f"steady_slo={rep.steady_state_attainment_pct}% ar_ttft_p99={rep.ar_ttft_p99_ms}ms "
-                f"peak_mib={rep.peak_gpu_reserved_mib} yields={rep.total_yields} oom={rep.oom_sessions}",
+                f"peak_mib={rep.peak_gpu_reserved_mib} yields={rep.total_yields} oom={rep.oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
                 flush=True,
             )
         finally:
@@ -377,13 +385,18 @@ def run_suite_b_skews_and_parity(
                     gentd26_deltas=gentd_deltas,
                 )
                 d = rep.to_dict()
+                err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+                if err_samples:
+                    d["error_samples"] = err_samples
                 d.pop("sessions", None)
                 d["skew_tag"] = skew_tag
                 skew_results.append(d)
                 print(
                     f"[M2.3-SKEW] policy={preset} skew={skew_tag} n={len(sk_suite.sessions)} "
                     f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
-                    f"steady_slo={rep.steady_state_attainment_pct}% ship={rep.path_a_ships} morph={rep.path_b_morphs}",
+                    f"steady_slo={rep.steady_state_attainment_pct}% ship={rep.path_a_ships} morph={rep.path_b_morphs} "
+                    f"oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
                     flush=True,
                 )
         finally:
@@ -416,6 +429,13 @@ def run_suite_b_skews_and_parity(
                     save_outputs_dir=tmp_acc_root / preset,
                 )
                 parity_runs[preset] = {s["session_id"]: s for s in rep.sessions}
+                acc_err = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
+                print(
+                    f"[M2.3-PARITY] policy={preset} n={len(acc_suite.sessions)} "
+                    f"ok={rep.completed_sessions} oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={acc_err[0]!r}" if acc_err else ""),
+                    flush=True,
+                )
             finally:
                 eng.shutdown()
                 gc.collect()
@@ -444,10 +464,24 @@ def run_suite_b_skews_and_parity(
                 m["session_id"] = sid
                 geneval_metrics.append(m)
 
+        ref_errs = [
+            f"{sid}: {str(s.get('error', ''))[:200]}"
+            for sid, s in parity_runs["monolithic_dp"].items()
+            if s.get("status") == "error"
+        ]
+        ms_errs = [
+            f"{sid}: {str(s.get('error', ''))[:200]}"
+            for sid, s in parity_runs["morphserve"].items()
+            if s.get("status") == "error"
+        ]
         parity_summary = {
             **parity_eval,
             "accuracy_suite_name": acc_suite.name,
             "accuracy_total_sessions": len(acc_suite.sessions),
+            "ref_error_sessions": len(ref_errs),
+            "morphserve_error_sessions": len(ms_errs),
+            "ref_error_samples": ref_errs[:5],
+            "morphserve_error_samples": ms_errs[:5],
             "visual_cot_geneval_sessions": sum(1 for s in acc_suite.sessions if s.quadrant == "visual_cot"),
             "multiturn_4turn_edit_sessions": sum(
                 1 for s in acc_suite.sessions if s.quadrant == "multiturn_edit" and len(s.turns) == 4

@@ -1,0 +1,323 @@
+{
+  "schema": "morphserve.osdi27.m24_internvlu.v3",
+  "timestamp_utc": "2026-11-23T13:06:11Z",
+  "num_gpus": 1,
+  "constrained_quota_gib": 12.0,
+  "morphserve_12gib_quota_verified": true,
+  "regime_a_40gb_burst": [
+    {
+      "policy_name": "morphserve",
+      "suite_name": "internvlu_parity_4",
+      "num_gpus": 1,
+      "offered_qps": 0.5,
+      "wall_seconds": 14.89,
+      "total_sessions": 4,
+      "completed_sessions": 4,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.25,
+      "raw_wall_goodput_rps": 0.1343,
+      "steady_state_goodput_rps": 0.25,
+      "steady_state_attainment_pct": 50.0,
+      "joint_slo_attainment_pct": 50.0,
+      "ar_slo_attainment_pct": 75.0,
+      "dit_slo_attainment_pct": 75.0,
+      "ar_ttft_p50_ms": 1546.24,
+      "ar_ttft_p95_ms": 2848.03,
+      "ar_ttft_p99_ms": 2963.74,
+      "ar_tpot_p50_ms": 70.61,
+      "ar_tpot_p95_ms": 99.47,
+      "ar_tpot_p99_ms": 99.47,
+      "dit_turn_p50_ms": 13665.46,
+      "dit_turn_p95_ms": 14487.56,
+      "dit_turn_p99_ms": 14560.63,
+      "peak_gpu_reserved_mib": 24726.0,
+      "host_shmem_delta_gib": 5.02,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 11926.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 0.0,
+          "goodput_rps": 0.0
+        },
+        "2.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        }
+      },
+      "status": "ok",
+      "regime": "smoke_1gpu_parity"
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "internvlu_parity_4",
+      "num_gpus": 1,
+      "offered_qps": 0.5,
+      "wall_seconds": 13.79,
+      "total_sessions": 4,
+      "completed_sessions": 4,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.25,
+      "raw_wall_goodput_rps": 0.1451,
+      "steady_state_goodput_rps": 0.25,
+      "steady_state_attainment_pct": 50.0,
+      "joint_slo_attainment_pct": 50.0,
+      "ar_slo_attainment_pct": 75.0,
+      "dit_slo_attainment_pct": 75.0,
+      "ar_ttft_p50_ms": 1368.6,
+      "ar_ttft_p95_ms": 2516.82,
+      "ar_ttft_p99_ms": 2618.88,
+      "ar_tpot_p50_ms": 66.81,
+      "ar_tpot_p95_ms": 92.52,
+      "ar_tpot_p99_ms": 92.52,
+      "dit_turn_p50_ms": 12554.52,
+      "dit_turn_p95_ms": 13377.89,
+      "dit_turn_p99_ms": 13451.08,
+      "peak_gpu_reserved_mib": 13186.0,
+      "host_shmem_delta_gib": 0.02,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 13186.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.125
+        },
+        "2.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        }
+      },
+      "status": "ok",
+      "regime": "smoke_1gpu_parity"
+    }
+  ],
+  "regime_b_memory_capped": [
+    {
+      "policy_name": "morphserve",
+      "suite_name": "internvlu_dual_regime_n2_h1024",
+      "num_gpus": 1,
+      "offered_qps": 0.5,
+      "wall_seconds": 10.52,
+      "total_sessions": 2,
+      "completed_sessions": 2,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5,
+      "raw_wall_goodput_rps": 0.1901,
+      "steady_state_goodput_rps": 0.5,
+      "steady_state_attainment_pct": 100.0,
+      "joint_slo_attainment_pct": 100.0,
+      "ar_slo_attainment_pct": 100.0,
+      "dit_slo_attainment_pct": 100.0,
+      "ar_ttft_p50_ms": 94.59,
+      "ar_ttft_p95_ms": 94.59,
+      "ar_ttft_p99_ms": 94.59,
+      "ar_tpot_p50_ms": 94.33,
+      "ar_tpot_p95_ms": 94.33,
+      "ar_tpot_p99_ms": 94.33,
+      "dit_turn_p50_ms": 10021.87,
+      "dit_turn_p95_ms": 10021.87,
+      "dit_turn_p99_ms": 10021.87,
+      "peak_gpu_reserved_mib": 11626.0,
+      "host_shmem_delta_gib": 8.83,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 25,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 4938.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "2.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.5
+        },
+        "2.5x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.5
+        },
+        "3.0x": {
+          "attainment_pct": 100.0,
+          "goodput_rps": 0.5
+        }
+      },
+      "status": "ok",
+      "pytorch_peak_reserved_mib": 4938.0,
+      "vmm_physical_pool_mib": 6688.0,
+      "regime": "regime_b_12gib_capped",
+      "quota_budget_plan": {
+        "quota_limit_mib": 12288.0,
+        "runtime_combined_budget_mib": 12288.0,
+        "runtime_pytorch_budget_mib": 5600.0,
+        "total_quota_fraction": 0.30384,
+        "vmm_physical_pool_mib": 6688.0
+      },
+      "memory_quota_audit": {
+        "combined_physical_mib": 11626.0,
+        "pytorch_peak_reserved_mib": 4938.0,
+        "quota_limit_mib": 12288.0,
+        "vmm_physical_pool_mib": 6688.0,
+        "within_quota": true
+      }
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "internvlu_dual_regime_n2_h1024",
+      "num_gpus": 1,
+      "offered_qps": 0.5,
+      "wall_seconds": 10.74,
+      "total_sessions": 2,
+      "completed_sessions": 1,
+      "oom_sessions": 1,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.25,
+      "raw_wall_goodput_rps": 0.0931,
+      "steady_state_goodput_rps": 0.25,
+      "steady_state_attainment_pct": 50.0,
+      "joint_slo_attainment_pct": 50.0,
+      "ar_slo_attainment_pct": 50.0,
+      "dit_slo_attainment_pct": 50.0,
+      "ar_ttft_p50_ms": 94.26,
+      "ar_ttft_p95_ms": 94.26,
+      "ar_ttft_p99_ms": 94.26,
+      "ar_tpot_p50_ms": 94.02,
+      "ar_tpot_p95_ms": 94.02,
+      "ar_tpot_p99_ms": 94.02,
+      "dit_turn_p50_ms": 0.0,
+      "dit_turn_p95_ms": 0.0,
+      "dit_turn_p99_ms": 0.0,
+      "peak_gpu_reserved_mib": 12084.0,
+      "host_shmem_delta_gib": 0.02,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 2,
+      "oom_retry_count": 1,
+      "peak_pytorch_reserved_mib": 12084.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "2.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.25
+        }
+      },
+      "status": "ok",
+      "pytorch_peak_reserved_mib": 12084.0,
+      "vmm_physical_pool_mib": 0.0,
+      "regime": "regime_b_12gib_capped",
+      "quota_budget_plan": {
+        "quota_limit_mib": 12288.0,
+        "runtime_combined_budget_mib": 12288.0,
+        "runtime_pytorch_budget_mib": 12288.0,
+        "total_quota_fraction": 0.30384,
+        "vmm_physical_pool_mib": 0.0
+      },
+      "memory_quota_audit": {
+        "combined_physical_mib": 12084.0,
+        "pytorch_peak_reserved_mib": 12084.0,
+        "quota_limit_mib": 12288.0,
+        "vmm_physical_pool_mib": 0.0,
+        "within_quota": true
+      }
+    }
+  ],
+  "lossless_parity": {
+    "ar_turns_compared": 2,
+    "ar_greedy_exact_match_pct": 100.0,
+    "images_compared": 2,
+    "image_mean_ssim": 1.0,
+    "image_min_ssim": 1.0,
+    "turn0_mean_ssim": 1.0,
+    "turn0_min_ssim": 1.0,
+    "chained_multiturn_mean_ssim": 1.0,
+    "chained_multiturn_min_ssim": 1.0,
+    "edit_per_turn_mean_ssim": {},
+    "mmvet_ref_score_pct": 0.0,
+    "mmvet_morphserve_score_pct": 0.0,
+    "mmvet_delta_pct": 0.0,
+    "owlv2_backend": "transformers_owlv2",
+    "geneval_evaluated": 0,
+    "geneval_ref_score_pct": null,
+    "geneval_morphserve_score_pct": null,
+    "geneval_delta_pct": null,
+    "geneval_by_tag": {},
+    "clip_backend": "transformers_clip",
+    "edit_turns_evaluated": 0,
+    "clip_t_ref_pct": null,
+    "clip_t_morphserve_pct": null,
+    "clip_t_delta_pct": null,
+    "clip_i_ref_pct": null,
+    "clip_i_morphserve_pct": null,
+    "clip_i_delta_pct": null,
+    "clip_pair_mean_sim_pct": null,
+    "lossless_pass": true
+  },
+  "status": "ok"
+}

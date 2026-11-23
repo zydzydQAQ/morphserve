@@ -141,13 +141,20 @@ class TestModule3Offline(unittest.TestCase):
         from PIL import Image
 
         rng = np.random.default_rng(2026)
-        for src_hw, dst_hw in (((64, 64), (122, 122)), ((122, 122), (37, 53)), ((48, 48), (48, 48)), ((2, 2), (7, 5))):
+        for src_hw, dst_hw in (
+            ((64, 64), (122, 122)),
+            ((122, 122), (37, 53)),
+            ((512, 512), (980, 980)),
+            ((500, 500), (496, 496)),
+            ((48, 48), (48, 48)),
+            ((2, 2), (7, 5)),
+        ):
             arr = rng.integers(0, 256, size=(src_hw[0], src_hw[1], 3), dtype=np.uint8)
             pil_out = np.asarray(Image.fromarray(arr).resize((dst_hw[1], dst_hw[0]), Image.BICUBIC), dtype=np.int16)
             chw_in = arr.transpose(2, 0, 1).astype(np.float32)
             np_out = pil_bicubic_resize_np(chw_in, dst_hw[0], dst_hw[1]).astype(np.int16).transpose(1, 2, 0)
             max_diff = int(np.abs(np_out - pil_out).max())
-            self.assertLessEqual(max_diff, 1, msg=f"src={src_hw} dst={dst_hw} max_diff={max_diff}")
+            self.assertEqual(max_diff, 0, msg=f"src={src_hw} dst={dst_hw} max_diff={max_diff}")
 
     def test_pil_bicubic_resize_matches_pillow_catmull_rom(self) -> None:
         try:
@@ -158,12 +165,13 @@ class TestModule3Offline(unittest.TestCase):
             self.skipTest("torch/PIL not available in offline WSL environment")
 
         rng = np.random.default_rng(2026)
-        arr = rng.integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
-        pil_out = np.asarray(Image.fromarray(arr).resize((122, 122), Image.BICUBIC), dtype=np.int16)
-        gpu_in = torch.from_numpy(arr.transpose(2, 0, 1).copy()).float()
-        gpu_out = pil_bicubic_resize_gpu(gpu_in, 122, 122).cpu().numpy().astype(np.int16).transpose(1, 2, 0)
-        max_diff = int(np.abs(gpu_out - pil_out).max())
-        self.assertLessEqual(max_diff, 1)
+        for src_hw, dst_hw in (((64, 64), (122, 122)), ((512, 512), (980, 980)), ((500, 500), (496, 496))):
+            arr = rng.integers(0, 256, size=(src_hw[0], src_hw[1], 3), dtype=np.uint8)
+            pil_out = np.asarray(Image.fromarray(arr).resize((dst_hw[1], dst_hw[0]), Image.BICUBIC), dtype=np.int16)
+            gpu_in = torch.from_numpy(arr.transpose(2, 0, 1).copy()).float()
+            gpu_out = pil_bicubic_resize_gpu(gpu_in, dst_hw[0], dst_hw[1]).cpu().numpy().astype(np.int16).transpose(1, 2, 0)
+            max_diff = int(np.abs(gpu_out - pil_out).max())
+            self.assertEqual(max_diff, 0, msg=f"src={src_hw} dst={dst_hw} max_diff={max_diff}")
 
     def test_flash_prefix_split_arithmetic_intensity_gate(self) -> None:
         self.assertTrue(should_use_flash_prefix_split(1026, 2048, 2))

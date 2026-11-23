@@ -1,0 +1,54 @@
+{
+  "schema": "morphserve.osdi27.stage1_1gpu_gate.v1",
+  "timestamp_utc": "2026-11-23T13:07:16Z",
+  "kairos_run_id": "morphserve-osdi27-r1-gate1g-20261123-r7",
+  "kairos_build": "2e0fc31",
+  "eval_models_dir": "/shared/data/MORPHSERVE/eval_models",
+  "eval_models_staged": {
+    "owlv2-base-patch16-ensemble": true,
+    "clip-vit-large-patch14": true
+  },
+  "gates": {
+    "pytest_a100": {
+      "status": "ok",
+      "log_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/pytest-a100.txt",
+      "tail": [
+        "tests/python/test_phase2_m23_m25_offline.py::TestPhase2M23M25Offline::test_exactness_evaluator_mmvet_and_parity",
+        "/usr/local/lib/python3.12/dist-packages/transformers/models/clip/tokenization_clip.py:79: DeprecationWarning: Deprecated in 0.9.0: BPE.__init__ will not create from files anymore, try `BPE.from_file` instead",
+        "BPE(",
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
+        "============ 71 passed, 1 skipped, 16 warnings in 123.42s (0:02:03) ============"
+      ]
+    },
+    "module1_vmm_bagel": {
+      "status": "ok",
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/module1/module1-report.json"
+    },
+    "module3_cfg_loopback": {
+      "status": "ok",
+      "owlv2_backend": "transformers_owlv2",
+      "clip_backend": "transformers_clip",
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/module3/module3-report.json"
+    },
+    "module4_preemption": {
+      "status": "ok",
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/module4/module4-report.json"
+    },
+    "internvlu_1gpu_smoke": {
+      "status": "ok",
+      "morphserve_12gib_quota_verified": true,
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/internvlu_1gpu/m24-internvlu-report.json"
+    },
+    "bagel_1gpu_cluster_smoke": {
+      "status": "ok",
+      "completed_sessions": 3,
+      "oom_sessions": 0,
+      "preempted_ar_count": 2,
+      "total_yields": 33,
+      "peak_gpu_reserved_mib": 33032.0,
+      "peak_pytorch_reserved_mib": 18440.0,
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-r1-gate1g-20261123-r7/bagel_1gpu/bagel-1gpu-smoke.json"
+    }
+  },
+  "status": "ok"
+}

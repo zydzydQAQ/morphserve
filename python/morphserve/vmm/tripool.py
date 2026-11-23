@@ -74,6 +74,13 @@ def _clone_outputs(obj: Any) -> Any:
     if hasattr(obj, "sample") and _TORCH.is_tensor(obj.sample):
         obj.sample = obj.sample.clone()
         return obj
+    if hasattr(obj, "latent_dist"):
+        ld = obj.latent_dist
+        for attr in ("parameters", "mean", "logvar", "std", "var"):
+            val = getattr(ld, attr, None)
+            if _TORCH.is_tensor(val):
+                setattr(ld, attr, val.clone())
+        return obj
     return obj
 
 

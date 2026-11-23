@@ -921,7 +921,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self.pager.bind_vmm(self.vmm, initial_alpha=self.policy.initial_alphas.get(self.rank, 1.0))
 
         if self.policy.use_module3_cow_loopback:
-            self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32)
+            self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=False)
 
         if self.policy.preemption_mode != "non_preemptive":
             self.sched = UnifiedPreemptiveScheduler(

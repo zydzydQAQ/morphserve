@@ -30,7 +30,7 @@ class SyntheticOutOfMemoryError(MemoryError):
 
 
 def is_oom_exception(exc: BaseException) -> bool:
-    """Classify PyTorch CUDA OOM, VMM MemoryError, and FlashAttention-3 C++ dispatcher OOM (`6f1ef24`)."""
+    """Classify PyTorch CUDA OOM, VMM MemoryError, cuBLAS/cuDNN workspace OOM, and FA3 C++ dispatcher OOM."""
     if isinstance(exc, MemoryError) or type(exc).__name__ == "OutOfMemoryError":
         return True
     msg = str(exc)
@@ -38,10 +38,16 @@ def is_oom_exception(exc: BaseException) -> bool:
     return (
         "out of memory" in low
         or "out of vmm memory" in low
+        or "memory allocation failed" in low
+        or "cudaerrormemoryallocation" in low
+        or "cublas_status_alloc_failed" in low
+        or "cudnn_status_alloc_failed" in low
+        or "ms_vmm_expert_load_layers_sync failed" in low
         or "exhausted: need" in low
         or "pool exhausted" in low
         or 'torch_call_dispatcher( "aten::new_empty"' in msg
         or 'torch_call_dispatcher( "aten::empty' in msg
+        or 'torch_call_dispatcher( "aten::resize_' in msg
     )
 
 

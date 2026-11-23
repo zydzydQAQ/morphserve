@@ -292,11 +292,19 @@ class MorphServeClusterEngine:
             with self._fut_lock:
                 self._pending_futures.pop(cid, None)
             raise
-        if res.get("status") == "error":
-            raise RuntimeError(
-                f"worker rank {rank} error on {payload.get('op')}: {res.get('error')}\n{res.get('traceback', '')}"
-            )
         self._sync_worker_telemetry(int(rank), res)
+        if res.get("status") == "error":
+            err_txt = str(res.get("error", ""))
+            if "cuda" in err_txt.lower():
+                self.router.update_worker_telemetry(
+                    int(rank),
+                    expert_alpha=0.0,
+                    kv_free_bytes=0,
+                    workers=self.worker_states,
+                )
+            raise RuntimeError(
+                f"worker rank {rank} error on {payload.get('op')}: {err_txt}\n{res.get('traceback', '')}"
+            )
         return res
 
     def _gpu_busy_map(self) -> dict[int, bool]:
@@ -1227,6 +1235,14 @@ class MorphServeClusterEngine:
         eff_qps = float(target_qps if target_qps is not None else suite.base_qps)
         if target_qps is not None and burstgpt_deltas and gentd26_deltas:
             assign_dual_trace_arrivals(sessions, burstgpt_deltas, gentd26_deltas, target_qps=eff_qps)
+        elif (
+            target_qps is not None
+            and eff_qps > 0.0
+            and len(sessions) > 1
+            and all(float(s.arrival_offset_s) == 0.0 for s in sessions)
+        ):
+            for idx_s, s_item in enumerate(sessions):
+                s_item.arrival_offset_s = round(idx_s / eff_qps, 4)
 
         t0 = time.perf_counter()
         outcomes = await asyncio.gather(

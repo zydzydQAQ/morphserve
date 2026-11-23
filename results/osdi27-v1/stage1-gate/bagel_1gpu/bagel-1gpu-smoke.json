@@ -1,0 +1,193 @@
+{
+  "policy_name": "morphserve",
+  "suite_name": "stage1_1gpu_3sess_preempt",
+  "num_gpus": 1,
+  "offered_qps": 1.5,
+  "wall_seconds": 10.39,
+  "total_sessions": 3,
+  "completed_sessions": 3,
+  "oom_sessions": 0,
+  "error_sessions": 0,
+  "joint_slo_goodput_rps": 0.5,
+  "raw_wall_goodput_rps": 0.0963,
+  "steady_state_goodput_rps": 0.5,
+  "steady_state_attainment_pct": 33.3,
+  "joint_slo_attainment_pct": 33.3,
+  "ar_slo_attainment_pct": 33.3,
+  "dit_slo_attainment_pct": 100.0,
+  "ar_ttft_p50_ms": 383.2,
+  "ar_ttft_p95_ms": 383.29,
+  "ar_ttft_p99_ms": 383.3,
+  "ar_tpot_p50_ms": 138.19,
+  "ar_tpot_p95_ms": 143.26,
+  "ar_tpot_p99_ms": 160.63,
+  "dit_turn_p50_ms": 5047.37,
+  "dit_turn_p95_ms": 5718.03,
+  "dit_turn_p99_ms": 5777.65,
+  "peak_gpu_reserved_mib": 33032.0,
+  "host_shmem_delta_gib": 12.27,
+  "vmm_overflow_creates": 0,
+  "vmm_super_to_fine_carves": 2,
+  "vmm_expert_evictions_for_kv": 0,
+  "vmm_expert_evictions_for_transient": 0,
+  "path_a_ships": 0,
+  "path_b_morphs": 0,
+  "preempted_ar_count": 2,
+  "total_yields": 33,
+  "worker_oom_count": 0,
+  "oom_retry_count": 0,
+  "peak_pytorch_reserved_mib": 18440.0,
+  "cross_node_ships": 0,
+  "max_cross_node_ship_bytes": 0,
+  "slo_curve_by_k": {
+    "1.5x": {
+      "attainment_pct": 33.3,
+      "goodput_rps": 0.5
+    },
+    "2.0x": {
+      "attainment_pct": 33.3,
+      "goodput_rps": 0.5
+    },
+    "2.5x": {
+      "attainment_pct": 66.7,
+      "goodput_rps": 1.0
+    },
+    "3.0x": {
+      "attainment_pct": 100.0,
+      "goodput_rps": 1.5
+    }
+  },
+  "status": "ok",
+  "sessions": [
+    {
+      "ar_slo_met": true,
+      "ar_texts": [],
+      "ar_tpots_ms": [],
+      "ar_ttfts_ms": [],
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [
+        512,
+        512
+      ],
+      "dit_turn_steps": [
+        14,
+        12
+      ],
+      "dit_turns_ms": [
+        5792.55,
+        4302.19
+      ],
+      "e2e_ms": 10380.49,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": true,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_turns": 0,
+      "quadrant": "multiturn_edit",
+      "session_id": "smk_edit_0",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "total_yields": 33
+    },
+    {
+      "ar_slo_met": false,
+      "ar_texts": [
+        "1. Clear and transparent water with minimal ripples or waves.\n2. Surrounding landscape with"
+      ],
+      "ar_tpots_ms": [
+        121.41,
+        167.25,
+        139.48,
+        129.31,
+        146.55,
+        138.19,
+        138.57,
+        137.95,
+        139.62,
+        137.64,
+        137.11,
+        139.09,
+        140.73,
+        141.07,
+        107.74,
+        112.17,
+        106.15,
+        106.54,
+        106.27
+      ],
+      "ar_ttfts_ms": [
+        383.1
+      ],
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [],
+      "dit_turn_steps": [],
+      "dit_turns_ms": [],
+      "e2e_ms": 2877.47,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": false,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_turns": 1,
+      "quadrant": "multi_image_vqa",
+      "session_id": "smk_vqa_mid_dit_0",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "total_yields": 0
+    },
+    {
+      "ar_slo_met": false,
+      "ar_texts": [
+        "The two seasonal colors typical of autumn mountain forests are orange and red."
+      ],
+      "ar_tpots_ms": [
+        121.41,
+        97.89,
+        139.84,
+        138.24,
+        138.19,
+        136.88,
+        138.87,
+        138.62,
+        139.5,
+        137.78,
+        137.25,
+        138.97,
+        139.31,
+        139.2
+      ],
+      "ar_ttfts_ms": [
+        383.3
+      ],
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [],
+      "dit_turn_steps": [],
+      "dit_turns_ms": [],
+      "e2e_ms": 2267.16,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": false,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_turns": 1,
+      "quadrant": "multi_image_vqa",
+      "session_id": "smk_vqa_mid_dit_1",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "total_yields": 0
+    }
+  ]
+}

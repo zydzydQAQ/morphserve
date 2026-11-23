@@ -1,0 +1,18 @@
+{
+  "cadence_ms": 100,
+  "gpus": {
+    "GPU-21027a73-5a0e-3c56-e18d-9435e84f5ed2": {
+      "first_timestamp": "2026/11/23 12:53:27.066",
+      "last_timestamp": "2026/11/23 13:07:16.530",
+      "memory_free_min_mib": 1426.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 39017.0,
+      "samples": 8252,
+      "utilization_mean_pct": 38.472370334464244
+    }
+  },
+  "invalid_samples": 0,
+  "schema": "kairos.memory-summary.v1",
+  "scope": "sampled NVML extrema; not allocator peaks",
+  "status": "completed"
+}

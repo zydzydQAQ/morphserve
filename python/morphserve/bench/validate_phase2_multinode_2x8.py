@@ -669,6 +669,9 @@ def run_multinode_e2e_benchmark(
 
             rep_dict = rep.to_dict()
             sess_rows = rep_dict.pop("sessions", [])
+            err_samples = [str(s.get("error", ""))[:240] for s in sess_rows if s.get("status") == "error"][:5]
+            if err_samples:
+                rep_dict["error_samples"] = err_samples
             if pol_name == "morphserve":
                 ms_max_inter_ship_bytes = max(
                     ms_max_inter_ship_bytes,
@@ -677,6 +680,13 @@ def run_multinode_e2e_benchmark(
                 for s_row in sess_rows:
                     for b in s_row.get("cross_node_ship_bytes_list") or ():
                         ms_max_inter_ship_bytes = max(ms_max_inter_ship_bytes, int(b))
+            print(
+                f"[M2.5-E2E] policy={pol_name} world_size={world_size} n={len(suite.sessions)} qps={offered_qps} "
+                f"steady_goodput={rep.steady_state_goodput_rps:.3f} steady_slo={rep.steady_state_attainment_pct}% "
+                f"xnode_ships={rep.cross_node_ships} oom={rep.oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
+                flush=True,
+            )
             results.append(rep_dict)
     finally:
         hub.close()

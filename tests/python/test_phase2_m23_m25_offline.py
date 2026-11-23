@@ -764,6 +764,155 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             assert chk["bridge_24mib_decision"]["dst_gpu"] == 8
             assert chk["suppressed_cross_node_1gib_kv_ship"] is True
 
+    def test_osdi27_r2b_regression_fixes(self) -> None:
+        from morphserve.engine import InProcessWorkerFleet, MorphServeClusterEngine
+        from morphserve.models.base import is_oom_exception
+        from morphserve.vmm import (
+            ExpertPartitionSpec,
+            LayerExpertPager,
+            LayerPackPlan,
+            NumaMemfdMirror,
+            ParamSlice,
+            SimulatedTriPoolBackend,
+        )
+
+        # 1. `is_oom_exception` classifies cuBLAS/cuDNN/CUDA workspace & resize allocation failures as OOM
+        for oom_msg in (
+            "RuntimeError: CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling cublasCreate(handle)",
+            "RuntimeError: cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
+            "RuntimeError: cudaErrorMemoryAllocation: out of memory",
+            "RuntimeError: memory allocation failed",
+            'RuntimeError: torch_call_dispatcher( "aten::resize_" ) failed',
+        ):
+            assert is_oom_exception(RuntimeError(oom_msg)) is True
+        assert is_oom_exception(RuntimeError("CUDA error: an illegal memory access was encountered")) is False
+
+        # 2. `LayerExpertPager._wrap_vae_callable`: when `vae.encode` runs OUTSIDE `generation_mode`
+        # (`was_gen_active == False`, as in `Bagel.forward_cache_update_vae`) and Arena-2 scratchpad
+        # evicts tail expert layers because `free_super_handles == 0`, `_wrap_vae_callable` MUST
+        # synchronously reload all `[0, prev_res)` layers once Arena-2 releases its handles!
+        class _DummyVae:
+            def __init__(self, vmm_ref: SimulatedTriPoolBackend) -> None:
+                self._vmm = vmm_ref
+                self.evicted_during_encode = False
+
+            def encode(self, x: int) -> int:
+                # Allocate 32 MiB (2 super-handles) inside transient scope -> forces eviction of tail expert layers!
+                ptr = self._vmm.allocate_transient_mib(32)
+                assert ptr != 0
+                self.evicted_during_encode = self._vmm.expert_resident_count(0) < 4
+                return x + 1
+
+            def decode(self, z: int) -> int:
+                ptr = self._vmm.allocate_transient_mib(32)
+                assert ptr != 0
+                return z + 1
+
+        class _RawParam:
+            def __init__(self, fill_byte: int) -> None:
+                self.raw_bytes = bytes([fill_byte]) * 4096
+                self.bound_view = None
+
+        # 4 layers * 16 MiB = 64 MiB fills the entire 64 MiB super-pool (`free_super_handles == 0`)
+        sim_vmm = SimulatedTriPoolBackend(
+            super_pool_mib=64,
+            fine_kv_pool_mib=16,
+            super_handle_mib=16,
+            allow_overflow=False,
+            materialize_va_bytes=True,
+        )
+        plans = [
+            LayerPackPlan(
+                layer_idx=i,
+                used_bytes=4096,
+                params=[
+                    ParamSlice(
+                        name=f"l{i}.w",
+                        offset=0,
+                        nbytes=4096,
+                        shape=(4096,),
+                        dtype_str="uint8",
+                        param_ref=_RawParam(0x10 + i),
+                    )
+                ],
+            )
+            for i in range(4)
+        ]
+        vae_mod = _DummyVae(sim_vmm)
+        spec = ExpertPartitionSpec(
+            name="unit_vae_encode_restore",
+            plans=plans,
+            layer_stride_bytes=16 * (1024**2),
+            hook_modules=[],
+            vae_module=vae_mod,
+            install_module_hooks=False,
+        )
+        pager = LayerExpertPager(spec)
+        mirror = NumaMemfdMirror.create(nbytes=pager.total_mirror_bytes, numa_node=0, name="unit_vae_restore")
+        try:
+            pager.offload_to_shared_mirror(mirror, populate=True)
+            pager.bind_vmm(sim_vmm, initial_alpha=1.0)
+            assert sim_vmm.expert_resident_count(pager.expert_id) == 4
+            assert pager._generation_active is False
+
+            out_enc = vae_mod.encode(41)
+            assert out_enc == 42
+            assert vae_mod.evicted_during_encode is True
+            # Synchronous restoration when `was_gen_active == False` guarantees `language_model(mode="gen")`
+            # never touches unmapped tail expert VAs!
+            assert sim_vmm.expert_resident_count(pager.expert_id) == 4
+            tail_view = sim_vmm.expert_layer_uint8_view(pager.expert_id, 3)
+            assert bytes(tail_view[:16]) == bytes([0x13]) * 16
+
+            # Conversely, `vae.decode` preserves asymmetric lazy residency (`resident < 4` after decode)
+            out_dec = vae_mod.decode(9)
+            assert out_dec == 10
+            assert sim_vmm.expert_resident_count(pager.expert_id) < 4
+        finally:
+            pager.close()
+            sim_vmm.shutdown()
+            mirror.close()
+
+        # 3. `MorphServeClusterEngine` paces `arrival_offset_s == 0.0` suites at `1 / target_qps`
+        zero_offset_suite = WorkloadSuite(
+            name="unit_zero_offset_pacing",
+            trace_source="deterministic",
+            base_qps=1.0,
+            sessions=[
+                InterleavedSession(
+                    session_id=f"z_{i}",
+                    quadrant="multi_image_vqa",
+                    source_dataset="unit",
+                    arrival_offset_s=0.0,
+                    turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="hi", max_ar_tokens=2)],
+                )
+                for i in range(4)
+            ],
+        )
+        pol_syn = EnginePolicyConfig.from_preset(
+            "morphserve",
+            num_gpus=2,
+            model_family="synthetic",
+            inter_turn_think_s_range=(0.0, 0.0),
+        )
+        with tempfile.TemporaryDirectory(dir=_scratch_dir()) as tmp:
+            eng = MorphServeClusterEngine(
+                policy=pol_syn,
+                model_dir=Path(tmp),
+                bench_root=Path(tmp),
+                tmp_root=Path(tmp) / "tmp_eng",
+                fleet=InProcessWorkerFleet(pol_syn),
+            )
+            try:
+                eng.start()
+                rep = eng.run_suite(zero_offset_suite, target_qps=20.0)
+                assert rep.completed_sessions == 4
+                assert rep.error_sessions == 0
+                # 4 sessions paced at 20 QPS -> last session arrives at 3 / 20 = 0.15s (`wall_seconds >= 0.14s`)
+                assert rep.wall_seconds >= 0.14
+            finally:
+                eng.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

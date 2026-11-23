@@ -178,10 +178,21 @@ class BagelExecutionInterceptor:
         if pager is not None and hasattr(pager, "set_wait_gate"):
             pager.set_wait_gate(lambda: self.is_gen_compute_active)
 
-    def enable_shared_prefix_cfg(self, min_shared_tokens: int = 32) -> BagelSharedPrefixPatch:
+    def enable_shared_prefix_cfg(
+        self,
+        min_shared_tokens: int = 32,
+        allow_cascade_split: bool = True,
+    ) -> BagelSharedPrefixPatch:
         """Install and bind `BagelSharedPrefixPatch` under this execution coordinator."""
         if self.cfg_patch is None:
-            self.cfg_patch = install_shared_prefix_bagel_hooks(self.pipeline, min_shared_tokens=min_shared_tokens)
+            self.cfg_patch = install_shared_prefix_bagel_hooks(
+                self.pipeline,
+                min_shared_tokens=min_shared_tokens,
+                allow_cascade_split=allow_cascade_split,
+            )
+        else:
+            self.cfg_patch.min_shared_tokens = int(min_shared_tokens)
+            self.cfg_patch.allow_cascade_split = bool(allow_cascade_split)
         return self.cfg_patch
 
     def _supports_packed_ar_gemm(self) -> bool:

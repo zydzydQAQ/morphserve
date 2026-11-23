@@ -425,7 +425,7 @@ def run_suite_b_skews_and_parity(
                 eng.start()
                 rep = eng.run_suite(
                     acc_suite,
-                    target_qps=0.5,
+                    target_qps=0.20,
                     save_outputs_dir=tmp_acc_root / preset,
                 )
                 parity_runs[preset] = {s["session_id"]: s for s in rep.sessions}

@@ -411,6 +411,10 @@ class GpuInPlaceLoopback:
             dtype=self.dtype,
         ):
             if update_vae:
+                vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
+                torch.manual_seed(vae_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(vae_seed)
                 vae_inp, new_lens, new_rope = prepare_vae_images_gpu(
                     self.bagel, [img_u8], ctx["kv_lens"], ctx["ropes"], self.new_token_ids
                 )

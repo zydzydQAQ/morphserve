@@ -1088,6 +1088,10 @@ class BagelCPTGAdapter(CPTGModelAdapter):
 
             with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 if update_vae:
+                    vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
+                    torch.manual_seed(vae_seed)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(vae_seed)
                     vi, nl, nr = self.pipeline.bagel.prepare_vae_images(
                         curr_kvlens=ctx["kv_lens"],
                         curr_rope=ctx["ropes"],

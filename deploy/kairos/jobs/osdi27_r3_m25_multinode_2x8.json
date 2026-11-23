@@ -1,5 +1,5 @@
 {
-  "name": "morphserve-osdi27-r3-node2x8-20261123",
+  "name": "morphserve-osdi27-r3-node2x8-20261124",
   "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "workers": 2,
   "gpus_per_worker": 8,
@@ -12,11 +12,11 @@
     },
     {
       "name": "KAIROS_RUN_ID",
-      "value": "morphserve-osdi27-r3-node2x8-20261123"
+      "value": "morphserve-osdi27-r3-node2x8-20261124"
     },
     {
       "name": "KAIROS_BUILD",
-      "value": "2e0fc31"
+      "value": "66d052a"
     },
     {
       "name": "KAIROS_REQUIRE_BUILD",

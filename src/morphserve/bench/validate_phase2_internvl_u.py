@@ -318,9 +318,10 @@ def run_internvlu_generality_validation(
         try:
             eng.start()
             rep = eng.run_suite(suite_b, target_qps=regime_b_qps)
-            w_stats = asyncio.run(
-                asyncio.gather(*(eng._rpc(g, {"op": "GET_STATS"}) for g in range(num_gpus)))
-            )
+            async def _fetch_w_stats() -> list[dict[str, Any]]:
+                return list(await asyncio.gather(*(eng._rpc(g, {"op": "GET_STATS"}) for g in range(num_gpus))))
+
+            w_stats = asyncio.run(_fetch_w_stats())
             d = rep.to_dict()
             d.pop("sessions", None)
             if w_stats and any("pytorch_reserved_mib" in st for st in w_stats):

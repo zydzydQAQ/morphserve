@@ -350,24 +350,35 @@ def load_internvlu_pipeline(
     torch.cuda.set_device(device_index)
     dev = torch.device(f"cuda:{device_index}")
 
-    vlm = InternVLUChatModel.from_pretrained(
-        str(model_dir / "vlm"),
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False,
-        local_files_only=True,
-    )
-    generation_decoder = InternVLUGenerationDecoder.from_pretrained(
-        str(model_dir / "generation_decoder"),
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False,
-        local_files_only=True,
-    )
-    vae = AutoencoderKLQwenImage.from_pretrained(
-        str(model_dir / "vae"),
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=False,
-        local_files_only=True,
-    )
+    def _load_bf16_pretrained(cls_obj: Any, sub_path: Path) -> Any:
+        try:
+            mod = cls_obj.from_pretrained(
+                str(sub_path),
+                dtype=torch.bfloat16,
+                low_cpu_mem_usage=False,
+                local_files_only=True,
+            )
+        except TypeError:
+            mod = cls_obj.from_pretrained(
+                str(sub_path),
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=False,
+                local_files_only=True,
+            )
+        # Explicitly cast floating-point parameters to BF16 (`transformers>=5` ignores `torch_dtype=`
+        # on custom `PreTrainedModel.__init__` submodules when `low_cpu_mem_usage=False`), while
+        # preserving FP32 rotary frequency buffers (`inv_freq` / `freqs`).
+        for p in mod.parameters():
+            if p.is_floating_point() and p.dtype != torch.bfloat16:
+                p.data = p.data.to(dtype=torch.bfloat16)
+        for bname, b in mod.named_buffers():
+            if b.is_floating_point() and b.dtype != torch.bfloat16 and "freq" not in bname.lower():
+                b.data = b.data.to(dtype=torch.bfloat16)
+        return mod
+
+    vlm = _load_bf16_pretrained(InternVLUChatModel, model_dir / "vlm")
+    generation_decoder = _load_bf16_pretrained(InternVLUGenerationDecoder, model_dir / "generation_decoder")
+    vae = _load_bf16_pretrained(AutoencoderKLQwenImage, model_dir / "vae")
     scheduler = DPMSolverMultistepScheduler.from_pretrained(
         str(model_dir / "scheduler"),
         local_files_only=True,

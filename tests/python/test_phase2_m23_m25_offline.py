@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from pathlib import Path
 import sys
@@ -910,6 +911,17 @@ class TestPhase2M23M25Offline(unittest.TestCase):
                 assert rep.error_sessions == 0
                 # 4 sessions paced at 20 QPS -> last session arrives at 3 / 20 = 0.15s (`wall_seconds >= 0.14s`)
                 assert rep.wall_seconds >= 0.14
+
+                # 5. Reused `MorphServeClusterEngine` resets `HalfNodeH2DPacer` analytical clock & worker `alpha`
+                eng.router.pacer.reserve_slot(0, 500.0, 240_000.0)
+                assert eng.router.pacer.predicted_wait_ms(0, 0.0) > 240_000.0
+                asyncio.run(eng._rpc(0, {"op": "SET_ALPHA", "alpha": 1.0}))
+                assert eng.worker_states[0].expert_alpha == 1.0
+                rep2 = eng.run_suite(zero_offset_suite, target_qps=40.0)
+                assert rep2.completed_sessions == 4
+                assert rep2.error_sessions == 0
+                assert eng.router.pacer.predicted_wait_ms(0, 0.0) < 1000.0
+                assert abs(eng.worker_states[0].expert_alpha - float(pol_syn.initial_alphas[0])) < 1e-6
             finally:
                 eng.shutdown()
 

@@ -941,7 +941,9 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 allow_overflow=self.policy.allow_vmm_overflow,
             )
             if self.pager is not None:
-                self.pager.bind_vmm(self.vmm, initial_alpha=self.policy.initial_alphas.get(self.rank, 1.0))
+                init_alpha = float(self.policy.initial_alphas.get(self.rank, 1.0))
+                self._initial_bound_alpha = init_alpha
+                self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
 
         if self.policy.use_module3_cow_loopback:
             self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=False)

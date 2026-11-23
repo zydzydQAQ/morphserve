@@ -175,6 +175,9 @@ class HalfNodeH2DPacer:
             )
         )
 
+    def reset_analytical_slots(self) -> None:
+        self._lib.ms_pacer_reset_slots(ctypes.c_void_p(self._handle))
+
     @contextmanager
     def acquire_thread_slot(self, gpu_id: int) -> Iterator[int]:
         gid = self.topology.half_group_of(gpu_id).group_id

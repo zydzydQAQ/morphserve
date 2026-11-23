@@ -375,6 +375,8 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_pacer_predicted_wait_ms.restype = ctypes.c_double
     L.ms_pacer_reserve_slot.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_double, ctypes.c_double]
     L.ms_pacer_reserve_slot.restype = ctypes.c_double
+    L.ms_pacer_reset_slots.argtypes = [ctypes.c_void_p]
+    L.ms_pacer_reset_slots.restype = None
     L.ms_pacer_acquire_thread.argtypes = [ctypes.c_void_p, ctypes.c_int]
     L.ms_pacer_acquire_thread.restype = None
     L.ms_pacer_release_thread.argtypes = [ctypes.c_void_p, ctypes.c_int]

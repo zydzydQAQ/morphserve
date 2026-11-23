@@ -676,10 +676,12 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                     max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
                     max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
                     init_alpha = min(init_alpha, max_fit_alpha)
+                self._initial_bound_alpha = float(init_alpha)
                 self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
             if self.vlm_pager is not None:
                 vlm_fit_layers = int(plan["super_pool_mib"]) // max(1, self.vlm_pager.layer_stride_mib)
                 vlm_init_alpha = min(1.0, float(vlm_fit_layers) / float(max(1, self.vlm_pager.num_layers)))
+                self._initial_vlm_alpha = float(vlm_init_alpha)
                 self.vlm_pager.bind_vmm(self.vmm, initial_alpha=vlm_init_alpha)
         else:
             self._quota_constrained = getattr(self.policy, "gpu_memory_fraction", None) is not None
@@ -1100,6 +1102,15 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         if self.pager is not None and self.vmm is not None:
             self.pager.set_residency_alpha(float(alpha))
         return self.resident_alpha()
+
+    def reset_for_new_suite(self) -> float:
+        if self.vmm is not None and self.vlm_pager is not None:
+            if self.pager is not None:
+                self.pager.set_residency_alpha(0.0)
+            self.vlm_pager.set_residency_alpha(float(getattr(self, "_initial_vlm_alpha", 1.0)))
+            return self.resident_alpha()
+        target = float(getattr(self, "_initial_bound_alpha", self.policy.initial_alphas.get(self.rank, 1.0)))
+        return self.set_residency_alpha(target)
 
     def resident_alpha(self) -> float:
         if self.pager is not None and self.vmm is not None:

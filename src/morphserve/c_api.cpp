@@ -700,6 +700,10 @@ double ms_pacer_reserve_slot(ms_pacer_t* p, int gpu_id, double duration_ms, doub
     }
 }
 
+void ms_pacer_reset_slots(ms_pacer_t* p) {
+    if (p && p->ptr) p->ptr->reset_analytical_slots();
+}
+
 void ms_pacer_acquire_thread(ms_pacer_t* p, int gpu_id) {
     if (p && p->ptr) p->ptr->acquire_thread_slot(gpu_id);
 }

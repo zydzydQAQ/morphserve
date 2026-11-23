@@ -827,6 +827,26 @@ class WorkerRuntime:
                             }
                         )
 
+                    elif op == "RESET_SUITE":
+                        self.oom_count = 0
+                        gc.collect()
+                        _clear_cuda_cache_if_present()
+                        if bool(cmd.get("reset_alpha", True)):
+                            new_alpha = self.adapter.reset_for_new_suite()
+                        else:
+                            new_alpha = float(self.adapter.resident_alpha())
+                        st = self.adapter.memory_and_vmm_stats()
+                        self.ack_sink(
+                            {
+                                "cmd_id": cmd_id,
+                                "rank": self.rank,
+                                "status": "ok",
+                                "oom_count": 0,
+                                **st,
+                                **self._telemetry_snapshot(resident_alpha=new_alpha),
+                            }
+                        )
+
                     else:
                         self.ack_sink(
                             {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": f"unknown op: {op}"}

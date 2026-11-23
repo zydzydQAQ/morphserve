@@ -169,6 +169,17 @@ class CPTGModelAdapter(ABC):
     def resident_alpha(self) -> float:
         """Return current `expert_alpha` residency fraction in `[0, 1]`."""
 
+    def reset_for_new_suite(self) -> float:
+        """Reset worker residency to its initial bound alpha before starting an independent benchmark suite."""
+        pol = getattr(self, "policy", None)
+        default_alpha = (
+            float(pol.initial_alphas.get(getattr(self, "rank", 0), 1.0))
+            if hasattr(pol, "initial_alphas")
+            else 1.0
+        )
+        target = float(getattr(self, "_initial_bound_alpha", default_alpha))
+        return self.set_residency_alpha(target)
+
     def available_kv_bytes(self, *, for_dit: bool = False) -> int:
         """Return current free + drop-clean reclaimable GPU KV capacity in bytes on this worker."""
         return 0

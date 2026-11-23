@@ -161,6 +161,7 @@ class MorphServeClusterEngine:
         self._ar_drained_events: list[asyncio.Event] = []
         self._active_dit_ranks: dict[int, int] = {}
         self._active_preemptions: dict[int, int] = {}
+        self._suites_completed = 0
         self._started = False
         self.host_shmem_delta_gib = 0.0
 
@@ -1214,11 +1215,38 @@ class MorphServeClusterEngine:
         self._xfer_locks = [asyncio.Lock() for _ in range(n_gpus)]
         self._dst_staging_sems = [asyncio.Semaphore(1) for _ in range(n_gpus)]
         self._inflight_ar_on_gpu = {g: 0 for g in range(n_gpus)}
+        self._active_dit_ranks = {g: 0 for g in range(n_gpus)}
+        self._active_preemptions = {g: 0 for g in range(n_gpus)}
         self._ar_drained_events = []
         for _ in range(n_gpus):
             ev = asyncio.Event()
             ev.set()
             self._ar_drained_events.append(ev)
+
+        # Reset analytical H2D timeline (`now_rel_ms` restarts at 0.0 per suite) and clean reused workers!
+        self.router.pacer.reset_analytical_slots()
+        if self.pacer is not None and self.pacer is not self.router.pacer:
+            self.pacer.reset_analytical_slots()
+        if self._suites_completed > 0:
+            reset_acks = await asyncio.gather(
+                *(self._rpc(g, {"op": "RESET_SUITE", "reset_alpha": True}) for g in range(n_gpus))
+            )
+            free_est = 22 * GIB if self.policy.use_tripool_vmm else 10 * GIB
+            alphas = {
+                g: float(reset_acks[g].get("resident_alpha", self.policy.initial_alphas.get(g, 1.0)))
+                for g in range(n_gpus)
+            }
+            kv_frees = {
+                g: int(reset_acks[g].get("kv_free_bytes", free_est))
+                for g in range(n_gpus)
+            }
+            self.worker_states = self.router.init_workers(
+                num_gpus=n_gpus,
+                role_of=self.policy.role_of,
+                initial_alphas=alphas,
+                kv_free_bytes=kv_frees,
+            )
+        self._suites_completed += 1
 
         if save_outputs_dir is not None:
             save_outputs_dir.mkdir(parents=True, exist_ok=True)

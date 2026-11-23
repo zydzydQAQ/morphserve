@@ -220,6 +220,7 @@ int ms_pacer_max_concurrent(const ms_pacer_t* p);
 int ms_pacer_group_of(const ms_pacer_t* p, int gpu_id);
 double ms_pacer_predicted_wait_ms(const ms_pacer_t* p, int gpu_id, double now_ms);
 double ms_pacer_reserve_slot(ms_pacer_t* p, int gpu_id, double duration_ms, double now_ms);
+void ms_pacer_reset_slots(ms_pacer_t* p);
 void ms_pacer_acquire_thread(ms_pacer_t* p, int gpu_id);
 void ms_pacer_release_thread(ms_pacer_t* p, int gpu_id);
 int ms_pacer_acquire_process_flock(ms_pacer_t* p, int gpu_id, int* out_group_id);

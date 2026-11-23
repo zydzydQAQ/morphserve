@@ -87,14 +87,15 @@ wait "${PID_SIM}"
 wait "${PID_PROBE}"
 
 # Stage Python data plane (`python/morphserve/`) + compatibility `src -> python` symlink
-rm -rf "${INSTALL_TMP}/python" "${INSTALL_TMP}/src"
+rm -rf "${INSTALL_TMP}/python" "${INSTALL_TMP}/src" "${INSTALL_TMP}/cpp_src"
 cp -R "${SRC_DIR}/python" "${INSTALL_TMP}/python"
 find "${INSTALL_TMP}/python" -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
 find "${INSTALL_TMP}/python" \( -name "*.pyc" -o -name "*.pyo" \) -delete 2>/dev/null || true
 ln -sfn "python" "${INSTALL_TMP}/src"
+cp -R "${SRC_DIR}/src" "${INSTALL_TMP}/cpp_src"
 
-# Stage tests, deploy scripts, docs, configs, and Phase-0/1 empirical JSON results (excluding raw logs/traces)
-for sub in configs docs deploy tests; do
+# Stage C++17 headers/entrypoints, tests, deploy scripts, docs, and configs
+for sub in include cmd configs docs deploy tests; do
   if [ -d "${SRC_DIR}/${sub}" ]; then
     rm -rf "${INSTALL_TMP}/${sub}"
     cp -R "${SRC_DIR}/${sub}" "${INSTALL_TMP}/${sub}"
@@ -103,7 +104,7 @@ for sub in configs docs deploy tests; do
 done
 chmod +x "${INSTALL_TMP}"/deploy/kairos/scripts/*.sh 2>/dev/null || true
 
-for top_doc in README.md pyproject.toml GLOSSARY.md; do
+for top_doc in CMakeLists.txt README.md pyproject.toml GLOSSARY.md; do
   if [ -f "${SRC_DIR}/${top_doc}" ]; then
     cp -f "${SRC_DIR}/${top_doc}" "${INSTALL_TMP}/${top_doc}"
   fi

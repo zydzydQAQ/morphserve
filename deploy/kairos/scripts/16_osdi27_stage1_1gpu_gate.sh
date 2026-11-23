@@ -195,12 +195,17 @@ for entry in "${BUILD}"/*; do
   [ -e "${entry}" ] || continue
   bname="$(basename "${entry}")"
   case "${bname}" in
-    tests|data|build) continue ;;
+    tests|data|build|src|cpp_src) continue ;;
   esac
   ln -sfn "${entry}" "${PYTEST_WS}/${bname}"
 done
+if [ -d "${SRC_STAGE}/src" ]; then
+  ln -sfn "${SRC_STAGE}/src" "${PYTEST_WS}/src"
+elif [ -d "${BUILD}/cpp_src" ]; then
+  ln -sfn "${BUILD}/cpp_src" "${PYTEST_WS}/src"
+fi
 if [ -d "${SRC_STAGE}" ]; then
-  for extra in deploy results README.md pyproject.toml GLOSSARY.md; do
+  for extra in include cmd CMakeLists.txt deploy results README.md pyproject.toml GLOSSARY.md; do
     if [ ! -e "${PYTEST_WS}/${extra}" ] && [ -e "${SRC_STAGE}/${extra}" ]; then
       ln -sfn "${SRC_STAGE}/${extra}" "${PYTEST_WS}/${extra}"
     fi
@@ -223,8 +228,8 @@ if python3 -c "import pytest" >/dev/null 2>&1; then
     "${PYTEST_WS}/tests" 2>&1 | tee "${RUN_DIR}/pytest-a100.txt"
 else
   echo "== [Stage 1 / Step c] pytest not installed; falling back to python3 -m unittest discover"
-  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${PYTEST_WS}/python:${PYTEST_WS}/src${PYTHONPATH:+:$PYTHONPATH}" \
-    python3 -m unittest discover -s "${PYTEST_WS}/tests" -p "test_*.py" -v \
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="${PYTEST_WS}/python${PYTHONPATH:+:$PYTHONPATH}" \
+    python3 -m unittest discover -s "${PYTEST_WS}/tests/python" -p "test_*.py" -v \
     2>&1 | tee "${RUN_DIR}/pytest-a100.txt"
 fi
 

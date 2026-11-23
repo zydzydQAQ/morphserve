@@ -90,5 +90,6 @@ for topfile in README.md pyproject.toml GLOSSARY.md; do
     cp "$SRC_DIR/$topfile" "$INSTALL_TMP/$topfile"
   fi
 done
+chmod +x "$INSTALL_TMP"/csrc/vmm_tripool/*.sh "$INSTALL_TMP"/deploy/kairos/scripts/*.sh 2>/dev/null || true
 
 echo "== build complete: $(cat "$INSTALL_TMP/VMM_BUILD_STATUS.json")"

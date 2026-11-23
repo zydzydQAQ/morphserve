@@ -155,28 +155,26 @@ def resolve_evaluator_model_dir(
     candidates: list[Path] = []
     if explicit_dir is not None:
         candidates.append(Path(explicit_dir))
-    env_specific = os.environ.get(env_key, "").strip()
-    if env_specific:
-        candidates.append(Path(env_specific))
-    env_root = os.environ.get("MORPHSERVE_EVAL_MODELS_DIR", "").strip()
-    if env_root:
-        candidates.append(Path(env_root) / basename)
 
     local_tmp = os.environ.get("MORPHSERVE_LOCAL_TMP", "").strip()
     if staging_root is not None:
         eff_staging = Path(staging_root)
-    elif local_tmp:
-        eff_staging = Path(local_tmp) / "eval_models"
+        candidates.append(eff_staging / basename)
     else:
-        eff_staging = Path("/tmp/morphserve_eval_models")
-
-    candidates.extend(
-        (
-            Path("/shared/data/MORPHSERVE/eval_models") / basename,
-            Path("/shared/data/MORPHSERVE/models") / basename,
-            eff_staging / basename,
+        env_specific = os.environ.get(env_key, "").strip()
+        if env_specific:
+            candidates.append(Path(env_specific))
+        env_root = os.environ.get("MORPHSERVE_EVAL_MODELS_DIR", "").strip()
+        if env_root:
+            candidates.append(Path(env_root) / basename)
+        eff_staging = Path(local_tmp) / "eval_models" if local_tmp else Path("/tmp/morphserve_eval_models")
+        candidates.extend(
+            (
+                Path("/shared/data/MORPHSERVE/eval_models") / basename,
+                Path("/shared/data/MORPHSERVE/models") / basename,
+                eff_staging / basename,
+            )
         )
-    )
     for cand in candidates:
         if _has_evaluator_weights(cand):
             return cand

@@ -1073,7 +1073,23 @@ class TriPoolVMM(_VmmKvSwapMixin):
         try:
             with _TORCH.cuda.use_mem_pool(pool):
                 pooled_out = fn(*args, **kwargs)
-            safe_out = _clone_outputs(pooled_out)
+            try:
+                safe_out = _clone_outputs(pooled_out)
+            except BaseException:
+                _TORCH.cuda.empty_cache()
+                safe_out = _clone_outputs(pooled_out)
+        except BaseException as exc:
+            pooled_out = None
+            try:
+                import gc
+                import traceback
+
+                if exc.__traceback__ is not None:
+                    traceback.clear_frames(exc.__traceback__)
+                gc.collect()
+            except Exception:
+                pass
+            raise
         finally:
             pooled_out = None
             del pool

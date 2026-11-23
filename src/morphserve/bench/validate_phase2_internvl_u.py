@@ -139,7 +139,7 @@ def compute_internvlu_memory_quota_overrides(
 
     if policy_name == "morphserve":
         super_handle_mib = 16
-        super_pool_mib = 4800
+        super_pool_mib = 4352
         fine_kv_pool_mib = 32
         vmm_pool_mib = float(super_pool_mib + fine_kv_pool_mib)
         runtime_pytorch_budget_mib = max(0.0, quota_mib - vmm_pool_mib)

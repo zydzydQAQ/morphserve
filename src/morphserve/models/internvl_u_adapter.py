@@ -105,7 +105,7 @@ def compute_internvlu_memory_plan(
             raw_quota_mib = min(raw_quota_mib, 12_288.0)
 
     if raw_quota_mib is not None:
-        ctx_headroom_mib = 256.0
+        ctx_headroom_mib = 128.0
         usable_quota_mib = max(float(handle_mib * 2), raw_quota_mib - ctx_headroom_mib)
         fine_mib = min(max(0, (int(policy_fine_kv_pool_mib) // 2) * 2), 64)
         min_super_mib = max(handle_mib, aligned_mirror_mib)
@@ -1082,8 +1082,12 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                         ).images
                     # Run QwenImage VAE decode OUTSIDE `generation_mode` so decoder blocks are unpinned
                     # under 12 GiB quota while staying 100% resident under ample 40/80 GB `super_pool`!
-                    imgs_t = self.pipe.image_pipeline.latents_to_pixels(latents_out.to(torch.bfloat16))
+                    lat_bf16 = latents_out.to(torch.bfloat16)
                     del latents_out
+                    if self._quota_constrained:
+                        torch.cuda.empty_cache()
+                    imgs_t = self.pipe.image_pipeline.latents_to_pixels(lat_bf16)
+                    del lat_bf16
                 else:
                     imgs_t = self.pipe.image_pipeline(
                         **diff_inp,

@@ -415,7 +415,7 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         )
         assert ov["super_handle_mib"] == 16
         assert ov["allow_vmm_overflow"] is False
-        assert ov["super_pool_mib"] + ov["fine_kv_pool_mib"] == 4832
+        assert ov["super_pool_mib"] + ov["fine_kv_pool_mib"] == 4384
         assert budget["runtime_combined_budget_mib"] == 12_288.0
         assert abs(ov["gpu_memory_fraction"] - 0.3) < 1e-6
 
@@ -436,7 +436,7 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             total_dev_mib=40_960.0,
             free_dev_mib=35_000.0,
             base_pytorch_alloc_mib=5_474.0,
-            mirror_bytes=4_480 * (1024**2),
+            mirror_bytes=4_160 * (1024**2),
             policy_super_pool_mib=pol.super_pool_mib,
             policy_fine_kv_pool_mib=pol.fine_kv_pool_mib,
             super_handle_mib=pol.super_handle_mib,
@@ -445,27 +445,27 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         )
         assert plan["quota_constrained"] is True
         assert plan["allow_overflow"] is False
-        assert plan["vmm_physical_pool_mib"] == 4832
+        assert plan["vmm_physical_pool_mib"] == 4384
         assert plan["pytorch_cap_mib"] + plan["vmm_physical_pool_mib"] <= 12_288.0
 
         # Explicit decomposed (`pytorch_peak_reserved_mib` + `vmm_physical_pool_mib`) audit
         ok_audit = verify_internvlu_memory_quota(
-            {"pytorch_peak_reserved_mib": 6_900.0, "vmm_physical_pool_mib": 4_832.0, "vmm_overflow_creates": 0},
+            {"pytorch_peak_reserved_mib": 6_900.0, "vmm_physical_pool_mib": 4_384.0, "vmm_overflow_creates": 0},
             pol,
             constrained_gib=12.0,
         )
         assert ok_audit["within_quota"] is True
-        assert ok_audit["combined_physical_mib"] == 11_732.0
+        assert ok_audit["combined_physical_mib"] == 11_284.0
 
         # Combined `ClusterRunReport.peak_gpu_reserved_mib` audit (no double-counting of VMM pool!)
         rep_audit = verify_internvlu_memory_quota(
-            {"peak_gpu_reserved_mib": 11_732.0, "vmm_overflow_creates": 0},
+            {"peak_gpu_reserved_mib": 11_284.0, "vmm_overflow_creates": 0},
             pol,
             constrained_gib=12.0,
         )
         assert rep_audit["within_quota"] is True
         assert rep_audit["pytorch_peak_reserved_mib"] == 6_900.0
-        assert rep_audit["combined_physical_mib"] == 11_732.0
+        assert rep_audit["combined_physical_mib"] == 11_284.0
 
         over_audit = verify_internvlu_memory_quota(
             {"pytorch_peak_reserved_mib": 7_800.0, "vmm_physical_pool_mib": 4_832.0, "vmm_overflow_creates": 0},

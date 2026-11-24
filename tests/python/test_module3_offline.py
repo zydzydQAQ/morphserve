@@ -25,6 +25,7 @@ from morphserve.kernels.gpu_loopback import (  # noqa: E402
     _extract_target_hw,
     pil_bicubic_resize_gpu,
     pil_bicubic_resize_np,
+    tv_bicubic_u8_resize_gpu,
 )
 
 
@@ -172,6 +173,30 @@ class TestModule3Offline(unittest.TestCase):
             gpu_out = pil_bicubic_resize_gpu(gpu_in, dst_hw[0], dst_hw[1]).cpu().numpy().astype(np.int16).transpose(1, 2, 0)
             max_diff = int(np.abs(gpu_out - pil_out).max())
             self.assertEqual(max_diff, 0, msg=f"src={src_hw} dst={dst_hw} max_diff={max_diff}")
+
+    def test_tv_bicubic_u8_resize_and_vae_norm_bit_exact_to_cpu_torchvision(self) -> None:
+        try:
+            import numpy as np
+            import torch
+            from torchvision.transforms import InterpolationMode
+            from torchvision.transforms.v2 import functional as F_v2
+        except ImportError:
+            self.skipTest("torch/torchvision not available in offline WSL environment")
+
+        # 1. Exact 0-ULP VAE normalization across all 256 uint8 values
+        u = torch.arange(256, dtype=torch.uint8)
+        cpu_vae = u.float() / 127.5 - 1.0
+        gpu_vae = (u.to(torch.float64) / 127.5).to(torch.float32) - 1.0
+        self.assertTrue(torch.equal(cpu_vae, gpu_vae))
+
+        # 2. Exact 0-pixel-diff `UpSampleKernel.cpp` `int16_t` bicubic antialias resize across upsample & downsample
+        rng = np.random.default_rng(2027)
+        for src_hw in ((512, 512), (1024, 1024), (512, 768), (2048, 2048)):
+            arr = rng.integers(0, 256, size=(3, src_hw[0], src_hw[1]), dtype=np.uint8)
+            t_in = torch.from_numpy(arr)
+            ref = F_v2.resize(t_in, [980, 980], interpolation=InterpolationMode.BICUBIC, antialias=True)
+            cand = tv_bicubic_u8_resize_gpu(t_in, 980, 980)
+            self.assertTrue(torch.equal(ref, cand), msg=f"src={src_hw} nz={int((ref != cand).sum().item())}")
 
     def test_flash_prefix_split_arithmetic_intensity_gate(self) -> None:
         self.assertTrue(should_use_flash_prefix_split(1026, 2048, 2))

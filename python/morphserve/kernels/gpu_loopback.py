@@ -265,6 +265,18 @@ def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
     import torch.nn.functional as F
 
     device = img_u8.device
+    is_tv_fast = callable(image_processor) and any(
+        cls.__name__ in ("TorchvisionBackend", "BaseImageProcessorFast")
+        for cls in type(image_processor).__mro__
+    )
+    if is_tv_fast:
+        try:
+            out = image_processor(images=img_u8, return_tensors="pt", input_data_format="channels_first")
+        except TypeError:
+            out = image_processor(images=img_u8, return_tensors="pt")
+        pv = out.pixel_values[0] if hasattr(out, "pixel_values") else out["pixel_values"][0]
+        return pv.to(device=device, dtype=torch.float32)
+
     x = img_u8.to(torch.float32)  # [3, H, W] in [0, 255]
 
     cfg = image_processor.to_dict() if hasattr(image_processor, "to_dict") else {}
@@ -290,7 +302,7 @@ def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
     do_rescale = bool(cfg.get("do_rescale", getattr(image_processor, "do_rescale", True)))
     if do_rescale:
         rescale_factor = float(cfg.get("rescale_factor", getattr(image_processor, "rescale_factor", 1.0 / 255.0)))
-        x = x * rescale_factor
+        x = (x.to(torch.float64) * rescale_factor).to(torch.float32)
 
     do_normalize = bool(cfg.get("do_normalize", getattr(image_processor, "do_normalize", True)))
     if do_normalize:
@@ -405,11 +417,8 @@ class GpuInPlaceLoopback:
         """Inject a GPU `[3, H, W]` uint8 image into `ctx['past_key_values']` via VAE + ViT, zero CPU round-trip."""
         import torch
 
-        with torch.inference_mode(), torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.dtype,
-        ):
+        ac_enabled = self.device.type != "cpu"
+        with torch.inference_mode():
             if update_vae:
                 vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
                 torch.manual_seed(vae_seed)
@@ -418,9 +427,10 @@ class GpuInPlaceLoopback:
                 vae_inp, new_lens, new_rope = prepare_vae_images_gpu(
                     self.bagel, [img_u8], ctx["kv_lens"], ctx["ropes"], self.new_token_ids
                 )
-                ctx["past_key_values"] = self.bagel.forward_cache_update_vae(
-                    self.vae, ctx["past_key_values"], **vae_inp
-                )
+                with torch.autocast(device_type=self.device.type, enabled=ac_enabled, dtype=self.dtype):
+                    ctx["past_key_values"] = self.bagel.forward_cache_update_vae(
+                        self.vae, ctx["past_key_values"], **vae_inp
+                    )
                 ctx["kv_lens"] = new_lens
                 ctx["ropes"] = new_rope
 
@@ -433,9 +443,10 @@ class GpuInPlaceLoopback:
                     ctx["ropes"],
                     self.new_token_ids,
                 )
-                ctx["past_key_values"] = self.bagel.forward_cache_update_vit(
-                    ctx["past_key_values"], **vit_inp
-                )
+                with torch.autocast(device_type=self.device.type, enabled=ac_enabled, dtype=self.dtype):
+                    ctx["past_key_values"] = self.bagel.forward_cache_update_vit(
+                        ctx["past_key_values"], **vit_inp
+                    )
                 ctx["kv_lens"] = new_lens
                 ctx["ropes"] = new_rope
         return ctx

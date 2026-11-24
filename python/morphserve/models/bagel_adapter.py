@@ -953,7 +953,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self.pipeline,
                 mode=self.policy.preemption_mode,
                 tpot_slo_ms=self.policy.ar_tpot_slo_ms,
-                guard_ms=14.0,
+                guard_ms=24.0,
                 init_layer_ms=10.5,
                 init_ar_step_ms=66.0,
                 pager=self.pager,
@@ -988,7 +988,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self._calibrated_ar_step_ms = max(5.0, min(66.0, float(tpots[-1])))
                 if self.sched is not None:
                     self.sched.ema_ar_step_ms = self._calibrated_ar_step_ms
-                    self.sched.guard_ms = 6.0
+                    self.sched.guard_ms = 24.0
                     self.sched.last_effective_chunk_layers = self.sched.compute_adaptive_chunk_layers()
             self.release_context("__warm_ar__")
 
@@ -1555,6 +1555,10 @@ class BagelCPTGAdapter(CPTGModelAdapter):
             def _poll_external_ar(now_s: float) -> list[ArDecodeTask]:
                 if poll_preempt_cmds is None:
                     return []
+                # Never run a new request's image/text prefill while an existing `ArDecodeTask`
+                # is mid-decode with a live inter-token TPOT clock ticking!
+                if self.sched is not None and self.sched.active_ar_tasks:
+                    return []
                 tasks: list[ArDecodeTask] = []
                 for ar_msg in poll_preempt_cmds():
                     ar_cid = str(ar_msg["ctx_id"])
@@ -1701,6 +1705,15 @@ class BagelCPTGAdapter(CPTGModelAdapter):
 
                         if self.sched is not None and self.sched._layer_calibrated:
                             self._calibrated_layer_ms_by_hw[hw_key] = float(self.sched.ema_layer_ms)
+
+                        # Drain any in-flight preempted AR tasks BEFORE FLUX `vae.decode` (65-280ms)
+                        # so `vae.decode` never stalls an active AR stream's inter-token TPOT!
+                        if self.sched is not None and emit_preempt_ack is not None:
+                            _flush_completed_ar()
+                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                self.sched.drain_remaining_ar_tasks()
+                            _flush_completed_ar()
+                            self.sched.external_arrival_poll = None
 
                         # Drop dead per-turn CFG branch caches immediately after denoising completes so
                         # think-time residency and multi-turn return shipping hold only live `main_ctx`!

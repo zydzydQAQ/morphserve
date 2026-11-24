@@ -43,6 +43,7 @@ def is_oom_exception(exc: BaseException) -> bool:
         or "cublas_status_alloc_failed" in low
         or "cudnn_status_alloc_failed" in low
         or "ms_vmm_expert_load_layers_sync failed" in low
+        or "ms_vmm_expert_wait_layer" in low
         or "exhausted: need" in low
         or "pool exhausted" in low
         or 'torch_call_dispatcher( "aten::new_empty"' in msg

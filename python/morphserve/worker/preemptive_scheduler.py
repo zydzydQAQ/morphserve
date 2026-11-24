@@ -412,9 +412,10 @@ class UnifiedPreemptiveScheduler:
             self._queued_gpu_ms = 0.0
             return
 
-        self._queued_gpu_ms += self.ema_layer_ms
+        eff_layer_ms = max(self.ema_layer_ms, 24.0) if self._step0_h2d_streaming else self.ema_layer_ms
+        self._queued_gpu_ms += eff_layer_ms
         est_gpu_s = max(time.perf_counter(), self._last_sync_s + self._queued_gpu_ms / 1000.0)
-        if self._should_yield_now(est_gpu_s, next_unit_ms=self.ema_layer_ms):
+        if self._should_yield_now(est_gpu_s, next_unit_ms=eff_layer_ms):
             _sync_cuda_if_present(dev)
             real_now = time.perf_counter()
             self._last_sync_s = real_now

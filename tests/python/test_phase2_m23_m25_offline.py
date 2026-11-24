@@ -784,6 +784,7 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             "RuntimeError: cudaErrorMemoryAllocation: out of memory",
             "RuntimeError: memory allocation failed",
             'RuntimeError: torch_call_dispatcher( "aten::resize_" ) failed',
+            "RuntimeError: ms_vmm_expert_wait_layer(0, 25) failed (rc=-3)",
         ):
             assert is_oom_exception(RuntimeError(oom_msg)) is True
         assert is_oom_exception(RuntimeError("CUDA error: an illegal memory access was encountered")) is False
@@ -944,6 +945,42 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert all(p_cache.value_cache[l].shape[0] == 23655 for l in range(28))
         _truncate_bagel_cache(p_cache, 0)
         assert all(p_cache.key_cache[l] is None for l in range(28))
+
+        # 6. `_vit_preprocess_u8_gpu` delegates directly to `TorchvisionBackend` fast processors
+        import types
+        from morphserve.kernels.gpu_loopback import _vit_preprocess_u8_gpu
+
+        class TorchvisionBackend:
+            pass
+
+        class _FakeSiglipFast(TorchvisionBackend):
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def __call__(self, *, images, return_tensors="pt", input_data_format="channels_first"):
+                self.calls.append(f"{return_tensors}:{input_data_format}")
+                return types.SimpleNamespace(pixel_values=[images])
+
+        class _FakeGpuU8:
+            device = "cuda:0"
+
+            def to(self, *, device=None, dtype=None):
+                return ("tv_fast_exact", device, dtype)
+
+        fake_torch_mod = types.ModuleType("torch")
+        fake_torch_mod.float32 = "f32"  # type: ignore[attr-defined]
+        fake_nn_mod = types.ModuleType("torch.nn")
+        fake_f_mod = types.ModuleType("torch.nn.functional")
+        fake_nn_mod.functional = fake_f_mod  # type: ignore[attr-defined]
+        fake_torch_mod.nn = fake_nn_mod  # type: ignore[attr-defined]
+        with mock.patch.dict(
+            sys.modules,
+            {"torch": fake_torch_mod, "torch.nn": fake_nn_mod, "torch.nn.functional": fake_f_mod},
+        ):
+            fast_proc = _FakeSiglipFast()
+            out_tv = _vit_preprocess_u8_gpu(_FakeGpuU8(), fast_proc)
+        assert fast_proc.calls == ["pt:channels_first"]
+        assert out_tv == ("tv_fast_exact", "cuda:0", "f32")
 
 
 if __name__ == "__main__":

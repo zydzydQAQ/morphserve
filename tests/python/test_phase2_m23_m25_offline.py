@@ -1107,9 +1107,18 @@ class TestPhase2M23M25Offline(unittest.TestCase):
 
     def test_cross_node_clock_skew_immunity_pager_fastpath_and_cascade_default(self) -> None:
         """Verify D6 clock-skew immunity, LayerExpertPager all-resident fast-path, and Cascade-CFG E2E default."""
+        import time
+
         from morphserve.engine.worker_runtime import WorkerRuntime
         from morphserve.models.base import SyntheticCPTGAdapter
-        from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, LayerPackPlan, NumaMemfdMirror, ParamSlice
+        from morphserve.vmm import (
+            ExpertPartitionSpec,
+            LayerExpertPager,
+            LayerPackPlan,
+            NumaMemfdMirror,
+            ParamSlice,
+            SimulatedTriPoolBackend,
+        )
 
         # 1. WorkerRuntime stamps local `_worker_recv_s`, completely ignoring a skewed cross-node `enqueue_time_s`!
         pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1)

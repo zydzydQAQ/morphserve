@@ -314,8 +314,10 @@ int DualPathMorphRouter::select_initial_gpu(
         }
         if (!idle.empty()) {
             std::sort(idle.begin(), idle.end(), [&](int a, int b) {
-                return std::make_tuple(pos_mod(a - cur, n), w_map.at(a).expert_alpha) <
-                       std::make_tuple(pos_mod(b - cur, n), w_map.at(b).expert_alpha);
+                const double aa = (routing_mode == "dual_path") ? -w_map.at(a).expert_alpha : w_map.at(a).expert_alpha;
+                const double ab = (routing_mode == "dual_path") ? -w_map.at(b).expert_alpha : w_map.at(b).expert_alpha;
+                return std::make_tuple(aa, pos_mod(a - cur, n)) <
+                       std::make_tuple(ab, pos_mod(b - cur, n));
             });
             const int chosen = idle.front();
             rr_cursor_ = (chosen + 1) % n;

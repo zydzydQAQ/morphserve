@@ -664,6 +664,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         self._kv_host_pinned_bytes: int = 0
         self._vmm_initial_pool_mib: float = 0.0
         self._max_reserved_mib = 0.0
+        self._max_driver_used_mib = 0.0
         self._max_pytorch_reserved_mib = 0.0
         self._calibrated_ar_step_ms: float | None = None
         self._calibrated_layer_ms_by_hw: dict[tuple[int, int], float] = {}
@@ -1013,21 +1014,48 @@ class BagelCPTGAdapter(CPTGModelAdapter):
             if self.pager is not None and self.vmm is not None:
                 self.pager.set_residency_alpha(self.policy.initial_alphas.get(self.rank, 1.0))
 
+        self.reset_peak_memory_stats()
+
+    def reset_peak_memory_stats(self) -> None:
+        import torch
+
         gc.collect()
+        if not torch.cuda.is_available():
+            self._max_pytorch_reserved_mib = 0.0
+            self._max_driver_used_mib = self._vmm_physical_pool_mib()
+            self._max_reserved_mib = self._max_driver_used_mib
+            return
+        torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
         pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB) if int(total_drv) > 0 else (pt_mib + self._vmm_physical_pool_mib())
         self._max_pytorch_reserved_mib = pt_mib
-        self._max_reserved_mib = pt_mib + self._vmm_physical_pool_mib()
+        self._max_driver_used_mib = drv_used_mib
+        self._max_reserved_mib = drv_used_mib
 
     def _update_hwm(self) -> None:
         import torch
 
+        if not torch.cuda.is_available():
+            return
         cur = float(torch.cuda.memory_reserved(self.device) / MIB)
         pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
         pt_peak = max(cur, pk)
         self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
-        self._max_reserved_mib = max(self._max_reserved_mib, pt_peak + self._vmm_physical_pool_mib())
+        # Sample instantaneous driver/NVML physical HBM (`cuMemGetInfo_v2`) so PyTorch allocator peak at t1
+        # and VMM pool size at t2 are NEVER double-counted across timestamps (`<= 40,442.37 MiB` on A100-40GB).
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        if int(total_drv) > 0:
+            drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB)
+            tot_mib = float(int(total_drv) / MIB)
+            inst_comb_mib = min(tot_mib, cur + self._vmm_physical_pool_mib())
+            phys_now = max(drv_used_mib, inst_comb_mib)
+            self._max_driver_used_mib = max(self._max_driver_used_mib, drv_used_mib)
+            self._max_reserved_mib = max(self._max_reserved_mib, phys_now)
+        else:
+            self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
 
     def _load_pil(self, rel_path: str) -> Any:
         from PIL import Image
@@ -1884,6 +1912,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         return {
             "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "combined_physical_mib": round(self._max_reserved_mib, 2),
+            "nvml_peak_used_mib": round(self._max_driver_used_mib if self._max_driver_used_mib > 0.0 else self._max_reserved_mib, 2),
             "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
             "vmm_stats": vmm_st,

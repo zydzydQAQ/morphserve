@@ -2495,6 +2495,35 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
 
     const double full_att_frac =
         static_cast<double>(joint_ok) / static_cast<double>(std::max<size_t>(1, n_sess));
+    const double survival_pct =
+        (n_sess == 0) ? 100.0 : round_1(100.0 * static_cast<double>(n_sess - ooms) / static_cast<double>(n_sess));
+
+    std::vector<double> survivor_dits;
+    for (size_t s = 0; s < n_sess; ++s) {
+        if (sess_oom[s]) continue;
+        for (const auto& [lat, _] : sess_dit_records[s]) {
+            survivor_dits.push_back(lat);
+        }
+    }
+    const size_t total_dit_units = survivor_dits.size() + ooms;
+    const double dit_survival_pct =
+        (total_dit_units == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(survivor_dits.size()) / static_cast<double>(total_dit_units));
+    auto sim_failure_aware_quantile = [](const std::vector<double>& surv, size_t tot, double q_pct) -> nlohmann::json {
+        if (tot == 0 || surv.empty()) return nullptr;
+        const double s_frac = static_cast<double>(surv.size()) / static_cast<double>(tot);
+        const double q_frac = q_pct / 100.0;
+        if (q_frac > s_frac + 1e-9) return nullptr;
+        return percentile_rounded(surv, std::min(100.0, (q_frac / std::max(1e-9, s_frac)) * 100.0));
+    };
+    nlohmann::json dit_cdf_pts = nlohmann::json::array();
+    for (double q_pct : {5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 85.0, 90.0, 95.0, 99.0}) {
+        dit_cdf_pts.push_back({
+            {"p", q_pct},
+            {"ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, q_pct)},
+        });
+    }
 
     return {
         {"policy_name", policy_name},
@@ -2508,6 +2537,8 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"full_trace_goodput_rps", round_4(offered_qps * full_att_frac)},
         {"joint_slo_attainment_pct", round_1(100.0 * att_frac)},
         {"full_trace_attainment_pct", round_1(100.0 * full_att_frac)},
+        {"survival_rate_pct", survival_pct},
+        {"dit_turn_survival_pct", dit_survival_pct},
         {"oom_sessions", ooms},
         {"oom_retries", total_retries},
         {"peak_hbm_mib", round_1(peak_hbm)},
@@ -2518,6 +2549,10 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"ar_ttft_p95_ms", percentile_rounded(ttfts, 95.0)},
         {"ar_tpot_p95_ms", percentile_rounded(tpots, 95.0)},
         {"dit_turn_p95_ms", percentile_rounded(dit_lats, 95.0)},
+        {"all_session_dit_p50_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 50.0)},
+        {"all_session_dit_p90_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 90.0)},
+        {"all_session_dit_p95_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 95.0)},
+        {"dit_cdf_points", dit_cdf_pts},
         {"path_a_ships", ships},
         {"path_b_morphs", morphs},
         {"preempted_ar_count", preemptions},
@@ -2768,6 +2803,44 @@ nlohmann::json ClusterSimulator::run_scale_and_interconnect_sweep(
 
     const auto h100_study = run_h100_80gb_generality_study(ph, bench_root, sources_dir);
 
+    // Full 9-point low-to-saturation `SLO Attainment (%) vs. QPS` curve (`0.05 -> 1.40` RPS) + `@80%/@90%` sustainable QPS.
+    const auto a100_pcie = presets.front();
+    nlohmann::json slo_vs_qps_8gpu = nlohmann::json::object();
+    for (const char* pol : kValidPolicies) {
+        nlohmann::json pts = nlohmann::json::array();
+        std::vector<std::pair<double, double>> full_curve;
+        std::vector<std::pair<double, double>> steady_curve;
+        for (double q : {0.05, 0.10, 0.15, 0.20, 0.25, 0.40, 0.80, 1.10, 1.40}) {
+            const int ns = (q <= 0.10) ? 28 : ((q <= 0.25) ? 48 : 96);
+            auto sr = simulate_cluster_point(
+                pol, 8, a100_pcie, q, ns, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", bench_root, sources_dir);
+            full_curve.emplace_back(q, sr.at("full_trace_attainment_pct").get<double>());
+            steady_curve.emplace_back(q, sr.at("joint_slo_attainment_pct").get<double>());
+            pts.push_back(std::move(sr));
+        }
+        auto interp_qps = [](const std::vector<std::pair<double, double>>& cv, double thr) -> double {
+            double best = 0.0;
+            for (size_t i = 0; i < cv.size(); ++i) {
+                const auto [q_cur, a_cur] = cv[i];
+                if (a_cur >= thr) {
+                    best = std::max(best, q_cur);
+                    if (i + 1 < cv.size() && cv[i + 1].second < thr && a_cur > cv[i + 1].second) {
+                        const double frac = (a_cur - thr) / (a_cur - cv[i + 1].second);
+                        best = std::max(best, q_cur + frac * (cv[i + 1].first - q_cur));
+                    }
+                }
+            }
+            return round_4(best);
+        };
+        slo_vs_qps_8gpu[pol] = {
+            {"max_sustainable_qps_80pct", interp_qps(full_curve, 80.0)},
+            {"max_sustainable_qps_90pct", interp_qps(full_curve, 90.0)},
+            {"steady_max_sustainable_qps_80pct", interp_qps(steady_curve, 80.0)},
+            {"steady_max_sustainable_qps_90pct", interp_qps(steady_curve, 90.0)},
+            {"points", std::move(pts)},
+        };
+    }
+
     std::time_t now_t = std::time(nullptr);
     std::tm gmt = {};
     gmtime_r(&now_t, &gmt);
@@ -2782,6 +2855,7 @@ nlohmann::json ClusterSimulator::run_scale_and_interconnect_sweep(
         {"physics_profile", ph.to_json()},
         {"calibration", val},
         {"interconnect_presets", presets_j},
+        {"slo_attainment_vs_qps_8gpu", slo_vs_qps_8gpu},
         {"scaling_matrix", matrix},
         {"h100_80gb_generality", h100_study},
         {"status", gate_ok ? "ok" : "check_failed"},

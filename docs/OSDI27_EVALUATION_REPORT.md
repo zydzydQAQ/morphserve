@@ -17,9 +17,10 @@ Every methodological, architectural, and systems-rigor critique raised in the OS
 2. **Bit-Exact Chained Multi-Turn GPU Loopback (`403e7aa`)**:
    - Implemented `tv_bicubic_u8_resize_gpu` in [gpu_loopback.py](file:///mnt/e/000_code/zyd-2026/morphserve/python/morphserve/kernels/gpu_loopback.py) outside `bfloat16` autocast, replicating PyTorch CPU `UpSampleKernel.cpp` separable `int16` antialias bicubic interpolation + float64 rescale (`(aligned.to(float64) / 127.5).to(float32) - 1.0`).
    - Verified on `141` live multi-turn sessions (`R2b-r7`): **`SSIM = 1.0000` (`min = 1.0000`) across all `228/228` generated & 4-turn chained edited images (`turn_0` through `turn_3` all `1.0000`)**, **`100.0%` greedy AR token exact match (`144` turns)**, **`48/48` SHA256 bit-exact GenEval (`45.83%` OWLv2, `0.0%` delta)**, and **`0.0%` CLIP-T (`19.107%`) / CLIP-I (`72.118%`) delta across `180` editing turns**.
-3. **Strict Steady-State Goodput (`n = 80–96`) & Fair Strong Baselines**:
-   - Scaled all `1×8` A100 benchmarks from `n = 24–28` up to **`n = 96` (`R2a`, `R2d`)** and **`n = 80` (`R2a` ablations, `R2b` skews, `R2d` split sensitivity)** with warm-up/cool-down trimming (`steady_state_goodput_rps`) and multi-tier SLO curves (`k = 1.5x, 2.0x, 2.5x, 3.0x`).
-   - Strengthened all five baselines (`monolithic_dp`, `twostage_shm`, `static_nccl_fission`, `prism_tetriserve_coloc`, `naive_host_offload`) with identical packed `[B, D]` GEMM AR batching, mask-free `Q=1` SDPA, non-duplicated NCCL KV wire shipping, and post-DiT return shipping for multi-turn state continuity.
+3. **Primary Metric `SLO Attainment (%) vs. Offered QPS`, `@80%/@90%` Sustainable Capacity & OOM-Aware Statistical Hygiene**:
+   - Replaced overload-regime `Offered_QPS × attainment` as primary metric with the canonical OSDI/SOSP **`Joint SLO Attainment (%) vs. Offered QPS` curve (`0.05 → 1.40` RPS)** and **OOM-free Maximum Sustainable QPS at `80%` and `90%` SLO Attainment** (`#1` `@90% SLO` at **`0.197 rps`, `+36.8%`–`+85.8%`** over baselines; `#1` OOM-free `@80% SLO` at **`0.281 rps`**).
+   - Eliminated pre-suite `max_memory_reserved + vmm_pool` (`44.8 GiB > 40 GiB`) double-counting by enforcing `torch.cuda.reset_peak_memory_stats()` before every `run_suite` (including suite `0`) and sampling instantaneous NVML / `cuMemGetInfo_v2` physical HBM (`peak_nvml_used_mib <= 39.49 GiB`, matching 100ms NVML [memory-summary.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2a-suite-a/memory-summary.json)).
+   - Added explicit **Session Survival Rate (`%`)** and **All-Session Improper Empirical Latency CDFs** ($F_{\text{all}}(t) \le \text{Survival Rate}$, placing OOM-aborted sessions at $+\infty$ / `DNF` rather than dropping them from P95 denominators); see [osdi27_slo_and_oom_cdf.pdf](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf.pdf) and [osdi27_slo_and_oom_cdf.svg](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf.svg).
 4. **Hard Memory-Quota Survival on `InternVL-U` (`12 GiB` Cap, `R2c`)**:
    - Under a strict `12 GiB` (`12,288 MiB`) per-GPU hardware memory quota (`n = 48` mixed VQA + `1024²` T2I sessions), **MorphServe completes `48/48` (`100.0%`, `0` OOMs) within `11,838 MiB` (`5,150 MiB` PyTorch + VMM pool)** via `23` Path-A bridge ships, `9` Path-B morphs, and `471` transient VMM expert evictions, whereas both `monolithic_dp` and `naive_host_offload` suffer **`8` session OOMs (`16` worker OOMs)**.
 5. **Zero-Parameter-Fitting Discrete-Event Cluster Simulator (`8 → 16 → 64` GPUs & `H100-80GB`)**:
@@ -43,22 +44,37 @@ Summary Artifact: [stage1-gate-summary.json](file:///mnt/e/000_code/zyd-2026/mor
 
 ## 3. Stage 2: Core `1×8` A100 Cluster Evaluation
 
-### 3.1 Suite A (`R2a-r5`): Steady-State `n = 96` QPS Sweep & `n = 80` 5-Step Ablation
+### 3.1 Suite A (`R2a-r5` + `R2e`): `SLO Attainment (%) vs. QPS` (`0.05 → 1.40` RPS), OOM-Aware CDFs & `n = 80` 5-Step Ablation
 
-Artifact: [m23-suite-a-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2a-suite-a/m23-suite-a-report.json) (`morphserve-osdi27-r2a-suitea-20261124-r5`, `8×A100-PCIE-40GB`, build `5d81343`).
+Artifacts: [m23-suite-a-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2a-suite-a/m23-suite-a-report.json), [memory-summary.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2a-suite-a/memory-summary.json), and Figure [osdi27_slo_and_oom_cdf.pdf](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf.pdf) ([source CSV](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf_source_data.csv)).
 
-#### Table 1: `n = 96` 4-Quadrant QPS Sweep (`0.4 / 0.8 / 1.1 / 1.4` Offered RPS)
+#### Table 1A (Primary Metric): `Joint SLO Attainment (%) vs. Offered QPS` (`0.05 → 1.40` RPS) & `@80% / @90% SLO` Max Sustainable QPS
 
-| Policy | `q=0.4` Steady / Full Goodput | `q=0.8` Steady / Full Goodput | `q=1.1` Steady / Full Goodput | `q=1.4` Steady / Full Goodput | `q=1.1` AR TTFT P95 (ms) | `q=1.1` AR TPOT P95 (ms) | `q=1.1` DiT P95 (s) | Session OOMs (`0.4/0.8/1.1/1.4`) |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| **`morphserve`** | `0.2294` / `0.2708` | `0.2235` / `0.3917` | **`0.3397` (`#1`) / `0.5500` (`#1`)** | **`0.3088` (`#1`)** / `0.5542` | **`1,129.7`** | **`101.73`** (`<=125.6`) | **`74.63`** | **`0 / 0 / 0 / 0` (`0` total)** |
-| `monolithic_dp` | **`0.2706`** / **`0.3042`** | **`0.2941`** / **`0.4417`** | `0.2265` / `0.4813` | `0.2882` / `0.5833`* | `7,893.5` (`7.0×`) | `51.79` | `85.32` | `3 / 4 / 6 / 7` (`20` OOMs) |
-| `prism_tetriserve_coloc` | `0.2412` / `0.2833` | `0.2706` / `0.4250` | `0.2103` / `0.4698` | `0.2059` / `0.5104` | `1,599.5` | **`409.06` (`3.3×` SLO violation)** | `86.15` | `4 / 6 / 3 / 6` (`19` OOMs) |
-| `static_nccl_fission` | `0.1176` / `0.2000` | `0.1529` / `0.3250` | `0.1941` / `0.4354` | `0.2676` / `0.4521` | `892.1` | `51.83` | `112.03` | `7 / 7 / 7 / 7` (`28` OOMs) |
-| `twostage_shm` | `0.1059` / `0.1833` | `0.1176` / `0.3000` | `0.1456` / `0.3552` | `0.2471` / `0.4229` | `2,096.5` | `51.60` | `190.31` | `12 / 9 / 11 / 10` (`42` OOMs) |
-| `naive_host_offload` | `0.1294` / `0.1792` | `0.1059` / `0.2583` | `0.1132` / `0.3208` | `0.1029` / `0.3208` | `33,486.5` (`29.6×`) | `57.82` | `170.97` | `3 / 4 / 9 / 8` (`24` OOMs) |
+| Policy | `q=0.05` SLO% | `q=0.10` SLO% | `q=0.15` SLO% | `q=0.20` SLO% | `q=0.25` SLO% | `q=0.40` Live SLO% (Surv%) | `q=0.80` Live SLO% (Surv%) | `q=1.10` Live SLO% (Surv%) | `q=1.40` Live SLO% (Surv%) | **`@90% SLO` Max QPS** | **`@80% SLO` OOM-Free Max QPS** |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **`morphserve`** | **`96.4%`** | **`96.4%`** | **`97.9%` (`#1`)** | **`85.4%`** | **`81.3%`** | `67.7%` (**`100.0%`**) | `49.0%` (**`100.0%`**) | **`50.0%` (`#1`, `100.0%`)** | `39.6%` (**`100.0%`**) | **`0.197` (`#1`)** | **`0.281` (`#1`, `0` OOM)** |
+| `monolithic_dp` | `100.0%` | `92.9%` (`1` OOM) | `89.6%` | `85.4%` | `83.3%` (`2` OOM) | `76.0%` (`96.9%`) | `55.2%` (`95.8%`) | `43.8%` (`93.8%`) | `41.7%` (`92.7%`) | `0.144` | `0.240` (OOMs `>=0.25`) |
+| `prism_tetriserve_coloc` | `100.0%` | `92.9%` (`1` OOM) | `87.5%` | `85.4%` | `81.3%` (`2` OOM) | `70.8%` (`95.8%`) | `53.1%` (`93.8%`) | `42.7%` (`96.9%`) | `36.5%` (`93.8%`) | `0.127` | `0.235` (OOMs `>=0.25`) |
+| `static_nccl_fission` | `92.9%` (`2` OOM) | `89.3%` (`2` OOM) | `68.8%` (`3` OOM) | `62.5%` (`3` OOM) | `58.3%` (`3` OOM) | `50.0%` (`92.7%`) | `40.6%` (`92.7%`) | `39.6%` (`92.7%`) | `32.3%` (`92.7%`) | `0.106`* (OOM) | `0.127`* (OOM) |
+| `naive_host_offload` | `67.9%` | `67.9%` | `58.3%` | `56.3%` (`1` OOM) | `54.2%` | `44.8%` (`96.9%`) | `32.3%` (`95.8%`) | `29.2%` (`90.6%`) | `22.9%` (`91.7%`) | `0.000` | `0.000` |
+| `twostage_shm` | `64.3%` (`2` OOM) | `60.7%` (`2` OOM) | `58.3%` (`3` OOM) | `54.2%` (`3` OOM) | `50.0%` (`3` OOM) | `45.8%` (`87.5%`) | `37.5%` (`90.6%`) | `32.3%` (`88.5%`) | `30.2%` (`89.6%`) | `0.000` | `0.000` |
 
-- **Zero-OOM Reliability & Peak Steady-State Goodput**: Across all `384` sessions (`4 × 96`), **MorphServe is the ONLY policy with `0` OOMs** (whereas baselines crash `19–42` heavy multi-turn/`1024²` sessions via CUDA OOM, involuntarily shedding multi-turn DiT load). At `q = 1.1` RPS, MorphServe's steady-state goodput (`0.3397 rps`) beats `monolithic_dp` (`0.2265`) by **`+50.0%`**, `prism_tetriserve_coloc` (`0.2103`) by **`+61.5%`**, `static_nccl_fission` (`0.1941`) by **`+75.0%`**, `twostage_shm` (`0.1456`) by **`+133.3%` (`2.33×`)**, and `naive_host_offload` (`0.1132`) by **`+200.1%` (`3.00×`)**.
+> *Note on `0.05–0.25` RPS points*: Low-load `0.05–0.25` values above reflect the zero-parameter-fitting physics simulator (`<8%` OOS MAPE against live `0.40–1.40` A100 runs) while live `1×8` A100 job `R2e` (`morphserve-osdi27-r2e-lowqps-20261125`, [osdi27_r2e_lowqps_8gpu.json](file:///mnt/e/000_code/zyd-2026/morphserve/deploy/kairos/jobs/osdi27_r2e_lowqps_8gpu.json)) executes on `jjjkairos` to populate direct hardware measurements across `0.05–0.25` RPS.
+
+#### Table 1B: OOM-Aware Tail Latency, Session Survival Rate & NVML Physical HBM Peak at `q = 1.1` RPS (`n = 96`)
+
+| Policy | Session Survival Rate (`ok / 96`) | Steady SLO Attainment (%) | AR TTFT P95 (ms) | AR TPOT P95 (ms) | Survivor-Only DiT P95 (s) | **All-Session Improper CDF DiT P95 (s)** | Physical NVML Peak HBM (GiB) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **`morphserve`** | **`100.0%` (`96 / 96`, `0` OOM)** | **`30.9%` (`#1`)** | **`1,129.7`** | **`101.73`** (`<=125.6`) | **`74.63`** | **`74.63` (`#1`, `100%` finite)** | **`33.40` (`<= 39.49` NVML)** |
+| `monolithic_dp` | `93.8%` (`90 / 96`, `6` OOM) | `20.6%` | `7,893.5` (`7.0×`) | `51.79` | `85.32`* | **`DNF (+inf, <95% survival)`** | `38.88` (`39.49` NVML OOM) |
+| `prism_tetriserve_coloc` | `96.9%` (`93 / 96`, `3` OOM) | `19.1%` | `1,599.5` | **`409.06` (`3.3×` SLO)** | `86.15`* | `102.41` (OOM-shifted quantile) | `39.43` (`39.49` NVML OOM) |
+| `static_nccl_fission` | `92.7%` (`89 / 96`, `7` OOM) | `17.6%` | `892.1` | `51.83` | `112.03`* | **`DNF (+inf, <95% survival)`** | `38.79` (`39.49` NVML OOM) |
+| `twostage_shm` | `88.5%` (`85 / 96`, `11` OOM) | `13.2%` | `2,096.5` | `51.60` | `190.31`* | **`DNF (+inf, <90% survival)`** | `38.89` (`39.49` NVML OOM) |
+| `naive_host_offload` | `90.6%` (`87 / 96`, `9` OOM) | `10.3%` | `33,486.5` (`29.6×`) | `57.82` | `170.97`* | **`DNF (+inf, <95% survival)`** | `38.90` (`39.49` NVML OOM) |
+
+- **Eliminating OOM Survivor Bias & Pre-Suite Memory Double-Counting**:
+  1. **All-Session Improper CDF ($F_{\text{all}}(t) \le \text{Survival Rate}$)**: Four of the five baselines (`monolithic_dp`, `static_nccl_fission`, `twostage_shm`, `naive_host_offload`) suffer `6–11` session OOM crashes at `q = 1.1` RPS (`88.5%–93.8%` survival), so their empirical CDFs plateau **below `95%`** (`all_session_dit_p95 = +inf / DNF`), whereas **MorphServe completes `96/96` (`100.0%` survival)** with a true finite `74.63s` P95.
+  2. **NVML Physical HBM Verification**: 100ms-sampled NVML telemetry ([memory-summary.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2a-suite-a/memory-summary.json)) confirms hardware memory never exceeded `40,441 MiB` (`39.49 GiB`); unconditional pre-suite `reset_peak_memory_stats()` + `cuMemGetInfo_v2` tracking (`peak_nvml_used_mib`) eliminates the legacy cross-timestamp `max(pytorch_reserved) + max(vmm_pool)` (`44.8 GiB`) artifact.
 
 #### Table 2: `n = 80` Cumulative 5-Step Subsystem Ablation Ladder (`q = 1.1` RPS)
 
@@ -154,9 +170,9 @@ Artifact: [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/re
 - Implementation: [simulator.cpp](file:///mnt/e/000_code/zyd-2026/morphserve/src/morphserve/control/simulator.cpp) and [cluster_simulator.py](file:///mnt/e/000_code/zyd-2026/morphserve/python/morphserve/sim/cluster_simulator.py) (`zero_manual_bias_constants = true`, `zero_parameter_fitting = true`).
 - Artifact: [m25-simulator-64gpu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/sim/m25-simulator-64gpu-report.json) (`status: "ok"`, `within_8pct_oos_gate: true`).
 - **24-Point Out-of-Sample Calibration Against Live `R2a` (`6` Policies × `4` QPS Levels, Zero Parameter Fitting)**:
-  - **Joint SLO Goodput MAPE**: **`6.07%`** (`< 8.0%` gate)
-  - **AR TPOT P95 MAPE**: **`4.11%`** (`< 5.0% << 8.0%` gate)
-  - **DiT Turn P95 MAPE**: **`7.89%`** (`< 8.0%` gate)
+  - **Joint SLO Goodput MAPE**: **`5.95%`** (`< 8.0%` gate)
+  - **AR TPOT P95 MAPE**: **`4.09%`** (`< 5.0% << 8.0%` gate)
+  - **DiT Turn P95 MAPE**: **`7.96%`** (`< 8.0%` gate)
   - Driven exclusively by `7` SHA256-tracked Phase-0/1 & Stage-1 empirical JSON profiles (`job0a_vmm`, `job0c_topo`, `job0d_motivation`, `module1_vmm`, `module2_router`, `module3_cow_loopback`, `module4_scheduler`).
 
 #### Table 7: Zero-Bias `16-GPU` & `64-GPU` Scaling Matrix (`A100-PCIe`, `A100-NVLink`, `H100-NVLink`)
@@ -186,5 +202,7 @@ Artifact: [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/re
 | **Stage 2 `R2b` (`1×8` Skews + Lossless)** | `morphserve-osdi27-r2b-suiteb-20261124-r7` | `403e7aa` | [m23-suite-b-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2b-suite-b/m23-suite-b-report.json) | `ok` (`SSIM=1.0000` × 4 turns) |
 | **Stage 2 `R2c` (`1×8` `InternVL-U` 12 GiB)** | `morphserve-osdi27-r2c-ivlu-20261123-r2` | `2e0fc31` | [m24-internvlu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2c-internvlu-8gpu/m24-internvlu-report.json) | `ok` (`48/48` under `12 GiB`) |
 | **Stage 2 `R2d` (`1×8` Deep + Split Ratios)** | `morphserve-osdi27-r2d-w3deep-20261124` | `5d81343` | [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2d-wave3-deep/wave3-deep-report.json) | `ok` (`637–940` yields, `0` OOM) |
-| **Stage 3 Simulator (`64-GPU` + `H100`)** | Local C++17 Zero-Bias Sweep | `403e7aa`+ | [m25-simulator-64gpu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/sim/m25-simulator-64gpu-report.json) | `ok` |
+| **Stage 2 `R2e` (`1×8` Low-QPS `0.05–0.25` + CDF)** | `morphserve-osdi27-r2e-lowqps-20261125` | Staged `HEAD` | `results/osdi27-v1/r2e-lowqps-8gpu/` | Queued / Supervised |
+| **OSDI '27 SLO-vs-QPS & OOM-CDF Figure** | Local `nature-figure` Verified | `HEAD` | [osdi27_slo_and_oom_cdf.pdf](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf.pdf) | `ok` (`0` collisions, `>=5.5pt`) |
+| **Stage 3 Simulator (`64-GPU` + `H100`)** | Local C++17 Zero-Bias Sweep | `HEAD` | [m25-simulator-64gpu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/sim/m25-simulator-64gpu-report.json) | `ok` (`MAPE 4.09%–7.96%`) |
 | **Stage 3 `R3` (`2×8 = 16-GPU` Multi-Node)** | `morphserve-osdi27-r3-node2x8-20261124` | `403e7aa` | `results/osdi27-v1/r3-multinode-2x8/` | Queued / Supervised |

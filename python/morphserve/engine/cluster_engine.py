@@ -116,7 +116,22 @@ class ClusterRunReport:
     total_yields: int
     worker_oom_count: int
     oom_retry_count: int
+    peak_nvml_used_mib: float = 0.0
     peak_pytorch_reserved_mib: float = 0.0
+    survival_rate_pct: float = 100.0
+    steady_state_survival_pct: float = 100.0
+    dit_turn_survival_pct: float = 100.0
+    session_e2e_p50_ms: float = 0.0
+    session_e2e_p95_ms: float = 0.0
+    session_e2e_p99_ms: float = 0.0
+    all_session_e2e_p50_ms: float | None = None
+    all_session_e2e_p90_ms: float | None = None
+    all_session_e2e_p95_ms: float | None = None
+    all_session_dit_p50_ms: float | None = None
+    all_session_dit_p90_ms: float | None = None
+    all_session_dit_p95_ms: float | None = None
+    e2e_cdf_points: list[dict[str, Any]] = field(default_factory=list)
+    dit_cdf_points: list[dict[str, Any]] = field(default_factory=list)
     cross_node_ships: int = 0
     max_cross_node_ship_bytes: int = 0
     slo_curve_by_k: dict[str, dict[str, float]] = field(default_factory=dict)
@@ -1227,10 +1242,13 @@ class MorphServeClusterEngine:
         self.router.pacer.reset_analytical_slots()
         if self.pacer is not None and self.pacer is not self.router.pacer:
             self.pacer.reset_analytical_slots()
-        if self._suites_completed > 0:
-            reset_acks = await asyncio.gather(
-                *(self._rpc(g, {"op": "RESET_SUITE", "reset_alpha": True}) for g in range(n_gpus))
-            )
+        # Reset per-suite `reset_peak_memory_stats()` + NVML peak watermark BEFORE every `run_suite`
+        # (including `_suites_completed == 0`) to eliminate pre-suite load/warmup double-counting!
+        should_reset_alpha = self._suites_completed > 0
+        reset_acks = await asyncio.gather(
+            *(self._rpc(g, {"op": "RESET_SUITE", "reset_alpha": should_reset_alpha}) for g in range(n_gpus))
+        )
+        if should_reset_alpha:
             free_est = 22 * GIB if self.policy.use_tripool_vmm else 10 * GIB
             alphas = {
                 g: float(reset_acks[g].get("resident_alpha", self.policy.initial_alphas.get(g, 1.0)))

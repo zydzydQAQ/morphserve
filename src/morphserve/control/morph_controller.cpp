@@ -222,6 +222,7 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     const nlohmann::json& outcomes_array,
     const nlohmann::json& worker_stats_array) {
     double peak_res_mib = 0.0;
+    double peak_nvml_mib = 0.0;
     double peak_pytorch_res_mib = 0.0;
     int worker_ooms = 0;
     int overflow_creates = 0;
@@ -231,12 +232,18 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
 
     if (worker_stats_array.is_array()) {
         for (const auto& st : worker_stats_array) {
+            const double nvml_pk =
+                (st.contains("nvml_peak_used_mib") && st["nvml_peak_used_mib"].is_number())
+                    ? st["nvml_peak_used_mib"].get<double>()
+                    : 0.0;
             const double comb =
-                (st.contains("combined_physical_mib") && st["combined_physical_mib"].is_number())
-                    ? st["combined_physical_mib"].get<double>()
-                    : ((st.contains("peak_reserved_mib") && st["peak_reserved_mib"].is_number())
-                           ? st["peak_reserved_mib"].get<double>()
-                           : 0.0);
+                (nvml_pk > 0.0)
+                    ? nvml_pk
+                    : ((st.contains("combined_physical_mib") && st["combined_physical_mib"].is_number())
+                           ? st["combined_physical_mib"].get<double>()
+                           : ((st.contains("peak_reserved_mib") && st["peak_reserved_mib"].is_number())
+                                  ? st["peak_reserved_mib"].get<double>()
+                                  : 0.0));
             const double pt =
                 (st.contains("pytorch_reserved_mib") && st["pytorch_reserved_mib"].is_number())
                     ? st["pytorch_reserved_mib"].get<double>()
@@ -244,6 +251,7 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
                            ? st["peak_reserved_mib"].get<double>()
                            : 0.0);
             peak_res_mib = std::max(peak_res_mib, comb);
+            peak_nvml_mib = std::max(peak_nvml_mib, (nvml_pk > 0.0) ? nvml_pk : comb);
             peak_pytorch_res_mib = std::max(peak_pytorch_res_mib, pt);
             worker_ooms += st.value("oom_count", 0);
             if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
@@ -265,6 +273,7 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     const size_t n_core = std::max<size_t>(1, core_end - core_begin);
 
     size_t core_joint_cnt = 0;
+    size_t core_ok_cnt = 0;
     size_t ok_cnt = 0;
     size_t oom_cnt = 0;
     size_t err_cnt = 0;
@@ -279,6 +288,7 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     int cross_node_ships = 0;
     int64_t max_xnode_bytes = 0;
 
+    std::vector<double> ok_e2es;
     std::vector<double> all_ttfts;
     std::vector<double> all_tpots;
     std::vector<double> all_dits;
@@ -290,6 +300,10 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         const bool joint_ok = is_ok && o.value("joint_slo_met", false);
         if (is_ok) {
             ++ok_cnt;
+            if (i >= core_begin && i < core_end) ++core_ok_cnt;
+            if (o.contains("e2e_ms") && o["e2e_ms"].is_number()) {
+                ok_e2es.push_back(o["e2e_ms"].get<double>());
+            }
             if (joint_ok) ++joint_cnt;
             if (o.value("ar_slo_met", false)) ++ar_cnt;
             if (o.value("dit_slo_met", false)) ++dit_cnt;
@@ -323,6 +337,43 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         }
     }
 
+    // Improper empirical CDF F_all(t) over ALL submitted requests/turns (OOM/failed mass placed at +inf):
+    // if target quantile `q_pct > survival_pct`, F_all^{-1}(q) = +inf (`nullptr` in JSON).
+    auto failure_aware_quantile = [](const std::vector<double>& survivors, size_t total_units, double q_pct) -> nlohmann::json {
+        if (total_units == 0 || survivors.empty()) {
+            return nullptr;
+        }
+        const double surv_frac = static_cast<double>(survivors.size()) / static_cast<double>(total_units);
+        const double q_frac = q_pct / 100.0;
+        if (q_frac > surv_frac + 1e-9) {
+            return nullptr;
+        }
+        const double eff_survivor_pct = std::min(100.0, (q_frac / std::max(1e-9, surv_frac)) * 100.0);
+        return percentile_rounded(survivors, eff_survivor_pct);
+    };
+
+    auto build_improper_cdf_points = [&](const std::vector<double>& survivors, size_t total_units) -> nlohmann::json {
+        nlohmann::json pts = nlohmann::json::array();
+        for (double q_pct : {5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 85.0, 90.0, 95.0, 99.0}) {
+            pts.push_back({
+                {"p", q_pct},
+                {"ms", failure_aware_quantile(survivors, total_units, q_pct)},
+            });
+        }
+        return pts;
+    };
+
+    const size_t n_failed_sess = oom_cnt + err_cnt;
+    const size_t total_dit_units = all_dits.size() + n_failed_sess;
+    const double survival_rate_pct =
+        (n_outcomes == 0) ? 100.0 : round_1(100.0 * static_cast<double>(ok_cnt) / static_cast<double>(n_tot));
+    const double steady_survival_pct =
+        (n_outcomes == 0) ? 100.0 : round_1(100.0 * static_cast<double>(core_ok_cnt) / static_cast<double>(n_core));
+    const double dit_survival_pct =
+        (total_dit_units == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(all_dits.size()) / static_cast<double>(total_dit_units));
+
     nlohmann::json slo_curve = nlohmann::json::object();
     for (const auto& [k_label, k_val] : std::vector<std::pair<std::string, double>>{
              {"1.5x", 1.5}, {"2.0x", 2.0}, {"2.5x", 2.5}, {"3.0x", 3.0}}) {
@@ -350,6 +401,9 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"completed_sessions", ok_cnt},
         {"oom_sessions", oom_cnt},
         {"error_sessions", err_cnt},
+        {"survival_rate_pct", survival_rate_pct},
+        {"steady_state_survival_pct", steady_survival_pct},
+        {"dit_turn_survival_pct", dit_survival_pct},
         {"joint_slo_goodput_rps", round_4(offered_qps * (static_cast<double>(joint_cnt) / static_cast<double>(n_tot)))},
         {"raw_wall_goodput_rps", round_4(static_cast<double>(joint_cnt) / wall_s)},
         {"steady_state_goodput_rps",
@@ -367,7 +421,19 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"dit_turn_p50_ms", percentile_rounded(all_dits, 50.0)},
         {"dit_turn_p95_ms", percentile_rounded(all_dits, 95.0)},
         {"dit_turn_p99_ms", percentile_rounded(all_dits, 99.0)},
+        {"session_e2e_p50_ms", percentile_rounded(ok_e2es, 50.0)},
+        {"session_e2e_p95_ms", percentile_rounded(ok_e2es, 95.0)},
+        {"session_e2e_p99_ms", percentile_rounded(ok_e2es, 99.0)},
+        {"all_session_e2e_p50_ms", failure_aware_quantile(ok_e2es, n_outcomes, 50.0)},
+        {"all_session_e2e_p90_ms", failure_aware_quantile(ok_e2es, n_outcomes, 90.0)},
+        {"all_session_e2e_p95_ms", failure_aware_quantile(ok_e2es, n_outcomes, 95.0)},
+        {"all_session_dit_p50_ms", failure_aware_quantile(all_dits, total_dit_units, 50.0)},
+        {"all_session_dit_p90_ms", failure_aware_quantile(all_dits, total_dit_units, 90.0)},
+        {"all_session_dit_p95_ms", failure_aware_quantile(all_dits, total_dit_units, 95.0)},
+        {"e2e_cdf_points", build_improper_cdf_points(ok_e2es, n_outcomes)},
+        {"dit_cdf_points", build_improper_cdf_points(all_dits, total_dit_units)},
         {"peak_gpu_reserved_mib", round_2(peak_res_mib)},
+        {"peak_nvml_used_mib", round_2(peak_nvml_mib)},
         {"peak_pytorch_reserved_mib", round_2(peak_pytorch_res_mib)},
         {"host_shmem_delta_gib", host_shmem_delta_gib},
         {"vmm_overflow_creates", overflow_creates},

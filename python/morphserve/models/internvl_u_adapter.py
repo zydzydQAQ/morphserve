@@ -702,16 +702,46 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         }
 
     def warmup(self) -> None:
-        return None
+        self.reset_peak_memory_stats()
+
+    def reset_peak_memory_stats(self) -> None:
+        import torch
+
+        gc.collect()
+        if not torch.cuda.is_available():
+            self._max_pytorch_reserved_mib = 0.0
+            self._max_driver_used_mib = self._vmm_physical_pool_mib()
+            self._max_reserved_mib = self._max_driver_used_mib
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB) if int(total_drv) > 0 else (pt_mib + self._vmm_physical_pool_mib())
+        self._max_pytorch_reserved_mib = pt_mib
+        self._max_driver_used_mib = drv_used_mib
+        self._max_reserved_mib = drv_used_mib
 
     def _update_hwm(self) -> None:
         import torch
 
+        if not torch.cuda.is_available():
+            return
         cur = float(torch.cuda.memory_reserved(self.device) / MIB)
         pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
         pt_peak = max(cur, pk)
         self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
-        self._max_reserved_mib = max(self._max_reserved_mib, pt_peak + self._vmm_physical_pool_mib())
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        if int(total_drv) > 0:
+            drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB)
+            tot_mib = float(int(total_drv) / MIB)
+            inst_comb_mib = min(tot_mib, cur + self._vmm_physical_pool_mib())
+            phys_now = max(drv_used_mib, inst_comb_mib)
+            self._max_driver_used_mib = max(getattr(self, "_max_driver_used_mib", 0.0), drv_used_mib)
+            self._max_reserved_mib = max(self._max_reserved_mib, phys_now)
+        else:
+            self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
 
     def _load_pil_if_any(self, cmd: dict[str, Any]) -> Any:
         from PIL import Image
@@ -1108,9 +1138,12 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             if self.pager is not None:
                 self.pager.set_residency_alpha(0.0)
             self.vlm_pager.set_residency_alpha(float(getattr(self, "_initial_vlm_alpha", 1.0)))
+            self.reset_peak_memory_stats()
             return self.resident_alpha()
         target = float(getattr(self, "_initial_bound_alpha", self.policy.initial_alphas.get(self.rank, 1.0)))
-        return self.set_residency_alpha(target)
+        alpha_now = self.set_residency_alpha(target)
+        self.reset_peak_memory_stats()
+        return alpha_now
 
     def resident_alpha(self) -> float:
         if self.pager is not None and self.vmm is not None:
@@ -1130,6 +1163,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         return {
             "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "combined_physical_mib": round(self._max_reserved_mib, 2),
+            "nvml_peak_used_mib": round(getattr(self, "_max_driver_used_mib", 0.0) or self._max_reserved_mib, 2),
             "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
             "vmm_stats": vmm_st,

@@ -982,6 +982,113 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert fast_proc.calls == ["pt:channels_first"]
         assert out_tv == ("tv_fast_exact", "cuda:0", "f32")
 
+    def test_osdi27_statistical_hygiene_peak_reset_oom_cdf_and_slo_knee(self) -> None:
+        """Verify per-suite `reset_peak_memory_stats`, OOM-aware improper CDFs, and `@80%/@90%` SLO QPS interpolation."""
+        import ctypes
+        import tempfile
+        from morphserve._core import call_json, encode_json, get_core_lib
+        from morphserve.bench.interleaved_bench import InterleavedSession, InterleavedTurn, WorkloadSuite
+        from morphserve.bench.run_phase2_bagel_main import _compute_sustainable_qps_summary
+        from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine
+        from morphserve.engine.multinode_fleet import serialize_policy_config
+        from morphserve.engine.worker_runtime import InProcessWorkerFleet
+        from morphserve.models import SyntheticCPTGAdapter
+
+        # 1. `reset_peak_memory_stats` is invoked before EVERY `run_suite` (including first suite `_suites_completed == 0`)
+        reset_calls: list[int] = []
+
+        class _TrackingAdapter(SyntheticCPTGAdapter):
+            def reset_peak_memory_stats(self) -> None:
+                reset_calls.append(self.rank)
+
+            def memory_and_vmm_stats(self) -> dict[str, object]:
+                base = super().memory_and_vmm_stats()
+                # Even if legacy `combined_physical_mib` were inflated, `nvml_peak_used_mib` governs physical peak!
+                base["combined_physical_mib"] = 44840.0
+                base["nvml_peak_used_mib"] = 25420.0
+                return base
+
+        pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="synthetic")
+        tiny_suite = WorkloadSuite(
+            name="hygiene_smoke",
+            trace_source="unit",
+            base_qps=10.0,
+            sessions=[
+                InterleavedSession(
+                    session_id="hyg_0",
+                    quadrant="multi_image_vqa",
+                    source_dataset="unit",
+                    arrival_offset_s=0.0,
+                    turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="hi", max_ar_tokens=4)],
+                )
+            ],
+        )
+        with tempfile.TemporaryDirectory(dir=_scratch_dir()) as tmp:
+            fleet = InProcessWorkerFleet(pol, adapter_factory=lambda r, p: _TrackingAdapter(rank=r, policy=p))
+            eng = MorphServeClusterEngine(
+                policy=pol,
+                model_dir=Path(tmp),
+                bench_root=Path(tmp),
+                tmp_root=Path(tmp) / "tmp_hyg",
+                fleet=fleet,
+            )
+            try:
+                eng.start()
+                rep1 = eng.run_suite(tiny_suite, target_qps=10.0)
+                assert len(reset_calls) >= 2  # Called across all ranks BEFORE suite 0!
+                assert rep1.peak_nvml_used_mib == 25420.0
+                assert rep1.peak_gpu_reserved_mib == 25420.0  # Eliminates 44.8 GiB double-counting!
+                assert rep1.survival_rate_pct == 100.0
+                assert rep1.all_session_e2e_p95_ms is not None
+            finally:
+                eng.shutdown()
+
+        # 2. Improper all-session CDF places OOM sessions at +inf (`None` when survival < 95%, shifted when >= 95%)
+        L = get_core_lib()
+        pol_json = encode_json(serialize_policy_config(EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=8)))
+        # Case A: 90/100 survive (`survival_rate_pct == 90.0% < 95%`) -> `all_session_e2e_p95_ms` is `None` (`+inf`), P90 is max survivor!
+        outcomes_90 = [
+            {
+                "status": "ok" if i < 90 else "oom",
+                "e2e_ms": float((i + 1) * 1000.0),
+                "ar_ttfts_ms": [200.0],
+                "ar_tpots_ms": [50.0],
+                "dit_turns_ms": [float((i + 1) * 500.0)] if i < 90 else [],
+                "ar_slo_met": True,
+                "dit_slo_met": True,
+                "joint_slo_met": (i < 90),
+            }
+            for i in range(100)
+        ]
+        agg_90 = call_json(
+            L,
+            L.ms_ctrl_aggregate_report_json,
+            pol_json,
+            b"cdf_test_90",
+            ctypes.c_double(0.4),
+            ctypes.c_double(250.0),
+            ctypes.c_double(0.2),
+            encode_json(outcomes_90),
+            encode_json([{"nvml_peak_used_mib": 39810.0, "pytorch_reserved_mib": 39810.0, "oom_count": 10}]),
+        )
+        assert agg_90["survival_rate_pct"] == 90.0
+        assert agg_90["all_session_e2e_p95_ms"] is None
+        assert agg_90["all_session_dit_p95_ms"] is None
+        assert abs(float(agg_90["all_session_e2e_p90_ms"]) - 90000.0) < 1e-3
+
+        # 3. `@80%` and `@90%` SLO linear crossing interpolation on `SLO Attainment (%) vs. QPS`
+        sweep_rows = [
+            {"policy_name": "morphserve", "offered_qps": 0.10, "joint_slo_attainment_pct": 95.0, "steady_state_attainment_pct": 95.0, "total_sessions": 48, "completed_sessions": 48, "oom_sessions": 0, "peak_nvml_used_mib": 34200.0},
+            {"policy_name": "morphserve", "offered_qps": 0.20, "joint_slo_attainment_pct": 85.0, "steady_state_attainment_pct": 85.0, "total_sessions": 48, "completed_sessions": 48, "oom_sessions": 0, "peak_nvml_used_mib": 35100.0},
+            {"policy_name": "morphserve", "offered_qps": 0.40, "joint_slo_attainment_pct": 65.0, "steady_state_attainment_pct": 65.0, "total_sessions": 96, "completed_sessions": 96, "oom_sessions": 0, "peak_nvml_used_mib": 36400.0},
+            {"policy_name": "twostage_shm", "offered_qps": 0.10, "joint_slo_attainment_pct": 62.5, "steady_state_attainment_pct": 58.0, "total_sessions": 48, "completed_sessions": 42, "oom_sessions": 6, "peak_nvml_used_mib": 39800.0},
+        ]
+        s_qps = _compute_sustainable_qps_summary(sweep_rows)
+        assert abs(s_qps["morphserve"]["max_sustainable_qps_90pct"] - 0.15) < 1e-4
+        assert abs(s_qps["morphserve"]["max_sustainable_qps_80pct"] - 0.25) < 1e-4
+        assert s_qps["twostage_shm"]["max_sustainable_qps_80pct"] == 0.0
+        assert s_qps["twostage_shm"]["max_sustainable_qps_90pct"] == 0.0
+
 
 if __name__ == "__main__":
     unittest.main()

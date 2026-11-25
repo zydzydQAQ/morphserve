@@ -835,6 +835,7 @@ class WorkerRuntime:
                             new_alpha = self.adapter.reset_for_new_suite()
                         else:
                             new_alpha = float(self.adapter.resident_alpha())
+                            self.adapter.reset_peak_memory_stats()
                         st = self.adapter.memory_and_vmm_stats()
                         self.ack_sink(
                             {

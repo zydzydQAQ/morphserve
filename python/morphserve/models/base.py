@@ -170,8 +170,12 @@ class CPTGModelAdapter(ABC):
     def resident_alpha(self) -> float:
         """Return current `expert_alpha` residency fraction in `[0, 1]`."""
 
+    def reset_peak_memory_stats(self) -> None:
+        """Reset per-suite CUDA allocator & NVML/driver physical HBM high-water marks before `run_suite`."""
+        return None
+
     def reset_for_new_suite(self) -> float:
-        """Reset worker residency to its initial bound alpha before starting an independent benchmark suite."""
+        """Reset worker residency to its initial bound alpha and clear peak memory stats for a new suite."""
         pol = getattr(self, "policy", None)
         default_alpha = (
             float(pol.initial_alphas.get(getattr(self, "rank", 0), 1.0))
@@ -179,7 +183,9 @@ class CPTGModelAdapter(ABC):
             else 1.0
         )
         target = float(getattr(self, "_initial_bound_alpha", default_alpha))
-        return self.set_residency_alpha(target)
+        alpha_now = self.set_residency_alpha(target)
+        self.reset_peak_memory_stats()
+        return alpha_now
 
     def available_kv_bytes(self, *, for_dit: bool = False) -> int:
         """Return current free + drop-clean reclaimable GPU KV capacity in bytes on this worker."""

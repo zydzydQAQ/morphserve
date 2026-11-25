@@ -9,7 +9,7 @@ kairos_check_shared_storage
 
 MODEL_DIR="${MODELS}/BAGEL-7B-MoT"
 BENCH_DIR="${DATA}/benchmarks/interleaved-bench-v1"
-PREV_SUITE_A="/shared/output/MORPHSERVE/runs/morphserve-osdi27-r2a-suitea-20261124-r5/m23-suite-a-report.json"
+PREV_SUITE_A="${MORPHSERVE_PREV_SUITE_A:-/shared/output/MORPHSERVE/runs/morphserve-osdi27-r2a-suitea-20261124-r5/m23-suite-a-report.json}"
 
 if [ ! -f "${MODEL_DIR}/MODEL_MANIFEST.json" ] || [ ! -f "${BENCH_DIR}/BENCH_MANIFEST.json" ]; then
   echo "error: missing BAGEL-7B-MoT or Interleaved-Bench manifest" >&2

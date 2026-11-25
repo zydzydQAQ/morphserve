@@ -147,10 +147,26 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             "no_m1_tripool_vmm",
         ]
         cfgs = dict(ladder)
+        # Strict single-variable Leave-One-Out checks relative to `full_morphserve`:
         assert cfgs["no_m4_layer_chunk"].preemption_mode == "non_preemptive"
+        assert cfgs["no_m4_layer_chunk"].use_module3_cow_loopback
+        assert cfgs["no_m4_layer_chunk"].routing_mode == "dual_path"
+        assert cfgs["no_m4_layer_chunk"].use_tripool_vmm
+
         assert not cfgs["no_m3_cow_loopback"].use_module3_cow_loopback
+        assert cfgs["no_m3_cow_loopback"].preemption_mode == "layer_chunk"
+        assert cfgs["no_m3_cow_loopback"].routing_mode == "dual_path"
+        assert cfgs["no_m3_cow_loopback"].use_tripool_vmm
+
         assert cfgs["no_m2_dual_path"].routing_mode == "sticky_least_loaded"
+        assert cfgs["no_m2_dual_path"].preemption_mode == "layer_chunk"
+        assert cfgs["no_m2_dual_path"].use_module3_cow_loopback
+        assert cfgs["no_m2_dual_path"].use_tripool_vmm
+
         assert not cfgs["no_m1_tripool_vmm"].use_tripool_vmm
+        assert cfgs["no_m1_tripool_vmm"].preemption_mode == "layer_chunk"
+        assert cfgs["no_m1_tripool_vmm"].use_module3_cow_loopback
+        assert cfgs["no_m1_tripool_vmm"].routing_mode == "dual_path"
 
     def test_exactness_evaluator_mmvet_and_parity(self) -> None:
         assert score_mmvet_answer("The painting is by Vincent van Gogh in 1889.", "van gogh<AND>1889") == 1.0

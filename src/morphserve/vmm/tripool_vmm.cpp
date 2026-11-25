@@ -603,8 +603,12 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
         if (evict_one_thinking_kv_region_locked(stream, exclude_region_id)) {
             continue;
         }
-        if (!cfg_.allow_overflow) {
-            throw std::runtime_error("TriPool physical pool exhausted for KV page (allow_overflow=0)");
+        const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+        const bool over_cap = (cfg_.max_pool_bytes > 0) && ((cur_pool_b + min_gran_) > cfg_.max_pool_bytes);
+        if (!cfg_.allow_overflow || over_cap) {
+            throw std::runtime_error(
+                over_cap ? "TriPool physical pool reached max_pool_bytes cap for KV page"
+                         : "TriPool physical pool exhausted for KV page (allow_overflow=0)");
         }
         free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
         ++fine_pool_total_;
@@ -2177,14 +2181,22 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
     if (!cfg_.allow_overflow) {
         throw std::runtime_error("TriPool super-handle pool exhausted (allow_overflow=0)");
     }
+    const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
     if (!free_fine_handles_.empty()) {
         const size_t deficit = sub_pages_ - free_fine_handles_.size();
+        const uint64_t add_b = static_cast<uint64_t>(deficit) * min_gran_;
+        if (cfg_.max_pool_bytes > 0 && (cur_pool_b + add_b > cfg_.max_pool_bytes)) {
+            throw std::runtime_error("TriPool super-handle pool reached max_pool_bytes cap");
+        }
         for (size_t j = 0; j < deficit; ++j) {
             free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
             ++fine_pool_total_;
             ++overflow_creates_;
         }
         return pop_fine_bundle_locked();
+    }
+    if (cfg_.max_pool_bytes > 0 && (cur_pool_b + super_bytes_ > cfg_.max_pool_bytes)) {
+        throw std::runtime_error("TriPool super-handle pool reached max_pool_bytes cap");
     }
     const uint64_t h = backend_->create_phys_handle(super_bytes_);
     ++super_pool_total_;

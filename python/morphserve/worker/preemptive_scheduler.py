@@ -223,6 +223,8 @@ class UnifiedPreemptiveScheduler:
 
     def _finalize_task_if_done(self, task: ArDecodeTask) -> None:
         if task.finished:
+            if callable(getattr(task.kv_cache, "invalidate_fast_ar", None)):
+                task.kv_cache.invalidate_fast_ar()
             self.completed_ar_tasks.append(task)
             if self.on_task_complete is not None:
                 self.on_task_complete(task)

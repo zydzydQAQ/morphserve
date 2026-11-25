@@ -288,6 +288,21 @@ class BagelExecutionInterceptor:
         sin = sin.squeeze(0)  # [B, head_dim]
 
         updated_caches = list(kv_caches)
+        if do_update:
+            for cache in updated_caches:
+                if (
+                    isinstance(cache, VmmNaiveCache)
+                    and not cache._fast_ar_active
+                    and cache.vmm is not None
+                    and not cache._closed
+                    and not cache._swapped_flag
+                ):
+                    cache.prepare_fast_ar_decode(reserve_tokens=128)
+
+        first_half_d = lm.layers[0].self_attn.head_dim // 2
+        cos_h0 = cos[..., :first_half_d]
+        sin_h0 = sin[..., :first_half_d]
+
         for layer_idx, decoder_layer in enumerate(lm.layers):
             residual = hidden_states
             normed = decoder_layer.input_layernorm(hidden_states)
@@ -303,8 +318,12 @@ class BagelExecutionInterceptor:
             k = attn_mod.k_norm(k.to(torch.float32))
 
             half_d = attn_mod.head_dim // 2
-            cos_h = cos[..., :half_d]
-            sin_h = sin[..., :half_d]
+            if half_d == first_half_d:
+                cos_h = cos_h0
+                sin_h = sin_h0
+            else:
+                cos_h = cos[..., :half_d]
+                sin_h = sin[..., :half_d]
             q = attn_mod.rotary_op(q.to(cos_h.dtype).unsqueeze(0), cos_h, sin_h).squeeze(0)
             k = attn_mod.rotary_op(k.to(cos_h.dtype).unsqueeze(0), cos_h, sin_h).squeeze(0)
 
@@ -316,11 +335,16 @@ class BagelExecutionInterceptor:
             use_gqa = attn_mod.num_heads != attn_mod.num_kv_heads
 
             if batch_size == 1:
-                full_k, full_v, _, used_vmm = append_or_update_kv_cache(
-                    updated_caches[0], layer_idx, k, v, update_past_key_values=do_update
-                )
-                if used_vmm:
+                c0 = updated_caches[0]
+                if do_update and isinstance(c0, VmmNaiveCache) and c0._fast_ar_active:
+                    full_k, full_v = c0.append_ar_token_fast(layer_idx, k, v)
                     self.ar_vmm_inplace_appends += 1
+                else:
+                    full_k, full_v, _, used_vmm = append_or_update_kv_cache(
+                        c0, layer_idx, k, v, update_past_key_values=do_update
+                    )
+                    if used_vmm:
+                        self.ar_vmm_inplace_appends += 1
                 self.ar_q1_fast_attn_calls += 1
                 attn_4d = F.scaled_dot_product_attention(
                     q.unsqueeze(0).permute(0, 2, 1, 3),
@@ -338,11 +362,16 @@ class BagelExecutionInterceptor:
                 for b in range(batch_size):
                     kb = k[b : b + 1]
                     vb = v[b : b + 1]
-                    full_kb, full_vb, _, used_vmm = append_or_update_kv_cache(
-                        updated_caches[b], layer_idx, kb, vb, update_past_key_values=do_update
-                    )
-                    if used_vmm:
+                    cb = updated_caches[b]
+                    if do_update and isinstance(cb, VmmNaiveCache) and cb._fast_ar_active:
+                        full_kb, full_vb = cb.append_ar_token_fast(layer_idx, kb, vb)
                         self.ar_vmm_inplace_appends += 1
+                    else:
+                        full_kb, full_vb, _, used_vmm = append_or_update_kv_cache(
+                            cb, layer_idx, kb, vb, update_past_key_values=do_update
+                        )
+                        if used_vmm:
+                            self.ar_vmm_inplace_appends += 1
                     qb_4d = q[b : b + 1].unsqueeze(0).permute(0, 2, 1, 3)
                     kb_4d = full_kb.unsqueeze(0).permute(0, 2, 1, 3)
                     vb_4d = full_vb.unsqueeze(0).permute(0, 2, 1, 3)

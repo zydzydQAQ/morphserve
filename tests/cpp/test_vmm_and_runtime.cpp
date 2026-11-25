@@ -92,6 +92,47 @@ void test_tripool_vmm_bidirectional_and_session_swap() {
     MS_CHECK(vmm->shutdown() == 0);
 }
 
+void test_tripool_vmm_max_pool_bytes_hard_cap() {
+    morphserve::vmm::TriPoolVMMConfig cfg;
+    cfg.device = 0;
+    cfg.super_pool_mib = 128;   // 2 x 64 MiB
+    cfg.fine_kv_pool_mib = 64;  // 32 x 2 MiB -> 192 MiB initial
+    cfg.super_handle_mib = 64;
+    cfg.transient_va_gib = 1;
+    cfg.kv_va_gib = 1;
+    cfg.allow_overflow = true;
+    cfg.max_pool_bytes = 256 * kMiB;  // Cap overflow at +64 MiB max
+    cfg.simulated = true;
+    cfg.materialize_sim_va = true;
+
+    auto vmm = morphserve::vmm::TriPoolVMM::create(cfg);
+    MS_CHECK(vmm->kv_free_bytes(/*for_dit=*/false) == 256 * kMiB);
+
+    const uint64_t sid = vmm->kv_session_create();
+    const int32_t rid = vmm->kv_region_alloc(384 * kMiB, sid);
+    MS_CHECK(rid >= 0);
+
+    // Growing to 256 MiB succeeds (+64 MiB overflow, hitting max_pool_bytes exactly)
+    MS_CHECK(vmm->kv_region_ensure(rid, 256 * kMiB, nullptr) != 0);
+    UnifiedVmmStatsC st{};
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(st.pool_total_bytes == 256 * kMiB);
+    MS_CHECK(vmm->kv_free_bytes(/*for_dit=*/false) == 0);
+
+    // Growing past 256 MiB must fail cleanly (return VA == 0) instead of exceeding max_pool_bytes!
+    MS_CHECK(vmm->kv_region_ensure(rid, 258 * kMiB, nullptr) == 0);
+
+    // Super-handle transient allocation must also respect max_pool_bytes (return VA == 0)!
+    MS_CHECK(vmm->transient_alloc(64 * kMiB, nullptr) == 0);
+
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(st.pool_total_bytes == 256 * kMiB);
+
+    MS_CHECK(vmm->kv_region_free(rid, nullptr) == 0);
+    vmm->kv_session_destroy(sid);
+    MS_CHECK(vmm->shutdown() == 0);
+}
+
 void test_mirror_pacer_and_transports() {
     const char* msg = "SHARED_MEMFD_CPP_OK";
     auto m0 = morphserve::runtime::NumaMemfdMirror::create(64 * 1024, 0, "cpp_mfd_share", msg, std::strlen(msg));
@@ -152,6 +193,7 @@ void test_mirror_pacer_and_transports() {
 
 int main() {
     test_tripool_vmm_bidirectional_and_session_swap();
+    test_tripool_vmm_max_pool_bytes_hard_cap();
     test_mirror_pacer_and_transports();
     std::cout << "[PASS] test_vmm_and_runtime\n";
     return 0;

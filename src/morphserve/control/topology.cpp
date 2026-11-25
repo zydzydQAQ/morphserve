@@ -992,6 +992,9 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
             const auto& sb = (*m4)["solo_baselines"];
             p.ar_unloaded_tpot_p50_ms = sb.value("unloaded_ar_tpot_p50_ms", p.ar_unloaded_tpot_p50_ms);
             p.ar_unloaded_tpot_p99_ms = sb.value("unloaded_ar_tpot_p99_ms", p.ar_unloaded_tpot_p99_ms);
+            if (sb.contains("vmm_ar_kv_step_overhead_ms") && sb["vmm_ar_kv_step_overhead_ms"].is_number()) {
+                p.vmm_ar_kv_step_overhead_ms = std::max(0.0, sb["vmm_ar_kv_step_overhead_ms"].get<double>());
+            }
             p.dit_512_cfg_step_mean_ms = sb.value("dit_cfg_step_mean_ms", p.dit_512_cfg_step_mean_ms);
             p.dit_512_layer_p50_ms = sb.value("dit_layer_p50_ms", p.dit_512_layer_p50_ms);
         }

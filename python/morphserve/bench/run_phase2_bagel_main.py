@@ -167,24 +167,32 @@ def scale_suite_sessions(suite: WorkloadSuite, target_sessions: int) -> Workload
 
 
 def build_ablation_configs(num_gpus: int = 8) -> list[tuple[str, EnginePolicyConfig]]:
-    """Construct the cumulative 5-step M1-M4 ablation ladder on BAGEL-7B-MoT."""
+    """Construct strict single-variable Leave-One-Out M1-M4 ablations relative to `full_morphserve`."""
     base_ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=num_gpus)
     no_m4 = replace(base_ms, policy_name="no_m4_layer_chunk", preemption_mode="non_preemptive")
-    no_m3 = replace(no_m4, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)
+    no_m3 = replace(base_ms, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)
     no_m2 = replace(
-        no_m3,
+        base_ms,
         policy_name="no_m2_dual_path",
         routing_mode="sticky_least_loaded",
         use_h2d_pacer=False,
         use_shared_numa_mirror=False,
     )
-    base_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=num_gpus)
+    no_m1 = replace(
+        base_ms,
+        policy_name="no_m1_tripool_vmm",
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        use_scoped_vae=False,
+        use_shared_numa_mirror=False,
+        use_h2d_pacer=False,
+    )
     return [
         ("full_morphserve", base_ms),
         ("no_m4_layer_chunk", no_m4),
         ("no_m3_cow_loopback", no_m3),
         ("no_m2_dual_path", no_m2),
-        ("no_m1_tripool_vmm", replace(base_mono, policy_name="no_m1_tripool_vmm")),
+        ("no_m1_tripool_vmm", no_m1),
     ]
 
 
@@ -368,17 +376,28 @@ def run_suite_a_qps_and_ablations(
             engine.shutdown()
             gc.collect()
 
+    all_off_ref = next(
+        (
+            r
+            for r in qps_sweep_results
+            if r.get("policy_name") == "monolithic_dp" and abs(float(r.get("offered_qps", 0.0)) - ablation_qps) < 1e-6
+        ),
+        None,
+    )
+
     report = {
         "schema": "morphserve.osdi27.m23_suite_a.v2",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "num_gpus": num_gpus,
         "sessions_per_point": len(suite.sessions),
         "ablation_sessions_per_point": len(ablation_suite.sessions),
+        "ablation_design": "leave_one_out_vs_full_morphserve",
         "qps_points": list(qps_points),
         "ablation_qps": ablation_qps,
         "sustainable_qps_summary": _compute_sustainable_qps_summary(qps_sweep_results),
         "qps_sweep": qps_sweep_results,
         "ablations": ablation_results,
+        "ablation_all_off_ref": all_off_ref,
         "status": "ok" if all(r["error_sessions"] == 0 for r in qps_sweep_results + ablation_results) else "check_failed",
     }
     out_path = output_dir / "m23-suite-a-report.json"

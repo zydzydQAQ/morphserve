@@ -424,7 +424,11 @@ class TriPoolVMM:
         ):
             free_drv, total_drv = _TORCH.cuda.mem_get_info(self.device)
             reserve = min(1536 * MIB, int(total_drv) // 16)
-            return max(0, int(free_drv) - reserve)
+            drv_extra = max(0, int(free_drv) - reserve)
+            if self.max_pool_bytes is not None and self.max_pool_bytes > 0:
+                cur_pool = int(self.stats().pool_total_bytes)
+                return min(drv_extra, max(0, int(self.max_pool_bytes) - cur_pool))
+            return drv_extra
         return 0
 
     def kv_free_bytes(self, for_dit: bool = False, include_overflow: bool = False) -> int:

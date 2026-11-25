@@ -1216,6 +1216,76 @@ class TestModule1VmmOffline(unittest.TestCase):
             mirror.close()
             vmm.shutdown()
 
+    def test_fast_ar_decode_and_max_pool_bytes_cap(self) -> None:
+        rng = np.random.default_rng(20261125)
+        try:
+            import torch as _th  # type: ignore[import-not-found]
+        except ImportError:
+            _th = None
+
+        vmm = TriPoolVMM(
+            device=0,
+            super_pool_mib=128,
+            fine_kv_pool_mib=64,
+            super_handle_mib=64,
+            transient_va_gib=1,
+            kv_va_gib=1,
+            allow_overflow=True,
+            max_pool_bytes=224 * 1024 * 1024,
+            simulated=True,
+        )
+        c1 = VmmNaiveCache(num_layers=4, vmm=vmm)
+        c2 = VmmNaiveCache(num_layers=4, vmm=vmm)
+        try:
+            self.assertEqual(vmm.kv_free_bytes(for_dit=False), 224 * 1024 * 1024)
+            prefill_np_k = [rng.standard_normal((12, 4, 32)).astype(np.float32) for _ in range(4)]
+            prefill_np_v = [rng.standard_normal((12, 4, 32)).astype(np.float32) for _ in range(4)]
+            for l in range(4):
+                pk = _th.from_numpy(prefill_np_k[l].copy()) if _th is not None else prefill_np_k[l]
+                pv = _th.from_numpy(prefill_np_v[l].copy()) if _th is not None else prefill_np_v[l]
+                c1.append_inplace(l, pk, pv)
+
+            # CoW alias c2 -> c1, then run fast AR decode on c2 and verify CoW isolation + lazy flush + truncate
+            for l in range(4):
+                v_ro = c1.key_cache[l][:]
+                v_ro._vmm_external_ro = True
+                v_ro._vmm_owner_ref = c1._self_ref
+                c2.key_cache[l] = v_ro
+                vv_ro = c1.value_cache[l][:]
+                vv_ro._vmm_external_ro = True
+                vv_ro._vmm_owner_ref = c1._self_ref
+                c2.value_cache[l] = vv_ro
+
+            self.assertTrue(c2.prepare_fast_ar_decode(reserve_tokens=20))
+            step_np_k = [[rng.standard_normal((1, 4, 32)).astype(np.float32) for _ in range(4)] for _ in range(25)]
+            step_np_v = [[rng.standard_normal((1, 4, 32)).astype(np.float32) for _ in range(4)] for _ in range(25)]
+            # 25 > 20 reserved tokens exercises automatic fast-path re-prepare on capacity boundary!
+            for s in range(25):
+                for l in range(4):
+                    sk = _th.from_numpy(step_np_k[s][l].copy()) if _th is not None else step_np_k[s][l]
+                    sv = _th.from_numpy(step_np_v[s][l].copy()) if _th is not None else step_np_v[s][l]
+                    fk, fv = c2.append_ar_token_fast(l, sk, sv)
+                    self.assertEqual(tuple(fk.shape), (12 + s + 1, 4, 32))
+                    self.assertEqual(tuple(fv.shape), (12 + s + 1, 4, 32))
+            self.assertEqual(c2.seq_lens, 37)
+
+            # Reading `c2.key_cache[l]` auto-flushes deferred fast-path metadata cleanly
+            for l in range(4):
+                expected_k = np.concatenate([prefill_np_k[l], *[step_np_k[s][l] for s in range(25)]], axis=0)
+                expected_v = np.concatenate([prefill_np_v[l], *[step_np_v[s][l] for s in range(25)]], axis=0)
+                self.assertTrue(np.array_equal(np.asarray(c2.key_cache[l]), expected_k))
+                self.assertTrue(np.array_equal(np.asarray(c2.value_cache[l]), expected_v))
+                # Parent c1 must remain completely untouched
+                self.assertTrue(np.array_equal(np.asarray(c1.key_cache[l]), prefill_np_k[l]))
+
+            c2.truncate(15)
+            self.assertEqual(c2.seq_lens, 15)
+            self.assertEqual(int(c2.key_cache[0].shape[0]), 15)
+        finally:
+            c2.close()
+            c1.close()
+            vmm.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

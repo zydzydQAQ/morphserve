@@ -150,6 +150,8 @@ class _VmmLayerTensorMap(dict):
             super().__setitem__(lidx, None)
 
     def __getitem__(self, layer_idx: int) -> Any:
+        if self._owner._fast_ar_dirty:
+            self._owner.flush_fast_ar()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
         if self._owner._is_swapped:
@@ -157,6 +159,8 @@ class _VmmLayerTensorMap(dict):
         return super().__getitem__(int(layer_idx))
 
     def get(self, layer_idx: int, default: Any = None) -> Any:
+        if self._owner._fast_ar_dirty:
+            self._owner.flush_fast_ar()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
         if self._owner._is_swapped:
@@ -164,6 +168,8 @@ class _VmmLayerTensorMap(dict):
         return super().get(int(layer_idx), default)
 
     def values(self):  # type: ignore[override]
+        if self._owner._fast_ar_dirty:
+            self._owner.flush_fast_ar()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
         if self._owner._is_swapped:
@@ -171,6 +177,8 @@ class _VmmLayerTensorMap(dict):
         return super().values()
 
     def items(self):  # type: ignore[override]
+        if self._owner._fast_ar_dirty:
+            self._owner.flush_fast_ar()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
         if self._owner._is_swapped:
@@ -178,6 +186,8 @@ class _VmmLayerTensorMap(dict):
         return super().items()
 
     def copy(self) -> dict[int, Any]:
+        if self._owner._fast_ar_dirty:
+            self._owner.flush_fast_ar()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
         if self._owner._is_swapped:
@@ -185,6 +195,8 @@ class _VmmLayerTensorMap(dict):
         return {k: dict.__getitem__(self, k) for k in self}
 
     def __setitem__(self, layer_idx: int, value: Any) -> None:
+        if self._owner._fast_ar_active or self._owner._fast_ar_dirty:
+            self._owner.invalidate_fast_ar()
         lidx = int(layer_idx)
         self._owner._touch_access()
         if value is None:
@@ -265,6 +277,13 @@ class VmmNaiveCache:
         self._row_bytes: dict[tuple[str, int], int] = {}
         self._lengths: dict[tuple[str, int], int] = {}
         self._capacity_views: dict[tuple[str, int], Any] = {}
+        self._fast_k_caps: list[Any] = [None] * self._num_layers
+        self._fast_v_caps: list[Any] = [None] * self._num_layers
+        self._fast_k_lens: list[int] = [0] * self._num_layers
+        self._fast_v_lens: list[int] = [0] * self._num_layers
+        self._fast_ar_active: bool = False
+        self._fast_ar_dirty: bool = False
+        self._fast_is_torch: bool = False
 
         self._swapped_flag: bool = False
         self._c_evictable: bool = False
@@ -391,6 +410,8 @@ class VmmNaiveCache:
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "VmmNaiveCache":
         """Deep-copy KV contents into a fresh Arena-1 `VmmNaiveCache` without pickling `self.vmm` (`CDLL`)."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
         was_pinned = self._is_pinned_active
         was_thinking = self._is_thinking
         self.mark_active()
@@ -425,6 +446,8 @@ class VmmNaiveCache:
 
     @property
     def seq_lens(self) -> int:
+        if self._fast_ar_dirty and self._num_layers > 0:
+            return int(self._fast_k_lens[0])
         if (
             self._lengths
             and ("k", 0) in self._lengths
@@ -478,6 +501,8 @@ class VmmNaiveCache:
 
     def mark_active(self, stream_ptr: int | None = None) -> None:
         """Pin this session's KV on GPU during an active AR/DiT turn and swap in if parked."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
         self._is_pinned_active = True
         self._is_thinking = False
         self._touch_access()
@@ -505,6 +530,8 @@ class VmmNaiveCache:
 
     def mark_thinking(self, trigger_watermark_check: bool = True, stream_ptr: int | None = None) -> int:
         """Mark session as inactive (inter-turn user think time) and optionally run high-watermark eviction."""
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         self._is_pinned_active = False
         self._is_thinking = True
         if self._closed or self.vmm is None:
@@ -554,6 +581,8 @@ class VmmNaiveCache:
 
     def swap_out_async(self, stream_ptr: int | None = None) -> int:
         """Asynchronously DMA all mapped K/V regions of this cache to Host Pinned DRAM and free GPU pages."""
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False) or not self._region_ids:
             return 0
         eff_stream = self._resolve_stream_ptr(stream_ptr)
@@ -580,6 +609,8 @@ class VmmNaiveCache:
 
     def swap_in_async(self, stream_ptr: int | None = None) -> int:
         """Asynchronously restore all swapped K/V regions back into their exact original GPU virtual addresses."""
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False) or not self._is_swapped:
             return 0
         was_pinned = self._is_pinned_active
@@ -663,8 +694,178 @@ class VmmNaiveCache:
 
     # ==================== In-Place Single-Step / Multi-Step / Batched Append API ====================
 
+    def flush_fast_ar(self) -> None:
+        """Materialize lazily updated per-layer AR lengths and `_tag_owner` views back into `key_cache`/`value_cache`."""
+        if not self._fast_ar_dirty:
+            return
+        self._fast_ar_dirty = False
+        if self._closed:
+            return
+        for lidx in range(self._num_layers):
+            kc = self._fast_k_caps[lidx]
+            if kc is not None:
+                kl = int(self._fast_k_lens[lidx])
+                self._lengths[("k", lidx)] = kl
+                dict.__setitem__(self.key_cache, lidx, self._tag_owner(kc[:kl]))
+            vc = self._fast_v_caps[lidx]
+            if vc is not None:
+                vl = int(self._fast_v_lens[lidx])
+                self._lengths[("v", lidx)] = vl
+                dict.__setitem__(self.value_cache, lidx, self._tag_owner(vc[:vl]))
+        self._touch_access()
+
+    def invalidate_fast_ar(self) -> None:
+        """Flush any deferred AR decode metadata and clear cached fast-path capacity views."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
+        if self._fast_ar_active:
+            self._fast_ar_active = False
+            for lidx in range(self._num_layers):
+                self._fast_k_caps[lidx] = None
+                self._fast_v_caps[lidx] = None
+
+    def prepare_fast_ar_decode(self, reserve_tokens: int = 128) -> bool:
+        """Pre-grow all layer capacity views and materialize CoW prefixes once before an AR decode loop."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
+        if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False):
+            self._fast_ar_active = False
+            return False
+        self._touch_access()
+        self._ensure_cow_parent_resident_if_any()
+        if self._is_swapped:
+            self.ensure_resident()
+
+        prev_k0 = dict.get(self.key_cache, 0)
+        if prev_k0 is None:
+            self._fast_ar_active = False
+            return False
+        is_torch_k0 = bool(_TORCH is not None and _TORCH.is_tensor(prev_k0))
+        is_sim_k0 = bool(_NP is not None and isinstance(prev_k0, (_NP.ndarray, _SimArrayKVTensor)))
+        if not (is_torch_k0 or is_sim_k0):
+            self._fast_ar_active = False
+            return False
+
+        stream_ptr = _stream_ptr_for_device(getattr(prev_k0, "device", "cpu"))
+        is_sim = bool(getattr(self.vmm, "is_simulated", False))
+        extra = max(16, int(reserve_tokens))
+
+        for lidx in range(self._num_layers):
+            for kind, target_map, caps_arr, lens_arr in (
+                ("k", self.key_cache, self._fast_k_caps, self._fast_k_lens),
+                ("v", self.value_cache, self._fast_v_caps, self._fast_v_lens),
+            ):
+                prev = dict.get(target_map, lidx)
+                if prev is None:
+                    self._fast_ar_active = False
+                    return False
+                if is_torch_k0 and not (_TORCH is not None and _TORCH.is_tensor(prev)):
+                    self._fast_ar_active = False
+                    return False
+                if not is_torch_k0 and not (_NP is not None and isinstance(prev, (_NP.ndarray, _SimArrayKVTensor))):
+                    self._fast_ar_active = False
+                    return False
+
+                owner_ref = getattr(prev, "_vmm_owner_ref", None)
+                if owner_ref is not None:
+                    ext_owner = owner_ref()
+                    if ext_owner is not None and ext_owner is not self and not ext_owner._closed and ext_owner._is_swapped:
+                        ext_owner.ensure_resident()
+
+                old_len = int(prev.shape[0])
+                trailing = tuple(int(d) for d in prev.shape[1:])
+                row_elems = 1
+                for d in trailing:
+                    row_elems *= d
+                elem_sz = int(prev.element_size()) if hasattr(prev, "element_size") else int(prev.itemsize)
+                row_bytes = max(1, row_elems * elem_sz)
+                needed_tokens = old_len + extra
+
+                cap_view = self._get_or_grow_capacity_view(
+                    kind, lidx, needed_tokens, row_bytes, trailing, prev, stream_ptr
+                )
+                if cap_view is None:
+                    self._fast_ar_active = False
+                    return False
+                if is_torch_k0 and (not (_TORCH is not None and _TORCH.is_tensor(cap_view)) or cap_view.device != prev.device):
+                    self._fast_ar_active = False
+                    return False
+                if not is_torch_k0 and not isinstance(cap_view, _SimArrayKVTensor):
+                    self._fast_ar_active = False
+                    return False
+
+                prev_after = dict.get(target_map, lidx)
+                if prev_after is not None:
+                    prev = prev_after
+                same_base = (
+                    hasattr(prev, "data_ptr")
+                    and hasattr(cap_view, "data_ptr")
+                    and int(prev.data_ptr()) == int(cap_view.data_ptr())
+                )
+                if old_len > 0 and not same_base:
+                    self._copy_rows_into(cap_view, 0, old_len, prev[:old_len], is_sim=is_sim)
+                    dict.__setitem__(target_map, lidx, self._tag_owner(cap_view[:old_len]))
+
+                self._lengths[(kind, lidx)] = old_len
+                caps_arr[lidx] = cap_view
+                lens_arr[lidx] = old_len
+
+        self._fast_is_torch = is_torch_k0
+        self._fast_ar_active = True
+        self._fast_ar_dirty = False
+        return True
+
+    def append_ar_token_fast(self, layer_idx: int, k_new: Any, v_new: Any) -> tuple[Any, Any]:
+        """Zero-overhead per-layer AR token append into pre-reserved `cap_view` (zero `ctypes`/stream/tag calls)."""
+        kc = self._fast_k_caps[layer_idx]
+        vc = self._fast_v_caps[layer_idx]
+        if kc is None or vc is None or self._swapped_flag:
+            return self.append_inplace(layer_idx, k_new, v_new)
+
+        is_2d = k_new.ndim == 2
+        delta = 1 if is_2d else int(k_new.shape[0])
+        kl = self._fast_k_lens[layer_idx]
+        vl = self._fast_v_lens[layer_idx]
+        new_kl = kl + delta
+        new_vl = vl + delta
+
+        if new_kl > int(kc.shape[0]) or new_vl > int(vc.shape[0]):
+            self.flush_fast_ar()
+            if not self.prepare_fast_ar_decode(reserve_tokens=max(256, delta + 128)):
+                return self.append_inplace(layer_idx, k_new, v_new)
+            kc = self._fast_k_caps[layer_idx]
+            vc = self._fast_v_caps[layer_idx]
+            kl = self._fast_k_lens[layer_idx]
+            vl = self._fast_v_lens[layer_idx]
+            new_kl = kl + delta
+            new_vl = vl + delta
+
+        if self._fast_is_torch:
+            if is_2d:
+                kc[kl].copy_(k_new)
+                vc[vl].copy_(v_new)
+            elif delta > 0:
+                kc[kl:new_kl].copy_(k_new)
+                vc[vl:new_vl].copy_(v_new)
+        else:
+            rhs_k = k_new.array if isinstance(k_new, _SimArrayKVTensor) else k_new
+            rhs_v = v_new.array if isinstance(v_new, _SimArrayKVTensor) else v_new
+            if is_2d:
+                kc.array[kl] = rhs_k
+                vc.array[vl] = rhs_v
+            elif delta > 0:
+                kc.array[kl:new_kl] = rhs_k
+                vc.array[vl:new_vl] = rhs_v
+
+        self._fast_k_lens[layer_idx] = new_kl
+        self._fast_v_lens[layer_idx] = new_vl
+        self._fast_ar_dirty = True
+        return kc[:new_kl], vc[:new_vl]
+
     def get_layer_kv(self, layer_idx: int) -> tuple[Any | None, Any | None, int]:
         """Return `(key_tensor, value_tensor, seq_len)` for `layer_idx`, auto-swapping in if needed."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
         lidx = int(layer_idx)
         self._touch_access()
         self._ensure_cow_parent_resident_if_any()
@@ -677,6 +878,8 @@ class VmmNaiveCache:
 
     def append_inplace(self, layer_idx: int, new_k: Any, new_v: Any) -> tuple[Any, Any]:
         """Append `[ΔL, H, D]` (or `[H, D]` single-step) K/V in-place without `torch.cat` reallocation."""
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         lidx = int(layer_idx)
         self._touch_access()
         self._ensure_cow_parent_resident_if_any()
@@ -789,6 +992,8 @@ class VmmNaiveCache:
 
     def truncate(self, new_seq_len: int) -> None:
         """Truncate active KV sequence length across all layers in O(1) without reallocating VA."""
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         target = max(0, int(new_seq_len))
         self._ensure_cow_parent_resident_if_any()
         if self._is_swapped and target > 0:
@@ -1140,6 +1345,8 @@ class VmmNaiveCache:
         return va_typed
 
     def _release_slot(self, kind: str, layer_idx: int) -> None:
+        if self._fast_ar_active or self._fast_ar_dirty:
+            self.invalidate_fast_ar()
         key = (kind, layer_idx)
         target_map = self.key_cache if kind == "k" else self.value_cache
         cur = dict.get(target_map, layer_idx)
@@ -1160,6 +1367,11 @@ class VmmNaiveCache:
     def close(self) -> None:
         if self._closed:
             return
+        self._fast_ar_dirty = False
+        self._fast_ar_active = False
+        for lidx in range(self._num_layers):
+            self._fast_k_caps[lidx] = None
+            self._fast_v_caps[lidx] = None
         eff_stream = self._resolve_stream_ptr(None)
         self._closed = True
         self._is_pinned_active = False

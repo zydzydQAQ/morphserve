@@ -437,6 +437,33 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         allow_overflow=False,
     )
     pager.bind_vmm(vmm, initial_alpha=0.5)
+    # Measure unloaded VMM fast-path AR decode TPOT to verify zero per-token VMM overhead vs stock `NaiveCache`
+    vmm_warm_ar = _make_ar_task(pipeline, ar_base_1, "vmm_warm", max_tokens=4, tpot_slo_ms=slo_20x, vmm=vmm)
+    vmm_warm_ar.kv_cache.prepare_fast_ar_decode(reserve_tokens=8)
+    vmm_solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=slo_20x, pager=pager)
+    vmm_solo_sched.submit_ar_task(vmm_warm_ar)
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        vmm_solo_sched.drain_remaining_ar_tasks()
+    vmm_warm_ar.kv_cache.close()
+
+    vmm_solo_ar = _make_ar_task(pipeline, ar_base_1, "vmm_solo", max_tokens=24, tpot_slo_ms=slo_20x, vmm=vmm)
+    vmm_solo_ar.kv_cache.prepare_fast_ar_decode(reserve_tokens=28)
+    vmm_solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=slo_20x, pager=pager)
+    vmm_solo_sched.submit_ar_task(vmm_solo_ar)
+    torch.cuda.synchronize()
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        vmm_solo_sched.drain_remaining_ar_tasks()
+    torch.cuda.synchronize()
+    vmm_solo_tpots = vmm_solo_ar.inter_token_latencies_ms()
+    vmm_solo_p50_ms = _pct(vmm_solo_tpots, 50)
+    vmm_solo_p99_ms = _pct(vmm_solo_tpots, 99)
+    vmm_solo_exact = vmm_solo_ar.generated_token_ids == ar_ref_tokens["ar1"][: len(vmm_solo_ar.generated_token_ids)]
+    vmm_solo_ar.kv_cache.close()
+    report["solo_baselines"]["vmm_unloaded_ar_tpot_p50_ms"] = vmm_solo_p50_ms
+    report["solo_baselines"]["vmm_unloaded_ar_tpot_p99_ms"] = vmm_solo_p99_ms
+    report["solo_baselines"]["vmm_ar_kv_step_overhead_ms"] = round(max(0.0, vmm_solo_p50_ms - unloaded_ar_p50_ms), 2)
+    report["solo_baselines"]["vmm_solo_ar_bit_exact"] = vmm_solo_exact
+
     interceptor.reset_ar_telemetry()
     stack_sched = UnifiedPreemptiveScheduler(
         pipeline,
@@ -506,6 +533,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         and lc20_res["switching_overhead_pct"] <= 5.0
         and all(r["dit_bit_exact"] for r in strict_curve_rows)
         and any(r["max_microbatch_size"] >= 2 for r in strict_curve_rows)
+        and report["solo_baselines"].get("vmm_solo_ar_bit_exact", False)
         and report["test2_full_m1_m3_m4_stack"]["m1_transient_reclaimed"]
         and report["test2_full_m1_m3_m4_stack"]["m1_overflow_creates"] == 0
         and report["test2_full_m1_m3_m4_stack"]["m1_vmm_inplace_ar_appends"] > 0

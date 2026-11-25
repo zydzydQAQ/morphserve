@@ -120,6 +120,9 @@ def _tensor_logical_bytes(t: Any) -> int:
 
 def _peek_cache_slot(slot_map: Any, layer_idx: int) -> Any:
     """Read `slot_map[layer_idx]` without triggering `VmmNaiveCache.ensure_resident()` or LRU mutation."""
+    owner = getattr(slot_map, "_owner", None)
+    if owner is not None and getattr(owner, "_fast_ar_dirty", False):
+        owner.flush_fast_ar()
     if isinstance(slot_map, dict):
         return dict.get(slot_map, layer_idx)
     return slot_map[layer_idx]
@@ -929,9 +932,38 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         return entry
 
     def bind_runtime_resources(self, pacer: Any | None = None) -> dict[str, Any]:
+        import torch
+
         self.pacer = pacer
         if self.policy.use_tripool_vmm:
-            self._vmm_initial_pool_mib = float(self.policy.super_pool_mib + self.policy.fine_kv_pool_mib)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            init_pool_mib = int(self.policy.super_pool_mib + self.policy.fine_kv_pool_mib)
+            self._vmm_initial_pool_mib = float(init_pool_mib)
+            max_pool_b = 0
+            if (
+                self.pager is not None
+                and self.policy.allow_vmm_overflow
+                and getattr(self.policy, "gpu_memory_fraction", None) is None
+                and getattr(self.policy, "gpu_memory_quota_mib", None) is None
+                and torch.cuda.is_available()
+            ):
+                # Reserve physical driver HBM headroom for upcoming `DirectNcclMesh` (~768 MiB) plus
+                # `1024^2` 3-branch DiT/ViT PyTorch activations (8,192 MiB) so VMM overflow handles
+                # never starve PyTorch's caching allocator into rare 40 GB boundary OOMs!
+                free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+                if int(total_drv) > 0:
+                    nccl_reserve_mib = (
+                        768
+                        if (
+                            int(self.policy.num_gpus) >= 2
+                            and str(self.policy.routing_mode) in ("dual_path", "static_nccl_fission")
+                        )
+                        else 0
+                    )
+                    headroom_b = (nccl_reserve_mib + 8192) * MIB
+                    max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
                 super_pool_mib=self.policy.super_pool_mib,
@@ -940,6 +972,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 transient_va_gib=self.policy.transient_va_gib,
                 kv_va_gib=self.policy.kv_va_gib,
                 allow_overflow=self.policy.allow_vmm_overflow,
+                max_pool_bytes=max_pool_b,
             )
             if self.pager is not None:
                 init_alpha = float(self.policy.initial_alphas.get(self.rank, 1.0))
@@ -1385,54 +1418,69 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                     }
                 )
 
-            with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                while True:
-                    active = [st for st in states if not st["done"]]
-                    if not active:
-                        break
-                    for st in active:
-                        st["gen_ids"].append(st["curr_tok_id"])
+            for st in states:
+                pkv_init = st["ctx"]["past_key_values"]
+                if callable(getattr(pkv_init, "prepare_fast_ar_decode", None)):
+                    pkv_init.prepare_fast_ar_decode(reserve_tokens=st["max_tokens"] + 4)
 
-                    prev_ar_lens = [
-                        int(k0.shape[0])
-                        if (k0 := _peek_cache_slot(st["ctx"]["past_key_values"].key_cache, 0)) is not None
-                        else 0
-                        for st in active
-                    ]
-                    try:
-                        next_tokens, updated_caches = self.interceptor.forward_ar_step_batch(
-                            [st["curr_tokens"] for st in active],
-                            [st["pos_ids"] for st in active],
-                            [st["ctx"]["past_key_values"] for st in active],
-                        )
-                    except BaseException as exc:
-                        for st, plen in zip(active, prev_ar_lens):
-                            _truncate_bagel_cache(st["ctx"]["past_key_values"], plen)
-                        if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0:
+            try:
+                with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    while True:
+                        active = [st for st in states if not st["done"]]
+                        if not active:
+                            break
+                        for st in active:
+                            st["gen_ids"].append(st["curr_tok_id"])
+
+                        prev_ar_lens = [
+                            int(pkv.seq_lens)
+                            if isinstance((pkv := st["ctx"]["past_key_values"]), VmmNaiveCache)
+                            else (int(k0.shape[0]) if (k0 := _peek_cache_slot(pkv.key_cache, 0)) is not None else 0)
+                            for st in active
+                        ]
+                        try:
                             next_tokens, updated_caches = self.interceptor.forward_ar_step_batch(
                                 [st["curr_tokens"] for st in active],
                                 [st["pos_ids"] for st in active],
                                 [st["ctx"]["past_key_values"] for st in active],
                             )
-                        else:
-                            for st in active:
-                                st["gen_ids"].pop()
-                            raise
+                        except BaseException as exc:
+                            for st, plen in zip(active, prev_ar_lens):
+                                _truncate_bagel_cache(st["ctx"]["past_key_values"], plen)
+                            if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0:
+                                for st in active:
+                                    pkv_re = st["ctx"]["past_key_values"]
+                                    if callable(getattr(pkv_re, "prepare_fast_ar_decode", None)):
+                                        pkv_re.prepare_fast_ar_decode(reserve_tokens=st["max_tokens"] + 4)
+                                next_tokens, updated_caches = self.interceptor.forward_ar_step_batch(
+                                    [st["curr_tokens"] for st in active],
+                                    [st["pos_ids"] for st in active],
+                                    [st["ctx"]["past_key_values"] for st in active],
+                                )
+                            else:
+                                for st in active:
+                                    st["gen_ids"].pop()
+                                raise
 
-                    # Single [B] int64 D2H readback synchronizes CUDA stream for the whole packed GEMM step
-                    next_ids = [int(x) for x in next_tokens.detach().cpu().tolist()]
-                    now_s = time.perf_counter()
-                    for idx, st in enumerate(active):
-                        nxt_id = next_ids[idx]
-                        st["ctx"]["past_key_values"] = updated_caches[idx]
-                        st["curr_tokens"] = next_tokens[idx : idx + 1]
-                        st["curr_tok_id"] = nxt_id
-                        st["pos_ids"] = st["pos_ids"] + 1
-                        st["stamps"].append(now_s)
-                        reached = len(st["gen_ids"]) >= st["max_tokens"]
-                        hit_eos = end_id is not None and nxt_id == int(end_id)
-                        if reached or hit_eos:
-                            st["done"] = True
+                        # Single [B] int64 D2H readback synchronizes CUDA stream for the whole packed GEMM step
+                        next_ids = [int(x) for x in next_tokens.detach().cpu().tolist()]
+                        now_s = time.perf_counter()
+                        for idx, st in enumerate(active):
+                            nxt_id = next_ids[idx]
+                            st["ctx"]["past_key_values"] = updated_caches[idx]
+                            st["curr_tokens"] = next_tokens[idx : idx + 1]
+                            st["curr_tok_id"] = nxt_id
+                            st["pos_ids"] = st["pos_ids"] + 1
+                            st["stamps"].append(now_s)
+                            reached = len(st["gen_ids"]) >= st["max_tokens"]
+                            hit_eos = end_id is not None and nxt_id == int(end_id)
+                            if reached or hit_eos:
+                                st["done"] = True
+            finally:
+                for st in states:
+                    pkv_fin = st["ctx"].get("past_key_values")
+                    if callable(getattr(pkv_fin, "invalidate_fast_ar", None)):
+                        pkv_fin.invalidate_fast_ar()
 
             self._update_hwm()
             alpha_now = self.resident_alpha()
@@ -1600,12 +1648,16 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         )
                         start_tok_gpu = st["packed_start_tokens"].to(self.device)
                         start_tok_int = int(st["packed_start_tokens"].reshape(-1)[0].item())
+                        max_ar_toks = max(1, int(ar_msg.get("max_ar_tokens", 32)))
+                        pkv_ar = ar_ctx["past_key_values"]
+                        if callable(getattr(pkv_ar, "prepare_fast_ar_decode", None)):
+                            pkv_ar.prepare_fast_ar_decode(reserve_tokens=max_ar_toks + 4)
                         task = ArDecodeTask(
                             req_id=str(ar_msg["cmd_id"]),
-                            kv_cache=ar_ctx["past_key_values"],
+                            kv_cache=pkv_ar,
                             curr_tokens=start_tok_gpu,
                             pos_ids=st["packed_query_position_ids"].to(self.device),
-                            max_tokens=int(ar_msg.get("max_ar_tokens", 32)),
+                            max_tokens=max_ar_toks,
                             end_token_id=self.pipeline.new_token_ids["eos_token_id"],
                             tpot_slo_ms=float(ar_msg.get("tpot_slo_ms", self.policy.ar_tpot_slo_ms)),
                             arrival_time_s=float(ar_msg.get("enqueue_time_s", now_s)),
@@ -1701,6 +1753,15 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                     )
                     gp = prep["gen_params"]
                     img_shape = prep["image_shape"]
+
+                    if (
+                        (int(img_shape[0]) >= 1024 or int(img_shape[1]) >= 1024)
+                        and torch.cuda.is_available()
+                        and (int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)))
+                        >= 768 * MIB
+                    ):
+                        # Release fragmented small-turn blocks before 1024^2 3-branch DiT activation burst
+                        torch.cuda.empty_cache()
 
                     try:
                         with self.interceptor.generation_session(

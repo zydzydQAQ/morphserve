@@ -329,23 +329,30 @@ PolicyConfig PolicyConfig::from_preset(
 }
 
 std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(int num_gpus) {
+    // Strict single-variable Leave-One-Out ablations relative to `full_morphserve` (M1+M2+M3+M4).
     PolicyConfig full = PolicyConfig::from_preset("morphserve", num_gpus);
+
     PolicyConfig no_m4 = full;
     no_m4.policy_name = "no_m4_layer_chunk";
     no_m4.preemption_mode = "non_preemptive";
 
-    PolicyConfig no_m3 = no_m4;
+    PolicyConfig no_m3 = full;
     no_m3.policy_name = "no_m3_cow_loopback";
     no_m3.use_module3_cow_loopback = false;
 
-    PolicyConfig no_m2 = no_m3;
+    PolicyConfig no_m2 = full;
     no_m2.policy_name = "no_m2_dual_path";
     no_m2.routing_mode = "sticky_least_loaded";
     no_m2.use_shared_numa_mirror = false;
     no_m2.use_h2d_pacer = false;
 
-    PolicyConfig no_m1 = PolicyConfig::from_preset("monolithic_dp", num_gpus);
+    PolicyConfig no_m1 = full;
     no_m1.policy_name = "no_m1_tripool_vmm";
+    no_m1.use_tripool_vmm = false;
+    no_m1.use_expert_pager = false;
+    no_m1.use_scoped_vae = false;
+    no_m1.use_shared_numa_mirror = false;
+    no_m1.use_h2d_pacer = false;
 
     return {
         {"full_morphserve", full},

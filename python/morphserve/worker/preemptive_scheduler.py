@@ -431,6 +431,23 @@ class UnifiedPreemptiveScheduler:
     def on_dit_step_complete(self, step_start_s: float, ar_compute_before_ms: float) -> None:
         """Invoked by `BagelExecutionInterceptor` after each `bagel.forward` denoising step."""
         dev = getattr(self.pipeline, "device", None)
+        if self.mode in ("step_preemptive", "layer_chunk"):
+            self._admit_due_arrivals(time.perf_counter())
+            need_sync = bool(
+                self.active_ar_tasks
+                or self._pending_arrivals
+                or self._step0_h2d_streaming
+                or len(self.step_times_ms) < 2
+            )
+            if not need_sync:
+                now_s = time.perf_counter()
+                self._last_sync_s = now_s
+                self._queued_gpu_ms = 0.0
+                self._step0_h2d_streaming = False
+                pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
+                self.step_times_ms.append(pure_step_ms)
+                return
+
         _sync_cuda_if_present(dev)
         now_s = time.perf_counter()
         self._last_sync_s = now_s

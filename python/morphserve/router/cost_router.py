@@ -407,6 +407,7 @@ class DualPathMorphRouter:
         active_dit_ranks: Mapping[int, int] | None = None,
         active_preemptions: Mapping[int, int] | None = None,
         max_preemptions_per_gpu: int = 2,
+        architecture: str = "tight_mot",
     ) -> int:
         with self._mu:
             req: dict[str, Any] = {
@@ -419,6 +420,7 @@ class DualPathMorphRouter:
                 "active_dit_ranks": {str(k): int(v) for k, v in (active_dit_ranks or {}).items()},
                 "active_preemptions": {str(k): int(v) for k, v in (active_preemptions or {}).items()},
                 "max_preemptions_per_gpu": int(max_preemptions_per_gpu),
+                "architecture": str(architecture),
             }
             if workers is not None and workers is not self.worker_states:
                 req["workers"] = {str(g): w.to_dict() for g, w in workers.items()}

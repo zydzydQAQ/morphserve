@@ -234,7 +234,8 @@ int DualPathMorphRouter::select_initial_gpu(
     const std::map<int, bool>& gpu_busy,
     const std::map<int, int>& active_dit_ranks,
     const std::map<int, int>& active_preemptions,
-    int max_preemptions_per_gpu) {
+    int max_preemptions_per_gpu,
+    const std::string& architecture) {
     std::lock_guard<std::mutex> lock(mu_);
     const auto& w_map = ext_workers ? *ext_workers : worker_states_;
     const int n = std::max(1, num_gpus);
@@ -294,8 +295,8 @@ int DualPathMorphRouter::select_initial_gpu(
             }
             if (!elig.empty()) {
                 std::sort(elig.begin(), elig.end(), [&](int a, int b) {
-                    return std::make_tuple(pre_cnt(a), dit_cnt(a) > 0 ? 0 : 1, w_map.at(a).expert_alpha, pos_mod(a - cur, n)) <
-                           std::make_tuple(pre_cnt(b), dit_cnt(b) > 0 ? 0 : 1, w_map.at(b).expert_alpha, pos_mod(b - cur, n));
+                    return std::make_tuple(pre_cnt(a), dit_cnt(a) > 0 ? 1 : 0, w_map.at(a).expert_alpha, pos_mod(a - cur, n)) <
+                           std::make_tuple(pre_cnt(b), dit_cnt(b) > 0 ? 1 : 0, w_map.at(b).expert_alpha, pos_mod(b - cur, n));
                 });
                 const int chosen = elig.front();
                 rr_cursor_ = (chosen + 1) % n;
@@ -313,9 +314,10 @@ int DualPathMorphRouter::select_initial_gpu(
             }
         }
         if (!idle.empty()) {
+            const bool prefer_high_alpha = (routing_mode == "dual_path" && architecture != "bridge_mllm_dit");
             std::sort(idle.begin(), idle.end(), [&](int a, int b) {
-                const double aa = (routing_mode == "dual_path") ? -w_map.at(a).expert_alpha : w_map.at(a).expert_alpha;
-                const double ab = (routing_mode == "dual_path") ? -w_map.at(b).expert_alpha : w_map.at(b).expert_alpha;
+                const double aa = prefer_high_alpha ? -w_map.at(a).expert_alpha : w_map.at(a).expert_alpha;
+                const double ab = prefer_high_alpha ? -w_map.at(b).expert_alpha : w_map.at(b).expert_alpha;
                 return std::make_tuple(aa, pos_mod(a - cur, n)) <
                        std::make_tuple(ab, pos_mod(b - cur, n));
             });
@@ -347,8 +349,14 @@ int DualPathMorphRouter::select_initial_gpu(
     std::sort(cands.begin(), cands.end(), [&](int a, int b) {
         const auto& wa = w_map.at(a);
         const auto& wb = w_map.at(b);
-        const double aa = (routing_mode == "dual_path") ? -wa.expert_alpha : 0.0;
-        const double ab = (routing_mode == "dual_path") ? -wb.expert_alpha : 0.0;
+        double aa = 0.0;
+        double ab = 0.0;
+        if (routing_mode == "dual_path") {
+            // For `bridge_mllm_dit` (e.g. InternVL-U), `PREP_DIT` runs VLM first and ships a tiny
+            // <500 KiB bridge via Path A to hot Decoder GPUs: prefer LOW decoder alpha (VLM resident)!
+            aa = (architecture == "bridge_mllm_dit") ? wa.expert_alpha : -wa.expert_alpha;
+            ab = (architecture == "bridge_mllm_dit") ? wb.expert_alpha : -wb.expert_alpha;
+        }
         return std::make_tuple(wa.kv_free_bytes >= min_kv_b ? 0 : 1, wa.queue_wait_ms, is_busy(a), aa, pos_mod(a - cur, n)) <
                std::make_tuple(wb.kv_free_bytes >= min_kv_b ? 0 : 1, wb.queue_wait_ms, is_busy(b), ab, pos_mod(b - cur, n));
     });

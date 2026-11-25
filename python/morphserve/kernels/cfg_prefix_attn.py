@@ -624,6 +624,7 @@ def _run_unpadded_varlen_cfg(
     v_suffix_list: list[Any | None],
     sm_scale: float,
     attn_noncausal: Any | None = None,
+    prefer_unpadded_varlen: bool = False,
 ) -> list[Any] | None:
     """High-res / short-prefix lossless CFG attention without LSE-merge bottleneck."""
     import torch
@@ -633,22 +634,6 @@ def _run_unpadded_varlen_cfg(
     h_kv = k_loc_list[0].shape[1]
     shared_set = set(shared_branch_ids)
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
-
-    if attn_noncausal is not None:
-        return _run_direct_workspace_noncausal_cfg(
-            q_list=q_list,
-            k_loc_list=k_loc_list,
-            v_loc_list=v_loc_list,
-            k_prefix=k_prefix,
-            v_prefix=v_prefix,
-            shared_branch_ids=shared_branch_ids,
-            k_suffix_list=k_suffix_list,
-            v_suffix_list=v_suffix_list,
-            attn_noncausal=attn_noncausal,
-        )
-
-    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
-    kind, _, fn, _ = backend
 
     all_k_parts: list[Any] = []
     all_v_parts: list[Any] = []
@@ -668,6 +653,29 @@ def _run_unpadded_varlen_cfg(
         all_v_parts.append(v_loc_list[b])
         b_len += int(k_loc_list[b].shape[0])
         k_lens.append(b_len)
+
+    # When `prefer_unpadded_varlen=True` (i.e. Cascade-CFG fast mode) and branch lengths are highly
+    # asymmetric (e.g. long multi-turn main/cfg_text vs short cfg_img), prefer unpadded `vllm_varlen`
+    # to eliminate wasteful left-padding of the short branch. Keep `attn_noncausal` for explicit
+    # bit-exact `lossless_varlen` fallback (`prefer_unpadded_varlen=False`).
+    asymmetric_pad = bool(
+        prefer_unpadded_varlen and len(k_lens) >= 2 and max(k_lens) >= 1024 and max(k_lens) > 2 * min(k_lens)
+    )
+    if attn_noncausal is not None and not asymmetric_pad:
+        return _run_direct_workspace_noncausal_cfg(
+            q_list=q_list,
+            k_loc_list=k_loc_list,
+            v_loc_list=v_loc_list,
+            k_prefix=k_prefix,
+            v_prefix=v_prefix,
+            shared_branch_ids=shared_branch_ids,
+            k_suffix_list=k_suffix_list,
+            v_suffix_list=v_suffix_list,
+            attn_noncausal=attn_noncausal,
+        )
+
+    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
+    kind, _, fn, _ = backend
 
     if kind == "vllm_varlen":
         q_cat = torch.cat(q_list, dim=0).contiguous()
@@ -689,6 +697,19 @@ def _run_unpadded_varlen_cfg(
         )
         out_cat = res[0] if isinstance(res, tuple) else res
         return list(out_cat.split(q_len, dim=0))
+
+    if attn_noncausal is not None:
+        return _run_direct_workspace_noncausal_cfg(
+            q_list=q_list,
+            k_loc_list=k_loc_list,
+            v_loc_list=v_loc_list,
+            k_prefix=k_prefix,
+            v_prefix=v_prefix,
+            shared_branch_ids=shared_branch_ids,
+            k_suffix_list=k_suffix_list,
+            v_suffix_list=v_suffix_list,
+            attn_noncausal=attn_noncausal,
+        )
 
     if kind == "flashinfer":
         outs = []
@@ -762,6 +783,7 @@ def shared_prefix_cfg_attention(
                 v_suffix_list=v_suffix_list,
                 sm_scale=sm_scale,
                 attn_noncausal=attn_noncausal,
+                prefer_unpadded_varlen=(backend in ("cascade_cfg", "flash_prefix", "unpadded_varlen")),
             )
             if unpadded_out is not None:
                 return unpadded_out

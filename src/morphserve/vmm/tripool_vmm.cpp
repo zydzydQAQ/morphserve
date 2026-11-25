@@ -162,7 +162,8 @@ int TriPoolVMM::shutdown() {
         streamer_thread_.join();
     }
 
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_ready_.wait(lock, [&] { return active_h2d_syncs_ == 0; });
     if (!initialized_) return 0;
     try {
         backend_->ensure_context();
@@ -575,6 +576,15 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
     std::unique_lock<std::mutex>* opt_lock,
     int32_t exclude_region_id) {
     while (free_fine_handles_.empty()) {
+        if (cfg_.allow_overflow && cfg_.max_pool_bytes > 0) {
+            const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+            if (cur_pool_b + min_gran_ <= cfg_.max_pool_bytes) {
+                free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
+                ++fine_pool_total_;
+                ++overflow_creates_;
+                break;
+            }
+        }
         if (!free_super_handles_.empty()) {
             const uint64_t super_h = free_super_handles_.back();
             free_super_handles_.pop_back();
@@ -677,6 +687,9 @@ int TriPoolVMM::kv_free_page(int32_t slot_idx, void* stream) {
         kv_slot_handles_[s] = 0;
         kv_free_slots_.push_back(slot_idx);
         if (kv_mapped_pages_ > 0) --kv_mapped_pages_;
+        if (cfg_.allow_overflow && !stop_streamer_) {
+            try_coalesce_fine_to_super_locked();
+        }
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_free_page error: %s\n", e.what());
@@ -749,7 +762,9 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
         backend_->ensure_context();
         const CapacitySnapshot snap = compute_kv_capacities_locked();
         const uint64_t eff_pool =
-            (cfg_.max_pool_bytes > 0) ? std::min(snap.pool_total_bytes, cfg_.max_pool_bytes) : snap.pool_total_bytes;
+            (cfg_.max_pool_bytes > 0)
+                ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
+                : snap.pool_total_bytes;
         if (eff_pool > 0) {
             const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
             const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
@@ -962,7 +977,9 @@ size_t TriPoolVMM::maybe_evict_thinking_kv_on_high_watermark(
     if (!initialized_) return 0;
     const CapacitySnapshot snap = compute_kv_capacities_locked();
     const uint64_t eff_pool =
-        (cfg_.max_pool_bytes > 0) ? std::min(snap.pool_total_bytes, cfg_.max_pool_bytes) : snap.pool_total_bytes;
+        (cfg_.max_pool_bytes > 0)
+            ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
+            : snap.pool_total_bytes;
     if (eff_pool == 0) return 0;
 
     uint64_t inflight_swap_bytes = 0;
@@ -1107,7 +1124,9 @@ uint64_t TriPoolVMM::kv_region_ensure(int32_t region_id, size_t needed_bytes, vo
         // Proactive watermark reclamation before mapping delta pages
         const CapacitySnapshot snap = compute_kv_capacities_locked();
         const uint64_t eff_pool =
-            (cfg_.max_pool_bytes > 0) ? std::min(snap.pool_total_bytes, cfg_.max_pool_bytes) : snap.pool_total_bytes;
+            (cfg_.max_pool_bytes > 0)
+                ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
+                : snap.pool_total_bytes;
         if (eff_pool > 0) {
             const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
             const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
@@ -1381,6 +1400,9 @@ int TriPoolVMM::kv_region_free(int32_t region_id, void* stream) {
             for (auto h : reg.handles) free_fine_handles_.push_back(h);
             reg.handles.clear();
             kv_mapped_pages_ = (kv_mapped_pages_ >= n) ? (kv_mapped_pages_ - n) : 0;
+            if (cfg_.allow_overflow && !stop_streamer_) {
+                try_coalesce_fine_to_super_locked();
+            }
         }
         if (reg.swap_host_pinned) {
             if (backend_->is_simulated()) {
@@ -1646,6 +1668,52 @@ int TriPoolVMM::expert_wait_layer(int expert_id, int layer_idx, void* compute_st
         }
     }
     return 0;
+}
+
+int TriPoolVMM::expert_sync_h2d(int expert_id) {
+    void* ev = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(mu_);
+        if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
+        if (backend_->is_simulated()) return 0;
+        auto& bank = experts_[static_cast<size_t>(expert_id)];
+        cv_ready_.wait(lock, [&] {
+            if (stop_streamer_ || streamer_error_) return true;
+            for (const auto& lyr : bank.layers) {
+                if (lyr.state == LayerState::QUEUED || lyr.state == LayerState::STREAMING) return false;
+            }
+            return true;
+        });
+        if (stop_streamer_ || streamer_error_) return -2;
+        ev = bank.last_h2d_event;
+        if (!ev) return 0;
+        ++active_h2d_syncs_;
+    }
+    int rc = 0;
+    try {
+        backend_->ensure_context();
+        if (!backend_->sync_event_noexcept(ev)) rc = -3;
+    } catch (...) {
+        rc = -3;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (active_h2d_syncs_ > 0) --active_h2d_syncs_;
+        cv_ready_.notify_all();
+    }
+    return rc;
+}
+
+size_t TriPoolVMM::coalesce_fine_to_super(size_t max_super) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!initialized_) return 0;
+    try {
+        backend_->ensure_context();
+        return try_coalesce_fine_to_super_locked(max_super);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[tripool_vmm] coalesce_fine_to_super error: %s\n", e.what());
+        return 0;
+    }
 }
 
 int TriPoolVMM::expert_evict_layer(int expert_id, int layer_idx, void* stream) {
@@ -2035,12 +2103,50 @@ void TriPoolVMM::swap_in_region_locked(
     }
 }
 
+size_t TriPoolVMM::try_coalesce_fine_to_super_locked(size_t max_super) {
+    size_t coalesced = 0;
+    while (coalesced < max_super &&
+           free_fine_handles_.size() >= base_fine_pages_ + sub_pages_ &&
+           fine_pool_total_ >= base_fine_pages_ + sub_pages_) {
+        std::vector<uint64_t> batch;
+        batch.reserve(sub_pages_);
+        for (size_t j = 0; j < sub_pages_; ++j) {
+            batch.push_back(free_fine_handles_.back());
+            free_fine_handles_.pop_back();
+        }
+        for (uint64_t fh : batch) {
+            backend_->release_phys_handle(fh, min_gran_);
+        }
+        fine_pool_total_ -= sub_pages_;
+        try {
+            const uint64_t sh = backend_->create_phys_handle(super_bytes_);
+            ++super_pool_total_;
+            free_super_handles_.push_back(sh);
+            ++coalesced;
+        } catch (...) {
+            for (size_t j = 0; j < sub_pages_; ++j) {
+                try {
+                    free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
+                    ++fine_pool_total_;
+                } catch (...) {
+                    break;
+                }
+            }
+            break;
+        }
+    }
+    return coalesced;
+}
+
 void TriPoolVMM::release_super_slot_to_pool_locked(SuperSlot& slot) {
     if (slot.is_fine_bundle()) {
         for (auto fh : slot.fine_hs) {
             free_fine_handles_.push_back(fh);
         }
         slot.fine_hs.clear();
+        if (cfg_.allow_overflow && !stop_streamer_) {
+            try_coalesce_fine_to_super_locked();
+        }
     } else if (slot.super_h) {
         free_super_handles_.push_back(slot.super_h);
         slot.super_h = 0;
@@ -2151,6 +2257,11 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
             return SuperSlot{h, {}};
         }
         if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
+            if (cfg_.allow_overflow && try_coalesce_fine_to_super_locked(1) > 0 && !free_super_handles_.empty()) {
+                const uint64_t h = free_super_handles_.back();
+                free_super_handles_.pop_back();
+                return SuperSlot{h, {}};
+            }
             return pop_fine_bundle_locked();
         }
         if (drain_one_queued_swap_out_locked()) {
@@ -2162,6 +2273,15 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
                 throw std::runtime_error("TriPool shutting down during super-slot acquisition");
             }
             continue;
+        }
+        if (cfg_.allow_overflow && cfg_.max_pool_bytes > 0) {
+            const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+            if (cur_pool_b + super_bytes_ <= cfg_.max_pool_bytes) {
+                const uint64_t h = backend_->create_phys_handle(super_bytes_);
+                ++super_pool_total_;
+                ++overflow_creates_;
+                return SuperSlot{h, {}};
+            }
         }
         if (evict_one_tail_expert_layer_locked(stream, for_kv, exclude_expert_id)) {
             continue;
@@ -2247,6 +2367,7 @@ void TriPoolVMM::map_and_submit_contiguous_locked(
             if (!backend_->is_simulated()) {
                 backend_->memcpy_h2d_async(dst_va, bank.host_pinned_base + byte_off, copy_bytes, h2d_stream_);
                 backend_->record_event(lyr.ready_event, h2d_stream_);
+                bank.last_h2d_event = lyr.ready_event;
             } else if (bank.host_accessible_va && bank.host_pinned_base && byte_off < bank.host_bytes) {
                 const size_t avail = std::min(copy_bytes, bank.host_bytes - byte_off);
                 backend_->memcpy_h2d_async(dst_va, bank.host_pinned_base + byte_off, avail, h2d_stream_);

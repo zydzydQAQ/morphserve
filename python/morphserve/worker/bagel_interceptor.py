@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+import threading
 import time
 from typing import Any, Callable, Sequence
 
@@ -616,7 +617,6 @@ class BagelExecutionInterceptor:
                 interceptor._gen_depth -= 1
 
             if interceptor._step0_release_cb is not None and not interceptor._step0_done:
-                _sync_cuda_if_present(interceptor.device)
                 cb = interceptor._step0_release_cb
                 interceptor._step0_done = True
                 interceptor._step0_release_cb = None
@@ -672,10 +672,16 @@ class BagelExecutionInterceptor:
         prev_sched = self._active_scheduler
         prev_cb = self._step0_release_cb
         prev_done = self._step0_done
+        pacer_lock = threading.Lock()
         pacer_active = {"held": False}
+        h2d_release_thread: threading.Thread | None = None
 
-        def _release_pacer_once() -> None:
-            if pacer_slot_cm is not None and pacer_active["held"]:
+        def _release_pacer_once(*, sync_before_release: bool = False) -> None:
+            with pacer_lock:
+                if pacer_slot_cm is None or not pacer_active["held"]:
+                    return
+                if sync_before_release:
+                    _sync_cuda_if_present(self.device)
                 pacer_active["held"] = False
                 pacer_slot_cm.__exit__(None, None, None)
 
@@ -683,10 +689,35 @@ class BagelExecutionInterceptor:
             if pacer_slot_cm is not None:
                 pacer_slot_cm.__enter__()
                 pacer_active["held"] = True
-                self._step0_release_cb = _release_pacer_once
+                self._step0_release_cb = lambda: _release_pacer_once(sync_before_release=True)
                 self._step0_done = False
             if eff_pager is not None:
                 stack.enter_context(eff_pager.generation_mode(prefetch_all=prefetch_all))
+                # Release `HalfNodeH2DPacer` immediately once H2D DMA finishes on `h2d_stream_`
+                # rather than holding the half-node flock across the entire Step-0 compute!
+                vmm_obj = getattr(eff_pager, "vmm", None)
+                if (
+                    pacer_slot_cm is not None
+                    and vmm_obj is not None
+                    and callable(getattr(vmm_obj, "sync_expert_h2d", None))
+                    and not bool(getattr(vmm_obj, "is_simulated", False))
+                ):
+                    eid = int(eff_pager.expert_id)
+
+                    def _wait_h2d_and_release() -> None:
+                        try:
+                            vmm_obj.sync_expert_h2d(eid)
+                        except Exception:
+                            pass
+                        finally:
+                            _release_pacer_once(sync_before_release=False)
+
+                    h2d_release_thread = threading.Thread(
+                        target=_wait_h2d_and_release,
+                        name=f"ms-h2d-pacer-rel-{eid}",
+                        daemon=True,
+                    )
+                    h2d_release_thread.start()
             if eff_cfg is not None:
                 stack.enter_context(eff_cfg.active(reset_stats=reset_cfg_stats))
             if scheduler is not None:
@@ -698,4 +729,6 @@ class BagelExecutionInterceptor:
                 self._active_scheduler = prev_sched
                 self._step0_release_cb = prev_cb
                 self._step0_done = prev_done
-                _release_pacer_once()
+                if h2d_release_thread is not None:
+                    h2d_release_thread.join(timeout=10.0)
+                _release_pacer_once(sync_before_release=False)

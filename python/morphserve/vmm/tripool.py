@@ -933,6 +933,23 @@ class TriPoolVMM:
         if rc != 0:
             raise RuntimeError(f"ms_vmm_expert_wait_layer({expert_id}, {layer_idx}) failed (rc={rc})")
 
+    def sync_expert_h2d(self, expert_id: int) -> None:
+        if self._closed or not self._handle:
+            return
+        rc = int(self.lib.ms_vmm_expert_sync_h2d(ctypes.c_void_p(self._handle), int(expert_id)))
+        if rc != 0:
+            raise RuntimeError(f"ms_vmm_expert_sync_h2d({expert_id}) failed (rc={rc})")
+
+    def coalesce_fine_to_super(self, max_super: int = 0) -> int:
+        if self._closed or not self._handle:
+            return 0
+        return int(
+            self.lib.ms_vmm_coalesce_fine_to_super(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_size_t(max(0, int(max_super))),
+            )
+        )
+
     def evict_expert_range(self, expert_id: int, start_layer: int, end_layer: int, stream_ptr: int = 0) -> int:
         n = int(
             self.lib.ms_vmm_expert_evict_range(

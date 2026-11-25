@@ -950,8 +950,9 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 and torch.cuda.is_available()
             ):
                 # Reserve physical driver HBM headroom for upcoming `DirectNcclMesh` (~768 MiB) plus
-                # `1024^2` 3-branch DiT/ViT PyTorch activations (8,192 MiB) so VMM overflow handles
-                # never starve PyTorch's caching allocator into rare 40 GB boundary OOMs!
+                # `1024^2` 3-branch DiT/ViT PyTorch activations (6,144 MiB), leaving ~1.8–2.6 GiB of
+                # safe VMM growth headroom above the 15 GiB initial pool so mid/low-QPS VAE spikes and
+                # KV growth never prematurely evict resident Gen Expert layers, while strictly preventing OOM!
                 free_drv, total_drv = torch.cuda.mem_get_info(self.device)
                 if int(total_drv) > 0:
                     nccl_reserve_mib = (
@@ -962,7 +963,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 8192) * MIB
+                    headroom_b = (nccl_reserve_mib + 6144) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -980,7 +981,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
 
         if self.policy.use_module3_cow_loopback:
-            self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=False)
+            self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=True)
 
         if self.policy.preemption_mode != "non_preemptive":
             self.sched = UnifiedPreemptiveScheduler(
@@ -1130,11 +1131,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         import torch
 
         swapped = False
-        if update_vae:
-            if self.pager is not None and self.vmm is not None:
-                self.pager.ensure_all_resident_sync()
-            elif self.naive_offloader is not None:
-                swapped = self.naive_offloader.swap_in_sync()
+        if update_vae and self.naive_offloader is not None:
+            swapped = self.naive_offloader.swap_in_sync()
         try:
             if torch.is_tensor(img_or_u8):
                 self.loopback.update_context_from_u8_gpu(ctx, img_or_u8, update_vae=update_vae, update_vit=update_vit)
@@ -1389,7 +1387,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
         with self._pinned_ctx(*cids):
             for cmd in batch_cmds:
                 cid = str(cmd["ctx_id"])
-                enq_s = float(cmd.get("enqueue_time_s", 0.0))
+                recv_s = float(cmd.get("_worker_recv_s", 0.0))
+                enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
                 t_prep0 = time.perf_counter()
                 if not cmd.get("_skip_prepare", False):
                     self.prepare_turn(cid, cmd)
@@ -1627,16 +1626,28 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 pacer_slot_cm = self.pacer.acquire_process_slot(self.rank)
 
             inflight_ar_meta: dict[int, tuple[str, str, dict[str, Any]]] = {}
+            deferred_img_ar_msgs: list[dict[str, Any]] = []
 
             def _poll_external_ar(now_s: float) -> list[ArDecodeTask]:
-                if poll_preempt_cmds is None:
+                if poll_preempt_cmds is None and not deferred_img_ar_msgs:
                     return []
-                # Never run a new request's image/text prefill while an existing `ArDecodeTask`
-                # is mid-decode with a live inter-token TPOT clock ticking!
-                if self.sched is not None and self.sched.active_ar_tasks:
+                incoming: list[dict[str, Any]] = []
+                if deferred_img_ar_msgs:
+                    incoming.extend(deferred_img_ar_msgs)
+                    deferred_img_ar_msgs.clear()
+                if poll_preempt_cmds is not None:
+                    incoming.extend(poll_preempt_cmds())
+                if not incoming:
                     return []
+                has_live_ar = bool(self.sched is not None and self.sched.active_ar_tasks)
                 tasks: list[ArDecodeTask] = []
-                for ar_msg in poll_preempt_cmds():
+                for ar_msg in incoming:
+                    has_img = bool(ar_msg.get("image_paths") or ar_msg.get("use_prev_image"))
+                    # Never stall a live AR task's TPOT clock with a heavy ViT image prefill (~300-600ms);
+                    # lightweight text-only prefills (~15-25ms) immediately join the active `[B, D]` microbatch!
+                    if has_live_ar and has_img:
+                        deferred_img_ar_msgs.append(ar_msg)
+                        continue
                     ar_cid = str(ar_msg["ctx_id"])
                     self._active_ctx_pins[ar_cid] = self._active_ctx_pins.get(ar_cid, 0) + 1
                     try:
@@ -1652,6 +1663,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         pkv_ar = ar_ctx["past_key_values"]
                         if callable(getattr(pkv_ar, "prepare_fast_ar_decode", None)):
                             pkv_ar.prepare_fast_ar_decode(reserve_tokens=max_ar_toks + 4)
+                        recv_s = float(ar_msg.get("_worker_recv_s", 0.0))
+                        arr_s = recv_s if recv_s > 0.0 else float(ar_msg.get("enqueue_time_s", now_s))
                         task = ArDecodeTask(
                             req_id=str(ar_msg["cmd_id"]),
                             kv_cache=pkv_ar,
@@ -1660,12 +1673,13 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                             max_tokens=max_ar_toks,
                             end_token_id=self.pipeline.new_token_ids["eos_token_id"],
                             tpot_slo_ms=float(ar_msg.get("tpot_slo_ms", self.policy.ar_tpot_slo_ms)),
-                            arrival_time_s=float(ar_msg.get("enqueue_time_s", now_s)),
+                            arrival_time_s=arr_s,
                             _curr_tok_int=start_tok_int,
                         )
                         task.last_step_time_s = task.arrival_time_s
                         inflight_ar_meta[id(task)] = (str(ar_msg["cmd_id"]), ar_cid, ar_entry)
                         tasks.append(task)
+                        has_live_ar = True
                     except BaseException:
                         rem = self._active_ctx_pins.get(ar_cid, 1) - 1
                         if rem <= 0:
@@ -1799,6 +1813,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         # so `vae.decode` never stalls an active AR stream's inter-token TPOT!
                         if self.sched is not None and emit_preempt_ack is not None:
                             _flush_completed_ar()
+                            if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
+                                self.sched._admit_due_arrivals(time.perf_counter())
                             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                                 self.sched.drain_remaining_ar_tasks()
                             _flush_completed_ar()
@@ -1843,6 +1859,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         if self.sched is not None and emit_preempt_ack is not None:
                             try:
                                 _flush_completed_ar()
+                                if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
+                                    self.sched._admit_due_arrivals(time.perf_counter())
                                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                                     self.sched.drain_remaining_ar_tasks()
                                 _flush_completed_ar()

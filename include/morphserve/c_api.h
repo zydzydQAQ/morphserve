@@ -170,6 +170,8 @@ int ms_vmm_expert_set_layer_used_bytes(ms_vmm_t* h, int expert_id, int layer_idx
 int ms_vmm_expert_load_layers_sync(ms_vmm_t* h, int expert_id, int start_layer, int end_layer_exclusive);
 int ms_vmm_expert_prefetch_async(ms_vmm_t* h, int expert_id, int start_layer, int end_layer_exclusive);
 int ms_vmm_expert_wait_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* compute_stream);
+int ms_vmm_expert_sync_h2d(ms_vmm_t* h, int expert_id);
+size_t ms_vmm_coalesce_fine_to_super(ms_vmm_t* h, size_t max_super);
 int ms_vmm_expert_evict_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* stream);
 int ms_vmm_expert_evict_range(ms_vmm_t* h, int expert_id, int start_layer, int end_layer_exclusive, void* stream);
 int ms_vmm_expert_is_resident(ms_vmm_t* h, int expert_id, int layer_idx);

@@ -133,6 +133,76 @@ void test_tripool_vmm_max_pool_bytes_hard_cap() {
     MS_CHECK(vmm->shutdown() == 0);
 }
 
+void test_tripool_vmm_grow_before_evict_and_fine_to_super_coalescing() {
+    morphserve::vmm::TriPoolVMMConfig cfg;
+    cfg.device = 0;
+    cfg.super_pool_mib = 128;   // 2 x 64 MiB
+    cfg.fine_kv_pool_mib = 64;  // 32 x 2 MiB -> 192 MiB initial
+    cfg.super_handle_mib = 64;
+    cfg.transient_va_gib = 1;
+    cfg.kv_va_gib = 1;
+    cfg.allow_overflow = true;
+    cfg.max_pool_bytes = 320 * kMiB;  // +128 MiB safe growth headroom
+    cfg.simulated = true;
+    cfg.materialize_sim_va = true;
+
+    auto vmm = morphserve::vmm::TriPoolVMM::create(cfg);
+    auto mirror = morphserve::runtime::NumaMemfdMirror::create(2 * kMiB, 0, "cpp_test_grow_mirror");
+    const int eid = vmm->expert_register(2, 64, mirror->data(), mirror->nbytes());
+    MS_CHECK(eid == 0);
+    MS_CHECK(vmm->expert_load_layers_sync(eid, 0, 2) == 0);
+    MS_CHECK(vmm->expert_resident_count(eid) == 2);
+    MS_CHECK(vmm->expert_sync_h2d(eid) == 0);
+
+    // 1. 64 MiB transient spike must GROW within max_pool_bytes BEFORE evicting resident experts!
+    vmm->scope_begin();
+    void* tr1 = vmm->transient_alloc(64 * kMiB, nullptr);
+    MS_CHECK(tr1 != nullptr);
+    vmm->transient_free(tr1, 64 * kMiB, nullptr);
+    MS_CHECK(vmm->scope_end(nullptr) == 0);
+
+    UnifiedVmmStatsC st{};
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(vmm->expert_resident_count(eid) == 2);
+    MS_CHECK(st.expert_auto_evictions_for_transient == 0);
+    MS_CHECK(st.overflow_creates == 1);
+    MS_CHECK(st.pool_total_bytes == 256 * kMiB);
+
+    // 2. 128 MiB KV grows fine pool (+64 MiB -> 320 MiB cap) with ZERO super_to_fine_carves and ZERO expert evictions!
+    const uint64_t sid = vmm->kv_session_create();
+    const int32_t rid = vmm->kv_region_alloc(128 * kMiB, sid);
+    MS_CHECK(rid >= 0);
+    MS_CHECK(vmm->kv_region_ensure(rid, 128 * kMiB, nullptr) != 0);
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(vmm->expert_resident_count(eid) == 2);
+    MS_CHECK(st.super_to_fine_carves == 0);
+    MS_CHECK(st.pool_total_bytes == 320 * kMiB);
+    MS_CHECK(st.fine_pool_total_pages == 64);
+
+    // 3. Freeing KV automatically coalesces the 32 excess 2 MiB fine pages back into 1 x 64 MiB super-handle!
+    MS_CHECK(vmm->kv_region_free(rid, nullptr) == 0);
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(st.fine_pool_total_pages == 32);
+    MS_CHECK(st.super_pool_total_handles == 4);
+    MS_CHECK(st.super_pool_free_handles == 2);
+    MS_CHECK(st.pool_total_bytes == 320 * kMiB);
+
+    // 4. At max_pool_bytes cap, a 192 MiB transient spike gracefully falls back to evicting 1 tail expert layer!
+    vmm->scope_begin();
+    void* tr2 = vmm->transient_alloc(192 * kMiB, nullptr);
+    MS_CHECK(tr2 != nullptr);
+    vmm->transient_free(tr2, 192 * kMiB, nullptr);
+    MS_CHECK(vmm->scope_end(nullptr) == 0);
+
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(vmm->expert_resident_count(eid) == 1);
+    MS_CHECK(st.expert_auto_evictions_for_transient == 1);
+    MS_CHECK(st.pool_total_bytes == 320 * kMiB);
+
+    vmm->kv_session_destroy(sid);
+    MS_CHECK(vmm->shutdown() == 0);
+}
+
 void test_mirror_pacer_and_transports() {
     const char* msg = "SHARED_MEMFD_CPP_OK";
     auto m0 = morphserve::runtime::NumaMemfdMirror::create(64 * 1024, 0, "cpp_mfd_share", msg, std::strlen(msg));
@@ -194,6 +264,7 @@ void test_mirror_pacer_and_transports() {
 int main() {
     test_tripool_vmm_bidirectional_and_session_swap();
     test_tripool_vmm_max_pool_bytes_hard_cap();
+    test_tripool_vmm_grow_before_evict_and_fine_to_super_coalescing();
     test_mirror_pacer_and_transports();
     std::cout << "[PASS] test_vmm_and_runtime\n";
     return 0;

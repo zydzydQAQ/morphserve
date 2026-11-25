@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import gc
 import inspect
 import math
 import os
 from pathlib import Path
 import sys
+import threading
 import time
 import types
 from typing import Any, Callable
@@ -760,26 +761,23 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
     @contextmanager
     def _vlm_execution_scope(self):
-        """Pin & materialize `vlm_pager` during VLM execution while leaving `decoder` unpinned for eviction."""
+        """Pin & materialize `vlm_pager` during VLM execution, holding H2D pacer ONLY during H2D weight loads."""
         if self.vlm_pager is None or self.vmm is None:
             yield
             return
         if self.pager is not None and self.pager.expert_id >= 0:
             self.vmm.set_expert_pinned(self.pager.expert_id, False)
-        pacer_cm = None
-        if (
-            self.pacer is not None
-            and self.vmm.expert_resident_count(self.vlm_pager.expert_id) < self.vlm_pager.num_layers
-        ):
-            pacer_cm = self.pacer.acquire_process_slot(self.rank)
-        try:
-            if pacer_cm is not None:
-                pacer_cm.__enter__()
-            with self.vlm_pager.generation_mode(prefetch_all=True):
-                yield
-        finally:
-            if pacer_cm is not None:
-                pacer_cm.__exit__(None, None, None)
+        if self.vmm.expert_resident_count(self.vlm_pager.expert_id) < self.vlm_pager.num_layers:
+            pacer_cm = self.pacer.acquire_process_slot(self.rank) if self.pacer is not None else nullcontext()
+            with pacer_cm:
+                self.vmm.set_expert_pinned(self.vlm_pager.expert_id, True)
+                try:
+                    self.vlm_pager.ensure_all_resident_sync()
+                except BaseException:
+                    self.vmm.set_expert_pinned(self.vlm_pager.expert_id, False)
+                    raise
+        with self.vlm_pager.generation_mode(prefetch_all=True):
+            yield
 
     def prepare_turn(self, ctx_id: str, cmd: dict[str, Any]) -> int:
         import torch
@@ -893,7 +891,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             results: list[dict[str, Any]] = []
             for cmd in batch_cmds:
                 cid = str(cmd["ctx_id"])
-                enq_s = float(cmd.get("enqueue_time_s", 0.0))
+                recv_s = float(cmd.get("_worker_recv_s", 0.0))
+                enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
                 t_cmd0 = time.perf_counter()
                 if not cmd.get("_skip_prepare", False):
                     self.prepare_turn(cid, dict(cmd, prepare_for_dit=False))
@@ -951,7 +950,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         per_step_ms = dt_ms / float(max_steps_executed)
         results = []
         for idx, cmd in enumerate(batch_cmds):
-            enq_s = float(cmd.get("enqueue_time_s", 0.0))
+            recv_s = float(cmd.get("_worker_recv_s", 0.0))
+            enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
             q_wait_ms = max(0.0, (t_start - enq_s) * 1000.0) if enq_s > 0.0 else 0.0
             seq = trimmed_seqs[idx]
             n_tok = max(1, int(len(seq)))
@@ -1045,15 +1045,52 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         ):
             pacer_cm = self.pacer.acquire_process_slot(self.rank)
 
+        pacer_lock = threading.Lock()
+        pacer_active = {"held": False}
+        h2d_release_thread: threading.Thread | None = None
+
+        def _release_pacer_once() -> None:
+            with pacer_lock:
+                if pacer_cm is None or not pacer_active["held"]:
+                    return
+                pacer_active["held"] = False
+                pacer_cm.__exit__(None, None, None)
+
         gen = torch.Generator(device=self.device).manual_seed(seed)
         try:
             if pacer_cm is not None:
                 pacer_cm.__enter__()
+                pacer_active["held"] = True
             if self.vlm_pager is not None and self.vmm is not None and self.vlm_pager.expert_id >= 0:
                 self.vmm.set_expert_pinned(self.vlm_pager.expert_id, False)
             with torch.inference_mode():
                 if self.pager is not None:
                     with self.pager.generation_mode(prefetch_all=True):
+                        # Release `HalfNodeH2DPacer` immediately once decoder H2D DMA finishes on `h2d_stream_`
+                        # so Steps 1..15 + QwenImage VAE decode run 100% concurrently across all 4 GPUs/half-node!
+                        if (
+                            pacer_cm is not None
+                            and self.vmm is not None
+                            and callable(getattr(self.vmm, "sync_expert_h2d", None))
+                            and not bool(getattr(self.vmm, "is_simulated", False))
+                        ):
+                            dec_eid = int(self.pager.expert_id)
+                            vmm_ref = self.vmm
+
+                            def _wait_dec_h2d_and_release() -> None:
+                                try:
+                                    vmm_ref.sync_expert_h2d(dec_eid)
+                                except Exception:
+                                    pass
+                                finally:
+                                    _release_pacer_once()
+
+                            h2d_release_thread = threading.Thread(
+                                target=_wait_dec_h2d_and_release,
+                                name=f"ms-ivlu-pacer-rel-{self.rank}",
+                                daemon=True,
+                            )
+                            h2d_release_thread.start()
                         # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
                         # `generation_decoder.prepare_forward_input` BEFORE `transformer_blocks[0]`'s pre-hook!
                         self.pager.wait_layer_if_needed(0, "prepare_forward_input")
@@ -1069,6 +1106,10 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                             generator=gen,
                             output_type="latent",
                         ).images
+                    if h2d_release_thread is not None:
+                        h2d_release_thread.join(timeout=10.0)
+                        h2d_release_thread = None
+                    _release_pacer_once()
                     # Run QwenImage VAE decode OUTSIDE `generation_mode` so decoder blocks are unpinned
                     # under 12 GiB quota while staying 100% resident under ample 40/80 GB `super_pool`!
                     lat_bf16 = latents_out.to(torch.bfloat16)
@@ -1101,8 +1142,9 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                         generator=gen,
                     ).images
         finally:
-            if pacer_cm is not None:
-                pacer_cm.__exit__(None, None, None)
+            if h2d_release_thread is not None:
+                h2d_release_thread.join(timeout=10.0)
+            _release_pacer_once()
             if self.naive_offloader is not None:
                 self.naive_offloader.drop_from_gpu()
 

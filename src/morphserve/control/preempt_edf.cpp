@@ -72,7 +72,11 @@ void PreemptEdfController::select_edf_microbatch(
     });
 
     const size_t max_serve = static_cast<size_t>(std::max(1, max_microbatch_cap_));
-    const double coalesce_window_ms = ema_ar_step_ms_ + ema_layer_ms_ + guard_ms_;
+    // Account for the current yield's own `ema_ar_step_ms_` execution time: if a peer task's
+    // remaining slack after this yield (`slack_ms - ema_ar_step_ms_`) would fall within one
+    // decode-plus-chunk window (`ema_ar_step_ms_ + ema_layer_ms_ + guard_ms_`), coalesce it into
+    // the same `[B, D]` packed microbatch now instead of anti-phase serial ping-pong!
+    const double coalesce_window_ms = 2.0 * ema_ar_step_ms_ + ema_layer_ms_ + guard_ms_;
     for (size_t rank_idx = 0; rank_idx < ordered.size(); ++rank_idx) {
         const size_t orig_idx = ordered[rank_idx];
         const double slack_ms = (deadlines_s[orig_idx] - now_s) * 1000.0;

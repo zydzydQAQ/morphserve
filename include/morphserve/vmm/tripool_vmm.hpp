@@ -169,6 +169,8 @@ public:
     int expert_load_layers_sync(int expert_id, int start_layer, int end_layer_exclusive);
     int expert_prefetch_async(int expert_id, int start_layer, int end_layer_exclusive);
     int expert_wait_layer(int expert_id, int layer_idx, void* compute_stream);
+    int expert_sync_h2d(int expert_id);
+    size_t coalesce_fine_to_super(size_t max_super = SIZE_MAX);
     int expert_evict_layer(int expert_id, int layer_idx, void* stream);
     int expert_evict_range(int expert_id, int start_layer, int end_layer_exclusive, void* stream);
     int expert_is_resident(int expert_id, int layer_idx);
@@ -224,6 +226,7 @@ private:
         size_t host_bytes = 0;
         bool pinned = false;
         bool host_accessible_va = false;
+        void* last_h2d_event = nullptr;
         std::vector<ExpertLayer> layers;
     };
 
@@ -291,6 +294,7 @@ private:
         int exclude_expert_id = -1,
         std::unique_lock<std::mutex>* opt_lock = nullptr);
     void release_super_slot_to_pool_locked(SuperSlot& slot);
+    size_t try_coalesce_fine_to_super_locked(size_t max_super = SIZE_MAX);
     void map_super_slot_locked(uint64_t slot_va, const SuperSlot& slot, bool host_access);
 
     void trim_idle_host_pinned_locked(size_t max_idle_bytes);
@@ -347,6 +351,7 @@ private:
     std::atomic<bool> atexit_teardown_{false};
     bool stop_streamer_ = false;
     bool streamer_error_ = false;
+    size_t active_h2d_syncs_ = 0;
 
     bool initialized_ = false;
     bool scope_active_ = false;

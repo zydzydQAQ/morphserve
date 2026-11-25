@@ -67,6 +67,56 @@ class TestPhase0Offline(unittest.TestCase):
             self.assertTrue((tmp / "install/python/morphserve/probe.py").is_file())
             self.assertTrue((tmp / "install/src/morphserve/probe.py").is_file())
 
+            cxx = shutil.which("g++")
+            assert cxx is not None
+            inc_args = [
+                f"-I{REPO_ROOT / 'include'}",
+                f"-I{REPO_ROOT / 'deploy/kairos/deps/nlohmann3.11.3'}",
+            ]
+            lib_dir = tmp / "install/lib"
+            link_args = [f"-L{lib_dir}", f"-Wl,-rpath,{lib_dir}", "-lmorphserve_core", "-ldl", "-pthread"]
+            for cpp_name in ("test_vmm_and_runtime", "test_control_and_sim"):
+                cpp_src = REPO_ROOT / "tests/cpp" / f"{cpp_name}.cpp"
+                if not cpp_src.is_file():
+                    continue
+                if cpp_name == "test_control_and_sim" and not (
+                    (REPO_ROOT / "results/phase0-job0c").is_dir()
+                    and (REPO_ROOT / "data/interleaved-bench-v1").is_dir()
+                ):
+                    continue
+                exe_path = tmp / cpp_name
+                comp = subprocess.run(
+                    [
+                        cxx,
+                        "-std=c++17",
+                        "-O2",
+                        "-Wall",
+                        "-Wextra",
+                        "-Wpedantic",
+                        *inc_args,
+                        str(cpp_src),
+                        *link_args,
+                        "-o",
+                        str(exe_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(comp.returncode, 0, msg=f"{cpp_name} compile failed:\n{comp.stderr}")
+                run_t = subprocess.run(
+                    [str(exe_path)],
+                    cwd=str(REPO_ROOT),
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+                self.assertEqual(
+                    run_t.returncode,
+                    0,
+                    msg=f"{cpp_name} failed:\nSTDOUT:\n{run_t.stdout}\nSTDERR:\n{run_t.stderr}",
+                )
+
     def test_shell_scripts_syntax(self) -> None:
         scripts = [
             REPO_ROOT / "deploy/kairos/scripts/build_stage.sh",

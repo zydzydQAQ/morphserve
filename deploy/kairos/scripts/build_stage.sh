@@ -46,7 +46,14 @@ CORE_SRCS=(
   "c_api.cpp"
 )
 
-MAX_JOBS="$(nproc 2>/dev/null || echo 4)"
+if [ -z "${MAX_JOBS:-}" ]; then
+  if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+    MAX_JOBS=1
+    echo "note: WSL detected; defaulting MAX_JOBS=1 to avoid WSL OOM (prefer Kairos in-container build via deploy_build.sh --mode stage; override with MAX_JOBS=N)" >&2
+  else
+    MAX_JOBS="$(nproc 2>/dev/null || echo 4)"
+  fi
+fi
 OBJS=()
 PIDS=()
 ACTIVE=0

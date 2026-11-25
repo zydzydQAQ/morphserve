@@ -292,6 +292,9 @@ class LayerExpertPager:
         self._wrapped_layer_methods: list[tuple[Any, str, Any]] = []
         self._orig_vae_methods: list[tuple[Any, str, Any]] = []
         self._generation_active = False
+        self._all_resident_synced = False
+        self._has_pending_async_prefetch = False
+        self._waited_layers: set[int] = set()
         self.layer_hook_calls: int = 0
         self.hook_methods_triggered: set[str] = set()
         self._packed_params_count = 0
@@ -412,6 +415,11 @@ class LayerExpertPager:
         initial_layers = int(round(float(initial_alpha) * self.num_layers))
         if initial_layers > 0:
             vmm.load_expert_layers_sync(self.expert_id, 0, initial_layers)
+        self._has_pending_async_prefetch = False
+        self._waited_layers.clear()
+        self._all_resident_synced = bool(
+            self.num_layers > 0 and vmm.expert_resident_count(self.expert_id) == self.num_layers
+        )
 
         if self.spec.install_module_hooks and self.spec.hook_modules:
             self._install_layer_hooks()
@@ -436,8 +444,15 @@ class LayerExpertPager:
             return
         self.layer_hook_calls += 1
         self.hook_methods_triggered.add(method_tag)
+        if self._all_resident_synced:
+            return
+        lid = int(layer_idx)
         s_ptr = _current_cuda_stream_ptr(self.vmm.device)
-        self.vmm.wait_expert_layer(self.expert_id, int(layer_idx), s_ptr)
+        self.vmm.wait_expert_layer(self.expert_id, lid, s_ptr)
+        self._waited_layers.add(lid)
+        if len(self._waited_layers) >= self.num_layers:
+            self._all_resident_synced = True
+            self._has_pending_async_prefetch = False
 
     def _install_layer_hooks(self) -> None:
         for layer_idx, mod in enumerate(self.spec.hook_modules):
@@ -470,6 +485,8 @@ class LayerExpertPager:
             was_gen_active = self._generation_active
             prev_res = vmm.expert_resident_count(self.expert_id)
             self._generation_active = False
+            self._all_resident_synced = False
+            self._waited_layers.clear()
             vmm.set_expert_pinned(self.expert_id, False)
             completed_ok = False
             try:
@@ -483,20 +500,30 @@ class LayerExpertPager:
                 #   `generation_mode(prefetch_all=True)` reloads them asynchronously during Step-1.
                 # - After `vae.encode`: when inside `generation_mode`, queue async background prefetch;
                 #   when outside `generation_mode` (e.g. `forward_cache_update_vae` right before
-                #   `language_model(mode="gen")` runs without wait hooks), reload evicted layers
-                #   synchronously now that `run_in_transient_scope` has released Arena-2 handles!
+                #   `language_model(mode="gen")` runs without wait hooks), load ALL missing layers
+                #   synchronously ONCE now that `run_in_transient_scope` has released Arena-2 handles!
                 try:
-                    if completed_ok and (not is_decode) and vmm.expert_resident_count(self.expert_id) < prev_res:
+                    if completed_ok and (not is_decode):
+                        cur_res = vmm.expert_resident_count(self.expert_id)
                         if was_gen_active:
-                            vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
+                            if cur_res < prev_res:
+                                vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
+                                self._has_pending_async_prefetch = True
                         else:
-                            missing = prev_res - vmm.expert_resident_count(self.expert_id)
-                            self._ensure_expert_headroom(missing)
-                            vmm.load_expert_layers_sync(self.expert_id, 0, prev_res)
+                            target_res = self.num_layers
+                            if cur_res < target_res:
+                                missing = target_res - cur_res
+                                self._ensure_expert_headroom(missing)
+                                vmm.load_expert_layers_sync(self.expert_id, 0, target_res)
+                                self._has_pending_async_prefetch = False
                 finally:
                     self._generation_active = was_gen_active
                     if was_gen_active:
                         vmm.set_expert_pinned(self.expert_id, True)
+                        self._all_resident_synced = bool(
+                            (not self._has_pending_async_prefetch)
+                            and vmm.expert_resident_count(self.expert_id) == self.num_layers
+                        )
 
         return _wrapped
 
@@ -521,9 +548,16 @@ class LayerExpertPager:
             )
         st = self.vmm.stats_dict()
         pool_free = int(st.get("pool_free_bytes", 0))
+        pool_total = int(st.get("pool_total_bytes", 0))
+        max_pool = int(getattr(self.vmm, "max_pool_bytes", None) or 0)
+        growth_headroom = (
+            max(0, max_pool - pool_total)
+            if (bool(getattr(self.vmm, "allow_overflow", False)) and max_pool > 0)
+            else 0
+        )
         self_unpinned = int(self.vmm.expert_resident_count(self.expert_id)) * self.layer_stride_bytes
         other_unpinned = max(0, int(st.get("expert_unpinned_bytes", 0)) - self_unpinned)
-        non_self_pool_free = pool_free + other_unpinned
+        non_self_pool_free = pool_free + growth_headroom + other_unpinned
         if non_self_pool_free < missing_bytes and hasattr(self.vmm, "reclaim_thinking_kv_bytes"):
             self.vmm.reclaim_thinking_kv_bytes(
                 missing_bytes - non_self_pool_free,
@@ -544,6 +578,9 @@ class LayerExpertPager:
             if cur < self.num_layers:
                 self._ensure_expert_headroom(self.num_layers - cur)
                 self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
+            self._has_pending_async_prefetch = False
+            self._waited_layers.clear()
+            self._all_resident_synced = bool(self.vmm.expert_resident_count(self.expert_id) == self.num_layers)
 
     def set_residency_alpha(self, alpha: float) -> int:
         assert self.vmm is not None
@@ -552,6 +589,9 @@ class LayerExpertPager:
         target = max(0, min(self.num_layers, int(round(float(alpha) * self.num_layers))))
         s_ptr = _current_cuda_stream_ptr(self.vmm.device)
         self._generation_active = False
+        self._all_resident_synced = False
+        self._has_pending_async_prefetch = False
+        self._waited_layers.clear()
         self.vmm.set_expert_pinned(self.expert_id, False)
         if target < self.num_layers:
             self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
@@ -560,26 +600,37 @@ class LayerExpertPager:
             self._ensure_expert_headroom(target - cur, for_dit=(target == self.num_layers))
         if target > 0:
             self.vmm.load_expert_layers_sync(self.expert_id, 0, target)
-        return int(self.vmm.expert_resident_count(self.expert_id))
+        res = int(self.vmm.expert_resident_count(self.expert_id))
+        self._all_resident_synced = bool(res == self.num_layers)
+        return res
 
     @contextmanager
     def generation_mode(self, prefetch_all: bool = True):
         assert self.vmm is not None
-        if prefetch_all:
-            cur = self.vmm.expert_resident_count(self.expert_id)
-            if cur < self.num_layers:
-                self._ensure_expert_headroom(self.num_layers - cur)
+        cur = self.vmm.expert_resident_count(self.expert_id)
+        if prefetch_all and cur < self.num_layers:
+            self._ensure_expert_headroom(self.num_layers - cur)
         self.vmm.set_expert_pinned(self.expert_id, True)
         self._generation_active = True
-        if prefetch_all:
-            if self.spec.install_module_hooks and self.spec.hook_modules or self._should_wait_predicate is not None:
-                self.vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
-            else:
-                self.ensure_all_resident_sync()
+        self._waited_layers.clear()
+        cur_pinned = self.vmm.expert_resident_count(self.expert_id)
+        if cur_pinned == self.num_layers and not self._has_pending_async_prefetch:
+            self._all_resident_synced = True
+        else:
+            self._all_resident_synced = False
+            if prefetch_all:
+                if self.spec.install_module_hooks and self.spec.hook_modules or self._should_wait_predicate is not None:
+                    queued = self.vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
+                    if queued > 0:
+                        self._has_pending_async_prefetch = True
+                else:
+                    self.ensure_all_resident_sync()
         try:
             yield self
         finally:
             self._generation_active = False
+            self._all_resident_synced = False
+            self._waited_layers.clear()
             self.vmm.set_expert_pinned(self.expert_id, False)
 
     def unbind_vmm_keep_mirror(self) -> None:

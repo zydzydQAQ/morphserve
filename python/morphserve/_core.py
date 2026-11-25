@@ -300,6 +300,10 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_vmm_expert_prefetch_async.restype = ctypes.c_int
     L.ms_vmm_expert_wait_layer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
     L.ms_vmm_expert_wait_layer.restype = ctypes.c_int
+    L.ms_vmm_expert_sync_h2d.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    L.ms_vmm_expert_sync_h2d.restype = ctypes.c_int
+    L.ms_vmm_coalesce_fine_to_super.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    L.ms_vmm_coalesce_fine_to_super.restype = ctypes.c_size_t
     L.ms_vmm_expert_evict_layer.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
     L.ms_vmm_expert_evict_layer.restype = ctypes.c_int
     L.ms_vmm_expert_evict_range.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]

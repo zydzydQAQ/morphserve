@@ -113,7 +113,8 @@ public:
         const std::map<int, bool>& gpu_busy = {},
         const std::map<int, int>& active_dit_ranks = {},
         const std::map<int, int>& active_preemptions = {},
-        int max_preemptions_per_gpu = 2);
+        int max_preemptions_per_gpu = 2,
+        const std::string& architecture = "tight_mot");
 
     int select_static_gen_gpu(
         const std::string& routing_mode,

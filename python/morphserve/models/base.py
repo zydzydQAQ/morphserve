@@ -132,7 +132,8 @@ class CPTGModelAdapter(ABC):
         results: list[dict[str, Any]] = []
         for cmd in batch_cmds:
             cid = str(cmd["ctx_id"])
-            enq_s = float(cmd.get("enqueue_time_s", 0.0))
+            recv_s = float(cmd.get("_worker_recv_s", 0.0))
+            enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
             t_start = time.perf_counter()
             self.prepare_turn(cid, cmd)
             out = self.decode_ar(cid, int(cmd.get("max_ar_tokens", 32)))
@@ -557,7 +558,8 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
         with self._pinned_ctx(*cids):
             for idx, cmd in enumerate(batch_cmds):
                 cid = str(cmd["ctx_id"])
-                enq_s = float(cmd.get("enqueue_time_s", 0.0))
+                recv_s = float(cmd.get("_worker_recv_s", 0.0))
+                enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
                 if not cmd.get("_skip_prepare", False):
                     self.prepare_turn(cid, cmd)
                 out = self.decode_ar(cid, int(cmd.get("max_ar_tokens", 8)))

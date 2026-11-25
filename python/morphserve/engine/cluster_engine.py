@@ -343,6 +343,7 @@ class MorphServeClusterEngine:
             gpu_busy=self._gpu_busy_map(),
             active_dit_ranks=self._active_dit_ranks,
             active_preemptions=self._active_preemptions,
+            architecture=self.policy.cptg_architecture,
         )
 
     async def _execute_ar_phase(
@@ -370,7 +371,6 @@ class MorphServeClusterEngine:
                         "image_paths": turn.image_paths,
                         "max_ar_tokens": turn.max_ar_tokens,
                         "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
-                        "enqueue_time_s": time.perf_counter(),
                         "prepare_for_dit": prepare_for_dit,
                     },
                 )
@@ -388,6 +388,9 @@ class MorphServeClusterEngine:
             while self._gpu_locks[resident_gpu].locked():
                 async with self._gpu_locks[resident_gpu]:
                     pass
+            # Measure coordinator-side queue wait purely on the Coordinator's monotonic clock and add it
+            # to the worker's purely worker-local `ttft_ms` so multi-node `perf_counter()` skew is 0!
+            coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
             self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
             self._ar_drained_events[resident_gpu].clear()
             try:
@@ -399,7 +402,6 @@ class MorphServeClusterEngine:
                         "prompt": turn.prompt,
                         "image_paths": turn.image_paths,
                         "max_ar_tokens": turn.max_ar_tokens,
-                        "enqueue_time_s": t_enq,
                         "prepare_for_dit": prepare_for_dit,
                     },
                 )
@@ -408,6 +410,8 @@ class MorphServeClusterEngine:
                 self._inflight_ar_on_gpu[resident_gpu] = rem
                 if rem == 0:
                     self._ar_drained_events[resident_gpu].set()
+            if ar_res.get("status") == "ok" and coord_queue_wait_ms > 0.0:
+                ar_res = dict(ar_res, ttft_ms=round(float(ar_res.get("ttft_ms", 0.0)) + coord_queue_wait_ms, 2))
             return ar_res, False
         finally:
             self.worker_states[resident_gpu].queue_wait_ms = max(

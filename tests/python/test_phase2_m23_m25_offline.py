@@ -1105,6 +1105,87 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert s_qps["twostage_shm"]["max_sustainable_qps_80pct"] == 0.0
         assert s_qps["twostage_shm"]["max_sustainable_qps_90pct"] == 0.0
 
+    def test_cross_node_clock_skew_immunity_pager_fastpath_and_cascade_default(self) -> None:
+        """Verify D6 clock-skew immunity, LayerExpertPager all-resident fast-path, and Cascade-CFG E2E default."""
+        from morphserve.engine.worker_runtime import WorkerRuntime
+        from morphserve.models.base import SyntheticCPTGAdapter
+        from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, LayerPackPlan, NumaMemfdMirror, ParamSlice
+
+        # 1. WorkerRuntime stamps local `_worker_recv_s`, completely ignoring a skewed cross-node `enqueue_time_s`!
+        pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1)
+        ad = SyntheticCPTGAdapter(rank=0, policy=pol)
+        ad.attach_expert_mirror(None, populate=True)
+        ad.bind_runtime_resources()
+        acks: list[dict] = []
+        rt = WorkerRuntime(rank=0, policy=pol, adapter=ad, peer_mesh=None, ack_sink=acks.append)
+        try:
+            skewed_remote_ts = time.perf_counter() - 2025.5  # Simulate Node 0 vs Node 1 boot offset!
+            rt.enqueue_command(
+                {
+                    "op": "EXEC_AR",
+                    "cmd_id": "skew_1",
+                    "ctx_id": "ctx_skew_1",
+                    "prompt": "hello",
+                    "max_ar_tokens": 4,
+                    "enqueue_time_s": skewed_remote_ts,
+                }
+            )
+            cmd = rt._pop_next_main_cmd(timeout=0.1)
+            assert cmd is not None and "_worker_recv_s" in cmd
+            rt._execute_ar_cmds_and_ack([cmd])
+            assert len(acks) == 1 and acks[0]["status"] == "ok"
+            # Must be ~12ms (pure worker-local), NOT ~2,025,500ms!
+            assert float(acks[0]["ttft_ms"]) < 1000.0, f"cross-node clock skew leaked into ttft_ms={acks[0]['ttft_ms']}"
+        finally:
+            ad.close()
+
+        # 2. LayerExpertPager all-resident fast-path skips redundant C++ wait_expert_layer calls on Steps 1..N
+        sim_vmm = SimulatedTriPoolBackend(
+            device=0, super_pool_mib=128, fine_kv_pool_mib=32, super_handle_mib=16, allow_overflow=False
+        )
+        plans = [
+            LayerPackPlan(
+                layer_idx=i,
+                used_bytes=4096,
+                params=[ParamSlice(name=f"l{i}", offset=0, nbytes=4096, shape=(4096,), dtype_str="uint8")],
+            )
+            for i in range(4)
+        ]
+        spec = ExpertPartitionSpec(
+            name="unit_fastpath",
+            plans=plans,
+            layer_stride_bytes=16 * (1024**2),
+            hook_modules=[],
+            vae_module=None,
+            install_module_hooks=False,
+        )
+        pager = LayerExpertPager(spec)
+        mirror = NumaMemfdMirror.create(nbytes=pager.total_mirror_bytes, numa_node=0, name="unit_fp_mirror")
+        try:
+            pager.offload_to_shared_mirror(mirror, populate=False)
+            pager.bind_vmm(sim_vmm, initial_alpha=0.5)
+            pager.set_wait_gate(lambda: True)
+            with pager.generation_mode(prefetch_all=True):
+                # Step 0: waits all 4 layers (triggers C++ wait_expert_layer)
+                for lidx in range(4):
+                    pager.wait_layer_if_needed(lidx, "forward")
+                calls_step0 = int(sim_vmm.stats_dict()["expert_wait_calls"])
+                assert calls_step0 == 4
+                assert pager._all_resident_synced is True
+                # Step 1: fast-path skips C++ wait_expert_layer completely while preserving layer_hook_calls!
+                for lidx in range(4):
+                    pager.wait_layer_if_needed(lidx, "forward")
+                assert int(sim_vmm.stats_dict()["expert_wait_calls"]) == calls_step0
+                assert pager.layer_hook_calls == 8
+        finally:
+            pager.close()
+            sim_vmm.shutdown()
+            mirror.close()
+
+        # 3. Verify `BagelCPTGAdapter` enables `allow_cascade_split=True` for E2E FlashPrefix-CFG
+        bagel_src = (REPO_ROOT / "python/morphserve/models/bagel_adapter.py").read_text(encoding="utf-8")
+        assert "enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=True)" in bagel_src
+
 
 if __name__ == "__main__":
     unittest.main()

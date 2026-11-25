@@ -54,7 +54,7 @@ void test_router_edf_and_budget_planner() {
     router.update_worker_telemetry(1, 0.25, 16 * kGiB, 4);  // stale seq 4 < 5 ignored!
     MS_CHECK(router.get_worker_state(1).kv_free_bytes == 200 * kMiB);
 
-    // PreemptEdfController adaptive chunking & EDF slack coalescing (window = 20 + 8.5 + 4 = 32.5 ms)
+    // PreemptEdfController adaptive chunking & EDF slack coalescing (window = 2*20 + 8.5 + 4 = 52.5 ms)
     PreemptEdfController edf(28, 60.0, 4.0, 8.5, 20.0, 3);
     MS_CHECK(edf.compute_adaptive_chunk_layers(60.0) == 4);
     MS_CHECK(edf.compute_adaptive_chunk_layers(100.0) == 8);
@@ -65,6 +65,49 @@ void test_router_edf_and_budget_planner() {
     MS_CHECK(due.size() == 3);
     MS_CHECK(due[0] == 1 && due[1] == 3 && due[2] == 0);
     MS_CHECK(def.size() == 1 && def[0] == 2);
+
+    // Anti-phase lock prevention at 100 ms TPOT SLO (50 ms AR step): 110 ms slack peer MUST coalesce into B=2!
+    PreemptEdfController edf_bagel(28, 100.0, 14.0, 10.5, 50.0, 4);
+    const double dls_antiphase[3] = {100.040, 100.110, 100.500};
+    edf_bagel.select_edf_microbatch(100.00, dls_antiphase, 3, /*force_all_urgent=*/false, due, def);
+    MS_CHECK(due.size() == 2 && due[0] == 0 && due[1] == 1);
+    MS_CHECK(def.size() == 1 && def[0] == 2);
+
+    // Architecture-aware initial placement:
+    // - `bridge_mllm_dit` (InternVL-U) prefers LOW decoder alpha (VLM-resident GPU) for `dit_t2i` & `cot_then_dit`
+    // - `tight_mot` (BAGEL) prefers HIGH gen alpha
+    // - `ar_only` preemption prefers non-DiT busy GPUs over GPUs actively executing DiT
+    DualPathMorphRouter router_arch(topo);
+    router_arch.init_workers(
+        2,
+        [](int) { return "hybrid"; },
+        {{0, 0.0}, {1, 1.0}},
+        {{0, 16 * kGiB}, {1, 16 * kGiB}});
+    MS_CHECK(
+        router_arch.select_initial_gpu(
+            2, "dual_path", "layer_chunk", {}, "dit_t2i", nullptr, {{0, false}, {1, false}}, {}, {}, 2, "bridge_mllm_dit") ==
+        0);
+    MS_CHECK(
+        router_arch.select_initial_gpu(
+            2, "dual_path", "layer_chunk", {}, "dit_t2i", nullptr, {{0, false}, {1, false}}, {}, {}, 2, "tight_mot") ==
+        1);
+    MS_CHECK(
+        router_arch.select_initial_gpu(
+            2, "dual_path", "layer_chunk", {}, "cot_then_dit", nullptr, {{0, false}, {1, false}}, {}, {}, 2, "bridge_mllm_dit") ==
+        0);
+    MS_CHECK(
+        router_arch.select_initial_gpu(
+            2,
+            "dual_path",
+            "layer_chunk",
+            {},
+            "ar_only",
+            nullptr,
+            {{0, true}, {1, true}},
+            {{0, 1}, {1, 0}},
+            {{0, 0}, {1, 0}},
+            2,
+            "tight_mot") == 1);
 
     // WorkerBudgetPlanner 12 GiB Regime B conservation (VLM + Decoder co-paged in 6688 MiB VMM pool)
     const auto q_pair = WorkerBudgetPlanner::compute_internvlu_quota_overrides(

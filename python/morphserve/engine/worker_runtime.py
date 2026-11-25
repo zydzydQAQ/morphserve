@@ -333,6 +333,8 @@ class WorkerRuntime:
 
     def enqueue_command(self, msg: dict[str, Any]) -> None:
         op = msg.get("op")
+        if op in ("EXEC_AR", "EXEC_AR_PREEMPT"):
+            msg = dict(msg, _worker_recv_s=time.perf_counter())
         if op == "EXEC_AR_PREEMPT":
             self.ar_preempt_q.put(msg)
         elif op in _XFER_OPS:

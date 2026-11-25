@@ -481,6 +481,26 @@ int ms_vmm_expert_wait_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* co
     }
 }
 
+int ms_vmm_expert_sync_h2d(ms_vmm_t* h, int expert_id) {
+    if (!h || !h->ptr) return -1;
+    try {
+        return h->ptr->expert_sync_h2d(expert_id);
+    } catch (const std::exception& e) {
+        set_err(e);
+        return -1;
+    }
+}
+
+size_t ms_vmm_coalesce_fine_to_super(ms_vmm_t* h, size_t max_super) {
+    if (!h || !h->ptr) return 0;
+    try {
+        return h->ptr->coalesce_fine_to_super(max_super == 0 ? SIZE_MAX : max_super);
+    } catch (const std::exception& e) {
+        set_err(e);
+        return 0;
+    }
+}
+
 int ms_vmm_expert_evict_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* stream) {
     if (!h || !h->ptr) return -1;
     try {
@@ -1255,7 +1275,8 @@ int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json) {
             parse_bool_map(j, "gpu_busy"),
             parse_int_map(j, "active_dit_ranks"),
             parse_int_map(j, "active_preemptions"),
-            j.value("max_preemptions_per_gpu", 2));
+            j.value("max_preemptions_per_gpu", 2),
+            j.value("architecture", std::string("tight_mot")));
     } catch (const std::exception& e) {
         set_err(e);
         return -1;

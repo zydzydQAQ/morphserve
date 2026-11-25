@@ -440,18 +440,18 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     # Measure unloaded VMM fast-path AR decode TPOT to verify zero per-token VMM overhead vs stock `NaiveCache`
     vmm_warm_ar = _make_ar_task(pipeline, ar_base_1, "vmm_warm", max_tokens=4, tpot_slo_ms=slo_20x, vmm=vmm)
     vmm_warm_ar.kv_cache.prepare_fast_ar_decode(reserve_tokens=8)
-    vmm_solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=slo_20x, pager=pager)
-    vmm_solo_sched.submit_ar_task(vmm_warm_ar)
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        vmm_solo_sched.drain_remaining_ar_tasks()
+    vmm_warm_sched = UnifiedPreemptiveScheduler(pipeline, mode="non_preemptive")
+    vmm_warm_sched.schedule_ar_arrival(0.0, vmm_warm_ar)
+    with vmm_warm_sched.run_session(), torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        vmm_warm_sched.drain_remaining_ar_tasks()
     vmm_warm_ar.kv_cache.close()
 
     vmm_solo_ar = _make_ar_task(pipeline, ar_base_1, "vmm_solo", max_tokens=24, tpot_slo_ms=slo_20x, vmm=vmm)
     vmm_solo_ar.kv_cache.prepare_fast_ar_decode(reserve_tokens=28)
-    vmm_solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="layer_chunk", tpot_slo_ms=slo_20x, pager=pager)
-    vmm_solo_sched.submit_ar_task(vmm_solo_ar)
+    vmm_solo_sched = UnifiedPreemptiveScheduler(pipeline, mode="non_preemptive")
+    vmm_solo_sched.schedule_ar_arrival(0.0, vmm_solo_ar)
     torch.cuda.synchronize()
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    with vmm_solo_sched.run_session(), torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         vmm_solo_sched.drain_remaining_ar_tasks()
     torch.cuda.synchronize()
     vmm_solo_tpots = vmm_solo_ar.inter_token_latencies_ms()

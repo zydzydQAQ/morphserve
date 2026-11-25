@@ -1,0 +1,30 @@
+{
+  "name": "morphserve-osdi27-r2e-lowqps-20261125",
+  "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "workers": 1,
+  "gpus_per_worker": 8,
+  "mount_shared": true,
+  "command": "bash /shared/data/MORPHSERVE/scripts/17_osdi27_r2e_lowqps_8gpu.sh",
+  "env": [
+    {
+      "name": "KAIROS_PROJECT",
+      "value": "MORPHSERVE"
+    },
+    {
+      "name": "KAIROS_RUN_ID",
+      "value": "morphserve-osdi27-r2e-lowqps-20261125"
+    },
+    {
+      "name": "KAIROS_BUILD",
+      "value": "539624f"
+    },
+    {
+      "name": "KAIROS_REQUIRE_BUILD",
+      "value": "1"
+    },
+    {
+      "name": "KAIROS_EXECUTION_IMAGE",
+      "value": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2"
+    }
+  ]
+}

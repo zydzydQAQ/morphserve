@@ -5311,9 +5311,9 @@
     "dit_512_transient_mib": 1088.0,
     "driver_total_hbm_40g_mib": 40442.37,
     "gpu_inplace_prep_only_ms": 2.487,
-    "kairos_2x8_cross_socket_gbps": 8.59,
-    "kairos_2x8_inter_node_gbps": 1.11,
-    "kairos_2x8_intra_half_gbps": 8.37,
+    "kairos_2x8_cross_socket_gbps": 8.63,
+    "kairos_2x8_inter_node_gbps": 1.07,
+    "kairos_2x8_intra_half_gbps": 8.41,
     "kv_mib_per_token": 0.05469,
     "layer_stride_mib": 448,
     "m4_adaptive_chunk_layers": 4,
@@ -16645,6 +16645,6 @@
     }
   },
   "status": "ok",
-  "timestamp_utc": "2026-11-25T09:48:49Z",
+  "timestamp_utc": "2026-11-25T11:31:43Z",
   "zero_manual_bias_constants": true
 }

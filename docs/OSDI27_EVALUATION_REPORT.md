@@ -157,13 +157,22 @@ Artifact: [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/re
 
 ## 4. Stage 3: `2×8` (`16-GPU`) Multi-Node Verification & Zero-Tuning `64-GPU` / `H100-80GB` Simulator
 
-### 4.1 Multi-Node `2×8` (`16×A100`) Cross-Node Fabric & Routing Verification
+### 4.1 Multi-Node `2×8` (`16×A100`) Live End-to-End & Cross-Node Fabric Evaluation (`R3`)
 
-- **Verified Baseline Fabric & Router Gate ([m25-multinode-2x8-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/morphserve-p2-m25node2x8-20261121-r2/m25-multinode-2x8-report.json))**:
-  - Measured across `2` nodes × `8` A100 GPUs (`16` ranks): `8.37 GB/s` intra-half PCIe, `8.59 GB/s` cross-socket PCIe, and `1.11 GB/s` inter-node Ethernet fabric (`963.23 ms` per `1 GiB`).
-  - `DualPathMorphRouter` ships compact `24 MiB` `bridge_mllm_dit` payloads cross-node (`25.67 ms` vs. `205.45 ms` morph) while **100% suppressing cross-node `1.5 GiB` `tight_mot` KV transfers** (`2,905.01 ms` wire vs. `161.80 ms` local Step-1 morph).
-- **Full `2×8` (`16-GPU`) Live E2E Campaign (`morphserve-osdi27-r3-node2x8-20261124`, build `403e7aa`)**:
-  - Queued on `jjjkairos` (`user-jjjkairos`, `2 × 8 = 16` GPUs) to produce `results/osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-e2e-report.json` across `morphserve`, `monolithic_dp`, and `static_nccl_fission` on `16` live GPUs.
+- **Artifacts**: [m25-multinode-2x8-e2e-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-e2e-report.json), [m25-multinode-2x8-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-report.json), and [memory-summary-node0.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r3-multinode-2x8/memory-summary-node0.json) (`morphserve-osdi27-r3-node2x8-20261124`, `gpu04` + `gpu02`, `2 × 8 = 16` A100 GPUs).
+- **Measured 3-Tier Interconnect Profile (`16` Ranks)**:
+  - `8.41 GB/s` intra-half PCIe (`127.72 ms / GiB`), `8.63 GB/s` cross-socket PCIe (`124.48 ms / GiB`), and **`1.07 GB/s` inter-node Ethernet fabric (`999.82 ms / GiB`)**.
+  - `DualPathMorphRouter` ships compact `24 MiB` `bridge_mllm_dit` payloads cross-node (`22.98 ms` wire, `31.52 ms` total cost vs. `205.45 ms` morph) while **100% suppressing cross-node multi-GiB `tight_mot` KV transfers** (`suppressed_cross_node_multigib_kv = true`, max cross-node ship `3.94 MiB` vs. `4,876.26 ms` multi-GiB wire penalty).
+
+#### Table 6B: Live `2×8` (`16×A100`) Multi-Node End-to-End Comparison (`n = 160` Sessions, `q = 1.6` RPS)
+
+| Policy | Session Survival (`ok / 160`) | Steady SLO Attainment (%) | Full-Trace SLO Attainment (%) | AR TTFT P50 (ms) | AR TPOT P95 (ms) | Survivor DiT P95 (s) | **All-Session Improper CDF DiT P95 (s)** | `ship / morph` (`cross_node_ships`, Max Payload) | Physical NVML Peak HBM (GiB) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **`morphserve`** | **`100.0%` (`160 / 160`, `0` OOM)** | **`51.8%` (`#1`, `0.829 rps`)** | **`56.9%` (`#1`, `0.910 rps`)** | **`874.6` (`#1`)** | **`100.57`** (`435` yields) | **`40.42`** | **`40.42` (`#1`, `100%` finite)** | **`84 / 148` (`15` x-node, `<= 3.94 MiB`)** | **`<= 39.49` (`40,433 MiB` NVML)** |
+| `monolithic_dp` | `96.9%` (`155 / 160`, `5` OOM) | `44.6%` (`0.714 rps`) | `45.6%` (`0.730 rps`) | `17,573.7` (`20.1×`) | `53.64` | `50.87`* | `53.80` (OOM-shifted) | `0 / 0` (`7` worker OOMs) | `38.85` (`40,433 MiB` NVML OOM) |
+| `static_nccl_fission` | `93.8%` (`150 / 160`, `10` OOM) | `17.9%` (`0.286 rps`) | `26.3%` (`0.420 rps`) | `1,013,274.3` (`1,158×`) | `54.28` | `76.48`* | **`DNF (+inf, <95% survival)`** | `192 / 0` (**`87` x-node, up to `1,230.6 MiB`**) | `38.79` (`40,433 MiB` NVML OOM) |
+
+- **Key Multi-Node Takeaway**: Over `1.07 GB/s` commodity Ethernet, static disaggregation (`static_nccl_fission`) ships `87` cross-node KV payloads up to `1.20 GiB` each, degrading steady SLO attainment by **`2.90×`** (`17.9%` vs. **`51.8%`** on MorphServe) and crashing `10` sessions (`93.8%` survival -> `All-Session P95 = DNF`). MorphServe keeps cross-node transfers strictly to compact `<= 3.94 MiB` semantic payloads (`15` ships) and executes `148` local Step-1 morphs + `435` mid-DiT `layer_chunk` yields (`0` OOMs, `20.1×` lower P50 AR TTFT than `monolithic_dp`).
 
 ### 4.2 Zero-Bias Out-of-Sample Simulator (`8 → 16 → 64` GPUs & `H100-80GB` Generality)
 
@@ -202,7 +211,7 @@ Artifact: [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/re
 | **Stage 2 `R2b` (`1×8` Skews + Lossless)** | `morphserve-osdi27-r2b-suiteb-20261124-r7` | `403e7aa` | [m23-suite-b-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2b-suite-b/m23-suite-b-report.json) | `ok` (`SSIM=1.0000` × 4 turns) |
 | **Stage 2 `R2c` (`1×8` `InternVL-U` 12 GiB)** | `morphserve-osdi27-r2c-ivlu-20261123-r2` | `2e0fc31` | [m24-internvlu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2c-internvlu-8gpu/m24-internvlu-report.json) | `ok` (`48/48` under `12 GiB`) |
 | **Stage 2 `R2d` (`1×8` Deep + Split Ratios)** | `morphserve-osdi27-r2d-w3deep-20261124` | `5d81343` | [wave3-deep-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r2d-wave3-deep/wave3-deep-report.json) | `ok` (`637–940` yields, `0` OOM) |
-| **Stage 2 `R2e` (`1×8` Low-QPS `0.05–0.25` + CDF)** | `morphserve-osdi27-r2e-lowqps-20261125` | `539624f` | `results/osdi27-v1/r2e-lowqps-8gpu/` | Queued / Supervised |
+| **Stage 2 `R2e` (`1×8` Low-QPS `0.05–0.25` + CDF)** | `morphserve-osdi27-r2e-lowqps-20261125` | `539624f` | `results/osdi27-v1/r2e-lowqps-8gpu/` | `Running` on `gpu04` |
 | **OSDI '27 SLO-vs-QPS & OOM-CDF Figure** | Local `nature-figure` Verified | `HEAD` | [osdi27_slo_and_oom_cdf.pdf](file:///mnt/e/000_code/zyd-2026/morphserve/docs/figures/osdi27_slo_and_oom_cdf.pdf) | `ok` (`0` collisions, `>=5.5pt`) |
 | **Stage 3 Simulator (`64-GPU` + `H100`)** | Local C++17 Zero-Bias Sweep | `HEAD` | [m25-simulator-64gpu-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/sim/m25-simulator-64gpu-report.json) | `ok` (`MAPE 4.09%–7.96%`) |
-| **Stage 3 `R3` (`2×8 = 16-GPU` Multi-Node)** | `morphserve-osdi27-r3-node2x8-20261124` | `403e7aa` | `results/osdi27-v1/r3-multinode-2x8/` | Queued / Supervised |
+| **Stage 3 `R3` (`2×8 = 16-GPU` Multi-Node)** | `morphserve-osdi27-r3-node2x8-20261124` | `403e7aa` | [m25-multinode-2x8-e2e-report.json](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-e2e-report.json) | `ok` (`160/160`, `51.8%` vs. `17.9%` static) |

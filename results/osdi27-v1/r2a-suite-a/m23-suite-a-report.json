@@ -1,0 +1,1825 @@
+{
+  "schema": "morphserve.osdi27.m23_suite_a.v2",
+  "timestamp_utc": "2026-11-24T13:03:59Z",
+  "num_gpus": 8,
+  "sessions_per_point": 96,
+  "ablation_sessions_per_point": 80,
+  "qps_points": [
+    0.4,
+    0.8,
+    1.1,
+    1.4
+  ],
+  "ablation_qps": 1.1,
+  "sustainable_qps_summary": {
+    "monolithic_dp": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.2941
+    },
+    "morphserve": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.3397
+    },
+    "naive_host_offload": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.1294
+    },
+    "prism_tetriserve_coloc": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.2706
+    },
+    "static_nccl_fission": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.2676
+    },
+    "twostage_shm": {
+      "max_sustainable_qps_80pct": 0.0,
+      "max_sustainable_qps_90pct": 0.0,
+      "peak_steady_state_goodput_rps": 0.2471
+    }
+  },
+  "qps_sweep": [
+    {
+      "policy_name": "morphserve",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1225.92,
+      "total_sessions": 96,
+      "completed_sessions": 96,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.2708,
+      "raw_wall_goodput_rps": 0.053,
+      "steady_state_goodput_rps": 0.2294,
+      "steady_state_attainment_pct": 57.4,
+      "joint_slo_attainment_pct": 67.7,
+      "ar_slo_attainment_pct": 99.0,
+      "dit_slo_attainment_pct": 68.8,
+      "ar_ttft_p50_ms": 858.73,
+      "ar_ttft_p95_ms": 1061.13,
+      "ar_ttft_p99_ms": 2481.59,
+      "ar_tpot_p50_ms": 60.71,
+      "ar_tpot_p95_ms": 100.36,
+      "ar_tpot_p99_ms": 104.66,
+      "dit_turn_p50_ms": 22010.09,
+      "dit_turn_p95_ms": 43099.57,
+      "dit_turn_p99_ms": 62055.7,
+      "peak_gpu_reserved_mib": 44840.0,
+      "host_shmem_delta_gib": 24.72,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 245,
+      "vmm_expert_evictions_for_kv": 1,
+      "vmm_expert_evictions_for_transient": 863,
+      "path_a_ships": 49,
+      "path_b_morphs": 93,
+      "preempted_ar_count": 8,
+      "total_yields": 318,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 30248.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 39.7,
+          "goodput_rps": 0.1588
+        },
+        "2.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 0.2294
+        },
+        "2.5x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 0.2529
+        },
+        "3.0x": {
+          "attainment_pct": 69.1,
+          "goodput_rps": 0.2765
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "morphserve",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 623.36,
+      "total_sessions": 96,
+      "completed_sessions": 96,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3917,
+      "raw_wall_goodput_rps": 0.0754,
+      "steady_state_goodput_rps": 0.2235,
+      "steady_state_attainment_pct": 27.9,
+      "joint_slo_attainment_pct": 49.0,
+      "ar_slo_attainment_pct": 97.9,
+      "dit_slo_attainment_pct": 50.0,
+      "ar_ttft_p50_ms": 829.37,
+      "ar_ttft_p95_ms": 1289.32,
+      "ar_ttft_p99_ms": 1484.07,
+      "ar_tpot_p50_ms": 61.32,
+      "ar_tpot_p95_ms": 108.06,
+      "ar_tpot_p99_ms": 110.29,
+      "dit_turn_p50_ms": 32387.44,
+      "dit_turn_p95_ms": 60566.35,
+      "dit_turn_p99_ms": 71113.18,
+      "peak_gpu_reserved_mib": 45608.0,
+      "host_shmem_delta_gib": 24.72,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 273,
+      "vmm_expert_evictions_for_kv": 1,
+      "vmm_expert_evictions_for_transient": 1788,
+      "path_a_ships": 70,
+      "path_b_morphs": 72,
+      "preempted_ar_count": 26,
+      "total_yields": 824,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 31016.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1059
+        },
+        "2.0x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 0.2235
+        },
+        "2.5x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.2706
+        },
+        "3.0x": {
+          "attainment_pct": 47.1,
+          "goodput_rps": 0.3765
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "morphserve",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 459.98,
+      "total_sessions": 96,
+      "completed_sessions": 96,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.55,
+      "raw_wall_goodput_rps": 0.1044,
+      "steady_state_goodput_rps": 0.3397,
+      "steady_state_attainment_pct": 30.9,
+      "joint_slo_attainment_pct": 50.0,
+      "ar_slo_attainment_pct": 97.9,
+      "dit_slo_attainment_pct": 51.0,
+      "ar_ttft_p50_ms": 824.24,
+      "ar_ttft_p95_ms": 1129.69,
+      "ar_ttft_p99_ms": 1511.34,
+      "ar_tpot_p50_ms": 61.88,
+      "ar_tpot_p95_ms": 101.73,
+      "ar_tpot_p99_ms": 109.97,
+      "dit_turn_p50_ms": 34476.32,
+      "dit_turn_p95_ms": 74631.94,
+      "dit_turn_p99_ms": 86392.21,
+      "peak_gpu_reserved_mib": 45608.0,
+      "host_shmem_delta_gib": 24.72,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 315,
+      "vmm_expert_evictions_for_kv": 2,
+      "vmm_expert_evictions_for_transient": 2744,
+      "path_a_ships": 65,
+      "path_b_morphs": 77,
+      "preempted_ar_count": 31,
+      "total_yields": 922,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 31016.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 10.3,
+          "goodput_rps": 0.1132
+        },
+        "2.0x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.3397
+        },
+        "2.5x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 0.4044
+        },
+        "3.0x": {
+          "attainment_pct": 45.6,
+          "goodput_rps": 0.5015
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "morphserve",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 366.49,
+      "total_sessions": 96,
+      "completed_sessions": 96,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5542,
+      "raw_wall_goodput_rps": 0.1037,
+      "steady_state_goodput_rps": 0.3088,
+      "steady_state_attainment_pct": 22.1,
+      "joint_slo_attainment_pct": 39.6,
+      "ar_slo_attainment_pct": 92.7,
+      "dit_slo_attainment_pct": 45.8,
+      "ar_ttft_p50_ms": 837.66,
+      "ar_ttft_p95_ms": 1967.85,
+      "ar_ttft_p99_ms": 2499.4,
+      "ar_tpot_p50_ms": 66.02,
+      "ar_tpot_p95_ms": 104.04,
+      "ar_tpot_p99_ms": 109.48,
+      "dit_turn_p50_ms": 36719.95,
+      "dit_turn_p95_ms": 66393.71,
+      "dit_turn_p99_ms": 82979.17,
+      "peak_gpu_reserved_mib": 45608.0,
+      "host_shmem_delta_gib": 24.72,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 336,
+      "vmm_expert_evictions_for_kv": 3,
+      "vmm_expert_evictions_for_transient": 3679,
+      "path_a_ships": 63,
+      "path_b_morphs": 79,
+      "preempted_ar_count": 38,
+      "total_yields": 1010,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 31016.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 5.9,
+          "goodput_rps": 0.0824
+        },
+        "2.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.3088
+        },
+        "2.5x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 0.3912
+        },
+        "3.0x": {
+          "attainment_pct": 38.2,
+          "goodput_rps": 0.5353
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1225.38,
+      "total_sessions": 96,
+      "completed_sessions": 93,
+      "oom_sessions": 3,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3042,
+      "raw_wall_goodput_rps": 0.0596,
+      "steady_state_goodput_rps": 0.2706,
+      "steady_state_attainment_pct": 67.6,
+      "joint_slo_attainment_pct": 76.0,
+      "ar_slo_attainment_pct": 90.6,
+      "dit_slo_attainment_pct": 80.2,
+      "ar_ttft_p50_ms": 857.75,
+      "ar_ttft_p95_ms": 2804.14,
+      "ar_ttft_p99_ms": 10336.6,
+      "ar_tpot_p50_ms": 49.37,
+      "ar_tpot_p95_ms": 51.53,
+      "ar_tpot_p99_ms": 54.4,
+      "dit_turn_p50_ms": 13244.52,
+      "dit_turn_p95_ms": 34569.95,
+      "dit_turn_p99_ms": 40277.14,
+      "peak_gpu_reserved_mib": 39782.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 3,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39782.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 54.4,
+          "goodput_rps": 0.2176
+        },
+        "2.0x": {
+          "attainment_pct": 67.6,
+          "goodput_rps": 0.2706
+        },
+        "2.5x": {
+          "attainment_pct": 69.1,
+          "goodput_rps": 0.2765
+        },
+        "3.0x": {
+          "attainment_pct": 69.1,
+          "goodput_rps": 0.2765
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 624.77,
+      "total_sessions": 96,
+      "completed_sessions": 92,
+      "oom_sessions": 4,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4417,
+      "raw_wall_goodput_rps": 0.0848,
+      "steady_state_goodput_rps": 0.2941,
+      "steady_state_attainment_pct": 36.8,
+      "joint_slo_attainment_pct": 55.2,
+      "ar_slo_attainment_pct": 85.4,
+      "dit_slo_attainment_pct": 61.5,
+      "ar_ttft_p50_ms": 860.46,
+      "ar_ttft_p95_ms": 5757.89,
+      "ar_ttft_p99_ms": 32093.0,
+      "ar_tpot_p50_ms": 49.96,
+      "ar_tpot_p95_ms": 52.27,
+      "ar_tpot_p99_ms": 53.89,
+      "dit_turn_p50_ms": 26027.99,
+      "dit_turn_p95_ms": 54737.01,
+      "dit_turn_p99_ms": 68852.61,
+      "peak_gpu_reserved_mib": 39808.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 4,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39808.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 0.2235
+        },
+        "2.0x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 0.2941
+        },
+        "2.5x": {
+          "attainment_pct": 41.2,
+          "goodput_rps": 0.3294
+        },
+        "3.0x": {
+          "attainment_pct": 44.1,
+          "goodput_rps": 0.3529
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 461.16,
+      "total_sessions": 96,
+      "completed_sessions": 90,
+      "oom_sessions": 6,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4813,
+      "raw_wall_goodput_rps": 0.0911,
+      "steady_state_goodput_rps": 0.2265,
+      "steady_state_attainment_pct": 20.6,
+      "joint_slo_attainment_pct": 43.8,
+      "ar_slo_attainment_pct": 76.0,
+      "dit_slo_attainment_pct": 55.2,
+      "ar_ttft_p50_ms": 873.48,
+      "ar_ttft_p95_ms": 7893.5,
+      "ar_ttft_p99_ms": 58937.22,
+      "ar_tpot_p50_ms": 49.61,
+      "ar_tpot_p95_ms": 51.79,
+      "ar_tpot_p99_ms": 53.13,
+      "dit_turn_p50_ms": 27769.97,
+      "dit_turn_p95_ms": 85315.91,
+      "dit_turn_p99_ms": 103293.09,
+      "peak_gpu_reserved_mib": 39816.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 8,
+      "oom_retry_count": 2,
+      "peak_pytorch_reserved_mib": 39816.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.1779
+        },
+        "2.0x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.2265
+        },
+        "2.5x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2588
+        },
+        "3.0x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.3559
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "monolithic_dp",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 367.77,
+      "total_sessions": 96,
+      "completed_sessions": 89,
+      "oom_sessions": 7,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5833,
+      "raw_wall_goodput_rps": 0.1088,
+      "steady_state_goodput_rps": 0.2882,
+      "steady_state_attainment_pct": 20.6,
+      "joint_slo_attainment_pct": 41.7,
+      "ar_slo_attainment_pct": 71.9,
+      "dit_slo_attainment_pct": 51.0,
+      "ar_ttft_p50_ms": 873.48,
+      "ar_ttft_p95_ms": 15753.28,
+      "ar_ttft_p99_ms": 47418.54,
+      "ar_tpot_p50_ms": 49.72,
+      "ar_tpot_p95_ms": 51.65,
+      "ar_tpot_p99_ms": 57.09,
+      "dit_turn_p50_ms": 24382.9,
+      "dit_turn_p95_ms": 94717.55,
+      "dit_turn_p99_ms": 114288.7,
+      "peak_gpu_reserved_mib": 39816.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 8,
+      "oom_retry_count": 1,
+      "peak_pytorch_reserved_mib": 39816.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.2059
+        },
+        "2.0x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.2882
+        },
+        "2.5x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.3294
+        },
+        "3.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.35
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "twostage_shm",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1228.08,
+      "total_sessions": 96,
+      "completed_sessions": 84,
+      "oom_sessions": 12,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.1833,
+      "raw_wall_goodput_rps": 0.0358,
+      "steady_state_goodput_rps": 0.1059,
+      "steady_state_attainment_pct": 26.5,
+      "joint_slo_attainment_pct": 45.8,
+      "ar_slo_attainment_pct": 85.4,
+      "dit_slo_attainment_pct": 47.9,
+      "ar_ttft_p50_ms": 806.9,
+      "ar_ttft_p95_ms": 1089.31,
+      "ar_ttft_p99_ms": 2144.5,
+      "ar_tpot_p50_ms": 49.33,
+      "ar_tpot_p95_ms": 51.48,
+      "ar_tpot_p99_ms": 53.54,
+      "dit_turn_p50_ms": 51033.79,
+      "dit_turn_p95_ms": 123265.65,
+      "dit_turn_p99_ms": 131730.49,
+      "peak_gpu_reserved_mib": 39798.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 95,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 12,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39798.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.0882
+        },
+        "2.0x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 0.1059
+        },
+        "2.5x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.1235
+        },
+        "3.0x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.1353
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "twostage_shm",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 627.75,
+      "total_sessions": 96,
+      "completed_sessions": 87,
+      "oom_sessions": 9,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3,
+      "raw_wall_goodput_rps": 0.0573,
+      "steady_state_goodput_rps": 0.1176,
+      "steady_state_attainment_pct": 14.7,
+      "joint_slo_attainment_pct": 37.5,
+      "ar_slo_attainment_pct": 88.5,
+      "dit_slo_attainment_pct": 39.6,
+      "ar_ttft_p50_ms": 791.14,
+      "ar_ttft_p95_ms": 1001.2,
+      "ar_ttft_p99_ms": 2502.86,
+      "ar_tpot_p50_ms": 48.75,
+      "ar_tpot_p95_ms": 51.13,
+      "ar_tpot_p99_ms": 52.77,
+      "dit_turn_p50_ms": 74436.0,
+      "dit_turn_p95_ms": 138952.24,
+      "dit_turn_p99_ms": 146317.9,
+      "peak_gpu_reserved_mib": 39822.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 106,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 9,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39822.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1059
+        },
+        "2.0x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.1176
+        },
+        "2.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.1529
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.1765
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "twostage_shm",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 581.01,
+      "total_sessions": 96,
+      "completed_sessions": 85,
+      "oom_sessions": 11,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3552,
+      "raw_wall_goodput_rps": 0.0534,
+      "steady_state_goodput_rps": 0.1456,
+      "steady_state_attainment_pct": 13.2,
+      "joint_slo_attainment_pct": 32.3,
+      "ar_slo_attainment_pct": 80.2,
+      "dit_slo_attainment_pct": 38.5,
+      "ar_ttft_p50_ms": 794.96,
+      "ar_ttft_p95_ms": 2096.45,
+      "ar_ttft_p99_ms": 3345.45,
+      "ar_tpot_p50_ms": 48.87,
+      "ar_tpot_p95_ms": 51.6,
+      "ar_tpot_p99_ms": 54.45,
+      "dit_turn_p50_ms": 77279.02,
+      "dit_turn_p95_ms": 190313.68,
+      "dit_turn_p99_ms": 226314.16,
+      "peak_gpu_reserved_mib": 39822.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 99,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 11,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39822.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.1294
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1456
+        },
+        "2.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1456
+        },
+        "3.0x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.1779
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "twostage_shm",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 581.58,
+      "total_sessions": 96,
+      "completed_sessions": 86,
+      "oom_sessions": 10,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4229,
+      "raw_wall_goodput_rps": 0.0499,
+      "steady_state_goodput_rps": 0.2471,
+      "steady_state_attainment_pct": 17.6,
+      "joint_slo_attainment_pct": 30.2,
+      "ar_slo_attainment_pct": 83.3,
+      "dit_slo_attainment_pct": 34.4,
+      "ar_ttft_p50_ms": 783.84,
+      "ar_ttft_p95_ms": 2364.27,
+      "ar_ttft_p99_ms": 3202.71,
+      "ar_tpot_p50_ms": 48.55,
+      "ar_tpot_p95_ms": 51.47,
+      "ar_tpot_p99_ms": 53.37,
+      "dit_turn_p50_ms": 80944.41,
+      "dit_turn_p95_ms": 194724.31,
+      "dit_turn_p99_ms": 214626.58,
+      "peak_gpu_reserved_mib": 39828.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 102,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 10,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39828.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2471
+        },
+        "2.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2471
+        },
+        "2.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2676
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.3088
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1223.48,
+      "total_sessions": 96,
+      "completed_sessions": 89,
+      "oom_sessions": 7,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.2,
+      "raw_wall_goodput_rps": 0.0392,
+      "steady_state_goodput_rps": 0.1176,
+      "steady_state_attainment_pct": 29.4,
+      "joint_slo_attainment_pct": 50.0,
+      "ar_slo_attainment_pct": 92.7,
+      "dit_slo_attainment_pct": 50.0,
+      "ar_ttft_p50_ms": 788.41,
+      "ar_ttft_p95_ms": 917.91,
+      "ar_ttft_p99_ms": 1052.44,
+      "ar_tpot_p50_ms": 49.95,
+      "ar_tpot_p95_ms": 52.13,
+      "ar_tpot_p99_ms": 54.0,
+      "dit_turn_p50_ms": 42765.72,
+      "dit_turn_p95_ms": 82744.71,
+      "dit_turn_p99_ms": 102000.71,
+      "peak_gpu_reserved_mib": 39722.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 7,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39722.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.1
+        },
+        "2.0x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.1176
+        },
+        "2.5x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.1353
+        },
+        "3.0x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 0.1471
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 623.06,
+      "total_sessions": 96,
+      "completed_sessions": 89,
+      "oom_sessions": 7,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.325,
+      "raw_wall_goodput_rps": 0.0626,
+      "steady_state_goodput_rps": 0.1529,
+      "steady_state_attainment_pct": 19.1,
+      "joint_slo_attainment_pct": 40.6,
+      "ar_slo_attainment_pct": 91.7,
+      "dit_slo_attainment_pct": 41.7,
+      "ar_ttft_p50_ms": 792.91,
+      "ar_ttft_p95_ms": 895.51,
+      "ar_ttft_p99_ms": 1105.63,
+      "ar_tpot_p50_ms": 49.9,
+      "ar_tpot_p95_ms": 51.97,
+      "ar_tpot_p99_ms": 55.29,
+      "dit_turn_p50_ms": 62903.13,
+      "dit_turn_p95_ms": 104825.06,
+      "dit_turn_p99_ms": 117731.93,
+      "peak_gpu_reserved_mib": 39722.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 7,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39722.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.1412
+        },
+        "2.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.1529
+        },
+        "2.5x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.1765
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.1765
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 459.45,
+      "total_sessions": 96,
+      "completed_sessions": 89,
+      "oom_sessions": 7,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4354,
+      "raw_wall_goodput_rps": 0.0827,
+      "steady_state_goodput_rps": 0.1941,
+      "steady_state_attainment_pct": 17.6,
+      "joint_slo_attainment_pct": 39.6,
+      "ar_slo_attainment_pct": 92.7,
+      "dit_slo_attainment_pct": 39.6,
+      "ar_ttft_p50_ms": 776.78,
+      "ar_ttft_p95_ms": 892.06,
+      "ar_ttft_p99_ms": 931.57,
+      "ar_tpot_p50_ms": 49.78,
+      "ar_tpot_p95_ms": 51.83,
+      "ar_tpot_p99_ms": 53.29,
+      "dit_turn_p50_ms": 71389.74,
+      "dit_turn_p95_ms": 112029.57,
+      "dit_turn_p99_ms": 122958.37,
+      "peak_gpu_reserved_mib": 39724.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 7,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39724.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.1779
+        },
+        "2.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.1941
+        },
+        "2.5x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2426
+        },
+        "3.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2588
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "static_nccl_fission",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 424.86,
+      "total_sessions": 96,
+      "completed_sessions": 89,
+      "oom_sessions": 7,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4521,
+      "raw_wall_goodput_rps": 0.073,
+      "steady_state_goodput_rps": 0.2676,
+      "steady_state_attainment_pct": 19.1,
+      "joint_slo_attainment_pct": 32.3,
+      "ar_slo_attainment_pct": 90.6,
+      "dit_slo_attainment_pct": 34.4,
+      "ar_ttft_p50_ms": 786.15,
+      "ar_ttft_p95_ms": 904.58,
+      "ar_ttft_p99_ms": 2673.72,
+      "ar_tpot_p50_ms": 49.86,
+      "ar_tpot_p95_ms": 52.13,
+      "ar_tpot_p99_ms": 54.84,
+      "dit_turn_p50_ms": 73910.8,
+      "dit_turn_p95_ms": 120578.35,
+      "dit_turn_p99_ms": 128694.62,
+      "peak_gpu_reserved_mib": 39724.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 7,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39724.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.2265
+        },
+        "2.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2676
+        },
+        "2.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2676
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.3088
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "prism_tetriserve_coloc",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1226.04,
+      "total_sessions": 96,
+      "completed_sessions": 92,
+      "oom_sessions": 4,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.2833,
+      "raw_wall_goodput_rps": 0.0555,
+      "steady_state_goodput_rps": 0.2412,
+      "steady_state_attainment_pct": 60.3,
+      "joint_slo_attainment_pct": 70.8,
+      "ar_slo_attainment_pct": 91.7,
+      "dit_slo_attainment_pct": 74.0,
+      "ar_ttft_p50_ms": 855.81,
+      "ar_ttft_p95_ms": 1126.32,
+      "ar_ttft_p99_ms": 2371.26,
+      "ar_tpot_p50_ms": 59.49,
+      "ar_tpot_p95_ms": 63.49,
+      "ar_tpot_p99_ms": 384.16,
+      "dit_turn_p50_ms": 12737.49,
+      "dit_turn_p95_ms": 48177.44,
+      "dit_turn_p99_ms": 55687.66,
+      "peak_gpu_reserved_mib": 39820.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 4193,
+      "vmm_super_to_fine_carves": 16,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 3,
+      "total_yields": 26,
+      "worker_oom_count": 4,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 36478.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 47.1,
+          "goodput_rps": 0.1882
+        },
+        "2.0x": {
+          "attainment_pct": 60.3,
+          "goodput_rps": 0.2412
+        },
+        "2.5x": {
+          "attainment_pct": 66.2,
+          "goodput_rps": 0.2647
+        },
+        "3.0x": {
+          "attainment_pct": 70.6,
+          "goodput_rps": 0.2824
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "prism_tetriserve_coloc",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 625.5,
+      "total_sessions": 96,
+      "completed_sessions": 90,
+      "oom_sessions": 6,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.425,
+      "raw_wall_goodput_rps": 0.0815,
+      "steady_state_goodput_rps": 0.2706,
+      "steady_state_attainment_pct": 33.8,
+      "joint_slo_attainment_pct": 53.1,
+      "ar_slo_attainment_pct": 81.3,
+      "dit_slo_attainment_pct": 60.4,
+      "ar_ttft_p50_ms": 834.94,
+      "ar_ttft_p95_ms": 1820.05,
+      "ar_ttft_p99_ms": 2371.85,
+      "ar_tpot_p50_ms": 58.87,
+      "ar_tpot_p95_ms": 353.0,
+      "ar_tpot_p99_ms": 1635.54,
+      "dit_turn_p50_ms": 26361.94,
+      "dit_turn_p95_ms": 57451.07,
+      "dit_turn_p99_ms": 64754.92,
+      "peak_gpu_reserved_mib": 40376.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 5784,
+      "vmm_super_to_fine_carves": 16,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 12,
+      "total_yields": 131,
+      "worker_oom_count": 6,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 36478.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 0.2118
+        },
+        "2.0x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.2706
+        },
+        "2.5x": {
+          "attainment_pct": 42.6,
+          "goodput_rps": 0.3412
+        },
+        "3.0x": {
+          "attainment_pct": 45.6,
+          "goodput_rps": 0.3647
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "prism_tetriserve_coloc",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 461.9,
+      "total_sessions": 96,
+      "completed_sessions": 93,
+      "oom_sessions": 3,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4698,
+      "raw_wall_goodput_rps": 0.0888,
+      "steady_state_goodput_rps": 0.2103,
+      "steady_state_attainment_pct": 19.1,
+      "joint_slo_attainment_pct": 42.7,
+      "ar_slo_attainment_pct": 77.1,
+      "dit_slo_attainment_pct": 52.1,
+      "ar_ttft_p50_ms": 854.1,
+      "ar_ttft_p95_ms": 1599.45,
+      "ar_ttft_p99_ms": 2348.96,
+      "ar_tpot_p50_ms": 59.77,
+      "ar_tpot_p95_ms": 409.06,
+      "ar_tpot_p99_ms": 1214.62,
+      "dit_turn_p50_ms": 27784.24,
+      "dit_turn_p95_ms": 86151.46,
+      "dit_turn_p99_ms": 103440.79,
+      "peak_gpu_reserved_mib": 40376.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 7240,
+      "vmm_super_to_fine_carves": 16,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 19,
+      "total_yields": 245,
+      "worker_oom_count": 3,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 36478.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.1618
+        },
+        "2.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2103
+        },
+        "2.5x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2588
+        },
+        "3.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2588
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "prism_tetriserve_coloc",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 368.36,
+      "total_sessions": 96,
+      "completed_sessions": 90,
+      "oom_sessions": 6,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5104,
+      "raw_wall_goodput_rps": 0.095,
+      "steady_state_goodput_rps": 0.2059,
+      "steady_state_attainment_pct": 14.7,
+      "joint_slo_attainment_pct": 36.5,
+      "ar_slo_attainment_pct": 71.9,
+      "dit_slo_attainment_pct": 47.9,
+      "ar_ttft_p50_ms": 847.94,
+      "ar_ttft_p95_ms": 1756.6,
+      "ar_ttft_p99_ms": 2025.48,
+      "ar_tpot_p50_ms": 59.8,
+      "ar_tpot_p95_ms": 385.8,
+      "ar_tpot_p99_ms": 1294.69,
+      "dit_turn_p50_ms": 31747.5,
+      "dit_turn_p95_ms": 78953.09,
+      "dit_turn_p99_ms": 125429.0,
+      "peak_gpu_reserved_mib": 41168.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 8317,
+      "vmm_super_to_fine_carves": 16,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 24,
+      "total_yields": 203,
+      "worker_oom_count": 6,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 36478.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 8.8,
+          "goodput_rps": 0.1235
+        },
+        "2.0x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.2059
+        },
+        "2.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.2265
+        },
+        "3.0x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.2882
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.4,
+      "wall_seconds": 1229.9,
+      "total_sessions": 96,
+      "completed_sessions": 93,
+      "oom_sessions": 3,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.1792,
+      "raw_wall_goodput_rps": 0.035,
+      "steady_state_goodput_rps": 0.1294,
+      "steady_state_attainment_pct": 32.4,
+      "joint_slo_attainment_pct": 44.8,
+      "ar_slo_attainment_pct": 80.2,
+      "dit_slo_attainment_pct": 51.0,
+      "ar_ttft_p50_ms": 850.87,
+      "ar_ttft_p95_ms": 8612.85,
+      "ar_ttft_p99_ms": 26302.57,
+      "ar_tpot_p50_ms": 50.52,
+      "ar_tpot_p95_ms": 53.18,
+      "ar_tpot_p99_ms": 54.61,
+      "dit_turn_p50_ms": 30747.06,
+      "dit_turn_p95_ms": 85341.89,
+      "dit_turn_p99_ms": 154512.27,
+      "peak_gpu_reserved_mib": 39788.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 3,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39788.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.0824
+        },
+        "2.0x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.1294
+        },
+        "2.5x": {
+          "attainment_pct": 44.1,
+          "goodput_rps": 0.1765
+        },
+        "3.0x": {
+          "attainment_pct": 47.1,
+          "goodput_rps": 0.1882
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 0.8,
+      "wall_seconds": 628.86,
+      "total_sessions": 96,
+      "completed_sessions": 92,
+      "oom_sessions": 4,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.2583,
+      "raw_wall_goodput_rps": 0.0493,
+      "steady_state_goodput_rps": 0.1059,
+      "steady_state_attainment_pct": 13.2,
+      "joint_slo_attainment_pct": 32.3,
+      "ar_slo_attainment_pct": 67.7,
+      "dit_slo_attainment_pct": 43.8,
+      "ar_ttft_p50_ms": 888.96,
+      "ar_ttft_p95_ms": 19075.81,
+      "ar_ttft_p99_ms": 71085.23,
+      "ar_tpot_p50_ms": 50.4,
+      "ar_tpot_p95_ms": 53.11,
+      "ar_tpot_p99_ms": 55.58,
+      "dit_turn_p50_ms": 43392.04,
+      "dit_turn_p95_ms": 116591.62,
+      "dit_turn_p99_ms": 135798.28,
+      "peak_gpu_reserved_mib": 39816.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 6,
+      "oom_retry_count": 2,
+      "peak_pytorch_reserved_mib": 39816.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 8.8,
+          "goodput_rps": 0.0706
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1059
+        },
+        "2.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.1176
+        },
+        "3.0x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.1647
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 487.28,
+      "total_sessions": 96,
+      "completed_sessions": 87,
+      "oom_sessions": 9,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3208,
+      "raw_wall_goodput_rps": 0.0575,
+      "steady_state_goodput_rps": 0.1132,
+      "steady_state_attainment_pct": 10.3,
+      "joint_slo_attainment_pct": 29.2,
+      "ar_slo_attainment_pct": 63.5,
+      "dit_slo_attainment_pct": 41.7,
+      "ar_ttft_p50_ms": 888.35,
+      "ar_ttft_p95_ms": 33486.48,
+      "ar_ttft_p99_ms": 55965.19,
+      "ar_tpot_p50_ms": 50.77,
+      "ar_tpot_p95_ms": 57.82,
+      "ar_tpot_p99_ms": 65.41,
+      "dit_turn_p50_ms": 44973.89,
+      "dit_turn_p95_ms": 170968.35,
+      "dit_turn_p99_ms": 199237.56,
+      "peak_gpu_reserved_mib": 39830.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 9,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39830.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 4.4,
+          "goodput_rps": 0.0485
+        },
+        "2.0x": {
+          "attainment_pct": 10.3,
+          "goodput_rps": 0.1132
+        },
+        "2.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1456
+        },
+        "3.0x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.1779
+        }
+      },
+      "status": "ok"
+    },
+    {
+      "policy_name": "naive_host_offload",
+      "suite_name": "main_mix_80_n96",
+      "num_gpus": 8,
+      "offered_qps": 1.4,
+      "wall_seconds": 484.8,
+      "total_sessions": 96,
+      "completed_sessions": 88,
+      "oom_sessions": 8,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3208,
+      "raw_wall_goodput_rps": 0.0454,
+      "steady_state_goodput_rps": 0.1029,
+      "steady_state_attainment_pct": 7.4,
+      "joint_slo_attainment_pct": 22.9,
+      "ar_slo_attainment_pct": 56.3,
+      "dit_slo_attainment_pct": 39.6,
+      "ar_ttft_p50_ms": 3227.97,
+      "ar_ttft_p95_ms": 48199.17,
+      "ar_ttft_p99_ms": 64850.37,
+      "ar_tpot_p50_ms": 50.75,
+      "ar_tpot_p95_ms": 53.12,
+      "ar_tpot_p99_ms": 57.56,
+      "dit_turn_p50_ms": 54637.86,
+      "dit_turn_p95_ms": 143496.69,
+      "dit_turn_p99_ms": 187773.23,
+      "peak_gpu_reserved_mib": 39830.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 9,
+      "oom_retry_count": 1,
+      "peak_pytorch_reserved_mib": 39830.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 2.9,
+          "goodput_rps": 0.0412
+        },
+        "2.0x": {
+          "attainment_pct": 7.4,
+          "goodput_rps": 0.1029
+        },
+        "2.5x": {
+          "attainment_pct": 8.8,
+          "goodput_rps": 0.1235
+        },
+        "3.0x": {
+          "attainment_pct": 10.3,
+          "goodput_rps": 0.1441
+        }
+      },
+      "status": "ok"
+    }
+  ],
+  "ablations": [
+    {
+      "policy_name": "morphserve",
+      "suite_name": "main_mix_80",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 337.15,
+      "total_sessions": 80,
+      "completed_sessions": 80,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.495,
+      "raw_wall_goodput_rps": 0.1068,
+      "steady_state_goodput_rps": 0.3143,
+      "steady_state_attainment_pct": 28.6,
+      "joint_slo_attainment_pct": 45.0,
+      "ar_slo_attainment_pct": 96.3,
+      "dit_slo_attainment_pct": 47.5,
+      "ar_ttft_p50_ms": 848.23,
+      "ar_ttft_p95_ms": 1458.06,
+      "ar_ttft_p99_ms": 2151.82,
+      "ar_tpot_p50_ms": 63.93,
+      "ar_tpot_p95_ms": 106.17,
+      "ar_tpot_p99_ms": 109.2,
+      "dit_turn_p50_ms": 31968.57,
+      "dit_turn_p95_ms": 77085.46,
+      "dit_turn_p99_ms": 92095.76,
+      "peak_gpu_reserved_mib": 44990.0,
+      "host_shmem_delta_gib": 24.71,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 230,
+      "vmm_expert_evictions_for_kv": 1,
+      "vmm_expert_evictions_for_transient": 684,
+      "path_a_ships": 53,
+      "path_b_morphs": 63,
+      "preempted_ar_count": 27,
+      "total_yields": 826,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 30398.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.1,
+          "goodput_rps": 0.1768
+        },
+        "2.0x": {
+          "attainment_pct": 28.6,
+          "goodput_rps": 0.3143
+        },
+        "2.5x": {
+          "attainment_pct": 44.6,
+          "goodput_rps": 0.4911
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 0.55
+        }
+      },
+      "status": "ok",
+      "ablation_name": "full_morphserve"
+    },
+    {
+      "policy_name": "no_m4_layer_chunk",
+      "suite_name": "main_mix_80",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 337.23,
+      "total_sessions": 80,
+      "completed_sessions": 80,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.3575,
+      "raw_wall_goodput_rps": 0.0771,
+      "steady_state_goodput_rps": 0.1964,
+      "steady_state_attainment_pct": 17.9,
+      "joint_slo_attainment_pct": 32.5,
+      "ar_slo_attainment_pct": 72.5,
+      "dit_slo_attainment_pct": 46.3,
+      "ar_ttft_p50_ms": 921.56,
+      "ar_ttft_p95_ms": 16223.55,
+      "ar_ttft_p99_ms": 23982.24,
+      "ar_tpot_p50_ms": 60.14,
+      "ar_tpot_p95_ms": 74.63,
+      "ar_tpot_p99_ms": 87.72,
+      "dit_turn_p50_ms": 30042.48,
+      "dit_turn_p95_ms": 70325.05,
+      "dit_turn_p99_ms": 85321.3,
+      "peak_gpu_reserved_mib": 45268.0,
+      "host_shmem_delta_gib": 24.71,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 265,
+      "vmm_expert_evictions_for_kv": 3,
+      "vmm_expert_evictions_for_transient": 669,
+      "path_a_ships": 58,
+      "path_b_morphs": 58,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 30676.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 17.9,
+          "goodput_rps": 0.1964
+        },
+        "2.0x": {
+          "attainment_pct": 17.9,
+          "goodput_rps": 0.1964
+        },
+        "2.5x": {
+          "attainment_pct": 21.4,
+          "goodput_rps": 0.2357
+        },
+        "3.0x": {
+          "attainment_pct": 26.8,
+          "goodput_rps": 0.2946
+        }
+      },
+      "status": "ok",
+      "ablation_name": "no_m4_layer_chunk"
+    },
+    {
+      "policy_name": "no_m3_cow_loopback",
+      "suite_name": "main_mix_80",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 342.67,
+      "total_sessions": 80,
+      "completed_sessions": 78,
+      "oom_sessions": 2,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.33,
+      "raw_wall_goodput_rps": 0.07,
+      "steady_state_goodput_rps": 0.1768,
+      "steady_state_attainment_pct": 16.1,
+      "joint_slo_attainment_pct": 30.0,
+      "ar_slo_attainment_pct": 68.8,
+      "dit_slo_attainment_pct": 48.8,
+      "ar_ttft_p50_ms": 910.78,
+      "ar_ttft_p95_ms": 18674.2,
+      "ar_ttft_p99_ms": 22728.9,
+      "ar_tpot_p50_ms": 59.62,
+      "ar_tpot_p95_ms": 63.81,
+      "ar_tpot_p99_ms": 78.27,
+      "dit_turn_p50_ms": 28607.51,
+      "dit_turn_p95_ms": 72545.17,
+      "dit_turn_p99_ms": 81727.73,
+      "peak_gpu_reserved_mib": 45790.0,
+      "host_shmem_delta_gib": 24.71,
+      "vmm_overflow_creates": 151,
+      "vmm_super_to_fine_carves": 385,
+      "vmm_expert_evictions_for_kv": 55,
+      "vmm_expert_evictions_for_transient": 559,
+      "path_a_ships": 48,
+      "path_b_morphs": 61,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 3,
+      "oom_retry_count": 1,
+      "peak_pytorch_reserved_mib": 29662.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.1,
+          "goodput_rps": 0.1768
+        },
+        "2.0x": {
+          "attainment_pct": 16.1,
+          "goodput_rps": 0.1768
+        },
+        "2.5x": {
+          "attainment_pct": 23.2,
+          "goodput_rps": 0.2554
+        },
+        "3.0x": {
+          "attainment_pct": 23.2,
+          "goodput_rps": 0.2554
+        }
+      },
+      "status": "ok",
+      "ablation_name": "no_m3_cow_loopback"
+    },
+    {
+      "policy_name": "no_m2_dual_path",
+      "suite_name": "main_mix_80",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 375.92,
+      "total_sessions": 80,
+      "completed_sessions": 80,
+      "oom_sessions": 0,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.4675,
+      "raw_wall_goodput_rps": 0.0904,
+      "steady_state_goodput_rps": 0.2946,
+      "steady_state_attainment_pct": 26.8,
+      "joint_slo_attainment_pct": 42.5,
+      "ar_slo_attainment_pct": 76.3,
+      "dit_slo_attainment_pct": 56.3,
+      "ar_ttft_p50_ms": 890.07,
+      "ar_ttft_p95_ms": 12539.83,
+      "ar_ttft_p99_ms": 38640.44,
+      "ar_tpot_p50_ms": 59.34,
+      "ar_tpot_p95_ms": 63.37,
+      "ar_tpot_p99_ms": 66.67,
+      "dit_turn_p50_ms": 29930.64,
+      "dit_turn_p95_ms": 110964.63,
+      "dit_turn_p99_ms": 117271.13,
+      "peak_gpu_reserved_mib": 45880.0,
+      "host_shmem_delta_gib": 98.21,
+      "vmm_overflow_creates": 200,
+      "vmm_super_to_fine_carves": 395,
+      "vmm_expert_evictions_for_kv": 77,
+      "vmm_expert_evictions_for_transient": 612,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 0,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 29752.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 19.6,
+          "goodput_rps": 0.2161
+        },
+        "2.0x": {
+          "attainment_pct": 26.8,
+          "goodput_rps": 0.2946
+        },
+        "2.5x": {
+          "attainment_pct": 33.9,
+          "goodput_rps": 0.3732
+        },
+        "3.0x": {
+          "attainment_pct": 35.7,
+          "goodput_rps": 0.3929
+        }
+      },
+      "status": "ok",
+      "ablation_name": "no_m2_dual_path"
+    },
+    {
+      "policy_name": "no_m1_tripool_vmm",
+      "suite_name": "main_mix_80",
+      "num_gpus": 8,
+      "offered_qps": 1.1,
+      "wall_seconds": 338.13,
+      "total_sessions": 80,
+      "completed_sessions": 76,
+      "oom_sessions": 4,
+      "error_sessions": 0,
+      "joint_slo_goodput_rps": 0.5225,
+      "raw_wall_goodput_rps": 0.1124,
+      "steady_state_goodput_rps": 0.275,
+      "steady_state_attainment_pct": 25.0,
+      "joint_slo_attainment_pct": 47.5,
+      "ar_slo_attainment_pct": 78.8,
+      "dit_slo_attainment_pct": 57.5,
+      "ar_ttft_p50_ms": 893.47,
+      "ar_ttft_p95_ms": 5198.79,
+      "ar_ttft_p99_ms": 20925.3,
+      "ar_tpot_p50_ms": 50.42,
+      "ar_tpot_p95_ms": 53.19,
+      "ar_tpot_p99_ms": 56.32,
+      "dit_turn_p50_ms": 22248.31,
+      "dit_turn_p95_ms": 63784.02,
+      "dit_turn_p99_ms": 99942.36,
+      "peak_gpu_reserved_mib": 39814.0,
+      "host_shmem_delta_gib": 0.21,
+      "vmm_overflow_creates": 0,
+      "vmm_super_to_fine_carves": 0,
+      "vmm_expert_evictions_for_kv": 0,
+      "vmm_expert_evictions_for_transient": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "preempted_ar_count": 0,
+      "total_yields": 0,
+      "worker_oom_count": 4,
+      "oom_retry_count": 0,
+      "peak_pytorch_reserved_mib": 39814.0,
+      "cross_node_ships": 0,
+      "max_cross_node_ship_bytes": 0,
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 23.2,
+          "goodput_rps": 0.2554
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.275
+        },
+        "2.5x": {
+          "attainment_pct": 28.6,
+          "goodput_rps": 0.3143
+        },
+        "3.0x": {
+          "attainment_pct": 37.5,
+          "goodput_rps": 0.4125
+        }
+      },
+      "status": "ok",
+      "ablation_name": "no_m1_tripool_vmm"
+    }
+  ],
+  "status": "ok"
+}

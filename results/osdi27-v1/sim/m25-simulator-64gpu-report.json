@@ -1,0 +1,4966 @@
+{
+  "calibration": {
+    "ar_tpot_p95_mape_pct": 4.11,
+    "dit_p95_mape_pct": 7.89,
+    "goodput_mape_pct": 6.07,
+    "max_point_error_pct": 24.44,
+    "per_point": [
+      {
+        "ar_tpot_p95_err_pct": 1.62,
+        "dit_p95_err_pct": 9.72,
+        "goodput_err_pct": 9.23,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "morphserve",
+        "real_goodput_rps": 0.2708,
+        "sim_goodput_rps": 0.2958
+      },
+      {
+        "ar_tpot_p95_err_pct": 5.35,
+        "dit_p95_err_pct": 1.22,
+        "goodput_err_pct": 12.76,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "morphserve",
+        "real_goodput_rps": 0.3917,
+        "sim_goodput_rps": 0.4417
+      },
+      {
+        "ar_tpot_p95_err_pct": 0.79,
+        "dit_p95_err_pct": 6.02,
+        "goodput_err_pct": 2.09,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "morphserve",
+        "real_goodput_rps": 0.55,
+        "sim_goodput_rps": 0.5615
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.67,
+        "dit_p95_err_pct": 11.11,
+        "goodput_err_pct": 15.79,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "morphserve",
+        "real_goodput_rps": 0.5542,
+        "sim_goodput_rps": 0.6417
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.86,
+        "dit_p95_err_pct": 9.12,
+        "goodput_err_pct": 4.11,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "monolithic_dp",
+        "real_goodput_rps": 0.3042,
+        "sim_goodput_rps": 0.2917
+      },
+      {
+        "ar_tpot_p95_err_pct": 6.91,
+        "dit_p95_err_pct": 9.75,
+        "goodput_err_pct": 1.88,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "monolithic_dp",
+        "real_goodput_rps": 0.4417,
+        "sim_goodput_rps": 0.45
+      },
+      {
+        "ar_tpot_p95_err_pct": 7.9,
+        "dit_p95_err_pct": 7.91,
+        "goodput_err_pct": 2.39,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "monolithic_dp",
+        "real_goodput_rps": 0.4813,
+        "sim_goodput_rps": 0.4698
+      },
+      {
+        "ar_tpot_p95_err_pct": 8.19,
+        "dit_p95_err_pct": 1.94,
+        "goodput_err_pct": 17.49,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "monolithic_dp",
+        "real_goodput_rps": 0.5833,
+        "sim_goodput_rps": 0.4813
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.96,
+        "dit_p95_err_pct": 9.06,
+        "goodput_err_pct": 2.29,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "twostage_shm",
+        "real_goodput_rps": 0.1833,
+        "sim_goodput_rps": 0.1875
+      },
+      {
+        "ar_tpot_p95_err_pct": 2.66,
+        "dit_p95_err_pct": 4.54,
+        "goodput_err_pct": 5.57,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "twostage_shm",
+        "real_goodput_rps": 0.3,
+        "sim_goodput_rps": 0.2833
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.88,
+        "dit_p95_err_pct": 3.71,
+        "goodput_err_pct": 6.45,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "twostage_shm",
+        "real_goodput_rps": 0.3552,
+        "sim_goodput_rps": 0.3781
+      },
+      {
+        "ar_tpot_p95_err_pct": 2.14,
+        "dit_p95_err_pct": 4.91,
+        "goodput_err_pct": 3.45,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "twostage_shm",
+        "real_goodput_rps": 0.4229,
+        "sim_goodput_rps": 0.4375
+      },
+      {
+        "ar_tpot_p95_err_pct": 0.69,
+        "dit_p95_err_pct": 6.08,
+        "goodput_err_pct": 6.25,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "static_nccl_fission",
+        "real_goodput_rps": 0.2,
+        "sim_goodput_rps": 0.1875
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.0,
+        "dit_p95_err_pct": 1.48,
+        "goodput_err_pct": 5.14,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "static_nccl_fission",
+        "real_goodput_rps": 0.325,
+        "sim_goodput_rps": 0.3417
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.27,
+        "dit_p95_err_pct": 1.44,
+        "goodput_err_pct": 5.26,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "static_nccl_fission",
+        "real_goodput_rps": 0.4354,
+        "sim_goodput_rps": 0.4125
+      },
+      {
+        "ar_tpot_p95_err_pct": 0.69,
+        "dit_p95_err_pct": 2.66,
+        "goodput_err_pct": 0.0,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "static_nccl_fission",
+        "real_goodput_rps": 0.4521,
+        "sim_goodput_rps": 0.4521
+      },
+      {
+        "ar_tpot_p95_err_pct": 2.08,
+        "dit_p95_err_pct": 24.44,
+        "goodput_err_pct": 2.93,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "prism_tetriserve_coloc",
+        "real_goodput_rps": 0.2833,
+        "sim_goodput_rps": 0.275
+      },
+      {
+        "ar_tpot_p95_err_pct": 4.44,
+        "dit_p95_err_pct": 6.19,
+        "goodput_err_pct": 3.93,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "prism_tetriserve_coloc",
+        "real_goodput_rps": 0.425,
+        "sim_goodput_rps": 0.4083
+      },
+      {
+        "ar_tpot_p95_err_pct": 17.73,
+        "dit_p95_err_pct": 19.41,
+        "goodput_err_pct": 2.45,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "prism_tetriserve_coloc",
+        "real_goodput_rps": 0.4698,
+        "sim_goodput_rps": 0.4583
+      },
+      {
+        "ar_tpot_p95_err_pct": 12.77,
+        "dit_p95_err_pct": 11.14,
+        "goodput_err_pct": 0.0,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "prism_tetriserve_coloc",
+        "real_goodput_rps": 0.5104,
+        "sim_goodput_rps": 0.5104
+      },
+      {
+        "ar_tpot_p95_err_pct": 1.3,
+        "dit_p95_err_pct": 9.17,
+        "goodput_err_pct": 11.61,
+        "num_gpus": 8,
+        "offered_qps": 0.4,
+        "policy_name": "naive_host_offload",
+        "real_goodput_rps": 0.1792,
+        "sim_goodput_rps": 0.2
+      },
+      {
+        "ar_tpot_p95_err_pct": 5.22,
+        "dit_p95_err_pct": 17.94,
+        "goodput_err_pct": 12.89,
+        "num_gpus": 8,
+        "offered_qps": 0.8,
+        "policy_name": "naive_host_offload",
+        "real_goodput_rps": 0.2583,
+        "sim_goodput_rps": 0.225
+      },
+      {
+        "ar_tpot_p95_err_pct": 3.36,
+        "dit_p95_err_pct": 9.92,
+        "goodput_err_pct": 7.14,
+        "num_gpus": 8,
+        "offered_qps": 1.1,
+        "policy_name": "naive_host_offload",
+        "real_goodput_rps": 0.3208,
+        "sim_goodput_rps": 0.2979
+      },
+      {
+        "ar_tpot_p95_err_pct": 5.2,
+        "dit_p95_err_pct": 0.55,
+        "goodput_err_pct": 4.55,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "policy_name": "naive_host_offload",
+        "real_goodput_rps": 0.3208,
+        "sim_goodput_rps": 0.3354
+      }
+    ],
+    "points_checked": 24,
+    "reference_source": "live_cluster_out_of_sample",
+    "within_5pct_gate": false,
+    "within_8pct_oos_gate": true,
+    "zero_parameter_fitting": true
+  },
+  "h100_80gb_generality": {
+    "hardware": {
+      "agg_h2d_gbps": 56.0,
+      "compute_speedup_x": 2.25,
+      "gpu_hbm_gib": 80.0,
+      "gpus_per_node": 8,
+      "inter_node_rdma_gbps": 46.0,
+      "inter_socket_p2p_gbps": 410.0,
+      "intra_half_p2p_gbps": 410.0,
+      "name": "H100_SXM5_NVLink900G_RDMA400G",
+      "solo_h2d_gbps": 52.0
+    },
+    "regime1_7b_qps_latency_curve": [
+      {
+        "ar_tpot_p95_ms": 42.34,
+        "ar_ttft_p95_ms": 409.4,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 17390.59,
+        "full_trace_attainment_pct": 79.2,
+        "full_trace_goodput_rps": 0.7125,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 70.6,
+        "joint_slo_goodput_rps": 0.6353,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 21,
+        "path_b_morphs": 121,
+        "peak_hbm_mib": 36486.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 5,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 50.0,
+            "goodput_rps": 0.45
+          },
+          "2.0x": {
+            "attainment_pct": 70.6,
+            "goodput_rps": 0.6353
+          },
+          "2.5x": {
+            "attainment_pct": 80.9,
+            "goodput_rps": 0.7279
+          },
+          "3.0x": {
+            "attainment_pct": 85.3,
+            "goodput_rps": 0.7676
+          }
+        },
+        "vmm_carves": 273,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 460.81,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 20127.21,
+        "full_trace_attainment_pct": 77.1,
+        "full_trace_goodput_rps": 0.6938,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 67.6,
+        "joint_slo_goodput_rps": 0.6088,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 42212.0,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 55.9,
+            "goodput_rps": 0.5029
+          },
+          "2.0x": {
+            "attainment_pct": 67.6,
+            "goodput_rps": 0.6088
+          },
+          "2.5x": {
+            "attainment_pct": 72.1,
+            "goodput_rps": 0.6485
+          },
+          "3.0x": {
+            "attainment_pct": 77.9,
+            "goodput_rps": 0.7015
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 421.92,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 66384.59,
+        "full_trace_attainment_pct": 40.6,
+        "full_trace_goodput_rps": 0.3656,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 22.1,
+        "joint_slo_goodput_rps": 0.1985,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 46631.8,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.1721
+          },
+          "2.0x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.1985
+          },
+          "2.5x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.2647
+          },
+          "3.0x": {
+            "attainment_pct": 33.8,
+            "goodput_rps": 0.3044
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 397.46,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 34425.43,
+        "full_trace_attainment_pct": 47.9,
+        "full_trace_goodput_rps": 0.4313,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 26.5,
+        "joint_slo_goodput_rps": 0.2382,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 39937.1,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 25.0,
+            "goodput_rps": 0.225
+          },
+          "2.0x": {
+            "attainment_pct": 26.5,
+            "goodput_rps": 0.2382
+          },
+          "2.5x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.2647
+          },
+          "3.0x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 0.3176
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 27.63,
+        "ar_ttft_p95_ms": 458.06,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 23711.12,
+        "full_trace_attainment_pct": 71.9,
+        "full_trace_goodput_rps": 0.6469,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 60.3,
+        "joint_slo_goodput_rps": 0.5426,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 43145.6,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 6,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 51.5,
+            "goodput_rps": 0.4632
+          },
+          "2.0x": {
+            "attainment_pct": 60.3,
+            "goodput_rps": 0.5426
+          },
+          "2.5x": {
+            "attainment_pct": 66.2,
+            "goodput_rps": 0.5956
+          },
+          "3.0x": {
+            "attainment_pct": 75.0,
+            "goodput_rps": 0.675
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 2741.66,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 27461.74,
+        "full_trace_attainment_pct": 56.3,
+        "full_trace_goodput_rps": 0.5063,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 45.6,
+        "joint_slo_goodput_rps": 0.4103,
+        "num_gpus": 8,
+        "offered_qps": 0.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 39028.0,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 38.2,
+            "goodput_rps": 0.3441
+          },
+          "2.0x": {
+            "attainment_pct": 45.6,
+            "goodput_rps": 0.4103
+          },
+          "2.5x": {
+            "attainment_pct": 51.5,
+            "goodput_rps": 0.4632
+          },
+          "3.0x": {
+            "attainment_pct": 58.8,
+            "goodput_rps": 0.5294
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 44.96,
+        "ar_ttft_p95_ms": 409.4,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 19557.72,
+        "full_trace_attainment_pct": 68.8,
+        "full_trace_goodput_rps": 0.9625,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 55.9,
+        "joint_slo_goodput_rps": 0.7824,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 54,
+        "path_b_morphs": 88,
+        "peak_hbm_mib": 36226.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 8,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 41.2,
+            "goodput_rps": 0.5765
+          },
+          "2.0x": {
+            "attainment_pct": 55.9,
+            "goodput_rps": 0.7824
+          },
+          "2.5x": {
+            "attainment_pct": 67.6,
+            "goodput_rps": 0.9471
+          },
+          "3.0x": {
+            "attainment_pct": 73.5,
+            "goodput_rps": 1.0294
+          }
+        },
+        "vmm_carves": 290,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 701.24,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 26951.64,
+        "full_trace_attainment_pct": 60.4,
+        "full_trace_goodput_rps": 0.8458,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 45.6,
+        "joint_slo_goodput_rps": 0.6382,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 42861.9,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 0.4941
+          },
+          "2.0x": {
+            "attainment_pct": 45.6,
+            "goodput_rps": 0.6382
+          },
+          "2.5x": {
+            "attainment_pct": 63.2,
+            "goodput_rps": 0.8853
+          },
+          "3.0x": {
+            "attainment_pct": 70.6,
+            "goodput_rps": 0.9882
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 531.15,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 81937.2,
+        "full_trace_attainment_pct": 38.5,
+        "full_trace_goodput_rps": 0.5396,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.2676,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 48250.8,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.2265
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.2676
+          },
+          "2.5x": {
+            "attainment_pct": 20.6,
+            "goodput_rps": 0.2882
+          },
+          "3.0x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.3294
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 397.46,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 39889.0,
+        "full_trace_attainment_pct": 41.7,
+        "full_trace_goodput_rps": 0.5833,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 20.6,
+        "joint_slo_goodput_rps": 0.2882,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 39937.1,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.2471
+          },
+          "2.0x": {
+            "attainment_pct": 20.6,
+            "goodput_rps": 0.2882
+          },
+          "2.5x": {
+            "attainment_pct": 25.0,
+            "goodput_rps": 0.35
+          },
+          "3.0x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.3912
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 135.89,
+        "ar_ttft_p95_ms": 534.82,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 27775.73,
+        "full_trace_attainment_pct": 56.3,
+        "full_trace_goodput_rps": 0.7875,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 39.7,
+        "joint_slo_goodput_rps": 0.5559,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 42989.6,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 10,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 30.9,
+            "goodput_rps": 0.4324
+          },
+          "2.0x": {
+            "attainment_pct": 39.7,
+            "goodput_rps": 0.5559
+          },
+          "2.5x": {
+            "attainment_pct": 48.5,
+            "goodput_rps": 0.6794
+          },
+          "3.0x": {
+            "attainment_pct": 60.3,
+            "goodput_rps": 0.8441
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 1777.68,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 34868.36,
+        "full_trace_attainment_pct": 50.0,
+        "full_trace_goodput_rps": 0.7,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 36.8,
+        "joint_slo_goodput_rps": 0.5147,
+        "num_gpus": 8,
+        "offered_qps": 1.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 41560.3,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.4118
+          },
+          "2.0x": {
+            "attainment_pct": 36.8,
+            "goodput_rps": 0.5147
+          },
+          "2.5x": {
+            "attainment_pct": 44.1,
+            "goodput_rps": 0.6176
+          },
+          "3.0x": {
+            "attainment_pct": 51.5,
+            "goodput_rps": 0.7206
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 45.58,
+        "ar_ttft_p95_ms": 410.85,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 21002.99,
+        "full_trace_attainment_pct": 57.3,
+        "full_trace_goodput_rps": 1.0885,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 41.2,
+        "joint_slo_goodput_rps": 0.7824,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 58,
+        "path_b_morphs": 84,
+        "peak_hbm_mib": 37350.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 22,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.3632
+          },
+          "2.0x": {
+            "attainment_pct": 41.2,
+            "goodput_rps": 0.7824
+          },
+          "2.5x": {
+            "attainment_pct": 55.9,
+            "goodput_rps": 1.0618
+          },
+          "3.0x": {
+            "attainment_pct": 61.8,
+            "goodput_rps": 1.1735
+          }
+        },
+        "vmm_carves": 343,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 2918.73,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 30363.28,
+        "full_trace_attainment_pct": 51.0,
+        "full_trace_goodput_rps": 0.9698,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 33.8,
+        "joint_slo_goodput_rps": 0.6426,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 43783.3,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.5309
+          },
+          "2.0x": {
+            "attainment_pct": 33.8,
+            "goodput_rps": 0.6426
+          },
+          "2.5x": {
+            "attainment_pct": 42.6,
+            "goodput_rps": 0.8103
+          },
+          "3.0x": {
+            "attainment_pct": 47.1,
+            "goodput_rps": 0.8941
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 655.34,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 75800.03,
+        "full_trace_attainment_pct": 34.4,
+        "full_trace_goodput_rps": 0.6531,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.3632,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 47658.7,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.3353
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.3632
+          },
+          "2.5x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.4191
+          },
+          "3.0x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.4471
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 432.35,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 42050.89,
+        "full_trace_attainment_pct": 38.5,
+        "full_trace_goodput_rps": 0.7323,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.3632,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 39937.1,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.2794
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.3632
+          },
+          "2.5x": {
+            "attainment_pct": 20.6,
+            "goodput_rps": 0.3912
+          },
+          "3.0x": {
+            "attainment_pct": 26.5,
+            "goodput_rps": 0.5029
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 177.98,
+        "ar_ttft_p95_ms": 746.25,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 28549.99,
+        "full_trace_attainment_pct": 47.9,
+        "full_trace_goodput_rps": 0.9104,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 29.4,
+        "joint_slo_goodput_rps": 0.5588,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 42031.6,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 16,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.4191
+          },
+          "2.0x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.5588
+          },
+          "2.5x": {
+            "attainment_pct": 36.8,
+            "goodput_rps": 0.6985
+          },
+          "3.0x": {
+            "attainment_pct": 47.1,
+            "goodput_rps": 0.8941
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 11817.94,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 36447.56,
+        "full_trace_attainment_pct": 33.3,
+        "full_trace_goodput_rps": 0.6333,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 17.6,
+        "joint_slo_goodput_rps": 0.3353,
+        "num_gpus": 8,
+        "offered_qps": 1.9,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 40303.0,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 0.2515
+          },
+          "2.0x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.3353
+          },
+          "2.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.5309
+          },
+          "3.0x": {
+            "attainment_pct": 33.8,
+            "goodput_rps": 0.6426
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 45.58,
+        "ar_ttft_p95_ms": 430.53,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 23143.86,
+        "full_trace_attainment_pct": 47.9,
+        "full_trace_goodput_rps": 1.1979,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 29.4,
+        "joint_slo_goodput_rps": 0.7353,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 70,
+        "path_b_morphs": 72,
+        "peak_hbm_mib": 37506.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 31,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3676
+          },
+          "2.0x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.7353
+          },
+          "2.5x": {
+            "attainment_pct": 39.7,
+            "goodput_rps": 0.9926
+          },
+          "3.0x": {
+            "attainment_pct": 57.4,
+            "goodput_rps": 1.4338
+          }
+        },
+        "vmm_carves": 364,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 14782.19,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 28603.69,
+        "full_trace_attainment_pct": 42.7,
+        "full_trace_goodput_rps": 1.0677,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 23.5,
+        "joint_slo_goodput_rps": 0.5882,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 43717.8,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.4044
+          },
+          "2.0x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.5882
+          },
+          "2.5x": {
+            "attainment_pct": 33.8,
+            "goodput_rps": 0.8456
+          },
+          "3.0x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 0.8824
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 2672.28,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 100281.9,
+        "full_trace_attainment_pct": 19.8,
+        "full_trace_goodput_rps": 0.4948,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 8.8,
+        "joint_slo_goodput_rps": 0.2206,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 50258.2,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 8.8,
+            "goodput_rps": 0.2206
+          },
+          "2.0x": {
+            "attainment_pct": 8.8,
+            "goodput_rps": 0.2206
+          },
+          "2.5x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 0.3309
+          },
+          "3.0x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.4044
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 23.33,
+        "ar_ttft_p95_ms": 426.26,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 47631.98,
+        "full_trace_attainment_pct": 35.4,
+        "full_trace_goodput_rps": 0.8854,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.4779,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 142,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 39937.1,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.4044
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.4779
+          },
+          "2.5x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.5515
+          },
+          "3.0x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.5515
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 295.77,
+        "ar_ttft_p95_ms": 762.4,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 34892.4,
+        "full_trace_attainment_pct": 41.7,
+        "full_trace_goodput_rps": 1.0417,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 22.1,
+        "joint_slo_goodput_rps": 0.5515,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 46771.6,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 22,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.4412
+          },
+          "2.0x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.5515
+          },
+          "2.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.6985
+          },
+          "3.0x": {
+            "attainment_pct": 30.9,
+            "goodput_rps": 0.7721
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 2956.04,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 41959.57,
+        "full_trace_attainment_pct": 37.5,
+        "full_trace_goodput_rps": 0.9375,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 22.1,
+        "joint_slo_goodput_rps": 0.5515,
+        "num_gpus": 8,
+        "offered_qps": 2.5,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 43757.2,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 0.3309
+          },
+          "2.0x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.5515
+          },
+          "2.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.6985
+          },
+          "3.0x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 0.8824
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_standard"
+      }
+    ],
+    "regime2_long_kv_high_concurrency": [
+      {
+        "ar_tpot_p95_ms": 45.69,
+        "ar_ttft_p95_ms": 1627.13,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 51323.4,
+        "full_trace_attainment_pct": 19.8,
+        "full_trace_goodput_rps": 0.475,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 17.6,
+        "joint_slo_goodput_rps": 0.4235,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 206,
+        "path_b_morphs": 197,
+        "peak_hbm_mib": 76454.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 190,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 7.4,
+            "goodput_rps": 0.1765
+          },
+          "2.0x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.4235
+          },
+          "2.5x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.5647
+          },
+          "3.0x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.6706
+          }
+        },
+        "vmm_carves": 2212,
+        "vmm_expert_evictions": 3397,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 37001.91,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 70505.98,
+        "full_trace_attainment_pct": 10.4,
+        "full_trace_goodput_rps": 0.25,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 14.7,
+        "joint_slo_goodput_rps": 0.3529,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 10,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3529
+          },
+          "2.0x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3529
+          },
+          "2.5x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.4588
+          },
+          "3.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.4588
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 18742.67,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 220742.15,
+        "full_trace_attainment_pct": 0.0,
+        "full_trace_goodput_rps": 0.0,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 0.0,
+        "joint_slo_goodput_rps": 0.0,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 28,
+        "path_a_ships": 138,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 0.0,
+            "goodput_rps": 0.0
+          },
+          "2.0x": {
+            "attainment_pct": 0.0,
+            "goodput_rps": 0.0
+          },
+          "2.5x": {
+            "attainment_pct": 0.0,
+            "goodput_rps": 0.0
+          },
+          "3.0x": {
+            "attainment_pct": 2.9,
+            "goodput_rps": 0.0706
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 426.26,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 110802.67,
+        "full_trace_attainment_pct": 26.0,
+        "full_trace_goodput_rps": 0.625,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 14.7,
+        "joint_slo_goodput_rps": 0.3529,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 403,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 63622.3,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3529
+          },
+          "2.0x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3529
+          },
+          "2.5x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.3882
+          },
+          "3.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.4588
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 575.78,
+        "ar_ttft_p95_ms": 12383.71,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 68795.92,
+        "full_trace_attainment_pct": 8.3,
+        "full_trace_goodput_rps": 0.2,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 11.8,
+        "joint_slo_goodput_rps": 0.2824,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 9,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 99,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 5.9,
+            "goodput_rps": 0.1412
+          },
+          "2.0x": {
+            "attainment_pct": 11.8,
+            "goodput_rps": 0.2824
+          },
+          "2.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.3529
+          },
+          "3.0x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.3882
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 26345.9,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 62261.77,
+        "full_trace_attainment_pct": 6.3,
+        "full_trace_goodput_rps": 0.15,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 8.8,
+        "joint_slo_goodput_rps": 0.2118,
+        "num_gpus": 8,
+        "offered_qps": 2.4,
+        "oom_retries": 0,
+        "oom_sessions": 3,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 5.9,
+            "goodput_rps": 0.1412
+          },
+          "2.0x": {
+            "attainment_pct": 8.8,
+            "goodput_rps": 0.2118
+          },
+          "2.5x": {
+            "attainment_pct": 11.8,
+            "goodput_rps": 0.2824
+          },
+          "3.0x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 0.3176
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 45.23,
+        "ar_ttft_p95_ms": 410.85,
+        "cross_node_ships": 1,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 43437.36,
+        "full_trace_attainment_pct": 59.9,
+        "full_trace_goodput_rps": 11.5,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 53.7,
+        "joint_slo_goodput_rps": 10.3059,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 52,
+        "path_b_morphs": 748,
+        "peak_hbm_mib": 53908.8,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 85,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 32.4,
+            "goodput_rps": 6.2118
+          },
+          "2.0x": {
+            "attainment_pct": 53.7,
+            "goodput_rps": 10.3059
+          },
+          "2.5x": {
+            "attainment_pct": 57.4,
+            "goodput_rps": 11.0118
+          },
+          "3.0x": {
+            "attainment_pct": 61.8,
+            "goodput_rps": 11.8588
+          }
+        },
+        "vmm_carves": 9430,
+        "vmm_expert_evictions": 188,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 5817.86,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 42810.8,
+        "full_trace_attainment_pct": 38.5,
+        "full_trace_goodput_rps": 7.4,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 38.2,
+        "joint_slo_goodput_rps": 7.3412,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 64597.9,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 38.2,
+            "goodput_rps": 7.3412
+          },
+          "2.0x": {
+            "attainment_pct": 38.2,
+            "goodput_rps": 7.3412
+          },
+          "2.5x": {
+            "attainment_pct": 41.2,
+            "goodput_rps": 7.9059
+          },
+          "3.0x": {
+            "attainment_pct": 41.9,
+            "goodput_rps": 8.0471
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 24.84,
+        "ar_ttft_p95_ms": 11899.94,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 86260.45,
+        "full_trace_attainment_pct": 9.4,
+        "full_trace_goodput_rps": 1.8,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 9.6,
+        "joint_slo_goodput_rps": 1.8353,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 48,
+        "path_a_ships": 337,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 5.9,
+            "goodput_rps": 1.1294
+          },
+          "2.0x": {
+            "attainment_pct": 9.6,
+            "goodput_rps": 1.8353
+          },
+          "2.5x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 2.5412
+          },
+          "3.0x": {
+            "attainment_pct": 15.4,
+            "goodput_rps": 2.9647
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 426.26,
+        "cross_node_ships": 309,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 43047.37,
+        "full_trace_attainment_pct": 56.3,
+        "full_trace_goodput_rps": 10.8,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 49.3,
+        "joint_slo_goodput_rps": 9.4588,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 800,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 63622.3,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 45.6,
+            "goodput_rps": 8.7529
+          },
+          "2.0x": {
+            "attainment_pct": 49.3,
+            "goodput_rps": 9.4588
+          },
+          "2.5x": {
+            "attainment_pct": 56.6,
+            "goodput_rps": 10.8706
+          },
+          "3.0x": {
+            "attainment_pct": 58.8,
+            "goodput_rps": 11.2941
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 139.52,
+        "ar_ttft_p95_ms": 674.07,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 42810.8,
+        "full_trace_attainment_pct": 36.5,
+        "full_trace_goodput_rps": 7.0,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 36.0,
+        "joint_slo_goodput_rps": 6.9176,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 64713.6,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 65,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 6.7765
+          },
+          "2.0x": {
+            "attainment_pct": 36.0,
+            "goodput_rps": 6.9176
+          },
+          "2.5x": {
+            "attainment_pct": 39.0,
+            "goodput_rps": 7.4824
+          },
+          "3.0x": {
+            "attainment_pct": 39.7,
+            "goodput_rps": 7.6235
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      },
+      {
+        "ar_tpot_p95_ms": 23.36,
+        "ar_ttft_p95_ms": 10048.87,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 28754.2,
+        "dit_turn_p95_ms": 48451.2,
+        "full_trace_attainment_pct": 33.3,
+        "full_trace_goodput_rps": 6.4,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 31.6,
+        "joint_slo_goodput_rps": 6.0706,
+        "num_gpus": 64,
+        "offered_qps": 19.2,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 62521.3,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 5.3647
+          },
+          "2.0x": {
+            "attainment_pct": 31.6,
+            "goodput_rps": 6.0706
+          },
+          "2.5x": {
+            "attainment_pct": 31.6,
+            "goodput_rps": 6.0706
+          },
+          "3.0x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 6.7765
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "bagel_7b_long_kv_high_concurrency"
+      }
+    ],
+    "regime2_scaled_56gib_weights": [
+      {
+        "ar_tpot_p95_ms": 84.1,
+        "ar_ttft_p95_ms": 6890.16,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 50649.14,
+        "full_trace_attainment_pct": 40.6,
+        "full_trace_goodput_rps": 0.5484,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 23.5,
+        "joint_slo_goodput_rps": 0.3176,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 68,
+        "path_b_morphs": 103,
+        "peak_hbm_mib": 73136.3,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 32,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 8.8,
+            "goodput_rps": 0.1191
+          },
+          "2.0x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.3176
+          },
+          "2.5x": {
+            "attainment_pct": 36.8,
+            "goodput_rps": 0.4963
+          },
+          "3.0x": {
+            "attainment_pct": 47.1,
+            "goodput_rps": 0.6353
+          }
+        },
+        "vmm_carves": 448,
+        "vmm_expert_evictions": 675,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 45.95,
+        "ar_ttft_p95_ms": 27396.48,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 62612.08,
+        "full_trace_attainment_pct": 36.5,
+        "full_trace_goodput_rps": 0.4922,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 17.6,
+        "joint_slo_goodput_rps": 0.2382,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 2,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 14.7,
+            "goodput_rps": 0.1985
+          },
+          "2.0x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.2382
+          },
+          "2.5x": {
+            "attainment_pct": 27.9,
+            "goodput_rps": 0.3772
+          },
+          "3.0x": {
+            "attainment_pct": 30.9,
+            "goodput_rps": 0.4169
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.22,
+        "ar_ttft_p95_ms": 3865.05,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 135622.04,
+        "full_trace_attainment_pct": 24.0,
+        "full_trace_goodput_rps": 0.3234,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 11.8,
+        "joint_slo_goodput_rps": 0.1588,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 12,
+        "path_a_ships": 114,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 10.3,
+            "goodput_rps": 0.139
+          },
+          "2.0x": {
+            "attainment_pct": 11.8,
+            "goodput_rps": 0.1588
+          },
+          "2.5x": {
+            "attainment_pct": 16.2,
+            "goodput_rps": 0.2184
+          },
+          "3.0x": {
+            "attainment_pct": 17.6,
+            "goodput_rps": 0.2382
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.16,
+        "ar_ttft_p95_ms": 788.58,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 89723.75,
+        "full_trace_attainment_pct": 34.4,
+        "full_trace_goodput_rps": 0.4641,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.2581,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 171,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 77868.3,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 13.2,
+            "goodput_rps": 0.1787
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.2581
+          },
+          "2.5x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.2978
+          },
+          "3.0x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.3176
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 544.17,
+        "ar_ttft_p95_ms": 1433.1,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 55765.35,
+        "full_trace_attainment_pct": 47.9,
+        "full_trace_goodput_rps": 0.6469,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 29.4,
+        "joint_slo_goodput_rps": 0.3971,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 3,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 19,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 23.5,
+            "goodput_rps": 0.3176
+          },
+          "2.0x": {
+            "attainment_pct": 29.4,
+            "goodput_rps": 0.3971
+          },
+          "2.5x": {
+            "attainment_pct": 35.3,
+            "goodput_rps": 0.4765
+          },
+          "3.0x": {
+            "attainment_pct": 36.8,
+            "goodput_rps": 0.4963
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.22,
+        "ar_ttft_p95_ms": 6776.47,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 75388.86,
+        "full_trace_attainment_pct": 35.4,
+        "full_trace_goodput_rps": 0.4781,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 19.1,
+        "joint_slo_goodput_rps": 0.2581,
+        "num_gpus": 8,
+        "offered_qps": 1.35,
+        "oom_retries": 0,
+        "oom_sessions": 3,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 10.3,
+            "goodput_rps": 0.139
+          },
+          "2.0x": {
+            "attainment_pct": 19.1,
+            "goodput_rps": 0.2581
+          },
+          "2.5x": {
+            "attainment_pct": 22.1,
+            "goodput_rps": 0.2978
+          },
+          "3.0x": {
+            "attainment_pct": 26.5,
+            "goodput_rps": 0.3574
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 78.76,
+        "ar_ttft_p95_ms": 760.06,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 28115.6,
+        "full_trace_attainment_pct": 91.1,
+        "full_trace_goodput_rps": 9.8438,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 89.7,
+        "joint_slo_goodput_rps": 9.6882,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 31,
+        "path_b_morphs": 308,
+        "peak_hbm_mib": 70532.3,
+        "policy_name": "morphserve",
+        "preempted_ar_count": 21,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 67.6,
+            "goodput_rps": 7.3059
+          },
+          "2.0x": {
+            "attainment_pct": 89.7,
+            "goodput_rps": 9.6882
+          },
+          "2.5x": {
+            "attainment_pct": 92.6,
+            "goodput_rps": 10.0059
+          },
+          "3.0x": {
+            "attainment_pct": 93.4,
+            "goodput_rps": 10.0853
+          }
+        },
+        "vmm_carves": 2242,
+        "vmm_expert_evictions": 591,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.16,
+        "ar_ttft_p95_ms": 2966.81,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 29530.75,
+        "full_trace_attainment_pct": 87.0,
+        "full_trace_goodput_rps": 9.3938,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 86.0,
+        "joint_slo_goodput_rps": 9.2912,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 77868.3,
+        "policy_name": "monolithic_dp",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 71.3,
+            "goodput_rps": 7.7029
+          },
+          "2.0x": {
+            "attainment_pct": 86.0,
+            "goodput_rps": 9.2912
+          },
+          "2.5x": {
+            "attainment_pct": 89.7,
+            "goodput_rps": 9.6882
+          },
+          "3.0x": {
+            "attainment_pct": 90.4,
+            "goodput_rps": 9.7676
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.16,
+        "ar_ttft_p95_ms": 1362.19,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 53597.74,
+        "full_trace_attainment_pct": 51.6,
+        "full_trace_goodput_rps": 5.5688,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 42.6,
+        "joint_slo_goodput_rps": 4.6059,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 16,
+        "path_a_ships": 264,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 81920.0,
+        "policy_name": "twostage_shm",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 36.0,
+            "goodput_rps": 3.8912
+          },
+          "2.0x": {
+            "attainment_pct": 42.6,
+            "goodput_rps": 4.6059
+          },
+          "2.5x": {
+            "attainment_pct": 47.8,
+            "goodput_rps": 5.1618
+          },
+          "3.0x": {
+            "attainment_pct": 48.5,
+            "goodput_rps": 5.2412
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.16,
+        "ar_ttft_p95_ms": 735.3,
+        "cross_node_ships": 210,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 29586.2,
+        "full_trace_attainment_pct": 84.4,
+        "full_trace_goodput_rps": 9.1125,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 78.7,
+        "joint_slo_goodput_rps": 8.4971,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 339,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 77868.3,
+        "policy_name": "static_nccl_fission",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 55.1,
+            "goodput_rps": 5.9559
+          },
+          "2.0x": {
+            "attainment_pct": 78.7,
+            "goodput_rps": 8.4971
+          },
+          "2.5x": {
+            "attainment_pct": 91.2,
+            "goodput_rps": 9.8471
+          },
+          "3.0x": {
+            "attainment_pct": 96.3,
+            "goodput_rps": 10.4029
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 51.12,
+        "ar_ttft_p95_ms": 888.51,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 29530.75,
+        "full_trace_attainment_pct": 82.3,
+        "full_trace_goodput_rps": 8.8875,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 80.9,
+        "joint_slo_goodput_rps": 8.7353,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 80549.4,
+        "policy_name": "prism_tetriserve_coloc",
+        "preempted_ar_count": 13,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 64.7,
+            "goodput_rps": 6.9882
+          },
+          "2.0x": {
+            "attainment_pct": 80.9,
+            "goodput_rps": 8.7353
+          },
+          "2.5x": {
+            "attainment_pct": 90.4,
+            "goodput_rps": 9.7676
+          },
+          "3.0x": {
+            "attainment_pct": 90.4,
+            "goodput_rps": 9.7676
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      },
+      {
+        "ar_tpot_p95_ms": 43.16,
+        "ar_ttft_p95_ms": 3605.94,
+        "cross_node_ships": 0,
+        "crossover_kv_mib": 58677.6,
+        "dit_turn_p95_ms": 32560.12,
+        "full_trace_attainment_pct": 66.1,
+        "full_trace_goodput_rps": 7.1438,
+        "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+        "joint_slo_attainment_pct": 62.5,
+        "joint_slo_goodput_rps": 6.75,
+        "num_gpus": 64,
+        "offered_qps": 10.8,
+        "oom_retries": 0,
+        "oom_sessions": 0,
+        "path_a_ships": 0,
+        "path_b_morphs": 0,
+        "peak_hbm_mib": 76179.3,
+        "policy_name": "naive_host_offload",
+        "preempted_ar_count": 0,
+        "skew_tag": "main_mix",
+        "slo_curve_by_k": {
+          "1.5x": {
+            "attainment_pct": 39.0,
+            "goodput_rps": 4.2088
+          },
+          "2.0x": {
+            "attainment_pct": 62.5,
+            "goodput_rps": 6.75
+          },
+          "2.5x": {
+            "attainment_pct": 66.9,
+            "goodput_rps": 7.2265
+          },
+          "3.0x": {
+            "attainment_pct": 80.9,
+            "goodput_rps": 8.7353
+          }
+        },
+        "vmm_carves": 0,
+        "vmm_expert_evictions": 0,
+        "vmm_kv_host_swap_ins": 0,
+        "vmm_kv_host_swap_outs": 0,
+        "workload_scale": "frontier_mot_56gib"
+      }
+    ]
+  },
+  "interconnect_presets": [
+    {
+      "agg_h2d_gbps": 10.348,
+      "compute_speedup_x": 1.0,
+      "gpu_hbm_gib": 40.0,
+      "gpus_per_node": 8,
+      "inter_node_rdma_gbps": 11.5,
+      "inter_socket_p2p_gbps": 9.55,
+      "intra_half_p2p_gbps": 10.581,
+      "name": "A100_PCIe_Gen4_RDMA100G",
+      "solo_h2d_gbps": 8.669
+    },
+    {
+      "agg_h2d_gbps": 24.5,
+      "compute_speedup_x": 1.08,
+      "gpu_hbm_gib": 40.0,
+      "gpus_per_node": 8,
+      "inter_node_rdma_gbps": 23.0,
+      "inter_socket_p2p_gbps": 265.0,
+      "intra_half_p2p_gbps": 265.0,
+      "name": "A100_SXM4_NVLink600G_RDMA200G",
+      "solo_h2d_gbps": 22.9
+    },
+    {
+      "agg_h2d_gbps": 56.0,
+      "compute_speedup_x": 2.25,
+      "gpu_hbm_gib": 80.0,
+      "gpus_per_node": 8,
+      "inter_node_rdma_gbps": 46.0,
+      "inter_socket_p2p_gbps": 410.0,
+      "intra_half_p2p_gbps": 410.0,
+      "name": "H100_SXM5_NVLink900G_RDMA400G",
+      "solo_h2d_gbps": 52.0
+    }
+  ],
+  "physics_profile": {
+    "ar_batched2_step_p50_ms": 55.88,
+    "ar_prefill_ms": 64.8,
+    "ar_unloaded_tpot_p50_ms": 49.91,
+    "ar_unloaded_tpot_p99_ms": 52.57,
+    "cpu_pil_prep_only_ms": 72.3,
+    "dit_1024_step_ms": 968.871,
+    "dit_512_20step_base_ms": 4953.31,
+    "dit_512_cfg_step_mean_ms": 288.02,
+    "dit_512_layer_p50_ms": 10.26,
+    "dit_512_transient_mib": 1088.0,
+    "driver_total_hbm_40g_mib": 40442.37,
+    "gpu_inplace_prep_only_ms": 2.487,
+    "kairos_2x8_cross_socket_gbps": 8.59,
+    "kairos_2x8_inter_node_gbps": 1.11,
+    "kairos_2x8_intra_half_gbps": 8.37,
+    "kv_mib_per_token": 0.05469,
+    "layer_stride_mib": 448,
+    "m4_adaptive_chunk_layers": 4,
+    "m4_colocated_ar_tpot_p50_ms": 87.01,
+    "monolithic_loaded_driver_mib": 28776.81,
+    "morphserve_dit_512_ms_per_kv_tok": 0.095754,
+    "morphserve_loopback_turn_ms": 796.203,
+    "nccl_intra_half_kv_gbps": 10.362,
+    "non_cow_kv_mult": 1.9979,
+    "num_expert_layers": 28,
+    "offloaded_base_driver_mib": 16366.81,
+    "paced_h2d_per_gpu_gbps": 12.34,
+    "packed_expert_data_mib": 12446.64,
+    "pcie_cross_half_p2p_gbps": 9.55,
+    "pcie_half0_agg_h2d_gbps": 10.348,
+    "pcie_half1_agg_h2d_gbps": 10.405,
+    "pcie_intra_half_p2p_gbps": 10.581,
+    "pcie_solo_h2d_gbps": 8.669,
+    "provenance_files": {
+      "job0a_vmm": "phase0-job0a-v2/vmm-bench.json@sha256:fc3ac943989d6dce",
+      "job0c_topo": "phase0-job0c/topo-8gpu-report.json@sha256:efd9139ec48804a2",
+      "job0d_motivation": "phase0-job0d-r2/motivation-report.json@sha256:2cdc3c029860f811",
+      "module1_vmm": "osdi27-v1/stage1-gate/module1/module1-report.json@sha256:3ceaf6c36e22e0ff",
+      "module2_router": "phase1-job1d-r4/module2-report.json@sha256:61a4957dd9de853b",
+      "module3_cow_loopback": "osdi27-v1/stage1-gate/module3/module3-report.json@sha256:beea7fb72d421b8d",
+      "module4_scheduler": "osdi27-v1/stage1-gate/module4/module4-report.json@sha256:c8ab77927e3c8f96"
+    },
+    "scoped_vae_1024_spike_mib": 3648.0,
+    "scoped_vae_512_spike_mib": 960.0,
+    "step_preempt_ar_tpot_p50_ms": 333.12,
+    "stock_dit_512_ms_per_kv_tok": 0.107341,
+    "stock_loopback_turn_ms": 896.973,
+    "turn_edit_512_kv_delta_mib": 325.28,
+    "twostage_shm_base_ms": 5.2,
+    "twostage_shm_ms_per_mib": 4.2081,
+    "unpaced_4gpu_half_h2d_per_gpu_gbps": 3.1,
+    "unscoped_vae_1024_reserved_mib": 6508.78,
+    "unscoped_vae_512_reserved_mib": 2022.78,
+    "vae_1024_ms": 212.32,
+    "vae_512_ms": 52.6,
+    "vmm_64m_acquire_4gib_ms": 5.437,
+    "vmm_ar_kv_step_overhead_ms": 9.6,
+    "vmm_full_expert_map_ms": 11.714,
+    "vmm_solo_h2d_stream_gbps": 12.334
+  },
+  "scaling_matrix": [
+    {
+      "ar_tpot_p95_ms": 102.53,
+      "ar_ttft_p95_ms": 925.22,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 69712.3,
+      "full_trace_attainment_pct": 46.9,
+      "full_trace_goodput_rps": 0.5391,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 0.2875,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 57,
+      "path_b_morphs": 85,
+      "peak_hbm_mib": 37440.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 28,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 10.3,
+          "goodput_rps": 0.1184
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.2875
+        },
+        "2.5x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.3551
+        },
+        "3.0x": {
+          "attainment_pct": 38.2,
+          "goodput_rps": 0.4397
+        }
+      },
+      "vmm_carves": 351,
+      "vmm_expert_evictions": 605,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 55.88,
+      "ar_ttft_p95_ms": 13481.05,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 86301.5,
+      "full_trace_attainment_pct": 44.8,
+      "full_trace_goodput_rps": 0.5151,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 23.5,
+      "joint_slo_goodput_rps": 0.2706,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 0,
+      "oom_sessions": 5,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2029
+        },
+        "2.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2706
+        },
+        "2.5x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 0.3044
+        },
+        "3.0x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.3721
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 3046.52,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 208581.32,
+      "full_trace_attainment_pct": 32.3,
+      "full_trace_goodput_rps": 0.3714,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 13.2,
+      "joint_slo_goodput_rps": 0.1522,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 0,
+      "oom_sessions": 9,
+      "path_a_ships": 108,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.1353
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1522
+        },
+        "2.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.186
+        },
+        "3.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2199
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 894.28,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 110853.44,
+      "full_trace_attainment_pct": 37.5,
+      "full_trace_goodput_rps": 0.4313,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 17.6,
+      "joint_slo_goodput_rps": 0.2029,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 0,
+      "oom_sessions": 7,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.186
+        },
+        "2.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2029
+        },
+        "2.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.2368
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2537
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 336.9,
+      "ar_ttft_p95_ms": 1688.99,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 66644.52,
+      "full_trace_attainment_pct": 44.8,
+      "full_trace_goodput_rps": 0.5151,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 23.5,
+      "joint_slo_goodput_rps": 0.2706,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 5,
+      "oom_sessions": 6,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 17,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2029
+        },
+        "2.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.2706
+        },
+        "2.5x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.3382
+        },
+        "3.0x": {
+          "attainment_pct": 35.3,
+          "goodput_rps": 0.4059
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 55.88,
+      "ar_ttft_p95_ms": 32996.92,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 143261.7,
+      "full_trace_attainment_pct": 22.9,
+      "full_trace_goodput_rps": 0.2635,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 7.4,
+      "joint_slo_goodput_rps": 0.0846,
+      "num_gpus": 8,
+      "offered_qps": 1.15,
+      "oom_retries": 0,
+      "oom_sessions": 3,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 2.9,
+          "goodput_rps": 0.0338
+        },
+        "2.0x": {
+          "attainment_pct": 7.4,
+          "goodput_rps": 0.0846
+        },
+        "2.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.1353
+        },
+        "3.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1522
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 101.64,
+      "ar_ttft_p95_ms": 924.4,
+      "cross_node_ships": 7,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 35387.09,
+      "full_trace_attainment_pct": 67.7,
+      "full_trace_goodput_rps": 1.5573,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 55.9,
+      "joint_slo_goodput_rps": 1.2853,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 36,
+      "path_b_morphs": 106,
+      "peak_hbm_mib": 36272.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 17,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 0.6426
+        },
+        "2.0x": {
+          "attainment_pct": 55.9,
+          "goodput_rps": 1.2853
+        },
+        "2.5x": {
+          "attainment_pct": 67.6,
+          "goodput_rps": 1.5559
+        },
+        "3.0x": {
+          "attainment_pct": 72.1,
+          "goodput_rps": 1.6574
+        }
+      },
+      "vmm_carves": 428,
+      "vmm_expert_evictions": 413,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.57,
+      "ar_ttft_p95_ms": 5216.53,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 41744.43,
+      "full_trace_attainment_pct": 66.7,
+      "full_trace_goodput_rps": 1.5333,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 57.4,
+      "joint_slo_goodput_rps": 1.3191,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 3,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 45.6,
+          "goodput_rps": 1.0485
+        },
+        "2.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 1.3191
+        },
+        "2.5x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 1.4544
+        },
+        "3.0x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 1.4544
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 949.32,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 99505.78,
+      "full_trace_attainment_pct": 42.7,
+      "full_trace_goodput_rps": 0.9823,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 0.575,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 8,
+      "path_a_ships": 110,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.4397
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.575
+        },
+        "2.5x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.6765
+        },
+        "3.0x": {
+          "attainment_pct": 35.3,
+          "goodput_rps": 0.8118
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 894.28,
+      "cross_node_ships": 85,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 58930.32,
+      "full_trace_attainment_pct": 42.7,
+      "full_trace_goodput_rps": 0.9823,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 23.5,
+      "joint_slo_goodput_rps": 0.5412,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 7,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.4735
+        },
+        "2.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.5412
+        },
+        "2.5x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 0.6426
+        },
+        "3.0x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.7441
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 306.74,
+      "ar_ttft_p95_ms": 1298.02,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 39279.91,
+      "full_trace_attainment_pct": 62.5,
+      "full_trace_goodput_rps": 1.4375,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 50.0,
+      "joint_slo_goodput_rps": 1.15,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40003.6,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 8,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 38.2,
+          "goodput_rps": 0.8794
+        },
+        "2.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 1.15
+        },
+        "2.5x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 1.3191
+        },
+        "3.0x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 1.4544
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.57,
+      "ar_ttft_p95_ms": 13325.57,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 95769.91,
+      "full_trace_attainment_pct": 42.7,
+      "full_trace_goodput_rps": 0.9823,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 30.9,
+      "joint_slo_goodput_rps": 0.7103,
+      "num_gpus": 16,
+      "offered_qps": 2.3,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.3382
+        },
+        "2.0x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.7103
+        },
+        "2.5x": {
+          "attainment_pct": 38.2,
+          "goodput_rps": 0.8794
+        },
+        "3.0x": {
+          "attainment_pct": 39.7,
+          "goodput_rps": 0.9132
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 62.17,
+      "ar_ttft_p95_ms": 921.14,
+      "cross_node_ships": 11,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 32669.9,
+      "full_trace_attainment_pct": 91.7,
+      "full_trace_goodput_rps": 8.4333,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 91.1,
+      "joint_slo_goodput_rps": 8.3786,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 55,
+      "path_b_morphs": 293,
+      "peak_hbm_mib": 36230.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 10,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 66.1,
+          "goodput_rps": 6.0786
+        },
+        "2.0x": {
+          "attainment_pct": 91.1,
+          "goodput_rps": 8.3786
+        },
+        "2.5x": {
+          "attainment_pct": 94.0,
+          "goodput_rps": 8.6524
+        },
+        "3.0x": {
+          "attainment_pct": 94.6,
+          "goodput_rps": 8.7071
+        }
+      },
+      "vmm_carves": 1106,
+      "vmm_expert_evictions": 764,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 946.88,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 35772.01,
+      "full_trace_attainment_pct": 84.2,
+      "full_trace_goodput_rps": 7.7433,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 79.8,
+      "joint_slo_goodput_rps": 7.3381,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 67.9,
+          "goodput_rps": 6.2429
+        },
+        "2.0x": {
+          "attainment_pct": 79.8,
+          "goodput_rps": 7.3381
+        },
+        "2.5x": {
+          "attainment_pct": 86.9,
+          "goodput_rps": 7.9952
+        },
+        "3.0x": {
+          "attainment_pct": 87.5,
+          "goodput_rps": 8.05
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 1999.65,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 64086.27,
+      "full_trace_attainment_pct": 51.2,
+      "full_trace_goodput_rps": 4.715,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 38.1,
+      "joint_slo_goodput_rps": 3.5048,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 17,
+      "path_a_ships": 280,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 29.8,
+          "goodput_rps": 2.7381
+        },
+        "2.0x": {
+          "attainment_pct": 38.1,
+          "goodput_rps": 3.5048
+        },
+        "2.5x": {
+          "attainment_pct": 45.8,
+          "goodput_rps": 4.2167
+        },
+        "3.0x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 4.6
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 894.28,
+      "cross_node_ships": 287,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 33866.7,
+      "full_trace_attainment_pct": 64.2,
+      "full_trace_goodput_rps": 5.9033,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 54.8,
+      "joint_slo_goodput_rps": 5.0381,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 15,
+      "path_a_ships": 288,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 42.9,
+          "goodput_rps": 3.9429
+        },
+        "2.0x": {
+          "attainment_pct": 54.8,
+          "goodput_rps": 5.0381
+        },
+        "2.5x": {
+          "attainment_pct": 62.5,
+          "goodput_rps": 5.75
+        },
+        "3.0x": {
+          "attainment_pct": 73.2,
+          "goodput_rps": 6.7357
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 62.17,
+      "ar_ttft_p95_ms": 956.48,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 35915.78,
+      "full_trace_attainment_pct": 85.4,
+      "full_trace_goodput_rps": 7.8583,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 81.5,
+      "joint_slo_goodput_rps": 7.5024,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 6,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 69.6,
+          "goodput_rps": 6.4071
+        },
+        "2.0x": {
+          "attainment_pct": 81.5,
+          "goodput_rps": 7.5024
+        },
+        "2.5x": {
+          "attainment_pct": 88.1,
+          "goodput_rps": 8.1048
+        },
+        "3.0x": {
+          "attainment_pct": 88.7,
+          "goodput_rps": 8.1595
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 52.49,
+      "ar_ttft_p95_ms": 5074.56,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 6318.3,
+      "dit_turn_p95_ms": 79518.07,
+      "full_trace_attainment_pct": 48.3,
+      "full_trace_goodput_rps": 4.4467,
+      "interconnect": "A100_PCIe_Gen4_RDMA100G",
+      "joint_slo_attainment_pct": 41.1,
+      "joint_slo_goodput_rps": 3.7786,
+      "num_gpus": 64,
+      "offered_qps": 9.2,
+      "oom_retries": 0,
+      "oom_sessions": 3,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 22.6,
+          "goodput_rps": 2.081
+        },
+        "2.0x": {
+          "attainment_pct": 41.1,
+          "goodput_rps": 3.7786
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 4.6
+        },
+        "3.0x": {
+          "attainment_pct": 55.4,
+          "goodput_rps": 5.0929
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 94.65,
+      "ar_ttft_p95_ms": 3549.78,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 65547.65,
+      "full_trace_attainment_pct": 45.8,
+      "full_trace_goodput_rps": 0.5683,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 0.31,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 59,
+      "path_b_morphs": 83,
+      "peak_hbm_mib": 37712.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 33,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 10.3,
+          "goodput_rps": 0.1276
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.31
+        },
+        "2.5x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.4012
+        },
+        "3.0x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 0.4559
+        }
+      },
+      "vmm_carves": 330,
+      "vmm_expert_evictions": 584,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 51.74,
+      "ar_ttft_p95_ms": 29661.52,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 75174.17,
+      "full_trace_attainment_pct": 41.7,
+      "full_trace_goodput_rps": 0.5167,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 19.1,
+      "joint_slo_goodput_rps": 0.2371,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 2,
+      "oom_sessions": 6,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.1459
+        },
+        "2.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2371
+        },
+        "2.5x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 0.3282
+        },
+        "3.0x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.3647
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 3620.39,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 143987.13,
+      "full_trace_attainment_pct": 29.2,
+      "full_trace_goodput_rps": 0.3617,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 13.2,
+      "joint_slo_goodput_rps": 0.1641,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 0,
+      "oom_sessions": 9,
+      "path_a_ships": 106,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1641
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1641
+        },
+        "2.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2371
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2735
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 828.04,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 99846.94,
+      "full_trace_attainment_pct": 36.5,
+      "full_trace_goodput_rps": 0.4521,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 17.6,
+      "joint_slo_goodput_rps": 0.2188,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 0,
+      "oom_sessions": 7,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.1824
+        },
+        "2.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2188
+        },
+        "2.5x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2735
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2735
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 341.13,
+      "ar_ttft_p95_ms": 1607.97,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 65381.29,
+      "full_trace_attainment_pct": 36.5,
+      "full_trace_goodput_rps": 0.4521,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 13.2,
+      "joint_slo_goodput_rps": 0.1641,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 3,
+      "oom_sessions": 6,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 20,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.1459
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1641
+        },
+        "2.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.2371
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.2735
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 51.74,
+      "ar_ttft_p95_ms": 17709.69,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 82177.58,
+      "full_trace_attainment_pct": 30.2,
+      "full_trace_goodput_rps": 0.3746,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 13.2,
+      "joint_slo_goodput_rps": 0.1641,
+      "num_gpus": 8,
+      "offered_qps": 1.24,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 7.4,
+          "goodput_rps": 0.0912
+        },
+        "2.0x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.1641
+        },
+        "2.5x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.2188
+        },
+        "3.0x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 0.3282
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 94.58,
+      "ar_ttft_p95_ms": 864.13,
+      "cross_node_ships": 7,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 39894.41,
+      "full_trace_attainment_pct": 68.8,
+      "full_trace_goodput_rps": 1.705,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 57.4,
+      "joint_slo_goodput_rps": 1.4224,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 47,
+      "path_b_morphs": 95,
+      "peak_hbm_mib": 37440.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 14,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.7659
+        },
+        "2.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 1.4224
+        },
+        "2.5x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 1.5682
+        },
+        "3.0x": {
+          "attainment_pct": 72.1,
+          "goodput_rps": 1.7871
+        }
+      },
+      "vmm_carves": 428,
+      "vmm_expert_evictions": 447,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 4768.8,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 40227.47,
+      "full_trace_attainment_pct": 65.6,
+      "full_trace_goodput_rps": 1.6275,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 54.4,
+      "joint_slo_goodput_rps": 1.3494,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 0,
+      "oom_sessions": 2,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 39.7,
+          "goodput_rps": 0.9847
+        },
+        "2.0x": {
+          "attainment_pct": 54.4,
+          "goodput_rps": 1.3494
+        },
+        "2.5x": {
+          "attainment_pct": 60.3,
+          "goodput_rps": 1.4953
+        },
+        "3.0x": {
+          "attainment_pct": 60.3,
+          "goodput_rps": 1.4953
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 964.09,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 102826.94,
+      "full_trace_attainment_pct": 39.6,
+      "full_trace_goodput_rps": 0.9817,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 19.1,
+      "joint_slo_goodput_rps": 0.4741,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 0,
+      "oom_sessions": 8,
+      "path_a_ships": 110,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.3647
+        },
+        "2.0x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.4741
+        },
+        "2.5x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.5835
+        },
+        "3.0x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.7294
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 828.04,
+      "cross_node_ships": 41,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 55756.14,
+      "full_trace_attainment_pct": 42.7,
+      "full_trace_goodput_rps": 1.0592,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 23.5,
+      "joint_slo_goodput_rps": 0.5835,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 0,
+      "oom_sessions": 7,
+      "path_a_ships": 114,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.5106
+        },
+        "2.0x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.5835
+        },
+        "2.5x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.7294
+        },
+        "3.0x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.8388
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 60.63,
+      "ar_ttft_p95_ms": 1359.86,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 38396.07,
+      "full_trace_attainment_pct": 67.7,
+      "full_trace_goodput_rps": 1.6792,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 57.4,
+      "joint_slo_goodput_rps": 1.4224,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 1,
+      "oom_sessions": 2,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 6,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 42.6,
+          "goodput_rps": 1.0576
+        },
+        "2.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 1.4224
+        },
+        "2.5x": {
+          "attainment_pct": 63.2,
+          "goodput_rps": 1.5682
+        },
+        "3.0x": {
+          "attainment_pct": 64.7,
+          "goodput_rps": 1.6047
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.68,
+      "ar_ttft_p95_ms": 7523.47,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 49608.67,
+      "full_trace_attainment_pct": 44.8,
+      "full_trace_goodput_rps": 1.1108,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 33.8,
+      "joint_slo_goodput_rps": 0.8388,
+      "num_gpus": 16,
+      "offered_qps": 2.48,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 38310.9,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 23.5,
+          "goodput_rps": 0.5835
+        },
+        "2.0x": {
+          "attainment_pct": 33.8,
+          "goodput_rps": 0.8388
+        },
+        "2.5x": {
+          "attainment_pct": 41.2,
+          "goodput_rps": 1.0212
+        },
+        "3.0x": {
+          "attainment_pct": 54.4,
+          "goodput_rps": 1.3494
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 57.56,
+      "ar_ttft_p95_ms": 854.27,
+      "cross_node_ships": 12,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 30818.68,
+      "full_trace_attainment_pct": 91.3,
+      "full_trace_goodput_rps": 9.0703,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 88.1,
+      "joint_slo_goodput_rps": 8.7567,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 47,
+      "path_b_morphs": 301,
+      "peak_hbm_mib": 36230.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 11,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 67.9,
+          "goodput_rps": 6.745
+        },
+        "2.0x": {
+          "attainment_pct": 88.1,
+          "goodput_rps": 8.7567
+        },
+        "2.5x": {
+          "attainment_pct": 92.3,
+          "goodput_rps": 9.1708
+        },
+        "3.0x": {
+          "attainment_pct": 92.9,
+          "goodput_rps": 9.23
+        }
+      },
+      "vmm_carves": 1086,
+      "vmm_expert_evictions": 769,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 876.74,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 33160.98,
+      "full_trace_attainment_pct": 87.9,
+      "full_trace_goodput_rps": 8.7389,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 83.9,
+      "joint_slo_goodput_rps": 8.3425,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 72.6,
+          "goodput_rps": 7.2183
+        },
+        "2.0x": {
+          "attainment_pct": 83.9,
+          "goodput_rps": 8.3425
+        },
+        "2.5x": {
+          "attainment_pct": 88.1,
+          "goodput_rps": 8.7567
+        },
+        "3.0x": {
+          "attainment_pct": 88.7,
+          "goodput_rps": 8.8158
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 981.05,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 58314.22,
+      "full_trace_attainment_pct": 53.8,
+      "full_trace_goodput_rps": 5.3428,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 42.3,
+      "joint_slo_goodput_rps": 4.2008,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 16,
+      "path_a_ships": 284,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 33.3,
+          "goodput_rps": 3.3133
+        },
+        "2.0x": {
+          "attainment_pct": 42.3,
+          "goodput_rps": 4.2008
+        },
+        "2.5x": {
+          "attainment_pct": 49.4,
+          "goodput_rps": 4.9108
+        },
+        "3.0x": {
+          "attainment_pct": 53.0,
+          "goodput_rps": 5.2658
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 828.04,
+      "cross_node_ships": 207,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 31111.63,
+      "full_trace_attainment_pct": 66.7,
+      "full_trace_goodput_rps": 6.6267,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 57.7,
+      "joint_slo_goodput_rps": 5.7392,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 15,
+      "path_a_ships": 288,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 44.6,
+          "goodput_rps": 4.4375
+        },
+        "2.0x": {
+          "attainment_pct": 57.7,
+          "goodput_rps": 5.7392
+        },
+        "2.5x": {
+          "attainment_pct": 65.5,
+          "goodput_rps": 6.5083
+        },
+        "3.0x": {
+          "attainment_pct": 75.6,
+          "goodput_rps": 7.5142
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 57.49,
+      "ar_ttft_p95_ms": 885.63,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 33255.35,
+      "full_trace_attainment_pct": 87.1,
+      "full_trace_goodput_rps": 8.6561,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 83.3,
+      "joint_slo_goodput_rps": 8.2833,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 1,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40442.4,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 4,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 73.8,
+          "goodput_rps": 7.3367
+        },
+        "2.0x": {
+          "attainment_pct": 83.3,
+          "goodput_rps": 8.2833
+        },
+        "2.5x": {
+          "attainment_pct": 88.7,
+          "goodput_rps": 8.8158
+        },
+        "3.0x": {
+          "attainment_pct": 88.7,
+          "goodput_rps": 8.8158
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 48.61,
+      "ar_ttft_p95_ms": 2620.14,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 43115.4,
+      "dit_turn_p95_ms": 35647.57,
+      "full_trace_attainment_pct": 67.1,
+      "full_trace_goodput_rps": 6.6681,
+      "interconnect": "A100_SXM4_NVLink600G_RDMA200G",
+      "joint_slo_attainment_pct": 62.5,
+      "joint_slo_goodput_rps": 6.2125,
+      "num_gpus": 64,
+      "offered_qps": 9.94,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 38052.2,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 45.2,
+          "goodput_rps": 4.4967
+        },
+        "2.0x": {
+          "attainment_pct": 62.5,
+          "goodput_rps": 6.2125
+        },
+        "2.5x": {
+          "attainment_pct": 67.9,
+          "goodput_rps": 6.745
+        },
+        "3.0x": {
+          "attainment_pct": 77.4,
+          "goodput_rps": 7.6917
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 45.63,
+      "ar_ttft_p95_ms": 410.85,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 24857.04,
+      "full_trace_attainment_pct": 49.0,
+      "full_trace_goodput_rps": 1.268,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 29.4,
+      "joint_slo_goodput_rps": 0.7618,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 59,
+      "path_b_morphs": 83,
+      "peak_hbm_mib": 36980.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 29,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 13.2,
+          "goodput_rps": 0.3428
+        },
+        "2.0x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.7618
+        },
+        "2.5x": {
+          "attainment_pct": 44.1,
+          "goodput_rps": 1.1426
+        },
+        "3.0x": {
+          "attainment_pct": 54.4,
+          "goodput_rps": 1.4093
+        }
+      },
+      "vmm_carves": 365,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 24.84,
+      "ar_ttft_p95_ms": 10134.58,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 33720.32,
+      "full_trace_attainment_pct": 43.8,
+      "full_trace_goodput_rps": 1.1331,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 0.6475,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 46762.5,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 19.1,
+          "goodput_rps": 0.4951
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.6475
+        },
+        "2.5x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 0.7999
+        },
+        "3.0x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 0.9522
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.36,
+      "ar_ttft_p95_ms": 1749.54,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 86766.1,
+      "full_trace_attainment_pct": 25.0,
+      "full_trace_goodput_rps": 0.6475,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 11.8,
+      "joint_slo_goodput_rps": 0.3047,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 142,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 46035.0,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.3047
+        },
+        "2.0x": {
+          "attainment_pct": 11.8,
+          "goodput_rps": 0.3047
+        },
+        "2.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.3809
+        },
+        "3.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.4571
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 403.22,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 47358.83,
+      "full_trace_attainment_pct": 33.3,
+      "full_trace_goodput_rps": 0.8633,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 17.6,
+      "joint_slo_goodput_rps": 0.4571,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 142,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 39937.1,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.419
+        },
+        "2.0x": {
+          "attainment_pct": 17.6,
+          "goodput_rps": 0.4571
+        },
+        "2.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.5332
+        },
+        "3.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 0.5713
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 295.61,
+      "ar_ttft_p95_ms": 809.33,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 37576.96,
+      "full_trace_attainment_pct": 43.8,
+      "full_trace_goodput_rps": 1.1331,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 0.6475,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 47329.6,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 19,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.5332
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 0.6475
+        },
+        "2.5x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 0.7618
+        },
+        "3.0x": {
+          "attainment_pct": 32.4,
+          "goodput_rps": 0.8379
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 24.84,
+      "ar_ttft_p95_ms": 8311.83,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 37118.34,
+      "full_trace_attainment_pct": 31.3,
+      "full_trace_goodput_rps": 0.8094,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 14.7,
+      "joint_slo_goodput_rps": 0.3809,
+      "num_gpus": 8,
+      "offered_qps": 2.59,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 41429.6,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 8.8,
+          "goodput_rps": 0.2285
+        },
+        "2.0x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.3809
+        },
+        "2.5x": {
+          "attainment_pct": 14.7,
+          "goodput_rps": 0.3809
+        },
+        "3.0x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 0.5332
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 45.53,
+      "ar_ttft_p95_ms": 410.85,
+      "cross_node_ships": 4,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 15590.01,
+      "full_trace_attainment_pct": 67.7,
+      "full_trace_goodput_rps": 3.5073,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 57.4,
+      "joint_slo_goodput_rps": 2.9709,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 37,
+      "path_b_morphs": 105,
+      "peak_hbm_mib": 36720.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 21,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 35.3,
+          "goodput_rps": 1.8282
+        },
+        "2.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 2.9709
+        },
+        "2.5x": {
+          "attainment_pct": 64.7,
+          "goodput_rps": 3.3518
+        },
+        "3.0x": {
+          "attainment_pct": 76.5,
+          "goodput_rps": 3.9612
+        }
+      },
+      "vmm_carves": 364,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.36,
+      "ar_ttft_p95_ms": 4115.41,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 23442.98,
+      "full_trace_attainment_pct": 65.6,
+      "full_trace_goodput_rps": 3.3994,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 58.8,
+      "joint_slo_goodput_rps": 3.0471,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 43163.1,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 42.6,
+          "goodput_rps": 2.2091
+        },
+        "2.0x": {
+          "attainment_pct": 58.8,
+          "goodput_rps": 3.0471
+        },
+        "2.5x": {
+          "attainment_pct": 69.1,
+          "goodput_rps": 3.5803
+        },
+        "3.0x": {
+          "attainment_pct": 70.6,
+          "goodput_rps": 3.6565
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 1527.8,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 45878.62,
+      "full_trace_attainment_pct": 29.2,
+      "full_trace_goodput_rps": 1.5108,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 22.1,
+      "joint_slo_goodput_rps": 1.1426,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 142,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 49006.7,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 16.2,
+          "goodput_rps": 0.8379
+        },
+        "2.0x": {
+          "attainment_pct": 22.1,
+          "goodput_rps": 1.1426
+        },
+        "2.5x": {
+          "attainment_pct": 27.9,
+          "goodput_rps": 1.4474
+        },
+        "3.0x": {
+          "attainment_pct": 29.4,
+          "goodput_rps": 1.5235
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 397.46,
+      "cross_node_ships": 60,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 24651.99,
+      "full_trace_attainment_pct": 43.8,
+      "full_trace_goodput_rps": 2.2663,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 25.0,
+      "joint_slo_goodput_rps": 1.295,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 142,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 39937.1,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 20.6,
+          "goodput_rps": 1.0665
+        },
+        "2.0x": {
+          "attainment_pct": 25.0,
+          "goodput_rps": 1.295
+        },
+        "2.5x": {
+          "attainment_pct": 30.9,
+          "goodput_rps": 1.5997
+        },
+        "3.0x": {
+          "attainment_pct": 39.7,
+          "goodput_rps": 2.0568
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 149.79,
+      "ar_ttft_p95_ms": 698.55,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 24293.23,
+      "full_trace_attainment_pct": 53.1,
+      "full_trace_goodput_rps": 2.7519,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 47.1,
+      "joint_slo_goodput_rps": 2.4376,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 43147.6,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 15,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 35.3,
+          "goodput_rps": 1.8282
+        },
+        "2.0x": {
+          "attainment_pct": 47.1,
+          "goodput_rps": 2.4376
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 2.59
+        },
+        "3.0x": {
+          "attainment_pct": 57.4,
+          "goodput_rps": 2.9709
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.36,
+      "ar_ttft_p95_ms": 5434.84,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 29285.16,
+      "full_trace_attainment_pct": 42.7,
+      "full_trace_goodput_rps": 2.2123,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 36.8,
+      "joint_slo_goodput_rps": 1.9044,
+      "num_gpus": 16,
+      "offered_qps": 5.18,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40953.5,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 26.5,
+          "goodput_rps": 1.3712
+        },
+        "2.0x": {
+          "attainment_pct": 36.8,
+          "goodput_rps": 1.9044
+        },
+        "2.5x": {
+          "attainment_pct": 50.0,
+          "goodput_rps": 2.59
+        },
+        "3.0x": {
+          "attainment_pct": 52.9,
+          "goodput_rps": 2.7424
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 27.7,
+      "ar_ttft_p95_ms": 410.05,
+      "cross_node_ships": 3,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 14202.99,
+      "full_trace_attainment_pct": 93.3,
+      "full_trace_goodput_rps": 19.32,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 92.3,
+      "joint_slo_goodput_rps": 19.0982,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 15,
+      "path_b_morphs": 333,
+      "peak_hbm_mib": 35720.8,
+      "policy_name": "morphserve",
+      "preempted_ar_count": 12,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 71.4,
+          "goodput_rps": 14.7857
+        },
+        "2.0x": {
+          "attainment_pct": 92.3,
+          "goodput_rps": 19.0982
+        },
+        "2.5x": {
+          "attainment_pct": 95.8,
+          "goodput_rps": 19.8375
+        },
+        "3.0x": {
+          "attainment_pct": 96.4,
+          "goodput_rps": 19.9607
+        }
+      },
+      "vmm_carves": 878,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 2192.92,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 15962.57,
+      "full_trace_attainment_pct": 84.2,
+      "full_trace_goodput_rps": 17.4225,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 81.5,
+      "joint_slo_goodput_rps": 16.8804,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 41419.0,
+      "policy_name": "monolithic_dp",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 70.2,
+          "goodput_rps": 14.5393
+        },
+        "2.0x": {
+          "attainment_pct": 81.5,
+          "goodput_rps": 16.8804
+        },
+        "2.5x": {
+          "attainment_pct": 86.3,
+          "goodput_rps": 17.8661
+        },
+        "3.0x": {
+          "attainment_pct": 86.9,
+          "goodput_rps": 17.9893
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 925.36,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 36636.73,
+      "full_trace_attainment_pct": 46.3,
+      "full_trace_goodput_rps": 9.5738,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 36.3,
+      "joint_slo_goodput_rps": 7.5161,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 348,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 46541.1,
+      "policy_name": "twostage_shm",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 31.0,
+          "goodput_rps": 6.4071
+        },
+        "2.0x": {
+          "attainment_pct": 36.3,
+          "goodput_rps": 7.5161
+        },
+        "2.5x": {
+          "attainment_pct": 44.6,
+          "goodput_rps": 9.2411
+        },
+        "3.0x": {
+          "attainment_pct": 54.2,
+          "goodput_rps": 11.2125
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 397.46,
+      "cross_node_ships": 226,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 15983.08,
+      "full_trace_attainment_pct": 80.0,
+      "full_trace_goodput_rps": 16.56,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 75.0,
+      "joint_slo_goodput_rps": 15.525,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 348,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 39937.1,
+      "policy_name": "static_nccl_fission",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 50.6,
+          "goodput_rps": 10.4732
+        },
+        "2.0x": {
+          "attainment_pct": 75.0,
+          "goodput_rps": 15.525
+        },
+        "2.5x": {
+          "attainment_pct": 89.3,
+          "goodput_rps": 18.4821
+        },
+        "3.0x": {
+          "attainment_pct": 93.5,
+          "goodput_rps": 19.3446
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 27.63,
+      "ar_ttft_p95_ms": 477.44,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 15689.76,
+      "full_trace_attainment_pct": 83.8,
+      "full_trace_goodput_rps": 17.3363,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 82.7,
+      "joint_slo_goodput_rps": 17.1268,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 40989.6,
+      "policy_name": "prism_tetriserve_coloc",
+      "preempted_ar_count": 13,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 67.3,
+          "goodput_rps": 13.9232
+        },
+        "2.0x": {
+          "attainment_pct": 82.7,
+          "goodput_rps": 17.1268
+        },
+        "2.5x": {
+          "attainment_pct": 86.9,
+          "goodput_rps": 17.9893
+        },
+        "3.0x": {
+          "attainment_pct": 89.3,
+          "goodput_rps": 18.4821
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    },
+    {
+      "ar_tpot_p95_ms": 23.33,
+      "ar_ttft_p95_ms": 2940.08,
+      "cross_node_ships": 0,
+      "crossover_kv_mib": 28754.2,
+      "dit_turn_p95_ms": 16783.98,
+      "full_trace_attainment_pct": 62.9,
+      "full_trace_goodput_rps": 13.0238,
+      "interconnect": "H100_SXM5_NVLink900G_RDMA400G",
+      "joint_slo_attainment_pct": 60.1,
+      "joint_slo_goodput_rps": 12.4446,
+      "num_gpus": 64,
+      "offered_qps": 20.7,
+      "oom_retries": 0,
+      "oom_sessions": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "peak_hbm_mib": 38064.3,
+      "policy_name": "naive_host_offload",
+      "preempted_ar_count": 0,
+      "skew_tag": "main_mix",
+      "slo_curve_by_k": {
+        "1.5x": {
+          "attainment_pct": 41.1,
+          "goodput_rps": 8.5018
+        },
+        "2.0x": {
+          "attainment_pct": 60.1,
+          "goodput_rps": 12.4446
+        },
+        "2.5x": {
+          "attainment_pct": 73.2,
+          "goodput_rps": 15.1554
+        },
+        "3.0x": {
+          "attainment_pct": 77.4,
+          "goodput_rps": 16.0179
+        }
+      },
+      "vmm_carves": 0,
+      "vmm_expert_evictions": 0,
+      "vmm_kv_host_swap_ins": 0,
+      "vmm_kv_host_swap_outs": 0,
+      "workload_scale": "bagel_7b_standard"
+    }
+  ],
+  "schema": "morphserve.osdi27.simulator.v3",
+  "status": "ok",
+  "timestamp_utc": "2026-11-25T04:20:32Z",
+  "zero_manual_bias_constants": true
+}

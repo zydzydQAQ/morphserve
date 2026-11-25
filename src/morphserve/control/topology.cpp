@@ -685,6 +685,7 @@ nlohmann::json ClusterPhysicsProfile::to_json() const {
         {"twostage_shm_ms_per_mib", twostage_shm_ms_per_mib},
         {"monolithic_loaded_driver_mib", monolithic_loaded_driver_mib},
         {"offloaded_base_driver_mib", offloaded_base_driver_mib},
+        {"driver_total_hbm_40g_mib", driver_total_hbm_40g_mib},
         {"num_expert_layers", num_expert_layers},
         {"layer_stride_mib", layer_stride_mib},
         {"packed_expert_data_mib", packed_expert_data_mib},
@@ -703,6 +704,9 @@ nlohmann::json ClusterPhysicsProfile::to_json() const {
         {"morphserve_dit_512_ms_per_kv_tok", morphserve_dit_512_ms_per_kv_tok},
         {"ar_prefill_ms", ar_prefill_ms},
         {"ar_unloaded_tpot_p50_ms", ar_unloaded_tpot_p50_ms},
+        {"ar_unloaded_tpot_p99_ms", ar_unloaded_tpot_p99_ms},
+        {"ar_batched2_step_p50_ms", ar_batched2_step_p50_ms},
+        {"vmm_ar_kv_step_overhead_ms", vmm_ar_kv_step_overhead_ms},
         {"dit_512_cfg_step_mean_ms", dit_512_cfg_step_mean_ms},
         {"dit_512_layer_p50_ms", dit_512_layer_p50_ms},
         {"m4_adaptive_chunk_layers", m4_adaptive_chunk_layers},
@@ -737,6 +741,7 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_json(const nlohmann::json& j) 
     p.twostage_shm_ms_per_mib = j.value("twostage_shm_ms_per_mib", p.twostage_shm_ms_per_mib);
     p.monolithic_loaded_driver_mib = j.value("monolithic_loaded_driver_mib", p.monolithic_loaded_driver_mib);
     p.offloaded_base_driver_mib = j.value("offloaded_base_driver_mib", p.offloaded_base_driver_mib);
+    p.driver_total_hbm_40g_mib = j.value("driver_total_hbm_40g_mib", p.driver_total_hbm_40g_mib);
     p.num_expert_layers = j.value("num_expert_layers", p.num_expert_layers);
     p.layer_stride_mib = j.value("layer_stride_mib", p.layer_stride_mib);
     p.packed_expert_data_mib = j.value("packed_expert_data_mib", p.packed_expert_data_mib);
@@ -755,6 +760,9 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_json(const nlohmann::json& j) 
     p.morphserve_dit_512_ms_per_kv_tok = j.value("morphserve_dit_512_ms_per_kv_tok", p.morphserve_dit_512_ms_per_kv_tok);
     p.ar_prefill_ms = j.value("ar_prefill_ms", p.ar_prefill_ms);
     p.ar_unloaded_tpot_p50_ms = j.value("ar_unloaded_tpot_p50_ms", p.ar_unloaded_tpot_p50_ms);
+    p.ar_unloaded_tpot_p99_ms = j.value("ar_unloaded_tpot_p99_ms", p.ar_unloaded_tpot_p99_ms);
+    p.ar_batched2_step_p50_ms = j.value("ar_batched2_step_p50_ms", p.ar_batched2_step_p50_ms);
+    p.vmm_ar_kv_step_overhead_ms = j.value("vmm_ar_kv_step_overhead_ms", p.vmm_ar_kv_step_overhead_ms);
     p.dit_512_cfg_step_mean_ms = j.value("dit_512_cfg_step_mean_ms", p.dit_512_cfg_step_mean_ms);
     p.dit_512_layer_p50_ms = j.value("dit_512_layer_p50_ms", p.dit_512_layer_p50_ms);
     p.m4_adaptive_chunk_layers = j.value("m4_adaptive_chunk_layers", p.m4_adaptive_chunk_layers);
@@ -888,11 +896,18 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto m1 = load("module1_vmm",
-                       {"refactor-20261122/module1-report.json", "phase1-job1a-r3/module1-report.json"})) {
+    if (auto m1 = load(
+            "module1_vmm",
+            {"osdi27-v1/stage1-gate/module1/module1-report.json",
+             "refactor-20261122/module1-report.json",
+             "phase1-job1a-r3/module1-report.json"})) {
         if (m1->contains("mem_monolithic_loaded")) {
-            p.monolithic_loaded_driver_mib =
-                (*m1)["mem_monolithic_loaded"].value("driver_used_mib", p.monolithic_loaded_driver_mib);
+            const auto& ml = (*m1)["mem_monolithic_loaded"];
+            p.monolithic_loaded_driver_mib = ml.value("driver_used_mib", p.monolithic_loaded_driver_mib);
+            if (ml.contains("driver_used_mib") && ml.contains("driver_free_mib")) {
+                p.driver_total_hbm_40g_mib =
+                    round_n(ml.value("driver_used_mib", 28776.81) + ml.value("driver_free_mib", 11665.56), 2);
+            }
         }
         if (m1->contains("mem_after_offload")) {
             p.offloaded_base_driver_mib =
@@ -925,8 +940,11 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto m3 = load("module3_cow_loopback",
-                       {"morphserve-p2-m21gate-20261121-r4/module3-report.json", "phase1-job1b-r7/module3-report.json"})) {
+    if (auto m3 = load(
+            "module3_cow_loopback",
+            {"osdi27-v1/stage1-gate/module3/module3-report.json",
+             "morphserve-p2-m21gate-20261121-r4/module3-report.json",
+             "phase1-job1b-r7/module3-report.json"})) {
         if (m3->contains("test2_gpu_inplace_loopback") && (*m3)["test2_gpu_inplace_loopback"].is_object()) {
             const auto& t2 = (*m3)["test2_gpu_inplace_loopback"];
             p.cpu_pil_prep_only_ms = t2.value("cpu_png_pil_prep_only_ms", p.cpu_pil_prep_only_ms);
@@ -967,12 +985,23 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto m4 = load("module4_scheduler", {"phase1-job1c-r3/module4-report.json"})) {
+    if (auto m4 = load(
+            "module4_scheduler",
+            {"osdi27-v1/stage1-gate/module4/module4-report.json", "phase1-job1c-r3/module4-report.json"})) {
         if (m4->contains("solo_baselines") && (*m4)["solo_baselines"].is_object()) {
             const auto& sb = (*m4)["solo_baselines"];
             p.ar_unloaded_tpot_p50_ms = sb.value("unloaded_ar_tpot_p50_ms", p.ar_unloaded_tpot_p50_ms);
+            p.ar_unloaded_tpot_p99_ms = sb.value("unloaded_ar_tpot_p99_ms", p.ar_unloaded_tpot_p99_ms);
             p.dit_512_cfg_step_mean_ms = sb.value("dit_cfg_step_mean_ms", p.dit_512_cfg_step_mean_ms);
             p.dit_512_layer_p50_ms = sb.value("dit_layer_p50_ms", p.dit_512_layer_p50_ms);
+        }
+        if (m4->contains("test0_batched_ar_scaling") && (*m4)["test0_batched_ar_scaling"].is_array()) {
+            for (const auto& row : (*m4)["test0_batched_ar_scaling"]) {
+                if (row.value("batch_size", 0) == 2) {
+                    p.ar_batched2_step_p50_ms = row.value("step_p50_ms", p.ar_batched2_step_p50_ms);
+                    break;
+                }
+            }
         }
         if (m4->contains("test1_policy_comparison") && (*m4)["test1_policy_comparison"].is_array()) {
             for (const auto& row : (*m4)["test1_policy_comparison"]) {
@@ -1004,7 +1033,10 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto m2x8_p = first_existing_file(root, {"morphserve-p2-m25node2x8-20261121-r2/m25-multinode-2x8-report.json"})) {
+    if (auto m2x8_p = first_existing_file(
+            root,
+            {"osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-report.json",
+             "morphserve-p2-m25node2x8-20261121-r2/m25-multinode-2x8-report.json"})) {
         const auto m2x8 = read_json_file(*m2x8_p);
         if (m2x8.contains("calibrated_gbps") && m2x8["calibrated_gbps"].is_object()) {
             const auto& cal = m2x8["calibrated_gbps"];

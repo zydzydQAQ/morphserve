@@ -48,31 +48,35 @@ class MeasuredPhysicsProfile:
 
     monolithic_loaded_driver_mib: float = 28776.81
     offloaded_base_driver_mib: float = 16366.81
+    driver_total_hbm_40g_mib: float = 40442.37
     num_expert_layers: int = 28
     layer_stride_mib: int = 448
     packed_expert_data_mib: float = 12446.64
-    dit_512_20step_base_ms: float = 4958.59
+    dit_512_20step_base_ms: float = 4953.31
     dit_512_transient_mib: float = 1088.0
     dit_1024_step_ms: float = 966.335
     vmm_full_expert_map_ms: float = 11.677
 
-    cpu_pil_prep_only_ms: float = 69.80
-    gpu_inplace_prep_only_ms: float = 2.452
-    stock_loopback_turn_ms: float = 887.943
-    morphserve_loopback_turn_ms: float = 793.547
+    cpu_pil_prep_only_ms: float = 72.30
+    gpu_inplace_prep_only_ms: float = 2.487
+    stock_loopback_turn_ms: float = 896.973
+    morphserve_loopback_turn_ms: float = 796.203
     non_cow_kv_mult: float = 1.9979
     turn_edit_512_kv_delta_mib: float = 325.28
     kv_mib_per_token: float = 0.05469
-    stock_dit_512_ms_per_kv_tok: float = 0.107796
-    morphserve_dit_512_ms_per_kv_tok: float = 0.097462
+    stock_dit_512_ms_per_kv_tok: float = 0.10734
+    morphserve_dit_512_ms_per_kv_tok: float = 0.095679
 
     ar_prefill_ms: float = 64.80
-    ar_unloaded_tpot_p50_ms: float = 62.82
-    dit_512_cfg_step_mean_ms: float = 286.55
-    dit_512_layer_p50_ms: float = 10.52
-    m4_adaptive_chunk_layers: int = 5
-    m4_colocated_ar_tpot_p50_ms: float = 110.98
-    step_preempt_ar_tpot_p50_ms: float = 346.13
+    ar_unloaded_tpot_p50_ms: float = 49.91
+    ar_unloaded_tpot_p99_ms: float = 52.57
+    ar_batched2_step_p50_ms: float = 55.88
+    vmm_ar_kv_step_overhead_ms: float = 9.60
+    dit_512_cfg_step_mean_ms: float = 288.02
+    dit_512_layer_p50_ms: float = 10.26
+    m4_adaptive_chunk_layers: int = 4
+    m4_colocated_ar_tpot_p50_ms: float = 87.01
+    step_preempt_ar_tpot_p50_ms: float = 333.12
 
     paced_h2d_per_gpu_gbps: float = 12.34
     unpaced_4gpu_half_h2d_per_gpu_gbps: float = 3.10

@@ -1,0 +1,81 @@
+{
+  "cadence_ms": 100,
+  "gpus": {
+    "GPU-6c6892f8-1aa0-4c8f-d1ec-bc514adcbd42": {
+      "first_timestamp": "2026/11/24 10:30:09.844",
+      "last_timestamp": "2026/11/24 13:59:40.441",
+      "memory_free_min_mib": 2.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40441.0,
+      "samples": 124884,
+      "utilization_mean_pct": 53.39170750456435
+    },
+    "GPU-979da027-ad90-4f70-6203-0e86fce22d4c": {
+      "first_timestamp": "2026/11/24 10:30:09.848",
+      "last_timestamp": "2026/11/24 13:59:40.445",
+      "memory_free_min_mib": 6.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40437.0,
+      "samples": 124884,
+      "utilization_mean_pct": 43.541966945324894
+    },
+    "GPU-9bd9082d-b7d4-f4de-cd0a-5788492a5247": {
+      "first_timestamp": "2026/11/24 10:30:09.844",
+      "last_timestamp": "2026/11/24 13:59:40.441",
+      "memory_free_min_mib": 6.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40437.0,
+      "samples": 124884,
+      "utilization_mean_pct": 25.580987156080855
+    },
+    "GPU-a331a424-15be-fa45-6b08-d951d2dce277": {
+      "first_timestamp": "2026/11/24 10:30:09.843",
+      "last_timestamp": "2026/11/24 13:59:40.441",
+      "memory_free_min_mib": 2.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40441.0,
+      "samples": 124884,
+      "utilization_mean_pct": 39.93914352519097
+    },
+    "GPU-afb5ebb2-a584-abce-e912-6cd50477f4bb": {
+      "first_timestamp": "2026/11/24 10:30:09.842",
+      "last_timestamp": "2026/11/24 13:59:40.431",
+      "memory_free_min_mib": 3.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40440.0,
+      "samples": 124884,
+      "utilization_mean_pct": 23.550270651164396
+    },
+    "GPU-bb1751f0-c0e1-a4e8-ae83-008e4246cced": {
+      "first_timestamp": "2026/11/24 10:30:09.847",
+      "last_timestamp": "2026/11/24 13:59:40.445",
+      "memory_free_min_mib": 2.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40441.0,
+      "samples": 124884,
+      "utilization_mean_pct": 26.508119534928113
+    },
+    "GPU-c2195fc4-0579-e149-dcd5-8f912dfb44c2": {
+      "first_timestamp": "2026/11/24 10:30:09.843",
+      "last_timestamp": "2026/11/24 13:59:40.441",
+      "memory_free_min_mib": 6.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40437.0,
+      "samples": 124884,
+      "utilization_mean_pct": 28.997846001089417
+    },
+    "GPU-e6a7b9a6-b668-5e8d-5989-b9934c468d94": {
+      "first_timestamp": "2026/11/24 10:30:09.850",
+      "last_timestamp": "2026/11/24 13:59:40.445",
+      "memory_free_min_mib": 2.0,
+      "memory_total_mib": 40960.0,
+      "memory_used_max_mib": 40441.0,
+      "samples": 124884,
+      "utilization_mean_pct": 49.65834694596545
+    }
+  },
+  "invalid_samples": 0,
+  "schema": "kairos.memory-summary.v1",
+  "scope": "sampled NVML extrema; not allocator peaks",
+  "status": "completed"
+}

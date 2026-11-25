@@ -1,8 +1,9 @@
 # MorphServe Phase-2 End-to-End Cluster Evaluation Report
 
 > **Platform**: `jjjkairos` (`8×` and `2×8 = 16×` `NVIDIA A100-PCIE-40GB`, Driver `570.133.20`, CUDA `13.0`, PyTorch `2.13.0+cu130`, `vLLM-Omni 0.30.0`, `transformers 5.14.1`, `diffusers 0.40.0`, NCCL `2.29.7`)
-> **Verified Builds**: `0805fc1` (`M2.3a-r3`, `smk1g-r3`) and `076e8c1` (`M2.3b-r6`, `Wave3-r3`, `M2.4-r6`; identical MorphServe runtime with FlashAttention-3 C++ `aten::new_empty` OOM classification for baseline stress runs)
-> **Status**: **ALL PHASE-2 GATES PASSED (`M2.1`–`M2.5` + `Wave-3` Full-80 & Split-Ratio Sensitivity)**
+> **Verified Builds**: `0805fc1` (`M2.3a-r3`, `smk1g-r3`), `076e8c1` (`M2.3b-r6`, `Wave3-r3`, `M2.4-r6`), and OSDI '27 Remediation Campaign Builds `2e0fc31` / `5d81343` / `403e7aa`
+> **OSDI '27 Full `n = 80–96` Remediation & Bit-Exact Campaign**: See [OSDI27_EVALUATION_REPORT.md](file:///mnt/e/000_code/zyd-2026/morphserve/docs/OSDI27_EVALUATION_REPORT.md) and [results/osdi27-v1](file:///mnt/e/000_code/zyd-2026/morphserve/results/osdi27-v1)
+> **Status**: **ALL PHASE-2 & OSDI '27 REMEDIATION GATES PASSED (`Stage 1`, `R2a`–`R2d`, Zero-Bias `64-GPU` Simulator; `R3` `2×8` Live Supervised)**
 
 ---
 

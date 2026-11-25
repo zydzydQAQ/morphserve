@@ -133,31 +133,35 @@ struct ClusterPhysicsProfile {
 
     double monolithic_loaded_driver_mib = 28776.81;
     double offloaded_base_driver_mib = 16366.81;
+    double driver_total_hbm_40g_mib = 40442.37;
     int num_expert_layers = 28;
     int layer_stride_mib = 448;
     double packed_expert_data_mib = 12446.64;
-    double dit_512_20step_base_ms = 4958.59;
+    double dit_512_20step_base_ms = 4953.31;
     double dit_512_transient_mib = 1088.0;
     double dit_1024_step_ms = 966.335;
     double vmm_full_expert_map_ms = 11.677;
 
-    double cpu_pil_prep_only_ms = 69.80;
-    double gpu_inplace_prep_only_ms = 2.452;
-    double stock_loopback_turn_ms = 887.943;
-    double morphserve_loopback_turn_ms = 793.547;
+    double cpu_pil_prep_only_ms = 72.30;
+    double gpu_inplace_prep_only_ms = 2.487;
+    double stock_loopback_turn_ms = 896.973;
+    double morphserve_loopback_turn_ms = 796.203;
     double non_cow_kv_mult = 1.9979;
     double turn_edit_512_kv_delta_mib = 325.28;
     double kv_mib_per_token = 0.05469;
-    double stock_dit_512_ms_per_kv_tok = 0.107796;
-    double morphserve_dit_512_ms_per_kv_tok = 0.097462;
+    double stock_dit_512_ms_per_kv_tok = 0.10734;
+    double morphserve_dit_512_ms_per_kv_tok = 0.095679;
 
     double ar_prefill_ms = 64.80;
-    double ar_unloaded_tpot_p50_ms = 62.82;
-    double dit_512_cfg_step_mean_ms = 286.55;
-    double dit_512_layer_p50_ms = 10.52;
-    int m4_adaptive_chunk_layers = 5;
-    double m4_colocated_ar_tpot_p50_ms = 110.98;
-    double step_preempt_ar_tpot_p50_ms = 346.13;
+    double ar_unloaded_tpot_p50_ms = 49.91;
+    double ar_unloaded_tpot_p99_ms = 52.57;
+    double ar_batched2_step_p50_ms = 55.88;
+    double vmm_ar_kv_step_overhead_ms = 9.60;
+    double dit_512_cfg_step_mean_ms = 288.02;
+    double dit_512_layer_p50_ms = 10.26;
+    int m4_adaptive_chunk_layers = 4;
+    double m4_colocated_ar_tpot_p50_ms = 87.01;
+    double step_preempt_ar_tpot_p50_ms = 333.12;
 
     double paced_h2d_per_gpu_gbps = 12.34;
     double unpaced_4gpu_half_h2d_per_gpu_gbps = 3.10;

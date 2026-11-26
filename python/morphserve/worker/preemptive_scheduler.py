@@ -294,13 +294,15 @@ class UnifiedPreemptiveScheduler:
         self._pending_arrivals.append((float(offset_ms) / 1000.0, task))
         self._pending_arrivals.sort(key=lambda pair: pair[0])
 
-    def admit_due_arrivals(self, now_s: float) -> None:
-        """Admit scheduled and externally polled AR arrivals due at or before `now_s`."""
+    def admit_due_arrivals(self, now_s: float) -> int:
+        """Admit scheduled and externally polled AR arrivals due at or before `now_s`; return count admitted."""
+        admitted = 0
         while self._pending_arrivals and (self._run_t0_s + self._pending_arrivals[0][0]) <= now_s:
             rel_s, task = self._pending_arrivals.pop(0)
             task.arrival_time_s = self._run_t0_s + rel_s
             task.last_step_time_s = task.arrival_time_s
             self.active_ar_tasks.append(task)
+            admitted += 1
         if self.external_arrival_poll is not None and not self.in_ar_yield:
             for task in self.external_arrival_poll(now_s):
                 if task.arrival_time_s <= 0.0:
@@ -308,6 +310,8 @@ class UnifiedPreemptiveScheduler:
                 if task.last_step_time_s <= 0.0:
                     task.last_step_time_s = task.arrival_time_s
                 self.active_ar_tasks.append(task)
+                admitted += 1
+        return admitted
 
     def _earliest_deadline_s(self) -> float | None:
         if not self.active_ar_tasks:
@@ -433,7 +437,12 @@ class UnifiedPreemptiveScheduler:
         if self._step_executor is not None:
             for t in live:
                 self._step_executor(t)
-            return len(live)
+            n_served = len(live)
+            if n_served > 1:
+                self.batched_ar_yields += 1
+            self.max_microbatch_size = max(self.max_microbatch_size, n_served)
+            self.ar_steps_executed += n_served
+            return n_served
         cap = max(1, self._max_microbatch_cap)
         served_total = 0
         for off in range(0, len(live), cap):

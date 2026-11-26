@@ -1877,6 +1877,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             pil_img = self.pipeline._decode_image_from_latent(
                                 self.pipeline.bagel, self.pipeline.vae, latents[0], img_shape
                             )
+                        if isinstance(pil_img, (list, tuple)) and pil_img:
+                            pil_img = pil_img[0]
                         session.last_img_pil = pil_img
                         session.last_img_u8 = None
                         if save_tmp_path:

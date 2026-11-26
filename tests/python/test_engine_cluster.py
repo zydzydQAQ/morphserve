@@ -189,7 +189,8 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
         policy_fine_kv_pool_mib=512,
         gpu_memory_quota_mib=12288.0,
     )
-    assert "effective_super_pool_mib" in plan or "quota_limit_mib" in plan
+    assert plan["allow_overflow"] is False
+    assert plan["super_pool_mib"] > 0 and plan["pytorch_cap_mib"] > 0
     ov, budget = WorkerBudgetPlanner.compute_internvlu_quota_overrides(
         "morphserve",
         num_gpus=8,
@@ -407,7 +408,7 @@ def test_worker_runtime_step_once_batching_and_clock_skew_immunity() -> None:
     bus = InMemoryByteBus(world_size=1)
     mesh = InMemoryPeerMesh(bus, rank=0)
     acks: list[dict[str, Any]] = []
-    rt = WorkerRuntime(rank=0, adapter=adapter, mesh=mesh, on_ack=acks.append, inmem_bus=bus)
+    rt = WorkerRuntime(rank=0, policy=pol, adapter=adapter, peer_mesh=mesh, ack_sink=acks.append, shm_bus=bus)
     try:
         # Enqueue two concurrent EXEC_AR commands with extreme remote clock skew (+3600s).
         skewed_wall = time.perf_counter() + 3600.0
@@ -453,7 +454,7 @@ def test_worker_runtime_step_once_batching_and_clock_skew_immunity() -> None:
         rel = rt.handle_command({"cmd_id": "c6", "op": "RELEASE_CTX", "ctx_id": "ctx_a"})
         assert rel is not None and rel["status"] == "ok"
     finally:
-        rt.shutdown()
+        rt.handle_command({"cmd_id": "c_shutdown", "op": "SHUTDOWN"})
         mesh.close()
         bus.close()
 

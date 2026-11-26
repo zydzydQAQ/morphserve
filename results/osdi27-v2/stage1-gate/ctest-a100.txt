@@ -1,0 +1,5 @@
+[tripool_vmm] kv_region_ensure error: TriPool physical pool reached max_pool_bytes cap for KV page
+[tripool_vmm] transient_alloc(67108864) error: TriPool super-handle pool reached max_pool_bytes cap
+[PASS] test_vmm_and_runtime
+[PASS] test_control_and_sim
+100% tests passed, 0 tests failed out of 2

@@ -345,17 +345,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--r2a-report",
         type=Path,
-        default=REPO_ROOT / "results" / "osdi27-v1" / "r2a-suite-a" / "m23-suite-a-report.json",
+        default=REPO_ROOT / "results" / "osdi27-v2" / "r2a-suite-a" / "m23-suite-a-report.json",
     )
     parser.add_argument(
         "--sim-report",
         type=Path,
-        default=REPO_ROOT / "results" / "osdi27-v1" / "sim" / "m25-simulator-64gpu-report.json",
+        default=REPO_ROOT / "results" / "osdi27-v2" / "sim" / "m25-simulator-64gpu-report.json",
     )
     parser.add_argument(
         "--r2e-report",
         type=Path,
-        default=REPO_ROOT / "results" / "osdi27-v1" / "r2e-lowqps-8gpu" / "m23-lowqps-slo-report.json",
+        default=REPO_ROOT / "results" / "osdi27-v2" / "r2e-lowqps-8gpu" / "m23-lowqps-slo-report.json",
     )
     parser.add_argument(
         "--out-dir",

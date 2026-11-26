@@ -80,7 +80,7 @@ class TestPhase0Offline(unittest.TestCase):
                 if not cpp_src.is_file():
                     continue
                 if cpp_name == "test_control_and_sim" and not (
-                    (REPO_ROOT / "results/phase0-job0c").is_dir()
+                    (REPO_ROOT / "results/hardware-profile/topo-8gpu").is_dir()
                     and (REPO_ROOT / "data/interleaved-bench-v1").is_dir()
                 ):
                     continue

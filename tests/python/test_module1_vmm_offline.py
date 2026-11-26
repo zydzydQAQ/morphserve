@@ -189,7 +189,7 @@ class TestModule1VmmOffline(unittest.TestCase):
             self.assertTrue((tmp / "install/tests/python/test_phase2_m21_m22_offline.py").is_file())
             self.assertTrue((tmp / "install/deploy/kairos/scripts/16_osdi27_stage1_1gpu_gate.sh").is_file())
             self.assertTrue((tmp / "install/GLOSSARY.md").is_file())
-            self.assertTrue((tmp / "install/results/phase0-job0c/topo-8gpu-report.json").is_file())
+            self.assertTrue((tmp / "install/results/hardware-profile/topo-8gpu/topo-8gpu-report.json").is_file())
             self.assertEqual(list((tmp / "install/results").rglob("*.log")), [])
             from morphserve.sim import MeasuredPhysicsProfile
 

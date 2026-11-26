@@ -1,0 +1,31 @@
+{
+  "schema": "morphserve.interleaved_bench.manifest.v2",
+  "total_bytes": 155022939,
+  "total_mib": 147.84,
+  "quadrants": [
+    "interleaved_co_creation",
+    "multiturn_edit",
+    "multi_image_vqa",
+    "visual_cot_highres"
+  ],
+  "counts": {
+    "mmvet_items": 218,
+    "magicbrush_sessions": 45,
+    "mse_templates": 100,
+    "geneval_prompts": 553,
+    "burstgpt_deltas": 2000,
+    "gentd26_deltas": 2000,
+    "phase_shift_360s_sessions": 288
+  },
+  "suites": [
+    "accuracy_geneval_mmvet.json",
+    "main_mix_80.json",
+    "main_mix_v2_80.json",
+    "phase_shift_360s.json",
+    "skew_ar20_dit80.json",
+    "skew_ar50_dit50.json",
+    "skew_ar80_dit20.json",
+    "smoke_8gpu_12.json"
+  ],
+  "status": "ok"
+}

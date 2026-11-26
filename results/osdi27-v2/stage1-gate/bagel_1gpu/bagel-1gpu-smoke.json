@@ -1,0 +1,816 @@
+{
+  "policy_name": "morphserve",
+  "suite_name": "stage1_1gpu_v2_3sess_bidir_preempt",
+  "num_gpus": 1,
+  "offered_qps": 1.5,
+  "wall_seconds": 19.11,
+  "total_sessions": 3,
+  "completed_sessions": 3,
+  "oom_sessions": 0,
+  "error_sessions": 0,
+  "joint_slo_goodput_rps": 1.5,
+  "raw_wall_goodput_rps": 0.157,
+  "steady_state_goodput_rps": 1.5,
+  "steady_state_attainment_pct": 100.0,
+  "joint_slo_attainment_pct": 100.0,
+  "ar_slo_attainment_pct": 100.0,
+  "dit_slo_attainment_pct": 100.0,
+  "ar_ttft_p50_ms": 377.0,
+  "ar_ttft_p95_ms": 1245.12,
+  "ar_ttft_p99_ms": 1367.67,
+  "ar_tpot_p50_ms": 94.93,
+  "ar_tpot_p95_ms": 100.64,
+  "ar_tpot_p99_ms": 100.84,
+  "dit_turn_p50_ms": 6465.53,
+  "dit_turn_p95_ms": 8811.75,
+  "dit_turn_p99_ms": 9037.68,
+  "peak_gpu_reserved_mib": 32494.81,
+  "host_shmem_delta_gib": 12.27,
+  "vmm_overflow_creates": 208,
+  "vmm_super_to_fine_carves": 0,
+  "vmm_expert_evictions_for_kv": 0,
+  "vmm_expert_evictions_for_transient": 0,
+  "path_a_ships": 0,
+  "path_b_morphs": 0,
+  "preempted_ar_count": 3,
+  "total_yields": 32,
+  "worker_oom_count": 0,
+  "oom_retry_count": 0,
+  "peak_nvml_used_mib": 32494.81,
+  "peak_pytorch_reserved_mib": 18440.0,
+  "survival_rate_pct": 100.0,
+  "steady_state_survival_pct": 100.0,
+  "dit_turn_survival_pct": 100.0,
+  "session_e2e_p50_ms": 15100.02,
+  "session_e2e_p95_ms": 17971.79,
+  "session_e2e_p99_ms": 18227.06,
+  "all_session_e2e_p50_ms": 15100.02,
+  "all_session_e2e_p90_ms": 17652.71,
+  "all_session_e2e_p95_ms": 17971.79,
+  "all_session_dit_p50_ms": 6465.53,
+  "all_session_dit_p90_ms": 8529.34,
+  "all_session_dit_p95_ms": 8811.75,
+  "e2e_cdf_points": [
+    {
+      "ms": 4972.89,
+      "p": 5.0
+    },
+    {
+      "ms": 6098.12,
+      "p": 10.0
+    },
+    {
+      "ms": 8348.6,
+      "p": 20.0
+    },
+    {
+      "ms": 10599.07,
+      "p": 30.0
+    },
+    {
+      "ms": 12849.55,
+      "p": 40.0
+    },
+    {
+      "ms": 15100.02,
+      "p": 50.0
+    },
+    {
+      "ms": 15738.19,
+      "p": 60.0
+    },
+    {
+      "ms": 16376.36,
+      "p": 70.0
+    },
+    {
+      "ms": 17014.54,
+      "p": 80.0
+    },
+    {
+      "ms": 17333.62,
+      "p": 85.0
+    },
+    {
+      "ms": 17652.71,
+      "p": 90.0
+    },
+    {
+      "ms": 17971.79,
+      "p": 95.0
+    },
+    {
+      "ms": 18227.06,
+      "p": 99.0
+    }
+  ],
+  "dit_cdf_points": [
+    {
+      "ms": 5574.82,
+      "p": 5.0
+    },
+    {
+      "ms": 5600.37,
+      "p": 10.0
+    },
+    {
+      "ms": 5651.48,
+      "p": 20.0
+    },
+    {
+      "ms": 5702.59,
+      "p": 30.0
+    },
+    {
+      "ms": 6017.99,
+      "p": 40.0
+    },
+    {
+      "ms": 6465.53,
+      "p": 50.0
+    },
+    {
+      "ms": 6913.07,
+      "p": 60.0
+    },
+    {
+      "ms": 7399.7,
+      "p": 70.0
+    },
+    {
+      "ms": 7964.52,
+      "p": 80.0
+    },
+    {
+      "ms": 8246.93,
+      "p": 85.0
+    },
+    {
+      "ms": 8529.34,
+      "p": 90.0
+    },
+    {
+      "ms": 8811.75,
+      "p": 95.0
+    },
+    {
+      "ms": 9037.68,
+      "p": 99.0
+    }
+  ],
+  "cross_node_ships": 0,
+  "max_cross_node_ship_bytes": 0,
+  "slo_config": {
+    "ar_tpot_slo_mode": "turn_p95",
+    "ar_tpot_slo_ms": 125.64,
+    "ar_ttft_slo_ms": 1500.0,
+    "cot_dit_decoupled": true,
+    "dit_1024_slo_ms": 65160.0,
+    "dit_512_slo_ms": 18360.0,
+    "k_ar": 2.0,
+    "k_dit": 3.0,
+    "primary_granularity": "turn_level",
+    "turn_oom_accounting": "planned_turns_denominator"
+  },
+  "slo_curve_by_k": {
+    "1.5x": {
+      "attainment_pct": 0.0,
+      "effective_slo_throughput_rps": 0.0,
+      "goodput_rps": 0.0,
+      "turn_attainment_pct": 37.5,
+      "turn_goodput_rps": 0.5625
+    },
+    "2.0x": {
+      "attainment_pct": 33.3,
+      "effective_slo_throughput_rps": 0.5,
+      "goodput_rps": 0.5,
+      "turn_attainment_pct": 75.0,
+      "turn_goodput_rps": 1.125
+    },
+    "2.5x": {
+      "attainment_pct": 100.0,
+      "effective_slo_throughput_rps": 1.5,
+      "goodput_rps": 1.5,
+      "turn_attainment_pct": 100.0,
+      "turn_goodput_rps": 1.5
+    },
+    "3.0x": {
+      "attainment_pct": 100.0,
+      "effective_slo_throughput_rps": 1.5,
+      "goodput_rps": 1.5,
+      "turn_attainment_pct": 100.0,
+      "turn_goodput_rps": 1.5
+    }
+  },
+  "slo_curve_by_dit_k": {
+    "2.0x": {
+      "ar_tpot_slo_ms": 125.64,
+      "ar_ttft_slo_ms": 1500.0,
+      "dit_1024_slo_ms": 43440.0,
+      "dit_512_slo_ms": 12240.0,
+      "session_attainment_pct": 33.3,
+      "session_goodput_rps": 0.5,
+      "turn_attainment_pct": 75.0,
+      "turn_goodput_rps": 1.125
+    },
+    "3.0x": {
+      "ar_tpot_slo_ms": 125.64,
+      "ar_ttft_slo_ms": 1500.0,
+      "dit_1024_slo_ms": 65160.0,
+      "dit_512_slo_ms": 18360.0,
+      "session_attainment_pct": 100.0,
+      "session_goodput_rps": 1.5,
+      "turn_attainment_pct": 100.0,
+      "turn_goodput_rps": 1.5
+    },
+    "4.0x": {
+      "ar_tpot_slo_ms": 125.64,
+      "ar_ttft_slo_ms": 1500.0,
+      "dit_1024_slo_ms": 86880.0,
+      "dit_512_slo_ms": 24480.0,
+      "session_attainment_pct": 100.0,
+      "session_goodput_rps": 1.5,
+      "turn_attainment_pct": 100.0,
+      "turn_goodput_rps": 1.5
+    }
+  },
+  "status": "ok",
+  "sessions": [
+    {
+      "active_jct_ms": 14814.25,
+      "ar_slo_mean_tpot_met": true,
+      "ar_slo_met": true,
+      "ar_slo_p95_tpot_met": true,
+      "ar_slo_strict_max_tpot_met": true,
+      "ar_texts": [],
+      "ar_tpots_ms": [],
+      "ar_ttfts_ms": [],
+      "ar_turn_tpots_ms": [],
+      "arrival_offset_s": 0.0,
+      "completed_offset_s": 15.1,
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [
+        512,
+        512
+      ],
+      "dit_turn_steps": [
+        14,
+        12
+      ],
+      "dit_turns_ms": [
+        5719.63,
+        9094.16
+      ],
+      "e2e_ms": 15100.02,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": true,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "phase_label": "",
+      "planned_ar_turns": 0,
+      "planned_dit_turns": 2,
+      "planned_turns": 2,
+      "preempted_ar_turns": 0,
+      "quadrant": "multiturn_edit",
+      "resident_alpha_sample": 1.0,
+      "session_id": "smk_edit_0",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "think_time_ms": 285.77,
+      "total_yields": 32,
+      "turn_records": [
+        {
+          "ar_tpot_mean_ms": null,
+          "ar_tpot_p95_ms": null,
+          "ar_tpot_strict_max_ms": null,
+          "ar_ttft_ms": null,
+          "dit_ms": 5719.63,
+          "dit_steps": 14,
+          "height": 512,
+          "kv_bytes": 1531904,
+          "modality_plan": "dit_t2i",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 0
+        },
+        {
+          "ar_tpot_mean_ms": null,
+          "ar_tpot_p95_ms": null,
+          "ar_tpot_strict_max_ms": null,
+          "ar_ttft_ms": null,
+          "dit_ms": 9094.16,
+          "dit_steps": 12,
+          "height": 512,
+          "kv_bytes": 342212608,
+          "modality_plan": "dit_edit",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 1
+        }
+      ]
+    },
+    {
+      "active_jct_ms": 17376.61,
+      "ar_slo_mean_tpot_met": true,
+      "ar_slo_met": true,
+      "ar_slo_p95_tpot_met": true,
+      "ar_slo_strict_max_tpot_met": true,
+      "ar_texts": [
+        "1. Capture the warm glow of the sun on the lighthouse's white facade, with the",
+        "Enhance the lighting to create a warm, golden hour glow on the lighthouse, emphasizing its"
+      ],
+      "ar_tpots_ms": [
+        95.06,
+        95.24,
+        98.44,
+        95.11,
+        100.84,
+        100.8,
+        95.3,
+        94.79,
+        94.52,
+        99.53,
+        98.01,
+        100.33,
+        95.32,
+        95.21,
+        95.27,
+        95.1,
+        96.84,
+        96.57,
+        100.32,
+        52.13,
+        51.79,
+        51.69,
+        51.92,
+        53.96,
+        51.88,
+        52.05,
+        51.61,
+        51.53,
+        51.5,
+        51.5,
+        51.56,
+        51.56,
+        51.98,
+        51.88,
+        54.1,
+        51.9,
+        54.03,
+        52.26
+      ],
+      "ar_ttfts_ms": [
+        376.96,
+        1398.31
+      ],
+      "ar_turn_tpots_ms": [
+        [
+          95.06,
+          95.24,
+          98.44,
+          95.11,
+          100.84,
+          100.8,
+          95.3,
+          94.79,
+          94.52,
+          99.53,
+          98.01,
+          100.33,
+          95.32,
+          95.21,
+          95.27,
+          95.1,
+          96.84,
+          96.57,
+          100.32
+        ],
+        [
+          52.13,
+          51.79,
+          51.69,
+          51.92,
+          53.96,
+          51.88,
+          52.05,
+          51.61,
+          51.53,
+          51.5,
+          51.5,
+          51.56,
+          51.56,
+          51.98,
+          51.88,
+          54.1,
+          51.9,
+          54.03,
+          52.26
+        ]
+      ],
+      "arrival_offset_s": 0.8,
+      "completed_offset_s": 19.092,
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [
+        512,
+        512
+      ],
+      "dit_turn_steps": [
+        12,
+        10
+      ],
+      "dit_turns_ms": [
+        5549.26,
+        7211.43
+      ],
+      "e2e_ms": 18290.88,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": true,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "phase_label": "",
+      "planned_ar_turns": 2,
+      "planned_dit_turns": 2,
+      "planned_turns": 4,
+      "preempted_ar_turns": 1,
+      "quadrant": "interleaved_co_creation",
+      "resident_alpha_sample": 1.0,
+      "session_id": "smk_cocreate_0",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "think_time_ms": 914.27,
+      "total_yields": 0,
+      "turn_records": [
+        {
+          "ar_tpot_mean_ms": 96.98,
+          "ar_tpot_p95_ms": 100.8,
+          "ar_tpot_strict_max_ms": 100.84,
+          "ar_ttft_ms": 376.96,
+          "dit_ms": null,
+          "dit_steps": 0,
+          "height": 0,
+          "kv_bytes": 2064384,
+          "modality_plan": "ar_only",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 0
+        },
+        {
+          "ar_tpot_mean_ms": null,
+          "ar_tpot_p95_ms": null,
+          "ar_tpot_strict_max_ms": null,
+          "ar_ttft_ms": null,
+          "dit_ms": 5549.26,
+          "dit_steps": 12,
+          "height": 512,
+          "kv_bytes": 3825664,
+          "modality_plan": "dit_t2i",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 1
+        },
+        {
+          "ar_tpot_mean_ms": 52.15,
+          "ar_tpot_p95_ms": 54.04,
+          "ar_tpot_strict_max_ms": 54.1,
+          "ar_ttft_ms": 1398.31,
+          "dit_ms": null,
+          "dit_steps": 0,
+          "height": 0,
+          "kv_bytes": 286990336,
+          "modality_plan": "ar_only",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 2
+        },
+        {
+          "ar_tpot_mean_ms": null,
+          "ar_tpot_p95_ms": null,
+          "ar_tpot_strict_max_ms": null,
+          "ar_ttft_ms": null,
+          "dit_ms": 7211.43,
+          "dit_steps": 10,
+          "height": 512,
+          "kv_bytes": 627843072,
+          "modality_plan": "dit_edit",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 3
+        }
+      ]
+    },
+    {
+      "active_jct_ms": 3402.6,
+      "ar_slo_mean_tpot_met": true,
+      "ar_slo_met": true,
+      "ar_slo_p95_tpot_met": true,
+      "ar_slo_strict_max_tpot_met": true,
+      "ar_texts": [
+        "1. Clear and transparent water with minimal ripples or waves.\n2. Surrounding landscape with",
+        "1. Golden yellow.\n2. Burnt orange."
+      ],
+      "ar_tpots_ms": [
+        95.06,
+        95.24,
+        98.44,
+        95.11,
+        100.84,
+        100.8,
+        95.3,
+        94.79,
+        94.52,
+        99.53,
+        98.01,
+        100.33,
+        95.32,
+        95.21,
+        95.27,
+        95.1,
+        96.84,
+        96.57,
+        100.32,
+        89.62,
+        88.93,
+        93.81,
+        91.23,
+        88.86,
+        89.58,
+        89.42,
+        92.93,
+        89.39,
+        94.54,
+        89.24
+      ],
+      "ar_ttfts_ms": [
+        377.04,
+        180.17
+      ],
+      "ar_turn_tpots_ms": [
+        [
+          95.06,
+          95.24,
+          98.44,
+          95.11,
+          100.84,
+          100.8,
+          95.3,
+          94.79,
+          94.52,
+          99.53,
+          98.01,
+          100.33,
+          95.32,
+          95.21,
+          95.27,
+          95.1,
+          96.84,
+          96.57,
+          100.32
+        ],
+        [
+          89.62,
+          88.93,
+          93.81,
+          91.23,
+          88.86,
+          89.58,
+          89.42,
+          92.93,
+          89.39,
+          94.54,
+          89.24
+        ]
+      ],
+      "arrival_offset_s": 0.8,
+      "completed_offset_s": 4.649,
+      "cross_node_ship_bytes_list": [],
+      "cross_node_ships": 0,
+      "dit_slo_met": true,
+      "dit_turn_heights": [],
+      "dit_turn_steps": [],
+      "dit_turns_ms": [],
+      "e2e_ms": 3847.65,
+      "error": "",
+      "image_paths_out": [],
+      "joint_slo_met": true,
+      "oom_retries": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "phase_label": "",
+      "planned_ar_turns": 2,
+      "planned_dit_turns": 0,
+      "planned_turns": 2,
+      "preempted_ar_turns": 2,
+      "quadrant": "multi_image_vqa",
+      "resident_alpha_sample": 1.0,
+      "session_id": "smk_vqa_mid_dit_0",
+      "ship_bytes_list": [],
+      "ship_ms_list": [],
+      "status": "ok",
+      "think_time_ms": 445.05,
+      "total_yields": 0,
+      "turn_records": [
+        {
+          "ar_tpot_mean_ms": 96.98,
+          "ar_tpot_p95_ms": 100.8,
+          "ar_tpot_strict_max_ms": 100.84,
+          "ar_ttft_ms": 377.04,
+          "dit_ms": null,
+          "dit_steps": 0,
+          "height": 0,
+          "kv_bytes": 2007040,
+          "modality_plan": "ar_only",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 0
+        },
+        {
+          "ar_tpot_mean_ms": 90.69,
+          "ar_tpot_p95_ms": 94.18,
+          "ar_tpot_strict_max_ms": 94.54,
+          "ar_ttft_ms": 180.17,
+          "dit_ms": null,
+          "dit_steps": 0,
+          "height": 0,
+          "kv_bytes": 3383296,
+          "modality_plan": "ar_only",
+          "morphed": false,
+          "shipped": false,
+          "status": "ok",
+          "turn_idx": 1
+        }
+      ]
+    }
+  ],
+  "steady_state_window_mode": "session_trim",
+  "steady_window_start_s": 0.0,
+  "steady_window_end_s": 0.8,
+  "steady_state_sessions": 3,
+  "steady_oom_sessions": 0,
+  "total_planned_turns": 8,
+  "completed_turns": 8,
+  "turn_slo_attainment_pct": 100.0,
+  "turn_slo_goodput_rps": 1.5,
+  "steady_planned_turns": 8,
+  "steady_completed_turns": 8,
+  "steady_turn_survival_pct": 100.0,
+  "steady_turn_slo_attainment_pct": 100.0,
+  "steady_turn_ar_slo_attainment_pct": 100.0,
+  "steady_turn_dit_slo_attainment_pct": 100.0,
+  "steady_turn_slo_goodput_rps": 1.5,
+  "steady_turn_goodput_tps": 4.0,
+  "effective_slo_throughput_rps": 1.5,
+  "steady_ar_slo_attainment_pct": 100.0,
+  "steady_ar_slo_mean_pct": 100.0,
+  "steady_ar_slo_strict_max_pct": 100.0,
+  "steady_dit_slo_attainment_pct": 100.0,
+  "active_jct_p50_ms": 14814.25,
+  "active_jct_p95_ms": 17120.37,
+  "active_jct_p99_ms": 17325.36,
+  "all_session_active_jct_p50_ms": 14814.25,
+  "all_session_active_jct_p90_ms": 16864.14,
+  "all_session_active_jct_p95_ms": 17120.37,
+  "active_jct_cdf_points": [
+    {
+      "ms": 4543.77,
+      "p": 5.0
+    },
+    {
+      "ms": 5684.93,
+      "p": 10.0
+    },
+    {
+      "ms": 7967.26,
+      "p": 20.0
+    },
+    {
+      "ms": 10249.59,
+      "p": 30.0
+    },
+    {
+      "ms": 12531.92,
+      "p": 40.0
+    },
+    {
+      "ms": 14814.25,
+      "p": 50.0
+    },
+    {
+      "ms": 15326.72,
+      "p": 60.0
+    },
+    {
+      "ms": 15839.19,
+      "p": 70.0
+    },
+    {
+      "ms": 16351.67,
+      "p": 80.0
+    },
+    {
+      "ms": 16607.9,
+      "p": 85.0
+    },
+    {
+      "ms": 16864.14,
+      "p": 90.0
+    },
+    {
+      "ms": 17120.37,
+      "p": 95.0
+    },
+    {
+      "ms": 17325.36,
+      "p": 99.0
+    }
+  ],
+  "kv_host_swap_outs": 0,
+  "per_turn_stats": {
+    "turn_0": {
+      "ar_tpot_p95_ms": 100.8,
+      "ar_ttft_p95_ms": 377.04,
+      "dit_p95_ms": 5719.63,
+      "kv_mib_mean": 1.78,
+      "kv_mib_p95": 1.96,
+      "ok": 3,
+      "oom": 0,
+      "slo_attainment_pct": 100.0,
+      "slo_met": 3,
+      "survival_pct": 100.0,
+      "total": 3
+    },
+    "turn_1": {
+      "ar_tpot_p95_ms": 94.18,
+      "ar_ttft_p95_ms": 180.17,
+      "dit_p95_ms": 8916.91,
+      "kv_mib_mean": 111.08,
+      "kv_mib_p95": 294.09,
+      "ok": 3,
+      "oom": 0,
+      "slo_attainment_pct": 100.0,
+      "slo_met": 3,
+      "survival_pct": 100.0,
+      "total": 3
+    },
+    "turn_2": {
+      "ar_tpot_p95_ms": 54.04,
+      "ar_ttft_p95_ms": 1398.31,
+      "dit_p95_ms": 0.0,
+      "kv_mib_mean": 273.7,
+      "kv_mib_p95": 273.7,
+      "ok": 1,
+      "oom": 0,
+      "slo_attainment_pct": 100.0,
+      "slo_met": 1,
+      "survival_pct": 100.0,
+      "total": 1
+    },
+    "turn_3": {
+      "ar_tpot_p95_ms": 0.0,
+      "ar_ttft_p95_ms": 0.0,
+      "dit_p95_ms": 7211.43,
+      "kv_mib_mean": 598.76,
+      "kv_mib_p95": 598.76,
+      "ok": 1,
+      "oom": 0,
+      "slo_attainment_pct": 100.0,
+      "slo_met": 1,
+      "survival_pct": 100.0,
+      "total": 1
+    }
+  },
+  "time_series_10s": [
+    {
+      "ar_ttft_p95_ms": 1245.12,
+      "dit_p95_ms": 8811.75,
+      "mean_alpha": 1.0,
+      "ok": 3,
+      "oom": 0,
+      "path_a_ships": 0,
+      "path_b_morphs": 0,
+      "phase_label": "",
+      "sessions": 3,
+      "slo_attainment_pct": 100.0,
+      "slo_met": 3,
+      "t_end_s": 10.0,
+      "t_start_s": 0.0,
+      "yields": 32
+    }
+  ]
+}

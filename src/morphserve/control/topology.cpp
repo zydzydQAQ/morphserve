@@ -803,7 +803,11 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         return read_json_file(*found);
     };
 
-    if (auto j0a = load("job0a_vmm", {"phase0-job0a-v2/vmm-bench.json", "phase0-job0a-r2/vmm-bench.json"})) {
+    if (auto j0a = load(
+            "job0a_vmm",
+            {"hardware-profile/vmm-microbench/vmm-bench.json",
+             "phase0-job0a-v2/vmm-bench.json",
+             "phase0-job0a-r2/vmm-bench.json"})) {
         if (j0a->contains("h2d_stream_gbps") && (*j0a)["h2d_stream_gbps"].is_object()) {
             p.vmm_solo_h2d_stream_gbps = (*j0a)["h2d_stream_gbps"].value("mean", p.vmm_solo_h2d_stream_gbps);
         }
@@ -817,7 +821,9 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto j0c = load("job0c_topo", {"phase0-job0c/topo-8gpu-report.json"})) {
+    if (auto j0c = load(
+            "job0c_topo",
+            {"hardware-profile/topo-8gpu/topo-8gpu-report.json", "phase0-job0c/topo-8gpu-report.json"})) {
         if (j0c->contains("numa_h2d") && (*j0c)["numa_h2d"].is_object()) {
             const auto& nh = (*j0c)["numa_h2d"];
             if (nh.contains("single_gpu_h2d_gbps") && nh["single_gpu_h2d_gbps"].is_object()) {
@@ -852,8 +858,11 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto j0d = load("job0d_motivation",
-                        {"phase0-job0d-r2/motivation-report.json", "phase0-job0d/motivation-report.json"})) {
+    if (auto j0d = load(
+            "job0d_motivation",
+            {"hardware-profile/motivation-baseline/motivation-report.json",
+             "phase0-job0d-r2/motivation-report.json",
+             "phase0-job0d/motivation-report.json"})) {
         if (j0d->contains("single_gpu") && (*j0d)["single_gpu"].contains("vae_batch_and_res_stress")) {
             const auto& vae = (*j0d)["single_gpu"]["vae_batch_and_res_stress"];
             if (vae.contains("512_b1")) {
@@ -898,7 +907,8 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
 
     if (auto m1 = load(
             "module1_vmm",
-            {"osdi27-v1/stage1-gate/module1/module1-report.json",
+            {"osdi27-v2/stage1-gate/module1/module1-report.json",
+             "osdi27-v1/stage1-gate/module1/module1-report.json",
              "refactor-20261122/module1-report.json",
              "phase1-job1a-r3/module1-report.json"})) {
         if (m1->contains("mem_monolithic_loaded")) {
@@ -942,7 +952,8 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
 
     if (auto m3 = load(
             "module3_cow_loopback",
-            {"osdi27-v1/stage1-gate/module3/module3-report.json",
+            {"osdi27-v2/stage1-gate/module3/module3-report.json",
+             "osdi27-v1/stage1-gate/module3/module3-report.json",
              "morphserve-p2-m21gate-20261121-r4/module3-report.json",
              "phase1-job1b-r7/module3-report.json"})) {
         if (m3->contains("test2_gpu_inplace_loopback") && (*m3)["test2_gpu_inplace_loopback"].is_object()) {
@@ -987,7 +998,9 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
 
     if (auto m4 = load(
             "module4_scheduler",
-            {"osdi27-v1/stage1-gate/module4/module4-report.json", "phase1-job1c-r3/module4-report.json"})) {
+            {"osdi27-v2/stage1-gate/module4/module4-report.json",
+             "osdi27-v1/stage1-gate/module4/module4-report.json",
+             "phase1-job1c-r3/module4-report.json"})) {
         if (m4->contains("solo_baselines") && (*m4)["solo_baselines"].is_object()) {
             const auto& sb = (*m4)["solo_baselines"];
             p.ar_unloaded_tpot_p50_ms = sb.value("unloaded_ar_tpot_p50_ms", p.ar_unloaded_tpot_p50_ms);
@@ -1019,7 +1032,9 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
         }
     }
 
-    if (auto m2 = load("module2_router", {"phase1-job1d-r4/module2-report.json"})) {
+    if (auto m2 = load(
+            "module2_router",
+            {"hardware-profile/module2-pcie-numa/module2-report.json", "phase1-job1d-r4/module2-report.json"})) {
         if (m2->contains("test1_shared_numa_memfd_and_h2d_pacer") &&
             (*m2)["test1_shared_numa_memfd_and_h2d_pacer"].is_object()) {
             const auto& t1 = (*m2)["test1_shared_numa_memfd_and_h2d_pacer"];
@@ -1038,7 +1053,8 @@ ClusterPhysicsProfile ClusterPhysicsProfile::from_phase01_results(const std::str
 
     if (auto m2x8_p = first_existing_file(
             root,
-            {"osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-report.json",
+            {"hardware-profile/multinode-2x8-net/m25-multinode-2x8-report.json",
+             "osdi27-v1/r3-multinode-2x8/m25-multinode-2x8-report.json",
              "morphserve-p2-m25node2x8-20261121-r2/m25-multinode-2x8-report.json"})) {
         const auto m2x8 = read_json_file(*m2x8_p);
         if (m2x8.contains("calibrated_gbps") && m2x8["calibrated_gbps"].is_object()) {

@@ -38,7 +38,7 @@ class TestModule2Offline(unittest.TestCase):
         self.assertLess(topo.effective_h2d_gbps(0, active_h2d_same_half=4), 2.70)
         self.assertGreater(topo.effective_p2p_gbps(0, 1), topo.effective_p2p_gbps(0, 4, concurrent_cross_half=4))
 
-        job0c_path = REPO_ROOT / "results/phase0-job0c/topo-8gpu-report.json"
+        job0c_path = REPO_ROOT / "results/hardware-profile/topo-8gpu/topo-8gpu-report.json"
         if job0c_path.exists():
             parsed = ClusterTopologyProfile.from_job0c_report(job0c_path)
             self.assertEqual(parsed.num_gpus, 8)

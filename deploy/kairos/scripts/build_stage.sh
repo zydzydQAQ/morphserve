@@ -105,8 +105,8 @@ find "${INSTALL_TMP}/python" \( -name "*.pyc" -o -name "*.pyo" \) -delete 2>/dev
 ln -sfn "python" "${INSTALL_TMP}/src"
 cp -R "${SRC_DIR}/src" "${INSTALL_TMP}/cpp_src"
 
-# Stage C++17 headers/entrypoints, tests, deploy scripts, docs, and configs
-for sub in include cmd configs docs deploy tests; do
+# Stage C++17 headers/entrypoints, tests, deploy scripts, helper scripts, docs, and configs
+for sub in include cmd configs docs deploy scripts tests; do
   if [ -d "${SRC_DIR}/${sub}" ]; then
     rm -rf "${INSTALL_TMP}/${sub}"
     cp -R "${SRC_DIR}/${sub}" "${INSTALL_TMP}/${sub}"

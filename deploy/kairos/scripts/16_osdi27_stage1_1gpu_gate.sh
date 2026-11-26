@@ -270,7 +270,7 @@ elif [ -d "${BUILD}/cpp_src" ]; then
   ln -sfn "${BUILD}/cpp_src" "${PYTEST_WS}/src"
 fi
 if [ -d "${SRC_STAGE}" ]; then
-  for extra in include cmd CMakeLists.txt deploy results README.md pyproject.toml GLOSSARY.md; do
+  for extra in include cmd CMakeLists.txt deploy scripts results README.md pyproject.toml GLOSSARY.md; do
     if [ ! -e "${PYTEST_WS}/${extra}" ] && [ -e "${SRC_STAGE}/${extra}" ]; then
       ln -sfn "${SRC_STAGE}/${extra}" "${PYTEST_WS}/${extra}"
     fi

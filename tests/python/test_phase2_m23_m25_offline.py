@@ -1404,6 +1404,80 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert rep["cand_missing_or_failed_sessions"] == 1
         assert rep["lossless_pass"] is False
 
+    def test_d1_d5_multiturn_turn_primary_summary_and_decoupled_slo_defaults(self) -> None:
+        from morphserve.bench.run_phase2_bagel_main import _compute_sustainable_qps_summary
+
+        pol_bagel = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
+        assert abs(pol_bagel.slo_scale_k - 2.0) < 1e-9
+        assert abs(pol_bagel.dit_slo_scale_k - 3.0) < 1e-9
+        assert abs(pol_bagel.ar_ttft_slo_ms - 1500.0) < 1e-6
+        assert abs(pol_bagel.ar_tpot_slo_ms - 125.64) < 1e-6
+        assert abs(pol_bagel.dit_512_slo_ms - 18360.0) < 1e-6
+        assert abs(pol_bagel.dit_1024_slo_ms - 65160.0) < 1e-6
+        assert abs(pol_bagel.dit_turn_slo_for(512, steps=20) - 18360.0) < 1e-6
+        assert abs(pol_bagel.dit_turn_slo_for(1024, steps=20) - 65160.0) < 1e-6
+
+        pol_ivl = EnginePolicyConfig.from_preset("morphserve", num_gpus=8, model_family="internvl_u")
+        assert abs(pol_ivl.dit_slo_scale_k - 3.0) < 1e-9
+        assert abs(pol_ivl.dit_512_slo_ms - 9750.0) < 1e-6
+        assert abs(pol_ivl.dit_1024_slo_ms - 21900.0) < 1e-6
+
+        sweep_rows = [
+            {
+                "policy_name": "morphserve",
+                "offered_qps": 0.20,
+                "steady_turn_slo_attainment_pct": 95.0,
+                "steady_turn_slo_goodput_rps": 0.19,
+                "steady_state_attainment_pct": 85.0,
+                "joint_slo_attainment_pct": 85.0,
+                "steady_state_survival_pct": 100.0,
+                "survival_rate_pct": 100.0,
+                "steady_oom_sessions": 0,
+                "oom_sessions": 0,
+                "total_sessions": 48,
+                "completed_sessions": 48,
+                "peak_nvml_used_mib": 34000.0,
+            },
+            {
+                "policy_name": "morphserve",
+                "offered_qps": 0.40,
+                "steady_turn_slo_attainment_pct": 85.0,
+                "steady_turn_slo_goodput_rps": 0.34,
+                "steady_state_attainment_pct": 65.0,
+                "joint_slo_attainment_pct": 65.0,
+                "steady_state_survival_pct": 100.0,
+                "survival_rate_pct": 100.0,
+                "steady_oom_sessions": 0,
+                "oom_sessions": 0,
+                "total_sessions": 48,
+                "completed_sessions": 48,
+                "peak_nvml_used_mib": 36000.0,
+            },
+            {
+                "policy_name": "morphserve",
+                "offered_qps": 0.60,
+                "steady_turn_slo_attainment_pct": 75.0,
+                "steady_turn_slo_goodput_rps": 0.45,
+                "steady_state_attainment_pct": 50.0,
+                "joint_slo_attainment_pct": 50.0,
+                "steady_state_survival_pct": 100.0,
+                "survival_rate_pct": 100.0,
+                "steady_oom_sessions": 0,
+                "oom_sessions": 0,
+                "total_sessions": 48,
+                "completed_sessions": 48,
+                "peak_nvml_used_mib": 37000.0,
+            },
+        ]
+        summary = _compute_sustainable_qps_summary(sweep_rows)["morphserve"]
+        assert summary["primary_metric"] == "steady_turn_slo_attainment_pct_vs_offered_qps"
+        assert summary["secondary_session_metric"] == "steady_state_slo_attainment_pct_vs_offered_qps"
+        assert abs(summary["turn_max_sustainable_qps_90pct"] - 0.30) < 1e-4
+        assert abs(summary["turn_max_sustainable_qps_80pct"] - 0.50) < 1e-4
+        assert abs(summary["turn_max_sustainable_qps_zero_oom_80pct"] - 0.50) < 1e-4
+        assert abs(summary["max_sustainable_qps_80pct"] - 0.25) < 1e-4
+        assert summary["slo_attainment_curve"][0]["steady_turn_slo_attainment_pct"] == 95.0
+
 
 if __name__ == "__main__":
     unittest.main()

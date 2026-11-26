@@ -344,10 +344,35 @@ def _compute_sustainable_qps_summary(qps_sweep_results: list[dict[str, Any]]) ->
             (float(r["offered_qps"]), float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"])))
             for r in rows_sorted
         ]
+        steady_turn_pts = [
+            (
+                float(r["offered_qps"]),
+                float(
+                    r.get(
+                        "steady_turn_slo_attainment_pct",
+                        r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]),
+                    )
+                ),
+            )
+            for r in rows_sorted
+        ]
         steady_zero_oom_pts = [
             (
                 float(r["offered_qps"]),
                 float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"])),
+                int(r.get("steady_oom_sessions", r.get("oom_sessions", 0))),
+            )
+            for r in rows_sorted
+        ]
+        steady_turn_zero_oom_pts = [
+            (
+                float(r["offered_qps"]),
+                float(
+                    r.get(
+                        "steady_turn_slo_attainment_pct",
+                        r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]),
+                    )
+                ),
                 int(r.get("steady_oom_sessions", r.get("oom_sessions", 0))),
             )
             for r in rows_sorted
@@ -358,6 +383,8 @@ def _compute_sustainable_qps_summary(qps_sweep_results: list[dict[str, Any]]) ->
         ]
         grid_80 = max((q for q, a in steady_pts if a >= 80.0), default=0.0)
         grid_90 = max((q for q, a in steady_pts if a >= 90.0), default=0.0)
+        turn_grid_80 = max((q for q, a in steady_turn_pts if a >= 80.0), default=0.0)
+        turn_grid_90 = max((q for q, a in steady_turn_pts if a >= 90.0), default=0.0)
         curve = []
         for r in rows_sorted:
             tot_s = max(1, int(r.get("total_sessions", 1)))
@@ -365,12 +392,18 @@ def _compute_sustainable_qps_summary(qps_sweep_results: list[dict[str, Any]]) ->
             surv_pct = float(r.get("survival_rate_pct", round(100.0 * ok_s / tot_s, 1)))
             steady_surv_pct = float(r.get("steady_state_survival_pct", surv_pct))
             steady_oom = int(r.get("steady_oom_sessions", r.get("oom_sessions", 0)))
+            steady_att = float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]))
+            steady_turn_att = float(r.get("steady_turn_slo_attainment_pct", steady_att))
             curve.append(
                 {
                     "offered_qps": float(r["offered_qps"]),
-                    "steady_state_attainment_pct": float(
-                        r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"])
+                    "steady_turn_slo_attainment_pct": steady_turn_att,
+                    "steady_turn_slo_goodput_rps": float(
+                        r.get("steady_turn_slo_goodput_rps", r.get("steady_state_goodput_rps", 0.0))
                     ),
+                    "steady_turn_survival_pct": float(r.get("steady_turn_survival_pct", steady_surv_pct)),
+                    "steady_planned_turns": int(r.get("steady_planned_turns", 0)),
+                    "steady_state_attainment_pct": steady_att,
                     "joint_slo_attainment_pct": float(r["joint_slo_attainment_pct"]),
                     "steady_state_survival_pct": steady_surv_pct,
                     "survival_rate_pct": surv_pct,
@@ -395,8 +428,17 @@ def _compute_sustainable_qps_summary(qps_sweep_results: list[dict[str, Any]]) ->
             )
         max_q_80 = _interpolate_slo_threshold_qps(steady_pts, 80.0)
         max_q_90 = _interpolate_slo_threshold_qps(steady_pts, 90.0)
+        turn_max_q_80 = _interpolate_slo_threshold_qps(steady_turn_pts, 80.0)
+        turn_max_q_90 = _interpolate_slo_threshold_qps(steady_turn_pts, 90.0)
         summary[pol] = {
-            "primary_metric": "steady_state_slo_attainment_pct_vs_offered_qps",
+            "primary_metric": "steady_turn_slo_attainment_pct_vs_offered_qps",
+            "secondary_session_metric": "steady_state_slo_attainment_pct_vs_offered_qps",
+            "turn_max_sustainable_qps_80pct": turn_max_q_80,
+            "turn_max_sustainable_qps_90pct": turn_max_q_90,
+            "turn_max_sustainable_qps_zero_oom_80pct": _interpolate_zero_oom_slo_qps(steady_turn_zero_oom_pts, 80.0),
+            "turn_max_sustainable_qps_zero_oom_90pct": _interpolate_zero_oom_slo_qps(steady_turn_zero_oom_pts, 90.0),
+            "turn_max_grid_qps_80pct": round(turn_grid_80, 3),
+            "turn_max_grid_qps_90pct": round(turn_grid_90, 3),
             "max_sustainable_qps_80pct": max_q_80,
             "max_sustainable_qps_90pct": max_q_90,
             "max_sustainable_qps_zero_oom_80pct": _interpolate_zero_oom_slo_qps(steady_zero_oom_pts, 80.0),
@@ -613,8 +655,9 @@ def run_suite_a_qps_and_ablations(
                 qps_sweep_results.append(d)
                 print(
                     f"[M2.3-QPS-v2] policy={preset} n={len(active_suite.sessions)} qps={qps} "
-                    f"eff_tput={getattr(rep, 'effective_slo_throughput_rps', rep.steady_state_goodput_rps):.3f} "
-                    f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                    f"turn_slo={getattr(rep, 'steady_turn_slo_attainment_pct', rep.steady_state_attainment_pct)}% "
+                    f"turn_gp={getattr(rep, 'steady_turn_slo_goodput_rps', rep.steady_state_goodput_rps):.3f} "
+                    f"sess_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
                     f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
                     f"ar_tpot_p95={rep.ar_tpot_p95_ms}ms dit_p95={rep.dit_turn_p95_ms}ms "
                     f"swaps={getattr(rep, 'kv_host_swap_outs', 0)} "

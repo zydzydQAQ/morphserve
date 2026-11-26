@@ -41,12 +41,13 @@ class EnginePolicyConfig:
     static_gen_ranks: tuple[int, ...] = ()
     initial_alphas: dict[int, float] = field(default_factory=dict)
 
-    # Per-class k× normalized unloaded SLOs (`D3`) & bounded OOM recovery
+    # Per-class decoupled k_AR / k_DiT normalized unloaded SLOs (`D1-D5`) & bounded OOM recovery
     slo_scale_k: float = 2.0
+    dit_slo_scale_k: float = 3.0
     ar_tpot_slo_ms: float = 125.64
     ar_ttft_slo_ms: float = 1500.0
-    dit_512_slo_ms: float = 12240.0
-    dit_1024_slo_ms: float = 43440.0
+    dit_512_slo_ms: float = 18360.0
+    dit_1024_slo_ms: float = 65160.0
     dit_turn_slo_override_ms: float | None = None
     max_oom_retries: int = 1
     inter_turn_think_s_range: tuple[float, float] = (2.0, 25.0)
@@ -78,7 +79,7 @@ class EnginePolicyConfig:
     def dit_turn_slo_for(self, height: int, steps: int = 20, k: float | None = None) -> float:
         if self.dit_turn_slo_override_ms is not None and k is None:
             return float(self.dit_turn_slo_override_ms)
-        eff_k = self.slo_scale_k if k is None else float(k)
+        eff_k = self.dit_slo_scale_k if k is None else float(k)
         return DEFAULT_OPERATOR_PROFILE.dit_turn_slo_ms(
             height=height,
             k=eff_k,
@@ -120,7 +121,7 @@ class EnginePolicyConfig:
                     d.pop(str_key)
                 else:
                     d[str_key] = str(d[str_key])
-        for flt_key in ("think_time_median_s", "think_time_sigma", "warmup_window_s", "steady_window_s"):
+        for flt_key in ("dit_slo_scale_k", "think_time_median_s", "think_time_sigma", "warmup_window_s", "steady_window_s"):
             if flt_key in d:
                 if d[flt_key] is None:
                     d.pop(flt_key)

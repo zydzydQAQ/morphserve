@@ -687,9 +687,6 @@ int TriPoolVMM::kv_free_page(int32_t slot_idx, void* stream) {
         kv_slot_handles_[s] = 0;
         kv_free_slots_.push_back(slot_idx);
         if (kv_mapped_pages_ > 0) --kv_mapped_pages_;
-        if (cfg_.allow_overflow && !stop_streamer_) {
-            try_coalesce_fine_to_super_locked();
-        }
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_free_page error: %s\n", e.what());
@@ -1400,9 +1397,6 @@ int TriPoolVMM::kv_region_free(int32_t region_id, void* stream) {
             for (auto h : reg.handles) free_fine_handles_.push_back(h);
             reg.handles.clear();
             kv_mapped_pages_ = (kv_mapped_pages_ >= n) ? (kv_mapped_pages_ - n) : 0;
-            if (cfg_.allow_overflow && !stop_streamer_) {
-                try_coalesce_fine_to_super_locked();
-            }
         }
         if (reg.swap_host_pinned) {
             if (backend_->is_simulated()) {
@@ -2144,9 +2138,6 @@ void TriPoolVMM::release_super_slot_to_pool_locked(SuperSlot& slot) {
             free_fine_handles_.push_back(fh);
         }
         slot.fine_hs.clear();
-        if (cfg_.allow_overflow && !stop_streamer_) {
-            try_coalesce_fine_to_super_locked();
-        }
     } else if (slot.super_h) {
         free_super_handles_.push_back(slot.super_h);
         slot.super_h = 0;
@@ -2257,7 +2248,13 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
             return SuperSlot{h, {}};
         }
         if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
-            if (cfg_.allow_overflow && try_coalesce_fine_to_super_locked(1) > 0 && !free_super_handles_.empty()) {
+            // Lazy hysteresis coalescing: only convert 32 x 2 MiB fine pages back into a
+            // 64 MiB super-handle when super handles are exhausted AND at least one full
+            // 64 MiB fine cushion remains, preventing carve<->coalesce driver call storms!
+            if (cfg_.allow_overflow &&
+                free_fine_handles_.size() >= base_fine_pages_ + 2 * sub_pages_ &&
+                try_coalesce_fine_to_super_locked(1) > 0 &&
+                !free_super_handles_.empty()) {
                 const uint64_t h = free_super_handles_.back();
                 free_super_handles_.pop_back();
                 return SuperSlot{h, {}};

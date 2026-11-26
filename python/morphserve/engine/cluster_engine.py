@@ -146,6 +146,9 @@ class SessionOutcome:
     ar_slo_mean_tpot_met: bool = True
     ar_slo_strict_max_tpot_met: bool = True
     turn_records: list[dict[str, Any]] = field(default_factory=list)
+    planned_turns: int = 0
+    planned_ar_turns: int = 0
+    planned_dit_turns: int = 0
     completed_offset_s: float = 0.0
     resident_alpha_sample: float = 1.0
 
@@ -209,7 +212,9 @@ class ClusterRunReport:
     dit_cdf_points: list[dict[str, Any]] = field(default_factory=list)
     cross_node_ships: int = 0
     max_cross_node_ship_bytes: int = 0
+    slo_config: dict[str, Any] = field(default_factory=dict)
     slo_curve_by_k: dict[str, dict[str, float]] = field(default_factory=dict)
+    slo_curve_by_dit_k: dict[str, dict[str, float]] = field(default_factory=dict)
     status: str = "ok"
     sessions: list[dict[str, Any]] = field(default_factory=list)
     steady_state_window_mode: str = "time"
@@ -217,6 +222,18 @@ class ClusterRunReport:
     steady_window_end_s: float = 0.0
     steady_state_sessions: int = 0
     steady_oom_sessions: int = 0
+    total_planned_turns: int = 0
+    completed_turns: int = 0
+    turn_slo_attainment_pct: float = 0.0
+    turn_slo_goodput_rps: float = 0.0
+    steady_planned_turns: int = 0
+    steady_completed_turns: int = 0
+    steady_turn_survival_pct: float = 100.0
+    steady_turn_slo_attainment_pct: float = 0.0
+    steady_turn_ar_slo_attainment_pct: float = 100.0
+    steady_turn_dit_slo_attainment_pct: float = 100.0
+    steady_turn_slo_goodput_rps: float = 0.0
+    steady_turn_goodput_tps: float = 0.0
     effective_slo_throughput_rps: float = 0.0
     steady_ar_slo_attainment_pct: float = 0.0
     steady_ar_slo_mean_pct: float = 0.0
@@ -802,6 +819,10 @@ class MorphServeClusterEngine:
                 4,
             )
 
+        planned_turns = len(sess.turns)
+        planned_ar_turns = sum(1 for t in sess.turns if t.modality_plan in ("ar_only", "cot_then_dit"))
+        planned_dit_turns = sum(1 for t in sess.turns if t.modality_plan != "ar_only")
+
         def _make_outcome(
             status: str,
             *,
@@ -850,6 +871,9 @@ class MorphServeClusterEngine:
                 ar_slo_mean_tpot_met=ar_mean_ok,
                 ar_slo_strict_max_tpot_met=ar_strict_ok,
                 turn_records=turn_records,
+                planned_turns=planned_turns,
+                planned_ar_turns=planned_ar_turns,
+                planned_dit_turns=planned_dit_turns,
                 completed_offset_s=completed_offset_s,
                 resident_alpha_sample=_sample_resident_alpha(),
             )
@@ -941,8 +965,10 @@ class MorphServeClusterEngine:
                                 "ar_tpot_mean_ms": (
                                     round(sum(turn_tpots) / float(len(turn_tpots)), 2) if turn_tpots else None
                                 ),
+                                "ar_tpot_strict_max_ms": round(max(turn_tpots), 2) if turn_tpots else None,
                                 "dit_ms": None,
                                 "height": 0,
+                                "dit_steps": 0,
                                 "kv_bytes": int(kv_bytes),
                                 "shipped": False,
                                 "morphed": False,
@@ -951,7 +977,9 @@ class MorphServeClusterEngine:
                         break
 
                     # ---- Branch 2: Visual-CoT / DiT Edit / High-Res T2I ----
-                    t_turn0 = time.perf_counter()
+                    # D3: For `cot_then_dit`, decouple AR CoT timing from DiT stage timing (`t_dit0` starts
+                    # strictly when AR CoT completes, covering routing, transfer/morph, queue, denoising, VAE).
+                    t_dit0 = time.perf_counter()
                     cot_text_pending: str | None = None
                     turn_ar_ttft: float | None = None
                     turn_ar_tpots: list[float] = []
@@ -986,8 +1014,10 @@ class MorphServeClusterEngine:
                                     "ar_ttft_ms": None,
                                     "ar_tpot_p95_ms": None,
                                     "ar_tpot_mean_ms": None,
+                                    "ar_tpot_strict_max_ms": None,
                                     "dit_ms": None,
                                     "height": int(turn.height),
+                                    "dit_steps": int(turn.dit_steps),
                                     "kv_bytes": int(kv_bytes),
                                     "shipped": False,
                                     "morphed": False,
@@ -1004,6 +1034,7 @@ class MorphServeClusterEngine:
                         ar_tpots.extend(turn_ar_tpots)
                         ar_turn_tpots.append(turn_ar_tpots)
                         cot_text_pending = str(cot_res.get("text", ""))
+                        t_dit0 = time.perf_counter()
                     else:
                         est_prep_ms = DEFAULT_OPERATOR_PROFILE.prep_overhead_ms
                         self.worker_states[resident_gpu].queue_wait_ms += est_prep_ms
@@ -1359,8 +1390,10 @@ class MorphServeClusterEngine:
                                 "ar_tpot_mean_ms": (
                                     round(sum(turn_ar_tpots) / float(len(turn_ar_tpots)), 2) if turn_ar_tpots else None
                                 ),
+                                "ar_tpot_strict_max_ms": round(max(turn_ar_tpots), 2) if turn_ar_tpots else None,
                                 "dit_ms": None,
                                 "height": int(turn.height),
+                                "dit_steps": int(turn.dit_steps),
                                 "kv_bytes": int(kv_bytes),
                                 "shipped": turn_shipped,
                                 "morphed": turn_morphed,
@@ -1379,7 +1412,7 @@ class MorphServeClusterEngine:
                         if save_outputs_dir is not None:
                             image_paths_out.append(save_tmp)
 
-                    dit_ms = (time.perf_counter() - t_turn0) * 1000.0
+                    dit_ms = (time.perf_counter() - t_dit0) * 1000.0
                     dit_turns.append(dit_ms)
                     dit_heights.append(int(turn.height))
                     dit_steps_list.append(int(turn.dit_steps))
@@ -1395,8 +1428,10 @@ class MorphServeClusterEngine:
                             "ar_tpot_mean_ms": (
                                 round(sum(turn_ar_tpots) / float(len(turn_ar_tpots)), 2) if turn_ar_tpots else None
                             ),
+                            "ar_tpot_strict_max_ms": round(max(turn_ar_tpots), 2) if turn_ar_tpots else None,
                             "dit_ms": round(dit_ms, 2),
                             "height": int(turn.height),
+                            "dit_steps": int(turn.dit_steps),
                             "kv_bytes": int(kv_bytes),
                             "shipped": turn_shipped,
                             "morphed": turn_morphed,

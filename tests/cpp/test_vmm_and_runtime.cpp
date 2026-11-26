@@ -179,8 +179,24 @@ void test_tripool_vmm_grow_before_evict_and_fine_to_super_coalescing() {
     MS_CHECK(st.pool_total_bytes == 320 * kMiB);
     MS_CHECK(st.fine_pool_total_pages == 64);
 
-    // 3. Freeing KV automatically coalesces the 32 excess 2 MiB fine pages back into 1 x 64 MiB super-handle!
+    // 3. Freeing KV retains warm 2 MiB fine pages (no eager coalesce thrashing on free!),
+    //    so immediate re-allocation incurs ZERO super_to_fine_carves and ZERO driver allocs;
+    //    explicit coalesce_fine_to_super() reclaims the 32 excess fine pages into 1 x 64 MiB super-handle.
     MS_CHECK(vmm->kv_region_free(rid, nullptr) == 0);
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(st.fine_pool_total_pages == 64);
+    MS_CHECK(st.super_pool_total_handles == 3);
+    MS_CHECK(st.pool_total_bytes == 320 * kMiB);
+
+    const int32_t rid_re = vmm->kv_region_alloc(128 * kMiB, sid);
+    MS_CHECK(rid_re >= 0);
+    MS_CHECK(vmm->kv_region_ensure(rid_re, 128 * kMiB, nullptr) != 0);
+    vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
+    MS_CHECK(st.super_to_fine_carves == 0);
+    MS_CHECK(st.fine_pool_total_pages == 64);
+    MS_CHECK(vmm->kv_region_free(rid_re, nullptr) == 0);
+
+    MS_CHECK(vmm->coalesce_fine_to_super(0) == 1);
     vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
     MS_CHECK(st.fine_pool_total_pages == 32);
     MS_CHECK(st.super_pool_total_handles == 4);

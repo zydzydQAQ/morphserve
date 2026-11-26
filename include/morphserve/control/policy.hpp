@@ -46,10 +46,11 @@ struct PolicyConfig {
     std::map<int, double> initial_alphas;
 
     double slo_scale_k = 2.0;
+    double dit_slo_scale_k = 3.0;
     double ar_tpot_slo_ms = 125.64;
     double ar_ttft_slo_ms = 1500.0;
-    double dit_512_slo_ms = 12240.0;
-    double dit_1024_slo_ms = 43440.0;
+    double dit_512_slo_ms = 18360.0;
+    double dit_1024_slo_ms = 65160.0;
     std::optional<double> dit_turn_slo_override_ms;
     int max_oom_retries = 1;
     std::pair<double, double> inter_turn_think_s_range = {2.0, 25.0};

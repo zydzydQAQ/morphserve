@@ -1251,10 +1251,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     };
     struct SimTurnRec {
         int turn_idx = 0;
+        std::string modality_plan;
         std::string status = "ok";
         std::optional<double> ar_ttft_ms;
         std::vector<double> ar_tpots_ms;
         std::optional<double> dit_ms;
+        int height = 0;
+        int dit_steps = 0;
         double kv_mib = 0.0;
     };
     struct PendingCotAr {
@@ -1290,6 +1293,12 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         sess_end_ms[usid_idx] = std::max(sess_end_ms[usid_idx], end_t_ms);
         SimTurnRec rec;
         rec.turn_idx = turn_idx;
+        if (turn_idx >= 0 && static_cast<size_t>(turn_idx) < built_sessions[usid_idx].turns.size()) {
+            const auto& ts = built_sessions[usid_idx].turns[static_cast<size_t>(turn_idx)];
+            rec.modality_plan = ts.modality_plan;
+            rec.height = ts.height;
+            rec.dit_steps = ts.dit_steps;
+        }
         rec.status = "oom";
         rec.kv_mib = sess_main_kv_mib[usid_idx];
         if (sess_pending_cot_ar[usid_idx].valid && sess_pending_cot_ar[usid_idx].turn_idx == turn_idx) {
@@ -2291,8 +2300,11 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 sess_dit_records[usid].push_back(SimDitRec{turn_lat, p.height, p.dit_steps});
                 SimTurnRec rec;
                 rec.turn_idx = p.ti;
+                rec.modality_plan = p.plan;
                 rec.status = "ok";
                 rec.dit_ms = turn_lat;
+                rec.height = p.height;
+                rec.dit_steps = p.dit_steps;
                 rec.kv_mib = p.cand_main_kv;
                 if (sess_pending_cot_ar[usid].valid && sess_pending_cot_ar[usid].turn_idx == p.ti) {
                     rec.ar_ttft_ms = sess_pending_cot_ar[usid].ttft_ms;
@@ -2403,8 +2415,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             sess_dit_records[usid].push_back(SimDitRec{turn_lat, p.height, p.dit_steps});
             SimTurnRec rec;
             rec.turn_idx = p.ti;
+            if (p.ti >= 0 && static_cast<size_t>(p.ti) < built_sessions[usid].turns.size()) {
+                rec.modality_plan = built_sessions[usid].turns[static_cast<size_t>(p.ti)].modality_plan;
+            }
             rec.status = "ok";
             rec.dit_ms = turn_lat;
+            rec.height = p.height;
+            rec.dit_steps = p.dit_steps;
             rec.kv_mib = p.cand_main_kv;
             if (sess_pending_cot_ar[usid].valid && sess_pending_cot_ar[usid].turn_idx == p.ti) {
                 rec.ar_ttft_ms = sess_pending_cot_ar[usid].ttft_ms;
@@ -2520,7 +2537,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     &ar_ttft_val,
                     &ar_turn_tp);
                 sess_turn_records[usid].push_back(SimTurnRec{
-                    ti, "ok", ar_ttft_val, std::move(ar_turn_tp), std::nullopt, sess_main_kv_mib[usid]});
+                    ti, "ar_only", "ok", ar_ttft_val, std::move(ar_turn_tp), std::nullopt, 0, 0, sess_main_kv_mib[usid]});
                 if (ti + 1 < n_turns) {
                     const double think_ms = compute_think_ms(usid, ti + 1);
                     sess_think_ms[usid] += think_ms;
@@ -2626,6 +2643,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 const double vae_dec_ms = is_1024 ? vae1024_ms : vae512_ms;
                 (void)eff_step_ms;
 
+                // D3: Decouple AR CoT latency from DiT stage latency (`dit_ready_ms` is the exact instant
+                // AR CoT finishes and DiT routing/transfer/morph/queue/denoising/VAE begins).
+                (void)t_turn0;
                 push_ev(
                     dit_ready_ms,
                     EV_DIT_READY,
@@ -2634,7 +2654,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         ti,
                         attempt,
                         cur_gpu,
-                        t_turn0,
+                        dit_ready_ms,
                         quad,
                         plan,
                         height,
@@ -2720,12 +2740,45 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         int total = 0;
         int ok = 0;
         int oom = 0;
+        int slo_met = 0;
         std::vector<double> ttfts;
         std::vector<double> tpots;
         std::vector<double> dits;
         std::vector<double> kv_mibs;
     };
     std::map<int, SimTurnAcc> turn_accs;
+
+    auto eval_sim_turn_slo = [&](const SimTurnRec& tr, double ttft_cap, double tpot_cap, std::optional<double> k_dit_opt) -> std::tuple<bool, bool, bool, bool, bool> {
+        const bool has_ar = (tr.modality_plan == "ar_only" || tr.modality_plan == "cot_then_dit" || tr.ar_ttft_ms.has_value());
+        const bool has_dit = (tr.modality_plan == "dit_t2i" || tr.modality_plan == "dit_edit" || tr.modality_plan == "cot_then_dit" || tr.dit_ms.has_value());
+        if (tr.status != "ok") {
+            return {has_ar, has_dit, false, false, false};
+        }
+        bool ar_ok = true;
+        if (has_ar) {
+            const double ttft_v = tr.ar_ttft_ms.value_or(0.0);
+            bool tp_ok = true;
+            if (!tr.ar_tpots_ms.empty()) {
+                if (policy.ar_tpot_slo_mode == "turn_mean") {
+                    tp_ok = mean_raw_sim(tr.ar_tpots_ms) <= tpot_cap;
+                } else if (policy.ar_tpot_slo_mode == "token_max" || policy.ar_tpot_slo_mode == "strict_max") {
+                    tp_ok = *std::max_element(tr.ar_tpots_ms.begin(), tr.ar_tpots_ms.end()) <= tpot_cap;
+                } else {
+                    tp_ok = percentile_raw_sim(tr.ar_tpots_ms, 95.0) <= tpot_cap;
+                }
+            }
+            ar_ok = (ttft_v <= ttft_cap) && tp_ok;
+        }
+        bool dit_ok = true;
+        if (has_dit) {
+            const int h = (tr.height > 0) ? tr.height : 512;
+            const int st = (tr.dit_steps > 0) ? tr.dit_steps : 20;
+            const double cap = (policy.dit_turn_slo_for(h, st, k_dit_opt) * cscale) / sp;
+            dit_ok = (tr.dit_ms.value_or(0.0) <= cap);
+        }
+        const bool j_ok = (!has_ar || ar_ok) && (!has_dit || dit_ok);
+        return {has_ar, has_dit, ar_ok, dit_ok, j_ok};
+    };
 
     int ships = 0;
     int morphs = 0;
@@ -2738,6 +2791,16 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     size_t core_ar_mean_ok = 0;
     size_t core_ar_strict_max_ok = 0;
     size_t core_dit_ok = 0;
+    size_t total_planned_turns = 0;
+    size_t total_completed_turns = 0;
+    size_t total_turn_joint_ok = 0;
+    size_t core_planned_turns = 0;
+    size_t core_completed_turns = 0;
+    size_t core_turn_joint_ok = 0;
+    size_t core_planned_ar_turns = 0;
+    size_t core_turn_ar_ok = 0;
+    size_t core_planned_dit_turns = 0;
+    size_t core_turn_dit_ok = 0;
     size_t ooms = 0;
     size_t joint_ok = 0;
     int total_retries = 0;
@@ -2745,6 +2808,32 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     for (size_t s = 0; s < n_sess; ++s) {
         total_retries += sess_retries[s];
         const bool core = (in_core[s] != 0);
+        const auto& s_spec = built_sessions[s];
+        const size_t s_planned = std::max<size_t>(s_spec.turns.size(), sess_turn_records[s].size());
+        size_t s_planned_ar = 0;
+        size_t s_planned_dit = 0;
+        for (const auto& tspec : s_spec.turns) {
+            if (tspec.modality_plan == "ar_only" || tspec.modality_plan == "cot_then_dit") ++s_planned_ar;
+            if (tspec.modality_plan != "ar_only") ++s_planned_dit;
+        }
+        total_planned_turns += s_planned;
+        if (core) {
+            core_planned_turns += s_planned;
+            core_planned_ar_turns += s_planned_ar;
+            core_planned_dit_turns += s_planned_dit;
+        }
+        for (const auto& tr : sess_turn_records[s]) {
+            const auto [h_ar, h_dit, t_ar_ok, t_dit_ok, t_j_ok] =
+                eval_sim_turn_slo(tr, ar_ttft_slo, ar_tpot_slo, std::nullopt);
+            if (tr.status == "ok") ++total_completed_turns;
+            if (t_j_ok) ++total_turn_joint_ok;
+            if (core) {
+                if (tr.status == "ok") ++core_completed_turns;
+                if (t_j_ok) ++core_turn_joint_ok;
+                if (h_ar && t_ar_ok) ++core_turn_ar_ok;
+                if (h_dit && t_dit_ok) ++core_turn_dit_ok;
+            }
+        }
         if (sess_oom[s]) {
             ++ooms;
             if (core) ++core_ooms;
@@ -2783,6 +2872,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 ++ta.total;
                 if (tr.status == "ok") {
                     ++ta.ok;
+                    const auto [h_ar2, h_dit2, t_ar2, t_dit2, t_j2] =
+                        eval_sim_turn_slo(tr, ar_ttft_slo, ar_tpot_slo, std::nullopt);
+                    (void)h_ar2;
+                    (void)h_dit2;
+                    (void)t_ar2;
+                    (void)t_dit2;
+                    if (t_j2) ++ta.slo_met;
                     if (tr.ar_ttft_ms.has_value()) ta.ttfts.push_back(*tr.ar_ttft_ms);
                     for (double tp : tr.ar_tpots_ms) ta.tpots.push_back(tp);
                     if (tr.dit_ms.has_value()) ta.dits.push_back(*tr.dit_ms);
@@ -2795,6 +2891,28 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     }
     const double att_frac = static_cast<double>(core_ok) / static_cast<double>(n_core);
     const double eff_slo_throughput_rps = round_4(offered_qps * att_frac);
+    const size_t n_core_turns = std::max<size_t>(1, core_planned_turns);
+    const size_t n_tot_turns = std::max<size_t>(1, total_planned_turns);
+    const double mean_turns_per_core =
+        (steady_sessions_cnt == 0)
+            ? 1.0
+            : (static_cast<double>(core_planned_turns) / static_cast<double>(steady_sessions_cnt));
+    const double steady_turn_att_frac = static_cast<double>(core_turn_joint_ok) / static_cast<double>(n_core_turns);
+    const double steady_turn_goodput_rps = round_4(offered_qps * steady_turn_att_frac);
+    const double steady_turn_goodput_tps = round_4(offered_qps * mean_turns_per_core * steady_turn_att_frac);
+    const double full_turn_att_frac = static_cast<double>(total_turn_joint_ok) / static_cast<double>(n_tot_turns);
+    const double steady_turn_surv_pct =
+        (core_planned_turns == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(core_completed_turns) / static_cast<double>(n_core_turns));
+    const double steady_turn_ar_pct =
+        (core_planned_ar_turns == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(core_turn_ar_ok) / static_cast<double>(core_planned_ar_turns));
+    const double steady_turn_dit_pct =
+        (core_planned_dit_turns == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(core_turn_dit_ok) / static_cast<double>(core_planned_dit_turns));
 
     nlohmann::json slo_curve_by_k = nlohmann::json::object();
     for (const auto& [k_lbl, k_val] : std::vector<std::pair<std::string, double>>{
@@ -2803,7 +2921,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         const double ttft_k = (slo_k.at("ar_ttft_slo_ms") * cscale) / sp;
         const double tpot_k = (slo_k.at("ar_tpot_slo_ms") * cscale) / sp;
         size_t k_ok_cnt = 0;
+        size_t k_t_ok = 0;
         for (size_t s : core_indices) {
+            for (const auto& tr : sess_turn_records[s]) {
+                const auto [ha, hd, aok, dok, tj] = eval_sim_turn_slo(tr, ttft_k, tpot_k, k_val);
+                (void)ha; (void)hd; (void)aok; (void)dok;
+                if (tj) ++k_t_ok;
+            }
             if (sess_oom[s]) continue;
             const SimArFlags k_ar_flags = eval_sim_ar_slos(
                 sess_ar_ttfts[s], sess_ar_tpots[s], sess_ar_turn_tpots[s], ttft_k, tpot_k);
@@ -2820,10 +2944,52 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         }
         const double k_frac = static_cast<double>(k_ok_cnt) / static_cast<double>(n_core);
         const double k_rps = round_4(offered_qps * k_frac);
+        const double kt_frac = static_cast<double>(k_t_ok) / static_cast<double>(n_core_turns);
         slo_curve_by_k[k_lbl] = {
             {"attainment_pct", round_1(100.0 * k_frac)},
             {"effective_slo_throughput_rps", k_rps},
             {"goodput_rps", k_rps},
+            {"turn_attainment_pct", round_1(100.0 * kt_frac)},
+            {"turn_goodput_rps", round_4(offered_qps * kt_frac)},
+        };
+    }
+
+    nlohmann::json slo_curve_by_dit_k = nlohmann::json::object();
+    for (const auto& [k_lbl, k_dit] : std::vector<std::pair<std::string, double>>{
+             {"2.0x", 2.0}, {"3.0x", 3.0}, {"4.0x", 4.0}}) {
+        size_t s_ok_cnt = 0;
+        size_t t_ok_cnt = 0;
+        for (size_t s : core_indices) {
+            for (const auto& tr : sess_turn_records[s]) {
+                const auto [ha, hd, aok, dok, tj] = eval_sim_turn_slo(tr, ar_ttft_slo, ar_tpot_slo, k_dit);
+                (void)ha; (void)hd; (void)aok; (void)dok;
+                if (tj) ++t_ok_cnt;
+            }
+            if (sess_oom[s]) continue;
+            const SimArFlags k_ar_flags = eval_sim_ar_slos(
+                sess_ar_ttfts[s], sess_ar_tpots[s], sess_ar_turn_tpots[s], ar_ttft_slo, ar_tpot_slo);
+            bool ok = select_sim_ar_slo(k_ar_flags, policy.ar_tpot_slo_mode);
+            if (ok) {
+                for (const auto& rec : sess_dit_records[s]) {
+                    if (rec.lat_ms > (policy.dit_turn_slo_for(rec.height, rec.steps, k_dit) * cscale) / sp) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (ok) ++s_ok_cnt;
+        }
+        const double s_frac = static_cast<double>(s_ok_cnt) / static_cast<double>(n_core);
+        const double t_frac = static_cast<double>(t_ok_cnt) / static_cast<double>(n_core_turns);
+        slo_curve_by_dit_k[k_lbl] = {
+            {"turn_attainment_pct", round_1(100.0 * t_frac)},
+            {"turn_goodput_rps", round_4(offered_qps * t_frac)},
+            {"session_attainment_pct", round_1(100.0 * s_frac)},
+            {"session_goodput_rps", round_4(offered_qps * s_frac)},
+            {"ar_ttft_slo_ms", round_2(ar_ttft_slo)},
+            {"ar_tpot_slo_ms", round_2(ar_tpot_slo)},
+            {"dit_512_slo_ms", round_2((policy.dit_turn_slo_for(512, 20, k_dit) * cscale) / sp)},
+            {"dit_1024_slo_ms", round_2((policy.dit_turn_slo_for(1024, 20, k_dit) * cscale) / sp)},
         };
     }
 
@@ -2876,10 +3042,14 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     for (const auto& [tidx, ta] : turn_accs) {
         const double t_surv =
             (ta.total == 0) ? 100.0 : round_1(100.0 * static_cast<double>(ta.ok) / static_cast<double>(ta.total));
+        const double t_slo_pct =
+            (ta.total == 0) ? 0.0 : round_1(100.0 * static_cast<double>(ta.slo_met) / static_cast<double>(ta.total));
         per_turn_stats["turn_" + std::to_string(tidx)] = {
             {"total", ta.total},
             {"ok", ta.ok},
             {"oom", ta.oom},
+            {"slo_met", ta.slo_met},
+            {"slo_attainment_pct", t_slo_pct},
             {"survival_pct", t_surv},
             {"ar_ttft_p95_ms", percentile_rounded(ta.ttfts, 95.0)},
             {"ar_tpot_p95_ms", percentile_rounded(ta.tpots, 95.0)},
@@ -2888,6 +3058,19 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             {"kv_mib_p95", percentile_rounded(ta.kv_mibs, 95.0)},
         };
     }
+
+    const nlohmann::json slo_config = {
+        {"k_ar", policy.slo_scale_k},
+        {"k_dit", policy.dit_slo_scale_k},
+        {"ar_ttft_slo_ms", round_2(ar_ttft_slo)},
+        {"ar_tpot_slo_ms", round_2(ar_tpot_slo)},
+        {"ar_tpot_slo_mode", policy.ar_tpot_slo_mode},
+        {"dit_512_slo_ms", round_2((policy.dit_turn_slo_for(512, 20) * cscale) / sp)},
+        {"dit_1024_slo_ms", round_2((policy.dit_turn_slo_for(1024, 20) * cscale) / sp)},
+        {"cot_dit_decoupled", true},
+        {"primary_granularity", "turn_level"},
+        {"turn_oom_accounting", "planned_turns_denominator"},
+    };
 
     return {
         {"policy_name", policy_name},
@@ -2903,6 +3086,18 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"steady_state_sessions", steady_sessions_cnt},
         {"steady_state_survival_pct", steady_survival_pct},
         {"steady_oom_sessions", core_ooms},
+        {"total_planned_turns", total_planned_turns},
+        {"completed_turns", total_completed_turns},
+        {"turn_slo_attainment_pct", round_1(100.0 * full_turn_att_frac)},
+        {"turn_slo_goodput_rps", round_4(offered_qps * full_turn_att_frac)},
+        {"steady_planned_turns", core_planned_turns},
+        {"steady_completed_turns", core_completed_turns},
+        {"steady_turn_survival_pct", steady_turn_surv_pct},
+        {"steady_turn_slo_attainment_pct", round_1(100.0 * steady_turn_att_frac)},
+        {"steady_turn_ar_slo_attainment_pct", steady_turn_ar_pct},
+        {"steady_turn_dit_slo_attainment_pct", steady_turn_dit_pct},
+        {"steady_turn_slo_goodput_rps", steady_turn_goodput_rps},
+        {"steady_turn_goodput_tps", steady_turn_goodput_tps},
         {"effective_slo_throughput_rps", eff_slo_throughput_rps},
         {"steady_state_goodput_rps", eff_slo_throughput_rps},
         {"joint_slo_goodput_rps", eff_slo_throughput_rps},
@@ -2956,7 +3151,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"path_b_morphs", morphs},
         {"preempted_ar_count", preemptions},
         {"cross_node_ships", cross_node_ships},
+        {"slo_config", slo_config},
         {"slo_curve_by_k", slo_curve_by_k},
+        {"slo_curve_by_dit_k", slo_curve_by_dit_k},
         {"per_turn_stats", per_turn_stats},
     };
 }
@@ -3010,7 +3207,9 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
                 8};
         }
         nlohmann::json ref_ov = nlohmann::json::object();
-        for (const char* opt_k : {"inter_turn_think_s_range",
+        for (const char* opt_k : {"slo_scale_k",
+                                  "dit_slo_scale_k",
+                                  "inter_turn_think_s_range",
                                   "think_time_dist",
                                   "think_time_median_s",
                                   "think_time_sigma",
@@ -3022,6 +3221,18 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
             if (ref.contains(opt_k) && !ref[opt_k].is_null()) {
                 ref_ov[opt_k] = ref[opt_k];
             }
+        }
+        if (ref.contains("slo_config") && ref["slo_config"].is_object()) {
+            const auto& sc = ref["slo_config"];
+            if (sc.contains("k_ar") && sc["k_ar"].is_number() && !ref_ov.contains("slo_scale_k")) {
+                ref_ov["slo_scale_k"] = sc["k_ar"];
+            }
+            if (sc.contains("k_dit") && sc["k_dit"].is_number() && !ref_ov.contains("dit_slo_scale_k")) {
+                ref_ov["dit_slo_scale_k"] = sc["k_dit"];
+            }
+        } else if (!ref_ov.contains("dit_slo_scale_k") && !ref.contains("steady_turn_slo_goodput_rps")) {
+            // Legacy v1 live reports evaluated DiT against uniform `k=2.0`.
+            ref_ov["dit_slo_scale_k"] = 2.0;
         }
         const auto sim = simulate_cluster_point(
             pol,
@@ -3040,9 +3251,13 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
 
         double real_gp = 0.0;
         double sim_gp = 0.0;
-        if (ref.contains("effective_slo_throughput_rps") && ref["effective_slo_throughput_rps"].is_number() &&
-            ref["effective_slo_throughput_rps"].get<double>() > 0.0 &&
-            ref.value("steady_state_window_mode", "") == "time") {
+        if (ref.contains("steady_turn_slo_goodput_rps") && ref["steady_turn_slo_goodput_rps"].is_number() &&
+            ref["steady_turn_slo_goodput_rps"].get<double>() > 0.0) {
+            real_gp = ref["steady_turn_slo_goodput_rps"].get<double>();
+            sim_gp = sim.at("steady_turn_slo_goodput_rps").get<double>();
+        } else if (ref.contains("effective_slo_throughput_rps") && ref["effective_slo_throughput_rps"].is_number() &&
+                   ref["effective_slo_throughput_rps"].get<double>() > 0.0 &&
+                   ref.value("steady_state_window_mode", "") == "time") {
             real_gp = ref["effective_slo_throughput_rps"].get<double>();
             sim_gp = sim.at("effective_slo_throughput_rps").get<double>();
         } else if (ref.contains("joint_slo_goodput_rps") && ref["joint_slo_goodput_rps"].is_number() &&

@@ -48,7 +48,7 @@ double PolicyConfig::dit_turn_slo_for(
     if (dit_turn_slo_override_ms.has_value() && !k_opt.has_value()) {
         return *dit_turn_slo_override_ms;
     }
-    const double eff_k = k_opt.has_value() ? *k_opt : slo_scale_k;
+    const double eff_k = k_opt.has_value() ? *k_opt : dit_slo_scale_k;
     const std::string fam = (model_family == "internvl_u") ? "internvl_u" : "bagel";
     return default_operator_profile().dit_turn_slo_ms(height, eff_k, fam, steps);
 }
@@ -79,6 +79,7 @@ nlohmann::json PolicyConfig::to_json() const {
         {"static_gen_ranks", static_gen_ranks},
         {"initial_alphas", alphas},
         {"slo_scale_k", slo_scale_k},
+        {"dit_slo_scale_k", dit_slo_scale_k},
         {"ar_tpot_slo_ms", ar_tpot_slo_ms},
         {"ar_ttft_slo_ms", ar_ttft_slo_ms},
         {"dit_512_slo_ms", dit_512_slo_ms},
@@ -138,6 +139,7 @@ static void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
                 cfg.initial_alphas[std::stoi(ait.key())] = ait.value().get<double>();
             }
         } else if (k == "slo_scale_k") cfg.slo_scale_k = v.get<double>();
+        else if (k == "dit_slo_scale_k") cfg.dit_slo_scale_k = v.get<double>();
         else if (k == "ar_tpot_slo_ms") cfg.ar_tpot_slo_ms = v.get<double>();
         else if (k == "ar_ttft_slo_ms") cfg.ar_ttft_slo_ms = v.get<double>();
         else if (k == "dit_512_slo_ms") cfg.dit_512_slo_ms = v.get<double>();
@@ -194,12 +196,16 @@ PolicyConfig PolicyConfig::from_preset(
         (overrides.contains("model_family") && overrides["model_family"].is_string())
             ? overrides["model_family"].get<std::string>()
             : "bagel";
-    const double k_val =
-        (overrides.contains("slo_scale_k") && overrides["slo_scale_k"].is_number())
-            ? overrides["slo_scale_k"].get<double>()
-            : 2.0;
-    const auto slo_map =
-        default_operator_profile().slo_thresholds_ms(k_val, (fam == "internvl_u") ? "internvl_u" : "bagel");
+    const bool has_k_override =
+        overrides.contains("slo_scale_k") && overrides["slo_scale_k"].is_number();
+    const double k_val = has_k_override ? overrides["slo_scale_k"].get<double>() : 2.0;
+    const double k_dit_val =
+        (overrides.contains("dit_slo_scale_k") && overrides["dit_slo_scale_k"].is_number())
+            ? overrides["dit_slo_scale_k"].get<double>()
+            : (has_k_override ? k_val : 3.0);
+    const std::string eff_fam = (fam == "internvl_u") ? "internvl_u" : "bagel";
+    const auto ar_slo_map = default_operator_profile().slo_thresholds_ms(k_val, eff_fam);
+    const auto dit_slo_map = default_operator_profile().slo_thresholds_ms(k_dit_val, eff_fam);
     const std::pair<double, double> think_default =
         (fam == "synthetic") ? std::make_pair(0.002, 0.005) : std::make_pair(2.0, 25.0);
 
@@ -209,10 +215,11 @@ PolicyConfig PolicyConfig::from_preset(
     cfg.model_family = fam;
     cfg.allow_cascade_cfg_split = false;
     cfg.slo_scale_k = k_val;
-    cfg.ar_tpot_slo_ms = slo_map.at("ar_tpot_slo_ms");
-    cfg.ar_ttft_slo_ms = slo_map.at("ar_ttft_slo_ms");
-    cfg.dit_512_slo_ms = slo_map.at("dit_512_slo_ms");
-    cfg.dit_1024_slo_ms = slo_map.at("dit_1024_slo_ms");
+    cfg.dit_slo_scale_k = k_dit_val;
+    cfg.ar_tpot_slo_ms = ar_slo_map.at("ar_tpot_slo_ms");
+    cfg.ar_ttft_slo_ms = ar_slo_map.at("ar_ttft_slo_ms");
+    cfg.dit_512_slo_ms = dit_slo_map.at("dit_512_slo_ms");
+    cfg.dit_1024_slo_ms = dit_slo_map.at("dit_1024_slo_ms");
     cfg.inter_turn_think_s_range = think_default;
     cfg.think_time_dist = (fam == "synthetic") ? "uniform" : "lognormal";
     cfg.think_time_median_s = (fam == "synthetic") ? 0.003 : 6.0;

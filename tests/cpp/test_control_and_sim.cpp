@@ -417,12 +417,122 @@ void test_v2_policy_think_slo_and_steady_window() {
     MS_CHECK(rep.at("time_series_10s").is_array() && rep.at("time_series_10s").size() >= 6);
 }
 
+void test_d1_d5_multiturn_slo_contract_and_cot_decoupling() {
+    // D4: Default preset decouples k_AR=2.0 (1500ms / 125.64ms) and k_DiT=3.0 (18360ms / 65160ms BAGEL; 9750ms / 21900ms InternVL-U)
+    const PolicyConfig pol_bagel = PolicyConfig::from_preset("morphserve", 8);
+    MS_CHECK(std::abs(pol_bagel.slo_scale_k - 2.0) < 1e-9);
+    MS_CHECK(std::abs(pol_bagel.dit_slo_scale_k - 3.0) < 1e-9);
+    MS_CHECK(std::abs(pol_bagel.ar_ttft_slo_ms - 1500.0) < 1e-6);
+    MS_CHECK(std::abs(pol_bagel.ar_tpot_slo_ms - 125.64) < 1e-6);
+    MS_CHECK(std::abs(pol_bagel.dit_512_slo_ms - 18360.0) < 1e-6);
+    MS_CHECK(std::abs(pol_bagel.dit_1024_slo_ms - 65160.0) < 1e-6);
+    MS_CHECK(std::abs(pol_bagel.dit_turn_slo_for(512, 20) - 18360.0) < 1e-6);
+    MS_CHECK(std::abs(pol_bagel.dit_turn_slo_for(1024, 20) - 65160.0) < 1e-6);
+
+    const PolicyConfig pol_ivl = PolicyConfig::from_preset("morphserve", 8, {{"model_family", "internvl_u"}});
+    MS_CHECK(std::abs(pol_ivl.dit_slo_scale_k - 3.0) < 1e-9);
+    MS_CHECK(std::abs(pol_ivl.dit_512_slo_ms - 9750.0) < 1e-6);
+    MS_CHECK(std::abs(pol_ivl.dit_1024_slo_ms - 21900.0) < 1e-6);
+
+    // D1 + D2 + D4 + D5: Two 4-turn steady sessions (`planned_turns=4` each => 8 planned turns):
+    // - Session A (`ok`): T0 ar_only ok, T1 cot_then_dit ok at 3.0x (dit=15000ms > 12240ms@2.0x, <= 18360ms@3.0x),
+    //   T2 ar_only ok, T3 dit_edit late at 3.0x (dit=20000ms > 18360ms@3.0x, <= 24480ms@4.0x).
+    //   => Session A has 3/4 turns met at 3.0x, 2/4 at 2.0x, 4/4 at 4.0x; session_ok = false at 3.0x, true at 4.0x!
+    // - Session B (`oom` at T1): T0 ar_only met SLO, T1 dit_edit OOM, T2 & T3 unexecuted!
+    //   => D2 planned-turns denominator: 1/4 turns met (T0=1, T1..T3=miss), session_ok = false, steady_oom = 1!
+    // Combined over 8 planned turns at k_DiT=3.0: 4/8 = 50.0% turn SLO, 0/2 = 0.0% session SLO, 50.0% session survival, 5/8 = 62.5% turn survival!
+    nlohmann::json out_a = {
+        {"session_id", "s_a"},
+        {"quadrant", "interleaved_co_creation"},
+        {"arrival_offset_s", 80.0},
+        {"status", "ok"},
+        {"e2e_ms", 42000.0},
+        {"active_jct_ms", 36000.0},
+        {"think_time_ms", 6000.0},
+        {"planned_turns", 4},
+        {"planned_ar_turns", 3},
+        {"planned_dit_turns", 2},
+        {"ar_ttfts_ms", nlohmann::json::array({300.0, 400.0, 350.0})},
+        {"ar_tpots_ms", nlohmann::json::array({55.0, 60.0, 58.0})},
+        {"ar_turn_tpots_ms", nlohmann::json::array({{55.0}, {60.0}, {58.0}})},
+        {"dit_turns_ms", nlohmann::json::array({15000.0, 20000.0})},
+        {"dit_turn_heights", nlohmann::json::array({512, 512})},
+        {"dit_turn_steps", nlohmann::json::array({20, 20})},
+        {"ar_slo_met", true},
+        {"dit_slo_met", false},
+        {"joint_slo_met", false},
+        {"turn_records",
+         nlohmann::json::array({
+             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 300.0}, {"ar_tpot_p95_ms", 55.0}, {"height", 0}, {"dit_steps", 0}},
+             {{"turn_idx", 1}, {"modality_plan", "cot_then_dit"}, {"status", "ok"}, {"ar_ttft_ms", 400.0}, {"ar_tpot_p95_ms", 60.0}, {"dit_ms", 15000.0}, {"height", 512}, {"dit_steps", 20}},
+             {{"turn_idx", 2}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 350.0}, {"ar_tpot_p95_ms", 58.0}, {"height", 0}, {"dit_steps", 0}},
+             {{"turn_idx", 3}, {"modality_plan", "dit_edit"}, {"status", "ok"}, {"dit_ms", 20000.0}, {"height", 512}, {"dit_steps", 20}},
+         })},
+    };
+    nlohmann::json out_b = {
+        {"session_id", "s_b"},
+        {"quadrant", "interleaved_co_creation"},
+        {"arrival_offset_s", 120.0},
+        {"status", "oom"},
+        {"e2e_ms", 5000.0},
+        {"active_jct_ms", 5000.0},
+        {"think_time_ms", 0.0},
+        {"planned_turns", 4},
+        {"planned_ar_turns", 2},
+        {"planned_dit_turns", 2},
+        {"ar_ttfts_ms", nlohmann::json::array({250.0})},
+        {"ar_tpots_ms", nlohmann::json::array({50.0})},
+        {"dit_turns_ms", nlohmann::json::array()},
+        {"ar_slo_met", false},
+        {"dit_slo_met", false},
+        {"joint_slo_met", false},
+        {"turn_records",
+         nlohmann::json::array({
+             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 250.0}, {"ar_tpot_p95_ms", 50.0}, {"height", 0}, {"dit_steps", 0}},
+             {{"turn_idx", 1}, {"modality_plan", "dit_edit"}, {"status", "oom"}, {"height", 512}, {"dit_steps", 20}},
+         })},
+    };
+    const auto rep = MorphControlEngine::aggregate_cluster_run_report(
+        pol_bagel, "unit_d1_d5_multiturn", 0.5, 200.0, 0.1, nlohmann::json::array({out_a, out_b}), nlohmann::json::array());
+
+    MS_CHECK(rep.at("steady_planned_turns").get<int>() == 8);
+    MS_CHECK(rep.at("steady_completed_turns").get<int>() == 5);
+    MS_CHECK(std::abs(rep.at("steady_turn_survival_pct").get<double>() - 62.5) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_turn_slo_attainment_pct").get<double>() - 50.0) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_turn_ar_slo_attainment_pct").get<double>() - 80.0) < 1e-6);   // 4/5 AR turns
+    MS_CHECK(std::abs(rep.at("steady_turn_dit_slo_attainment_pct").get<double>() - 25.0) < 1e-6);  // 1/4 DiT turns
+    MS_CHECK(std::abs(rep.at("steady_state_attainment_pct").get<double>() - 0.0) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_state_survival_pct").get<double>() - 50.0) < 1e-6);
+    MS_CHECK(rep.at("slo_config").at("k_ar").get<double>() == 2.0);
+    MS_CHECK(rep.at("slo_config").at("k_dit").get<double>() == 3.0);
+    MS_CHECK(rep.at("slo_config").at("cot_dit_decoupled").get<bool>() == true);
+    MS_CHECK(rep.at("slo_config").at("primary_granularity").get<std::string>() == "turn_level");
+    const auto& by_dk = rep.at("slo_curve_by_dit_k");
+    MS_CHECK(std::abs(by_dk.at("2.0x").at("turn_attainment_pct").get<double>() - 37.5) < 1e-6);  // 3/8 (A:T0,T2 + B:T0)
+    MS_CHECK(std::abs(by_dk.at("3.0x").at("turn_attainment_pct").get<double>() - 50.0) < 1e-6);  // 4/8 (+ A:T1)
+    MS_CHECK(std::abs(by_dk.at("4.0x").at("turn_attainment_pct").get<double>() - 62.5) < 1e-6);  // 5/8 (+ A:T3)
+    MS_CHECK(std::abs(by_dk.at("4.0x").at("session_attainment_pct").get<double>() - 50.0) < 1e-6);  // A passes at 4.0x
+
+    // D3 in C++17 Simulator: `cot_then_dit` solo 512px turn must measure DiT latency strictly AFTER AR CoT finishes (~5-6s, NOT ~8-9s!)
+    const auto ph = ClusterPhysicsProfile::defaults();
+    const auto hw0 = HardwareInterconnectSpec::presets(&ph)[0];
+    std::vector<SimSessionSpec> cot_solo = {
+        {0, 0.0, "visual_cot_highres", {{"cot_then_dit", 512, 20, 48, 0, false}}, "solo_cot_0", "main"},
+    };
+    const auto sim_rep = ClusterSimulator::simulate_cluster_point(
+        "morphserve", 8, hw0, 0.1, 1, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &cot_solo);
+    MS_CHECK(sim_rep.at("dit_turn_p50_ms").get<double>() < 6500.0);
+    MS_CHECK(std::abs(sim_rep.at("steady_turn_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
+    MS_CHECK(sim_rep.contains("slo_curve_by_dit_k") && sim_rep.at("slo_curve_by_dit_k").contains("3.0x"));
+}
+
 }  // namespace
 
 int main() {
     test_router_edf_and_budget_planner();
     test_physics_ledger_and_simulator();
     test_v2_policy_think_slo_and_steady_window();
+    test_d1_d5_multiturn_slo_contract_and_cot_decoupling();
     std::cout << "[PASS] test_control_and_sim\n";
     return 0;
 }

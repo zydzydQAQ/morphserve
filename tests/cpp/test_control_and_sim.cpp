@@ -515,7 +515,7 @@ void test_d1_d5_multiturn_slo_contract_and_cot_decoupling() {
     MS_CHECK(std::abs(by_dk.at("4.0x").at("session_attainment_pct").get<double>() - 50.0) < 1e-6);  // A passes at 4.0x
 
     // D3 in C++17 Simulator: `cot_then_dit` solo 512px turn must measure DiT latency strictly AFTER AR CoT finishes (~5-6s, NOT ~8-9s!)
-    const auto ph = ClusterPhysicsProfile::defaults();
+    const ClusterPhysicsProfile ph{};
     const auto hw0 = HardwareInterconnectSpec::presets(&ph)[0];
     std::vector<SimSessionSpec> cot_solo = {
         {0.0, "visual_cot_highres", {{"cot_then_dit", 512, 20, 48, 0, false}}, "solo_cot_0", "main"},

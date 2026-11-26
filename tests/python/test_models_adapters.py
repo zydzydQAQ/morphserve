@@ -15,13 +15,13 @@ from morphserve.models import (
     InternVLUCPTGAdapter,
     SyntheticCPTGAdapter,
     SyntheticOutOfMemoryError,
-    VmmOutOfMemoryError,
     is_oom_exception,
 )
 from morphserve.vmm import (
     ExpertPartitionSpec,
     NaiveHostOffloader,
     StaticFissionDropper,
+    VmmOutOfMemoryError,
 )
 
 

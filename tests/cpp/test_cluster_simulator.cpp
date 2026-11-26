@@ -157,7 +157,7 @@ void test_static_fission_multiturn_and_asymmetric_splits() {
         {2000.0, "visual_cot", {{"cot_then_dit", 512, 20, 48, 0, false}}, "mix_2", "main"},
         {3000.0, "multiturn_edit", {{"dit_edit", 512, 20, 48, 1, false}, {"dit_edit", 512, 20, 48, 0, false}}, "mix_3", "main"},
     };
-    for (const std::string& preset : {"static_2und_6gen", "static_6und_2gen"}) {
+    for (const char* preset : {"static_2und_6gen", "static_6und_2gen"}) {
         const auto rep = ClusterSimulator::simulate_cluster_point(
             preset, 8, hw8, 0.4, 4, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &mixed);
         MS_CHECK(rep.at("status").get<std::string>() == "ok");

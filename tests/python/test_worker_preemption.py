@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from morphserve.models import VmmOutOfMemoryError
+from morphserve.vmm import VmmOutOfMemoryError
 from morphserve.worker import (
     ArDecodeTask,
     BagelExecutionInterceptor,

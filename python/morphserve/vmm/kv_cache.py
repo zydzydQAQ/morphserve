@@ -1228,9 +1228,10 @@ class VmmNaiveCache:
 
     def _store_layer_tensor(self, kind: str, layer_idx: int, tensor: Any, prev_view: Any | None) -> Any:
         key = (kind, layer_idx)
-        if getattr(tensor, "_vmm_external_ro", False):
-            owner_ref = getattr(tensor, "_vmm_owner_ref", None)
-            if owner_ref is not None and owner_ref() is not self:
+        owner_ref = getattr(tensor, "_vmm_owner_ref", None)
+        foreign_owner = owner_ref() if owner_ref is not None else None
+        if getattr(tensor, "_vmm_external_ro", False) or (foreign_owner is not None and foreign_owner is not self):
+            if foreign_owner is not None and foreign_owner is not self:
                 self._cow_parent_ref = owner_ref
             self._lengths[key] = int(tensor.shape[0])
             return tensor

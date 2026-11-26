@@ -877,7 +877,7 @@ class NaiveHostOffloader:
         for p, cpu_t in self._cpu_shadows:
             if p.numel() == 0:
                 p.data = cpu_t.to(self.device)
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
             torch.cuda.synchronize(self.device)
         self._resident_on_gpu = True
         return True

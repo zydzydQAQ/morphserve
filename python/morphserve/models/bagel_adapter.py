@@ -993,7 +993,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             return vmm_avail
 
         if not is_cuda:
-            return 0
+            live_b = sum(s.logical_bytes() for s in self._ctx_store.values() if not s.is_swapped)
+            return max(0, 16 * GIB - live_b)
         free_drv, total_drv = torch.cuda.mem_get_info(self.device)
         if getattr(self.policy, "gpu_memory_fraction", None) is not None:
             quota_b = int(total_drv * float(self.policy.gpu_memory_fraction))

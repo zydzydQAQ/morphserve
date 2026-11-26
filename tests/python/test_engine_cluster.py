@@ -243,7 +243,7 @@ def test_topology_defaults_and_router_operator_profile_readonly_and_telemetry_se
     assert topo_16.same_node(0, 7) is True
     assert topo_16.same_node(0, 8) is False
     # Inter-node default bandwidth must be canonical 11.5 GB/s (no 1.15 GB/s drift).
-    assert topo_16.p2p_bw(0, 8) >= 10.0
+    assert topo_16.effective_p2p_gbps(0, 8) >= 10.0
 
     # Custom OperatorLatencyProfile must be honored by C++ DualPathMorphRouter!
     op_heavy = replace(op_default, bagel_expert_bytes=op_default.bagel_expert_bytes * 2)
@@ -327,7 +327,7 @@ def test_peer_byte_transport_bidirectional_inmemory_and_tcp() -> None:
 
     # 1. InMemoryByteBus + InMemoryPeerMesh bidirectional exchange + SHM put/pop
     bus = InMemoryByteBus(world_size=2)
-    with InMemoryPeerMesh(bus, 0, 2) as ep0, InMemoryPeerMesh(bus, 1, 2) as ep1:
+    with InMemoryPeerMesh(bus, 0) as ep0, InMemoryPeerMesh(bus, 1) as ep1:
         got: dict[str, bytes] = {}
 
         def _r0() -> None:
@@ -405,7 +405,7 @@ def test_worker_runtime_step_once_batching_and_clock_skew_immunity() -> None:
     pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic")
     adapter = SyntheticCPTGAdapter(rank=0, policy=pol)
     bus = InMemoryByteBus(world_size=1)
-    mesh = InMemoryPeerMesh(bus, rank=0, world_size=1)
+    mesh = InMemoryPeerMesh(bus, rank=0)
     acks: list[dict[str, Any]] = []
     rt = WorkerRuntime(rank=0, adapter=adapter, mesh=mesh, on_ack=acks.append, inmem_bus=bus)
     try:
@@ -506,13 +506,12 @@ def test_cluster_engine_oom_retry_and_exhaustion(tmp_path: Path) -> None:
     pol = EnginePolicyConfig.from_preset(
         "morphserve", num_gpus=2, model_family="synthetic", inter_turn_think_s_range=(0.0, 0.0)
     )
-    # 1. Rank 0 OOMs on "oom_trigger" while rank 1 succeeds -> session recovers via OOM retry!
+    # 1. Rank 0 OOMs transiently while rank 1 succeeds -> session recovers via OOM retry!
     fleet_recover = InProcessWorkerFleet(
         pol,
         adapter_factory=lambda rank, policy: SyntheticCPTGAdapter(
             rank=rank,
             policy=policy,
-            oom_prompts=("oom_trigger",),
             oom_ranks=(0,),
         ),
     )

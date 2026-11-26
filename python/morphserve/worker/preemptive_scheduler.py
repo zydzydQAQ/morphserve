@@ -273,7 +273,7 @@ class UnifiedPreemptiveScheduler:
     def interceptor(self) -> BagelExecutionInterceptor:
         return BagelExecutionInterceptor.for_pipeline(self.pipeline)
 
-    def begin_session_clock(self) -> None:
+    def begin_session_clock(self) -> float:
         now = time.perf_counter()
         self._run_t0_s = now
         self._last_sync_s = now
@@ -287,6 +287,7 @@ class UnifiedPreemptiveScheduler:
                 streaming = int(self.pager.vmm.expert_resident_count(self.pager.expert_id)) < int(self.pager.num_layers)
         self._step0_h2d_streaming = streaming
         self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
+        return now
 
     def schedule_ar_arrival(self, offset_ms: float, task: ArDecodeTask) -> None:
         """Register an AR decode task to arrive `offset_ms` after the mixed run starts."""

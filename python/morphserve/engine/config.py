@@ -162,6 +162,11 @@ class EnginePolicyConfig:
         """Serialize to compact UTF-8 JSON matching C++ `PolicyConfig::from_json`."""
         return json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
 
+    @classmethod
+    def from_json(cls, raw: str) -> "EnginePolicyConfig":
+        """Deserialize from UTF-8 JSON produced by `to_json()` or C++ `PolicyConfig::to_json()`."""
+        return cls.from_dict(json.loads(raw))
+
     def with_overrides(self, **overrides: Any) -> "EnginePolicyConfig":
         """Return a new `EnginePolicyConfig` with field overrides applied without mutating `self`."""
         if not overrides:

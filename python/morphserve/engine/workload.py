@@ -112,9 +112,11 @@ def hamilton_apportion(
 ) -> dict[str, int]:
     """Apportion `total` integer slots across `weights` using the largest-remainder (Hamilton) method."""
     keys = list(weights.keys())
+    if int(total) < 0:
+        raise ValueError(f"hamilton_apportion requires total >= 0, got {total}")
     if not keys:
         return {}
-    n_total = max(0, int(total))
+    n_total = int(total)
     pos_weights = {k: max(0.0, float(weights[k])) for k in keys}
     w_sum = sum(pos_weights.values())
     if n_total == 0 or w_sum <= 0.0:

@@ -257,7 +257,7 @@ def evaluate_cross_node_routing_check(
         g: WorkerState(
             gpu_id=g,
             role="hybrid" if g == 0 else "gen",
-            expert_alpha=0.50 if g == 0 else 1.0,
+            expert_alpha=0.0 if g == 0 else 1.0,
             queue_wait_ms=0.0 if g in (0, gpus_per_node) else 4500.0,
             kv_free_bytes=20 * GIB,
         )

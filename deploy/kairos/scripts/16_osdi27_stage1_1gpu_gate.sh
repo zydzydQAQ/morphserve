@@ -13,6 +13,7 @@ set -euo pipefail
 
 # Enforce Stage-1 < 80% /shared cap even during any lazy build inside morphserve_common.sh.
 export KAIROS_MAX_PERCENT="${KAIROS_MAX_PERCENT:-80}"
+export KAIROS_BUILD_CMD="${KAIROS_BUILD_CMD:-bash \"\$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"}"
 
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
 

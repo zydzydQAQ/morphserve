@@ -1,0 +1,764 @@
+"""Seam tests for `MorphServeClusterEngine`, `WorkerFleet`, `DualPathMorphRouter`, `PeerByteTransport`, `EnginePolicyConfig`, and `ClusterSimulator`."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+import threading
+import time
+from typing import Any
+
+import pytest
+
+from morphserve.engine import (
+    ClusterRunReport,
+    EnginePolicyConfig,
+    InProcessWorkerFleet,
+    InterleavedSession,
+    InterleavedTurn,
+    LocalNodeWorkerHost,
+    MorphServeClusterEngine,
+    MultinodeCoordinatorHub,
+    RunWindowOptions,
+    STATIC_SPLIT_POLICIES,
+    TcpMultinodeWorkerFleet,
+    VALID_POLICIES,
+    WorkerBudgetPlanner,
+    WorkerFleet,
+    WorkerRuntime,
+    WorkloadSuite,
+    build_ablation_configs,
+    build_static_split_configs,
+    hamilton_apportion,
+    run_multinode_worker_daemon,
+)
+from morphserve.models import SyntheticCPTGAdapter
+from morphserve.router import (
+    CPTGRequestSpec,
+    ClusterTopologyProfile,
+    DualPathMorphRouter,
+    OperatorLatencyProfile,
+    WorkerState,
+    default_operator_profile,
+    default_topology_for,
+)
+from morphserve.runtime import (
+    InMemoryByteBus,
+    InMemoryPeerMesh,
+    TcpByteMesh,
+    find_free_tcp_port,
+)
+from morphserve.sim import (
+    HardwareInterconnectSpec,
+    MeasuredPhysicsProfile,
+    SimGpuMemoryLedger,
+    WorkloadScaleSpec,
+    simulate_cluster_point,
+)
+
+
+def _make_multiturn_suite(name: str = "unit_multiturn") -> WorkloadSuite:
+    return WorkloadSuite(
+        name=name,
+        trace_source="unit_synthetic",
+        base_qps=2.0,
+        sessions=[
+            InterleavedSession(
+                session_id="sess_interleaved_0",
+                quadrant="interleaved_co_creation",
+                source_dataset="unit",
+                arrival_offset_s=0.0,
+                turns=[
+                    InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="plan alpine cabin", max_ar_tokens=4),
+                    InterleavedTurn(turn_idx=1, modality_plan="dit_t2i", prompt="alpine cabin", height=512, width=512, dit_steps=2),
+                    InterleavedTurn(
+                        turn_idx=2,
+                        modality_plan="ar_only",
+                        prompt="inspect cabin",
+                        max_ar_tokens=4,
+                        use_prev_image=True,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3,
+                        modality_plan="dit_edit",
+                        prompt="add warm lantern",
+                        height=512,
+                        width=512,
+                        dit_steps=2,
+                        use_prev_image=True,
+                    ),
+                ],
+            ),
+            InterleavedSession(
+                session_id="sess_vqa_1",
+                quadrant="multi_image_vqa",
+                source_dataset="unit",
+                arrival_offset_s=0.02,
+                turns=[
+                    InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="describe scene", max_ar_tokens=4),
+                    InterleavedTurn(turn_idx=1, modality_plan="ar_only", prompt="follow up question", max_ar_tokens=4),
+                ],
+            ),
+            InterleavedSession(
+                session_id="sess_cot_2",
+                quadrant="visual_cot_highres",
+                source_dataset="unit",
+                arrival_offset_s=0.04,
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="cot_then_dit",
+                        prompt="reason and draw lighthouse",
+                        max_ar_tokens=4,
+                        height=1024,
+                        width=1024,
+                        dit_steps=2,
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+# ==================== 1. Policy Config, RunWindowOptions, BudgetPlanner & Apportionment ====================
+
+
+def test_policy_config_presets_serialization_ablations_and_run_window_options(tmp_path: Path) -> None:
+    for pname in VALID_POLICIES + STATIC_SPLIT_POLICIES:
+        cfg = EnginePolicyConfig.from_preset(pname, num_gpus=8)
+        assert cfg.policy_name == pname
+        rebuilt = EnginePolicyConfig.from_dict(cfg.to_dict())
+        assert rebuilt == cfg
+        rebuilt_json = EnginePolicyConfig.from_json(cfg.to_json())
+        assert rebuilt_json == cfg
+
+    ablations = dict(build_ablation_configs(num_gpus=8))
+    assert set(ablations) == {
+        "full_morphserve",
+        "no_m4_layer_chunk",
+        "no_m3_cow_loopback",
+        "no_m2_dual_path",
+        "no_m1_tripool_vmm",
+    }
+    assert ablations["full_morphserve"].use_tripool_vmm is True
+    assert ablations["no_m1_tripool_vmm"].use_tripool_vmm is False
+    assert ablations["no_m3_cow_loopback"].use_module3_cow_loopback is False
+    assert ablations["no_m4_layer_chunk"].preemption_mode != "layer_chunk"
+
+    splits = dict(build_static_split_configs(num_gpus=8))
+    assert len(splits["static_2und_6gen"].static_und_ranks) == 2
+    assert len(splits["static_2und_6gen"].static_gen_ranks) == 6
+    assert len(splits["static_6und_2gen"].static_und_ranks) == 6
+    assert len(splits["static_6und_2gen"].static_gen_ranks) == 2
+
+    # RunWindowOptions must return a modified copy without mutating the source policy.
+    base = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
+    orig_ttft = base.ar_ttft_slo_ms
+    orig_warmup = base.warmup_window_s
+    opts = RunWindowOptions(
+        inter_turn_think_s_range=(0.5, 2.5),
+        think_time_dist="uniform",
+        steady_window_mode="time",
+        warmup_window_s=15.0,
+        steady_window_s=60.0,
+        slo_scale_k=4.0,
+        dit_slo_scale_k=6.0,
+        ar_tpot_slo_mode="turn_mean",
+    )
+    eff = opts.apply_to_policy(base)
+    assert base.ar_ttft_slo_ms == orig_ttft
+    assert base.warmup_window_s == orig_warmup
+    assert eff.inter_turn_think_s_range == (0.5, 2.5)
+    assert eff.think_time_dist == "uniform"
+    assert eff.steady_window_mode == "time"
+    assert eff.warmup_window_s == 15.0
+    assert eff.steady_window_s == 60.0
+    assert eff.ar_tpot_slo_mode == "turn_mean"
+    assert eff.slo_scale_k == 4.0
+    assert eff.dit_slo_scale_k == 6.0
+    assert eff.ar_ttft_slo_ms > orig_ttft or eff.ar_ttft_slo_ms != orig_ttft
+
+    # Public WorkerBudgetPlanner seam
+    plan = WorkerBudgetPlanner.compute_internvlu_memory_plan(
+        total_dev_mib=40960.0,
+        free_dev_mib=36000.0,
+        base_pytorch_alloc_mib=4200.0,
+        mirror_bytes=4 * (1024**3),
+        policy_super_pool_mib=4864,
+        policy_fine_kv_pool_mib=512,
+        gpu_memory_quota_mib=12288.0,
+    )
+    assert "effective_super_pool_mib" in plan or "quota_limit_mib" in plan
+    ov, budget = WorkerBudgetPlanner.compute_internvlu_quota_overrides(
+        "morphserve",
+        num_gpus=8,
+        vendor_dir=tmp_path,
+        constrained_gib=12.0,
+        total_gpu_gib=40.0,
+    )
+    assert ov["allow_vmm_overflow"] is False
+    assert budget["runtime_combined_budget_mib"] <= budget["quota_limit_mib"] + 1e-3
+    pol_ivlu = EnginePolicyConfig.from_preset("morphserve", num_gpus=8, **ov)
+    pass_audit = WorkerBudgetPlanner.verify_internvlu_memory_quota(
+        {
+            "peak_pytorch_reserved_mib": 4500.0,
+            "vmm_physical_pool_mib": 6000.0,
+            "peak_gpu_reserved_mib": 10500.0,
+            "vmm_overflow_creates": 0,
+        },
+        pol_ivlu,
+        constrained_gib=12.0,
+    )
+    assert pass_audit["within_quota"] is True
+
+
+def test_hamilton_apportion_invariants() -> None:
+    res = hamilton_apportion(10, {"a": 0.34, "b": 0.33, "c": 0.33})
+    assert sum(res.values()) == 10
+    assert res == {"a": 4, "b": 3, "c": 3}
+
+    capped = hamilton_apportion(10, {"a": 0.8, "b": 0.2}, caps={"a": 5, "b": 10})
+    assert capped == {"a": 5, "b": 5}
+
+    assert hamilton_apportion(0, {"a": 1.0, "b": 2.0}) == {"a": 0, "b": 0}
+    with pytest.raises(ValueError):
+        hamilton_apportion(-1, {"a": 1.0})
+
+
+# ==================== 2. Topology & DualPathMorphRouter C++ Write-Through ====================
+
+
+def test_topology_defaults_and_router_operator_profile_readonly_and_telemetry_seq() -> None:
+    op_default = default_operator_profile()
+    assert op_default.bagel_expert_bytes > 0
+    assert op_default.ar_tpot_ms > 0
+
+    topo_4 = default_topology_for(4)
+    assert topo_4.num_gpus == 4
+    topo_8 = default_topology_for(8)
+    assert topo_8.num_gpus == 8
+    topo_16 = default_topology_for(16, gpus_per_node=8)
+    assert topo_16.num_gpus == 16
+    assert topo_16.same_node(0, 7) is True
+    assert topo_16.same_node(0, 8) is False
+    # Inter-node default bandwidth must be canonical 11.5 GB/s (no 1.15 GB/s drift).
+    assert topo_16.p2p_bw(0, 8) >= 10.0
+
+    # Custom OperatorLatencyProfile must be honored by C++ DualPathMorphRouter!
+    op_heavy = replace(op_default, bagel_expert_bytes=op_default.bagel_expert_bytes * 2)
+    r_default = DualPathMorphRouter(topo_8, operator_profile=op_default)
+    r_heavy = DualPathMorphRouter(topo_8, operator_profile=op_heavy)
+    try:
+        x_default = r_default.analytical_crossover_kv_mib(alpha=0.5, src_gpu=0, dst_gpu=1)
+        x_heavy = r_heavy.analytical_crossover_kv_mib(alpha=0.5, src_gpu=0, dst_gpu=1)
+        assert x_heavy > x_default
+
+        r_default.init_workers(8, lambda _g: "hybrid", initial_alphas={g: 0.5 for g in range(8)})
+        # AR queue reserve & release mutate C++ directly and clamp at 0.
+        r_default.reserve_ar_queue(0, 250.0)
+        assert abs(r_default.get_worker_state(0).queue_wait_ms - 250.0) < 1e-6
+        r_default.release_ar_queue(0, 100.0)
+        assert abs(r_default.get_worker_state(0).queue_wait_ms - 150.0) < 1e-6
+        r_default.release_ar_queue(0, 999.0)
+        assert r_default.get_worker_state(0).queue_wait_ms == 0.0
+
+        # Explicit write-through via set_worker_state_fields + monotonic telemetry_seq enforcement.
+        r_default.set_worker_state_fields(1, expert_alpha=1.0, queue_wait_ms=0.0, kv_free_bytes=20 * (1024**3))
+        assert r_default.get_worker_state(1).expert_alpha == 1.0
+        r_default.update_worker_telemetry(1, kv_free_bytes=12 * (1024**3), telemetry_seq=10)
+        assert r_default.get_worker_state(1).kv_free_bytes == 12 * (1024**3)
+        # Stale telemetry_seq must be ignored!
+        r_default.update_worker_telemetry(1, kv_free_bytes=1 * (1024**3), telemetry_seq=5)
+        assert r_default.get_worker_state(1).kv_free_bytes == 12 * (1024**3)
+        # Newer telemetry_seq updates C++ state.
+        r_default.update_worker_telemetry(1, kv_free_bytes=15 * (1024**3), telemetry_seq=11)
+        assert r_default.get_worker_state(1).kv_free_bytes == 15 * (1024**3)
+
+        # Readonly transition plan must NOT mutate worker queue or KV reservations!
+        snap_before = r_default.worker_states_snapshot()
+        req = CPTGRequestSpec(
+            req_id="ro_test",
+            src_gpu=0,
+            kv_bytes=16 * (1024**2),
+            dit_step1_ms=280.0,
+            dit_total_steps=20,
+            resolution=512,
+        )
+        dec_ro, ship_ro = r_default.plan_transition_readonly(
+            routing_mode="dual_path",
+            static_und_ranks=(),
+            static_gen_ranks=(),
+            req=req,
+            est_dit_ms=5000.0,
+            now_ms=0.0,
+        )
+        snap_after = r_default.worker_states_snapshot()
+        assert snap_after[dec_ro.dst_gpu].queue_wait_ms == snap_before[dec_ro.dst_gpu].queue_wait_ms
+        assert snap_after[dec_ro.dst_gpu].kv_free_bytes == snap_before[dec_ro.dst_gpu].kv_free_bytes
+
+        # Mutating plan_and_reserve must match decision and actually reserve queue wait.
+        dec_mut, ship_mut = r_default.plan_and_reserve_transition(
+            routing_mode="dual_path",
+            static_und_ranks=(),
+            static_gen_ranks=(),
+            req=req,
+            est_dit_ms=5000.0,
+            now_ms=0.0,
+        )
+        assert dec_mut.path == dec_ro.path
+        assert dec_mut.dst_gpu == dec_ro.dst_gpu
+        assert ship_mut == ship_ro
+        assert r_default.get_worker_state(dec_mut.dst_gpu).queue_wait_ms >= snap_before[dec_mut.dst_gpu].queue_wait_ms + 4999.0
+    finally:
+        r_default.close()
+        r_heavy.close()
+
+
+# ==================== 3. Unified PeerByteTransport (InMemory & TCP) ====================
+
+
+def test_peer_byte_transport_bidirectional_inmemory_and_tcp() -> None:
+    port = find_free_tcp_port()
+    assert 1024 <= port <= 65535
+
+    payload_01 = bytes((i * 13 + 7) % 256 for i in range(65536))
+    payload_10 = bytes((i * 29 + 3) % 256 for i in range(49152))
+
+    # 1. InMemoryByteBus + InMemoryPeerMesh bidirectional exchange + SHM put/pop
+    bus = InMemoryByteBus(world_size=2)
+    with InMemoryPeerMesh(bus, 0, 2) as ep0, InMemoryPeerMesh(bus, 1, 2) as ep1:
+        got: dict[str, bytes] = {}
+
+        def _r0() -> None:
+            ep0.send_u8(payload_01, dst_rank=1)
+            data, _ = ep0.recv_u8(len(payload_10), src_rank=1)
+            got["r0"] = bytes(data)
+
+        def _r1() -> None:
+            ep1.send_u8(payload_10, dst_rank=0)
+            data, _ = ep1.recv_u8(len(payload_01), src_rank=0)
+            got["r1"] = bytes(data)
+
+        t0 = threading.Thread(target=_r0)
+        t1 = threading.Thread(target=_r1)
+        t0.start()
+        t1.start()
+        t0.join(timeout=5.0)
+        t1.join(timeout=5.0)
+        assert not t0.is_alive() and not t1.is_alive()
+        assert got["r0"] == payload_10
+        assert got["r1"] == payload_01
+
+        bus.put_shm("k0", b"shared-payload")
+        assert bus.pop_shm("k0") == b"shared-payload"
+    bus.close()
+
+    # 2. Full-duplex TcpByteMesh concurrent bidirectional exchange without deadlock
+    with TcpByteMesh(world_size=2, bind_host="127.0.0.1") as mesh:
+        ep0 = mesh.endpoint_for(0)
+        ep1 = mesh.endpoint_for(1)
+        got_tcp: dict[str, bytes] = {}
+        errs: list[BaseException] = []
+
+        def _t0_send() -> None:
+            try:
+                ep0.send_u8(payload_01, dst_rank=1)
+            except BaseException as exc:
+                errs.append(exc)
+
+        def _t0_recv() -> None:
+            try:
+                data, _ = ep0.recv_u8(len(payload_10), src_rank=1)
+                got_tcp["r0"] = bytes(data)
+            except BaseException as exc:
+                errs.append(exc)
+
+        def _t1_send() -> None:
+            try:
+                ep1.send_u8(payload_10, dst_rank=0)
+            except BaseException as exc:
+                errs.append(exc)
+
+        def _t1_recv() -> None:
+            try:
+                data, _ = ep1.recv_u8(len(payload_01), src_rank=0)
+                got_tcp["r1"] = bytes(data)
+            except BaseException as exc:
+                errs.append(exc)
+
+        threads = [threading.Thread(target=fn) for fn in (_t0_send, _t0_recv, _t1_send, _t1_recv)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=10.0)
+        assert not errs
+        assert all(not th.is_alive() for th in threads)
+        assert got_tcp["r0"] == payload_10
+        assert got_tcp["r1"] == payload_01
+
+
+# ==================== 4. Deterministic WorkerRuntime Public Step Seam & Clock Skew ====================
+
+
+def test_worker_runtime_step_once_batching_and_clock_skew_immunity() -> None:
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic")
+    adapter = SyntheticCPTGAdapter(rank=0, policy=pol)
+    bus = InMemoryByteBus(world_size=1)
+    mesh = InMemoryPeerMesh(bus, rank=0, world_size=1)
+    acks: list[dict[str, Any]] = []
+    rt = WorkerRuntime(rank=0, adapter=adapter, mesh=mesh, on_ack=acks.append, inmem_bus=bus)
+    try:
+        # Enqueue two concurrent EXEC_AR commands with extreme remote clock skew (+3600s).
+        skewed_wall = time.perf_counter() + 3600.0
+        rt.enqueue_command(
+            {
+                "cmd_id": "c1",
+                "op": "EXEC_AR",
+                "ctx_id": "ctx_a",
+                "prompt": "first prompt",
+                "max_ar_tokens": 3,
+                "enqueued_wall_s": skewed_wall,
+            }
+        )
+        rt.enqueue_command(
+            {
+                "cmd_id": "c2",
+                "op": "EXEC_AR",
+                "ctx_id": "ctx_b",
+                "prompt": "second prompt",
+                "max_ar_tokens": 3,
+                "enqueued_wall_s": skewed_wall,
+            }
+        )
+        assert rt.step_once(timeout_s=0.1) is True
+        assert {a["cmd_id"] for a in acks} == {"c1", "c2"}
+        for ack in acks:
+            assert ack["status"] == "ok"
+            # Skewed wall clock must NOT inflate TTFT by 3,600,000 ms!
+            assert 0.0 <= float(ack["ttft_ms"]) < 500.0
+            assert int(ack["kv_free_bytes"]) == adapter.available_kv_bytes()
+
+        # Direct handle_command seam for PREP_DIT -> EXEC_DIT -> GET_STATS -> RELEASE_CTX
+        prep = rt.handle_command(
+            {"cmd_id": "c3", "op": "PREP_DIT", "ctx_id": "ctx_a", "prompt": "draw", "height": 512, "width": 512}
+        )
+        assert prep is not None and prep["status"] == "ok"
+        dit = rt.handle_command(
+            {"cmd_id": "c4", "op": "EXEC_DIT", "ctx_id": "ctx_a", "prompt": "draw", "height": 512, "width": 512, "dit_steps": 2}
+        )
+        assert dit is not None and dit["status"] == "ok"
+        stats = rt.handle_command({"cmd_id": "c5", "op": "GET_STATS"})
+        assert stats is not None and stats["status"] == "ok"
+        rel = rt.handle_command({"cmd_id": "c6", "op": "RELEASE_CTX", "ctx_id": "ctx_a"})
+        assert rel is not None and rel["status"] == "ok"
+    finally:
+        rt.shutdown()
+        mesh.close()
+        bus.close()
+
+
+# ==================== 5. MorphServeClusterEngine E2E, RunWindowOptions & OOM Retry ====================
+
+
+def test_cluster_engine_multiturn_continuity_run_options_and_canonical_report(tmp_path: Path) -> None:
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="synthetic", inter_turn_think_s_range=(0.0, 0.0))
+    suite = _make_multiturn_suite()
+    save_dir = tmp_path / "outputs"
+    fleet = InProcessWorkerFleet(pol)
+    engine = MorphServeClusterEngine(policy=pol, fleet=fleet, tmp_root=tmp_path / "tmp")
+    engine.start()
+    try:
+        orig_think = engine.policy.inter_turn_think_s_range
+        orig_mode = engine.policy.steady_window_mode
+        opts = RunWindowOptions(
+            inter_turn_think_s_range=(0.0, 0.01),
+            think_time_dist="uniform",
+            steady_window_mode="session_trim",
+            steady_state_trim_frac=0.0,
+        )
+        rep = engine.run_suite(suite, target_qps=4.0, save_outputs_dir=save_dir, run_options=opts)
+        assert isinstance(rep, ClusterRunReport)
+        # Running with RunWindowOptions must NEVER mutate engine.policy.
+        assert engine.policy.inter_turn_think_s_range == orig_think
+        assert engine.policy.steady_window_mode == orig_mode
+
+        assert rep.total_sessions == len(suite.sessions)
+        assert rep.completed_sessions == len(suite.sessions)
+        assert rep.oom_sessions == 0
+        assert rep.error_sessions == 0
+        # Canonical report schema invariants
+        assert rep.joint_slo_goodput_rps == rep.steady_joint_slo_goodput_rps
+        assert rep.joint_slo_attainment_pct == rep.steady_joint_slo_attainment_pct
+        rep_dict = rep.to_dict()
+        assert "full_trace_goodput_rps" in rep_dict
+        assert "full_trace_joint_slo_attainment_pct" in rep_dict
+        assert "vmm_physical_pool_mib" in rep_dict
+        assert "kv_host_swap_ins" in rep_dict
+        # Verify multi-turn image outputs were saved cleanly
+        assert (save_dir / "sess_interleaved_0_t1.png").is_file()
+        assert (save_dir / "sess_interleaved_0_t3.png").is_file()
+    finally:
+        engine.shutdown()
+
+
+def test_cluster_engine_oom_retry_and_exhaustion(tmp_path: Path) -> None:
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve", num_gpus=2, model_family="synthetic", inter_turn_think_s_range=(0.0, 0.0)
+    )
+    # 1. Rank 0 OOMs on "oom_trigger" while rank 1 succeeds -> session recovers via OOM retry!
+    fleet_recover = InProcessWorkerFleet(
+        pol,
+        adapter_factory=lambda rank, policy: SyntheticCPTGAdapter(
+            rank=rank,
+            policy=policy,
+            oom_prompts=("oom_trigger",),
+            oom_ranks=(0,),
+        ),
+    )
+    suite_one = WorkloadSuite(
+        name="oom_retry_suite",
+        trace_source="unit",
+        base_qps=1.0,
+        sessions=[
+            InterleavedSession(
+                session_id="s_oom_0",
+                quadrant="multi_image_vqa",
+                source_dataset="unit",
+                arrival_offset_s=0.0,
+                turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="oom_trigger", max_ar_tokens=3)],
+            )
+        ],
+    )
+    engine = MorphServeClusterEngine(policy=pol, fleet=fleet_recover, tmp_root=tmp_path / "recover")
+    engine.start()
+    try:
+        rep = engine.run_suite(suite_one, target_qps=1.0)
+        assert rep.completed_sessions == 1
+        assert rep.oom_sessions == 0
+    finally:
+        engine.shutdown()
+
+    # 2. Both ranks OOM -> cleanly reported as oom_sessions == 1 with no hang.
+    fleet_all_oom = InProcessWorkerFleet(
+        pol,
+        adapter_factory=lambda rank, policy: SyntheticCPTGAdapter(
+            rank=rank,
+            policy=policy,
+            oom_prompts=("oom_trigger",),
+            oom_ranks=(0, 1),
+        ),
+    )
+    engine2 = MorphServeClusterEngine(policy=pol, fleet=fleet_all_oom, tmp_root=tmp_path / "all_oom")
+    engine2.start()
+    try:
+        rep2 = engine2.run_suite(suite_one, target_qps=1.0)
+        assert rep2.oom_sessions == 1
+        assert rep2.completed_sessions == 0
+    finally:
+        engine2.shutdown()
+
+
+# ==================== 6. Worker Fault Fail-Fast & Multinode Fleet End-to-End ====================
+
+
+class _FaultInjectingFleet(WorkerFleet):
+    """Minimal public `WorkerFleet` implementation that triggers `on_worker_fault` on the first AR command."""
+
+    def __init__(self, num_gpus: int = 1) -> None:
+        self.num_gpus = int(num_gpus)
+        self._on_ack: Callable[[dict[str, Any]], None] | None = None
+        self._on_fault: Callable[[list[int], str], None] | None = None
+
+    def start(
+        self,
+        on_ack: Callable[[dict[str, Any]], None],
+        on_worker_fault: Callable[[list[int], str], None] | None = None,
+    ) -> dict[str, Any]:
+        self._on_ack = on_ack
+        self._on_fault = on_worker_fault
+        return {
+            "host_shmem_delta_gib": 0.0,
+            "workers": {
+                r: {
+                    "role": "hybrid",
+                    "resident_alpha": 1.0,
+                    "kv_free_bytes": 16 * (1024**3),
+                }
+                for r in range(self.num_gpus)
+            },
+        }
+
+    def send(self, rank: int, payload: dict[str, Any]) -> None:
+        op = payload.get("op")
+        if op in ("RESET_SUITE", "GET_STATS", "RELEASE_CTX"):
+            if self._on_ack is not None:
+                self._on_ack({"cmd_id": payload.get("cmd_id"), "rank": rank, "status": "ok", "stats": {}})
+            return
+        # Simulate abrupt worker death on first workload RPC.
+        if self._on_fault is not None:
+            threading.Thread(
+                target=self._on_fault,
+                args=([rank], "simulated child SIGKILL"),
+                daemon=True,
+            ).start()
+
+    def shutdown(self) -> None:
+        return None
+
+
+def test_cluster_engine_worker_fault_fails_fast_without_hanging(tmp_path: Path) -> None:
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic", inter_turn_think_s_range=(0.0, 0.0))
+    fleet = _FaultInjectingFleet(num_gpus=1)
+    engine = MorphServeClusterEngine(policy=pol, fleet=fleet, tmp_root=tmp_path / "fault")
+    engine.start()
+    try:
+        suite = WorkloadSuite(
+            name="fault_suite",
+            trace_source="unit",
+            base_qps=1.0,
+            sessions=[
+                InterleavedSession(
+                    session_id="s_fault_0",
+                    quadrant="multi_image_vqa",
+                    source_dataset="unit",
+                    arrival_offset_s=0.0,
+                    turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="hello", max_ar_tokens=4)],
+                )
+            ],
+        )
+        t0 = time.perf_counter()
+        rep = engine.run_suite(suite, target_qps=1.0)
+        elapsed = time.perf_counter() - t0
+        assert elapsed < 5.0
+        assert rep.error_sessions == 1
+        assert rep.completed_sessions == 0
+    finally:
+        engine.shutdown()
+
+
+def test_local_node_worker_host_and_multinode_tcp_fleet_end_to_end_and_disconnect(tmp_path: Path) -> None:
+    # 1. Single-node LocalNodeWorkerHost direct public lifecycle check
+    pol1 = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="synthetic")
+    host_acks: list[dict[str, Any]] = []
+    host = LocalNodeWorkerHost(
+        node_rank=0,
+        gpus_per_node=2,
+        policy=pol1,
+        model_dir=tmp_path,
+        bench_root=tmp_path,
+        backend="inproc_mem",
+        on_ack=host_acks.append,
+    )
+    host.prepare_until_mesh()
+    ready = host.finalize_mesh_and_start()
+    try:
+        assert len(ready["workers"]) == 2
+        assert host.check_worker_liveness() == []
+    finally:
+        host.shutdown()
+
+    # 2. 2-node x 2-GPU (4 ranks) TcpMultinodeWorkerFleet + run_multinode_worker_daemon end-to-end
+    pol4 = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=4,
+        model_family="synthetic",
+        inter_turn_think_s_range=(0.0, 0.0),
+    )
+    topo4 = default_topology_for(4, gpus_per_node=2)
+    port = find_free_tcp_port()
+    hub = MultinodeCoordinatorHub(
+        num_nodes=2,
+        gpus_per_node=2,
+        port=port,
+        bind_host="127.0.0.1",
+        advertise_host="127.0.0.1",
+        backend="inproc_tcp",
+        connect_timeout_s=30.0,
+    )
+
+    daemon_errs: list[BaseException] = []
+
+    def _run_remote_daemon() -> None:
+        try:
+            run_multinode_worker_daemon(
+                master_addr="127.0.0.1",
+                port=hub.bound_port,
+                node_rank=1,
+                num_nodes=2,
+                gpus_per_node=2,
+                advertise_host="127.0.0.1",
+                connect_timeout_s=30.0,
+            )
+        except BaseException as exc:
+            daemon_errs.append(exc)
+
+    d1 = threading.Thread(target=_run_remote_daemon, daemon=True)
+    d1.start()
+
+    fleet = TcpMultinodeWorkerFleet(policy=pol4, model_dir=tmp_path, bench_root=tmp_path, hub=hub)
+    engine = MorphServeClusterEngine(policy=pol4, topology=topo4, fleet=fleet, tmp_root=tmp_path / "mn")
+    try:
+        engine.start()
+        rep = engine.run_suite(_make_multiturn_suite("mn_2x2"), target_qps=4.0)
+        assert rep.completed_sessions == 3
+        assert rep.oom_sessions == 0
+        assert rep.error_sessions == 0
+    finally:
+        engine.shutdown()
+        hub.close()
+        d1.join(timeout=10.0)
+    assert not daemon_errs
+
+
+# ==================== 7. ClusterSimulator Public Seam & Ledger ====================
+
+
+def test_cluster_simulator_custom_sessions_full_overrides_and_ledger_stats() -> None:
+    ph_zero = MeasuredPhysicsProfile()
+    ph_def = MeasuredPhysicsProfile.default()
+    assert ph_zero == ph_def
+    ph_ov = MeasuredPhysicsProfile(vae_512_ms=ph_def.vae_512_ms + 5.0)
+    assert ph_ov.vae_512_ms == ph_def.vae_512_ms + 5.0
+    with pytest.raises(TypeError):
+        MeasuredPhysicsProfile(nonexistent_physics_field=1.0)
+
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
+    with SimGpuMemoryLedger(
+        gpu_id=0,
+        total_hbm_mib=ph_def.driver_total_hbm_40g_mib,
+        policy=pol,
+        role="hybrid",
+        resident_expert_layers=14,
+        physics=ph_def,
+    ) as ledger:
+        st0 = ledger.stats()
+        assert int(st0["free_kv_bytes"]) == ledger.free_kv_bytes()
+        assert ledger.upsert_kv(1, 512.0) is True
+        ok, _ = ledger.exec_dit_vae(512, active_sid=1)
+        assert ok is True
+        st1 = ledger.stats()
+        assert st1["peak_used_mib"] <= ph_def.driver_total_hbm_40g_mib + 1e-3
+        ledger.release_session(1)
+        assert ledger.stats()["active_kv_mib"] == 0.0
+
+    hw = HardwareInterconnectSpec.presets(ph_def)[0]
+    custom = [
+        (0.0, "interleaved_co_creation", (("ar_only", 512), ("dit_t2i", 512))),
+        (500.0, "multiturn_edit", (("dit_edit", 512), ("dit_edit", 512))),
+    ]
+    sim_rep = simulate_cluster_point(
+        "morphserve",
+        num_gpus=8,
+        hw=hw,
+        offered_qps=0.5,
+        num_sessions=len(custom),
+        seed=2026,
+        physics=ph_def,
+        workload_scale=WorkloadScaleSpec.bagel_7b_standard(),
+        custom_sessions=custom,
+        policy_overrides={"allow_cascade_cfg_split": True, "steady_state_trim_frac": 0.0},
+    )
+    assert sim_rep["total_sessions"] == len(custom)
+    assert sim_rep["joint_slo_goodput_rps"] == sim_rep["steady_joint_slo_goodput_rps"]
+    assert sim_rep["joint_slo_attainment_pct"] == sim_rep["steady_joint_slo_attainment_pct"]

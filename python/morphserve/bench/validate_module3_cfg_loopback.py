@@ -25,7 +25,6 @@ from morphserve.kernels import (
     cow_fork_context,
     decode_latent_to_u8_gpu,
     get_fa2_backend_status,
-    install_shared_prefix_bagel_hooks,
     prepare_vae_images_gpu,
     prepare_vit_images_gpu,
     rebind_cow_prefix,
@@ -33,6 +32,7 @@ from morphserve.kernels import (
     shared_prefix_cfg_attention_ref,
 )
 from morphserve.models import load_bagel_pipeline
+from morphserve.worker import BagelExecutionInterceptor
 
 
 def _left_pad_stack_stock(tensors):
@@ -454,7 +454,9 @@ def run_validation(
     report["load_seconds"] = round(time.perf_counter() - t_load0, 2)
     num_layers = pipeline.bagel.config.llm_config.num_hidden_layers
     loopback = GpuInPlaceLoopback(pipeline)
-    cfg_patch = install_shared_prefix_bagel_hooks(pipeline, min_shared_tokens=32)
+    interceptor = BagelExecutionInterceptor.for_pipeline(pipeline).enable_shared_prefix_cfg(
+        min_shared_tokens=32, allow_cascade_split=True
+    )
 
     # ==================== Test 1: Triton Shared-Prefix CFG Attention Microbenchmark ====================
     # Benchmark directly against BAGEL's real FlashAttention-2 DiffusionAttention (`attn_noncausal`)!
@@ -650,7 +652,7 @@ def run_validation(
                 turn3_snapshot = (deepcopy(main_ctx), deepcopy(cfg_text_ctx), deepcopy(cfg_img_ctx), p)
 
             if use_morphserve:
-                with cfg_patch.active(reset_stats=True):
+                with interceptor.shared_prefix_cfg_scope(reset_stats=True, allow_cascade_split=True):
                     img, gen_ms, last_u8_gpu = _run_bagel_generate_3branch(
                         pipeline,
                         main_ctx,
@@ -661,14 +663,13 @@ def run_validation(
                         seed=52 + turn_idx,
                         decode_gpu_u8=True,
                     )
-                shared_len = cfg_patch.last_shared_prefix_len
-                shared_calls = cfg_patch.shared_attn_calls
-                cascade_calls = cfg_patch.cascade_split_calls
-                naive_toks = cfg_patch.last_naive_kv_tokens
-                padded_toks = cfg_patch.last_padded_naive_kv_tokens
-                uniq_toks = cfg_patch.last_unique_kv_tokens
+                shared_len = interceptor.last_shared_prefix_len
+                shared_calls = interceptor.shared_attn_calls
+                cascade_calls = interceptor.cascade_split_calls
+                naive_toks = interceptor.last_naive_kv_tokens
+                padded_toks = interceptor.last_padded_naive_kv_tokens
+                uniq_toks = interceptor.last_unique_kv_tokens
             else:
-                cfg_patch.enabled = False
                 img, gen_ms, _ = _run_bagel_generate_3branch(
                     pipeline, main_ctx, cfg_text_ctx, cfg_img_ctx, p, steps=steps, seed=52 + turn_idx
                 )
@@ -723,7 +724,7 @@ def run_validation(
     m_l, ct_l, ci_l = deepcopy(m_c), deepcopy(ct_c), deepcopy(ci_c)
     rebind_cow_prefix(m_c["past_key_values"], ct_c["past_key_values"])
     SharedPrefixCache.clear_memo()
-    with cfg_patch.active(reset_stats=True, allow_cascade_split=True):
+    with interceptor.shared_prefix_cfg_scope(reset_stats=True, allow_cascade_split=True):
         same_ctx_t3_img, same_ctx_t3_ms, _ = _run_bagel_generate_3branch(
             pipeline, m_c, ct_c, ci_c, p_t3, steps=steps, seed=52 + len(prompts) - 1
         )
@@ -731,7 +732,7 @@ def run_validation(
 
     rebind_cow_prefix(m_l["past_key_values"], ct_l["past_key_values"])
     SharedPrefixCache.clear_memo()
-    with cfg_patch.active(reset_stats=True, allow_cascade_split=False):
+    with interceptor.shared_prefix_cfg_scope(reset_stats=True, allow_cascade_split=False):
         lossless_t3_img, _, _ = _run_bagel_generate_3branch(
             pipeline, m_l, ct_l, ci_l, p_t3, steps=steps, seed=52 + len(prompts) - 1
         )
@@ -807,14 +808,13 @@ def run_validation(
         _update_text_ctx(pipeline, ci_ctx, cot_prompt)
         SharedPrefixCache.clear_memo()
         if use_ms:
-            with cfg_patch.active(reset_stats=True):
+            with interceptor.shared_prefix_cfg_scope(reset_stats=True, allow_cascade_split=True):
                 im, gms, u8_cot = _run_bagel_generate_3branch(
                     pipeline, ctx_m, ct_ctx, ci_ctx, cot_prompt, steps=steps, seed=77, decode_gpu_u8=True
                 )
-            sh_l = cfg_patch.last_shared_prefix_len
-            sh_c = cfg_patch.shared_attn_calls
+            sh_l = interceptor.last_shared_prefix_len
+            sh_c = interceptor.shared_attn_calls
         else:
-            cfg_patch.enabled = False
             im, gms, u8_cot = _run_bagel_generate_3branch(
                 pipeline, ctx_m, ct_ctx, ci_ctx, cot_prompt, steps=steps, seed=77
             )
@@ -869,7 +869,7 @@ def run_validation(
         "mmvet_rubric_smoke_score": mmvet_cot_parity,
     }
 
-    cfg_patch.uninstall()
+    interceptor.uninstall()
     del stock_imgs, ms_imgs, cot_stock_img, cot_ms_img, pipeline
     gc.collect()
     torch.cuda.empty_cache()

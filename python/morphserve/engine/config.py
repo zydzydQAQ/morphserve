@@ -1,11 +1,14 @@
-"""Policy configurations and presets for `MorphServeClusterEngine` & 5-baseline comparison matrix."""
+"""Policy configurations, preset/ablation builders, `RunWindowOptions`, and `WorkerBudgetPlanner`."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, replace
+import json
+from pathlib import Path
 from typing import Any
 
-from morphserve.router.topology import DEFAULT_OPERATOR_PROFILE
+from morphserve.router.topology import default_operator_profile
 
 VALID_POLICIES = (
     "morphserve",
@@ -15,6 +18,42 @@ VALID_POLICIES = (
     "prism_tetriserve_coloc",
     "naive_host_offload",
 )
+
+STATIC_SPLIT_POLICIES = (
+    "static_2und_6gen",
+    "static_4und_4gen",
+    "static_6und_2gen",
+)
+
+
+def _serialize_overrides(overrides: Mapping[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for k, v in overrides.items():
+        if k == "initial_alphas" and isinstance(v, Mapping):
+            out[k] = {str(rk): float(rv) for rk, rv in v.items()}
+        elif isinstance(v, tuple):
+            out[k] = list(v)
+        elif isinstance(v, Path):
+            out[k] = str(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _parse_named_policy_list(raw: Any) -> list[tuple[str, "EnginePolicyConfig"]]:
+    out: list[tuple[str, EnginePolicyConfig]] = []
+    if isinstance(raw, Mapping):
+        for k, v in raw.items():
+            out.append((str(k), EnginePolicyConfig.from_dict(v)))
+        return out
+    for item in raw:
+        if isinstance(item, Mapping):
+            name = str(item.get("name") or item.get("label") or item["policy_name"])
+            cfg_d = item.get("config") or item.get("policy") or item
+            out.append((name, EnginePolicyConfig.from_dict(cfg_d)))
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            out.append((str(item[0]), EnginePolicyConfig.from_dict(item[1])))
+    return out
 
 
 @dataclass
@@ -80,7 +119,7 @@ class EnginePolicyConfig:
         if self.dit_turn_slo_override_ms is not None and k is None:
             return float(self.dit_turn_slo_override_ms)
         eff_k = self.dit_slo_scale_k if k is None else float(k)
-        return DEFAULT_OPERATOR_PROFILE.dit_turn_slo_ms(
+        return default_operator_profile().dit_turn_slo_ms(
             height=height,
             k=eff_k,
             model_family="internvl_u" if self.model_family == "internvl_u" else "bagel",
@@ -99,8 +138,38 @@ class EnginePolicyConfig:
             return "und"
         return "hybrid"
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to the canonical C++/wire JSON dictionary schema."""
+        raw = asdict(self)
+        raw["initial_alphas"] = {str(k): float(v) for k, v in self.initial_alphas.items()}
+        raw["static_und_ranks"] = [int(x) for x in self.static_und_ranks]
+        raw["static_gen_ranks"] = [int(x) for x in self.static_gen_ranks]
+        raw["inter_turn_think_s_range"] = [
+            float(self.inter_turn_think_s_range[0]),
+            float(self.inter_turn_think_s_range[1]),
+        ]
+        raw["allow_cascade_cfg_split"] = bool(self.allow_cascade_cfg_split)
+        raw["think_time_dist"] = str(self.think_time_dist)
+        raw["think_time_median_s"] = float(self.think_time_median_s)
+        raw["think_time_sigma"] = float(self.think_time_sigma)
+        raw["ar_tpot_slo_mode"] = str(self.ar_tpot_slo_mode)
+        raw["steady_window_mode"] = str(self.steady_window_mode)
+        raw["warmup_window_s"] = float(self.warmup_window_s)
+        raw["steady_window_s"] = float(self.steady_window_s)
+        return raw
+
+    def to_json(self) -> str:
+        """Serialize to compact UTF-8 JSON matching C++ `PolicyConfig::from_json`."""
+        return json.dumps(self.to_dict(), separators=(",", ":"), ensure_ascii=False)
+
+    def with_overrides(self, **overrides: Any) -> "EnginePolicyConfig":
+        """Return a new `EnginePolicyConfig` with field overrides applied without mutating `self`."""
+        if not overrides:
+            return self
+        return replace(self, **overrides)
+
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EnginePolicyConfig":
+    def from_dict(cls, data: Mapping[str, Any]) -> "EnginePolicyConfig":
         d = dict(data)
         d["initial_alphas"] = {int(k): float(v) for k, v in (d.get("initial_alphas") or {}).items()}
         d["static_und_ranks"] = tuple(int(x) for x in (d.get("static_und_ranks") or ()))
@@ -121,7 +190,13 @@ class EnginePolicyConfig:
                     d.pop(str_key)
                 else:
                     d[str_key] = str(d[str_key])
-        for flt_key in ("dit_slo_scale_k", "think_time_median_s", "think_time_sigma", "warmup_window_s", "steady_window_s"):
+        for flt_key in (
+            "dit_slo_scale_k",
+            "think_time_median_s",
+            "think_time_sigma",
+            "warmup_window_s",
+            "steady_window_s",
+        ):
             if flt_key in d:
                 if d[flt_key] is None:
                     d.pop(flt_key)
@@ -139,19 +214,191 @@ class EnginePolicyConfig:
         from morphserve._core import call_json, encode_json, get_core_lib
 
         L = get_core_lib()
-        ser_overrides: dict[str, Any] = {}
-        for k, v in overrides.items():
-            if k == "initial_alphas" and isinstance(v, dict):
-                ser_overrides[k] = {str(rk): float(rv) for rk, rv in v.items()}
-            elif isinstance(v, tuple):
-                ser_overrides[k] = list(v)
-            else:
-                ser_overrides[k] = v
         out = call_json(
             L,
             L.ms_policy_from_preset_json,
             str(policy_name).encode("utf-8"),
             int(num_gpus),
-            encode_json(ser_overrides),
+            encode_json(_serialize_overrides(overrides)),
         )
         return cls.from_dict(out)
+
+
+@dataclass(frozen=True)
+class RunWindowOptions:
+    """Per-run think-time, steady-state window, and SLO overrides for `MorphServeClusterEngine.run_suite`."""
+
+    inter_turn_think_s_range: tuple[float, float] | None = None
+    think_time_dist: str | None = None
+    think_time_median_s: float | None = None
+    think_time_sigma: float | None = None
+    steady_window_mode: str | None = None
+    warmup_window_s: float | None = None
+    steady_window_s: float | None = None
+    steady_state_trim_frac: float | None = None
+    slo_scale_k: float | None = None
+    dit_slo_scale_k: float | None = None
+    ar_tpot_slo_mode: str | None = None
+
+    def apply_to_policy(self, policy: EnginePolicyConfig) -> EnginePolicyConfig:
+        """Return an updated `EnginePolicyConfig` copy applying non-None run window options."""
+        updates: dict[str, Any] = {}
+        if self.inter_turn_think_s_range is not None:
+            updates["inter_turn_think_s_range"] = (
+                float(self.inter_turn_think_s_range[0]),
+                float(self.inter_turn_think_s_range[1]),
+            )
+        if self.think_time_dist is not None:
+            updates["think_time_dist"] = str(self.think_time_dist)
+        if self.think_time_median_s is not None:
+            updates["think_time_median_s"] = float(self.think_time_median_s)
+        if self.think_time_sigma is not None:
+            updates["think_time_sigma"] = float(self.think_time_sigma)
+        if self.steady_window_mode is not None:
+            updates["steady_window_mode"] = str(self.steady_window_mode)
+        if self.warmup_window_s is not None:
+            updates["warmup_window_s"] = float(self.warmup_window_s)
+        if self.steady_window_s is not None:
+            updates["steady_window_s"] = float(self.steady_window_s)
+        if self.steady_state_trim_frac is not None:
+            updates["steady_state_trim_frac"] = float(self.steady_state_trim_frac)
+        if self.ar_tpot_slo_mode is not None:
+            updates["ar_tpot_slo_mode"] = str(self.ar_tpot_slo_mode)
+
+        fam = "internvl_u" if policy.model_family == "internvl_u" else "bagel"
+        if self.slo_scale_k is not None:
+            k_ar = float(self.slo_scale_k)
+            ar_slos = default_operator_profile().slo_thresholds_ms(k=k_ar, model_family=fam)
+            updates["slo_scale_k"] = k_ar
+            updates["ar_ttft_slo_ms"] = ar_slos["ar_ttft_slo_ms"]
+            updates["ar_tpot_slo_ms"] = ar_slos["ar_tpot_slo_ms"]
+        if self.dit_slo_scale_k is not None:
+            k_dit = float(self.dit_slo_scale_k)
+            dit_slos = default_operator_profile().slo_thresholds_ms(k=k_dit, model_family=fam)
+            updates["dit_slo_scale_k"] = k_dit
+            updates["dit_512_slo_ms"] = dit_slos["dit_512_slo_ms"]
+            updates["dit_1024_slo_ms"] = dit_slos["dit_1024_slo_ms"]
+
+        return replace(policy, **updates) if updates else policy
+
+
+def build_ablation_configs(num_gpus: int = 8, **overrides: Any) -> list[tuple[str, EnginePolicyConfig]]:
+    """Build Leave-One-Out M1-M4 ablation configs via C++17 `build_ablation_configs`."""
+    from morphserve._core import call_json, encode_json, get_core_lib
+
+    L = get_core_lib()
+    raw = call_json(
+        L,
+        L.ms_policy_build_ablation_configs_json,
+        int(num_gpus),
+        encode_json(_serialize_overrides(overrides)),
+    )
+    return _parse_named_policy_list(raw)
+
+
+def build_static_split_configs(num_gpus: int = 8, **overrides: Any) -> list[tuple[str, EnginePolicyConfig]]:
+    """Build elastic + static split-ratio sensitivity configs (`2:6`, `4:4`, `6:2`) via C++17."""
+    from morphserve._core import call_json, encode_json, get_core_lib
+
+    L = get_core_lib()
+    raw = call_json(
+        L,
+        L.ms_policy_build_static_split_configs_json,
+        int(num_gpus),
+        encode_json(_serialize_overrides(overrides)),
+    )
+    return _parse_named_policy_list(raw)
+
+
+class WorkerBudgetPlanner:
+    """Public Python adapter over C++17 `morphserve::control::WorkerBudgetPlanner` (`ms_budget_*`)."""
+
+    @staticmethod
+    def compute_internvlu_memory_plan(
+        *,
+        total_dev_mib: float,
+        free_dev_mib: float,
+        base_pytorch_alloc_mib: float,
+        mirror_bytes: int,
+        policy_super_pool_mib: int,
+        policy_fine_kv_pool_mib: int,
+        super_handle_mib: int = 64,
+        allow_vmm_overflow: bool = True,
+        gpu_memory_fraction: float | None = None,
+        gpu_memory_quota_mib: float | None = None,
+    ) -> dict[str, Any]:
+        from morphserve._core import call_json, encode_json, get_core_lib
+
+        L = get_core_lib()
+        req = {
+            "total_dev_mib": float(total_dev_mib),
+            "free_dev_mib": float(free_dev_mib),
+            "base_pytorch_alloc_mib": float(base_pytorch_alloc_mib),
+            "mirror_bytes": int(mirror_bytes),
+            "policy_super_pool_mib": int(policy_super_pool_mib),
+            "policy_fine_kv_pool_mib": int(policy_fine_kv_pool_mib),
+            "super_handle_mib": int(super_handle_mib),
+            "allow_vmm_overflow": bool(allow_vmm_overflow),
+            "gpu_memory_fraction": None if gpu_memory_fraction is None else float(gpu_memory_fraction),
+            "gpu_memory_quota_mib": None if gpu_memory_quota_mib is None else float(gpu_memory_quota_mib),
+        }
+        return call_json(L, L.ms_budget_internvlu_plan_json, encode_json(req))
+
+    @staticmethod
+    def compute_internvlu_quota_overrides(
+        policy_name: str,
+        num_gpus: int,
+        vendor_dir: str | Path,
+        *,
+        constrained_gib: float = 12.0,
+        total_gpu_gib: float = 40.0,
+    ) -> tuple[dict[str, Any], dict[str, float]]:
+        from morphserve._core import call_json, get_core_lib
+
+        L = get_core_lib()
+        out = call_json(
+            L,
+            L.ms_budget_internvlu_quota_overrides_json,
+            str(policy_name).encode("utf-8"),
+            int(num_gpus),
+            str(vendor_dir).encode("utf-8"),
+            float(constrained_gib),
+            float(total_gpu_gib),
+        )
+        ov = dict(out["overrides"])
+        tr = ov.get("inter_turn_think_s_range")
+        if isinstance(tr, list) and len(tr) == 2:
+            ov["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
+        if "initial_alphas" in ov and isinstance(ov["initial_alphas"], Mapping):
+            ov["initial_alphas"] = {int(k): float(v) for k, v in ov["initial_alphas"].items()}
+        budget = dict(out.get("budget") or out["budget_plan"])
+        return ov, budget
+
+    @staticmethod
+    def verify_internvlu_memory_quota(
+        run_result: Mapping[str, Any],
+        policy: EnginePolicyConfig,
+        *,
+        constrained_gib: float = 12.0,
+    ) -> dict[str, Any]:
+        from morphserve._core import call_json, encode_json, get_core_lib
+
+        L = get_core_lib()
+        return call_json(
+            L,
+            L.ms_budget_verify_internvlu_quota_json,
+            encode_json(dict(run_result)),
+            encode_json(policy.to_dict()),
+            float(constrained_gib),
+        )
+
+
+__all__ = [
+    "EnginePolicyConfig",
+    "RunWindowOptions",
+    "STATIC_SPLIT_POLICIES",
+    "VALID_POLICIES",
+    "WorkerBudgetPlanner",
+    "build_ablation_configs",
+    "build_static_split_configs",
+]

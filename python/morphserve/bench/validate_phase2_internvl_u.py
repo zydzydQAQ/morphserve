@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-from dataclasses import replace
-import gc
 import json
-import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any
+from typing import Any, Callable
 
 from morphserve.bench.exactness import ExactnessEvaluator
+from morphserve.bench.harness import BenchmarkRunner, local_tmp_base, resolve_sources_dir
 from morphserve.bench.interleaved_bench import (
     InterleavedSession,
     InterleavedTurn,
@@ -21,7 +18,7 @@ from morphserve.bench.interleaved_bench import (
     REFINEMENT_TEMPLATES,
     WorkloadSuite,
 )
-from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine
+from morphserve.engine.config import EnginePolicyConfig, RunWindowOptions, WorkerBudgetPlanner
 
 
 def _load_optional_bench_prompts(bench_root: Path | None) -> tuple[list[dict[str, str]], list[str]]:
@@ -61,24 +58,19 @@ def _load_optional_bench_prompts(bench_root: Path | None) -> tuple[list[dict[str
             geneval_prompts.clear()
 
     if not geneval_prompts:
-        for cand in (
-            root / "sources/geneval_evaluation_metadata.jsonl",
-            root.parent / "bench_sources/geneval_evaluation_metadata.jsonl",
-        ):
-            if cand.is_file():
-                try:
-                    for line in cand.read_text(encoding="utf-8").splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        obj = json.loads(line)
-                        p = str(obj.get("prompt", "")).strip()
-                        if p:
-                            geneval_prompts.append(p)
-                    if geneval_prompts:
-                        break
-                except Exception:
-                    geneval_prompts.clear()
+        gv_jsonl = resolve_sources_dir(root) / "geneval_evaluation_metadata.jsonl"
+        if gv_jsonl.is_file():
+            try:
+                for line in gv_jsonl.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    obj = json.loads(line)
+                    p = str(obj.get("prompt", "")).strip()
+                    if p:
+                        geneval_prompts.append(p)
+            except Exception:
+                geneval_prompts.clear()
 
     return mmvet_items, geneval_prompts
 
@@ -127,7 +119,6 @@ def build_internvlu_suite(
 
     for i in range(int(num_sessions)):
         if i > 0:
-            # Deterministic bursty arrivals (clusters of 4 tight requests followed by pause)
             t_off += dt_base * (0.25 if (i % 4 != 0) else 2.95)
 
         slot = i % 10
@@ -136,7 +127,6 @@ def build_internvlu_suite(
         refine_prompt = REFINEMENT_TEMPLATES[i % len(REFINEMENT_TEMPLATES)]
 
         if slot in (0, 2, 5, 8):
-            # 40%: 3-turn `ar_only -> dit_t2i -> ar_only(use_prev_image=True)`
             sessions.append(
                 InterleavedSession(
                     session_id=f"ivlu_cocreate_{i:03d}",
@@ -177,7 +167,6 @@ def build_internvlu_suite(
                 )
             )
         elif slot in (1, 4, 7):
-            # 30%: 4-turn `dit_t2i -> ar_only(use_prev_image=True) -> dit_edit(use_prev_image=True) -> ar_only(use_prev_image=True)`
             sessions.append(
                 InterleavedSession(
                     session_id=f"ivlu_edit4_{i:03d}",
@@ -228,7 +217,6 @@ def build_internvlu_suite(
                 )
             )
         else:
-            # 30%: 2-turn `ar_only -> ar_only`
             if has_real_mmvet:
                 a = mmvet_items[(i * 2) % len(mmvet_items)]
                 b = mmvet_items[(i * 2 + 1) % len(mmvet_items)]
@@ -312,11 +300,6 @@ def _detect_gpu_total_gib(default_gib: float = 40.0) -> float:
     return float(default_gib)
 
 
-def _local_tmp_base() -> Path:
-    raw = os.environ.get("MORPHSERVE_LOCAL_TMP", "").strip()
-    return Path(raw) if raw else Path("/tmp")
-
-
 def compute_internvlu_memory_quota_overrides(
     policy_name: str,
     num_gpus: int,
@@ -325,27 +308,15 @@ def compute_internvlu_memory_quota_overrides(
     constrained_gib: float = 12.0,
     total_gpu_gib: float | None = 40.0,
 ) -> tuple[dict[str, Any], dict[str, float]]:
-    """Compute honest per-GPU `12 GiB` quota overrides via C++17 `WorkerBudgetPlanner`."""
-    from morphserve._core import call_json, get_core_lib
-
+    """Compute honest per-GPU `12 GiB` quota overrides via public `WorkerBudgetPlanner`."""
     eff_total_gib = _detect_gpu_total_gib(40.0) if total_gpu_gib is None else float(total_gpu_gib)
-    L = get_core_lib()
-    out = call_json(
-        L,
-        L.ms_budget_internvlu_quota_overrides_json,
-        str(policy_name).encode("utf-8"),
-        int(num_gpus),
-        str(vendor_dir).encode("utf-8"),
-        float(constrained_gib),
-        float(eff_total_gib),
+    return WorkerBudgetPlanner.compute_internvlu_quota_overrides(
+        policy_name=str(policy_name),
+        num_gpus=int(num_gpus),
+        vendor_dir=str(vendor_dir),
+        constrained_gib=float(constrained_gib),
+        total_gpu_gib=float(eff_total_gib),
     )
-    ov = dict(out["overrides"])
-    tr = ov.get("inter_turn_think_s_range")
-    if isinstance(tr, list) and len(tr) == 2:
-        ov["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
-    if "initial_alphas" in ov and isinstance(ov["initial_alphas"], dict):
-        ov["initial_alphas"] = {int(k): float(v) for k, v in ov["initial_alphas"].items()}
-    return ov, dict(out.get("budget") or out["budget_plan"])
 
 
 def verify_internvlu_memory_quota(
@@ -354,17 +325,11 @@ def verify_internvlu_memory_quota(
     *,
     constrained_gib: float = 12.0,
 ) -> dict[str, Any]:
-    """Audit observed `PyTorch peak_reserved_mib + TriPool-VMM physical_pool_mib <= quota_limit_mib` via C++."""
-    from morphserve._core import call_json, encode_json, get_core_lib
-    from morphserve.engine.multinode_fleet import serialize_policy_config
-
-    L = get_core_lib()
-    return call_json(
-        L,
-        L.ms_budget_verify_internvlu_quota_json,
-        encode_json(run_result),
-        encode_json(serialize_policy_config(policy)),
-        float(constrained_gib),
+    """Audit observed `PyTorch peak_reserved_mib + TriPool-VMM physical_pool_mib <= quota_limit_mib` via public `WorkerBudgetPlanner`."""
+    return WorkerBudgetPlanner.verify_internvlu_memory_quota(
+        run_result=run_result,
+        policy=policy,
+        constrained_gib=float(constrained_gib),
     )
 
 
@@ -384,23 +349,6 @@ def _think_time_overrides(smoke_1gpu: bool) -> dict[str, Any]:
     }
 
 
-def _strip_sessions_keep_failures(report_dict: dict[str, Any]) -> dict[str, Any]:
-    raw_sessions = report_dict.pop("sessions", None) or []
-    failed = [
-        {
-            "session_id": str(s.get("session_id", "")),
-            "quadrant": str(s.get("quadrant", "")),
-            "status": str(s.get("status", "")),
-            "error": str(s.get("error", ""))[:400],
-        }
-        for s in raw_sessions
-        if s.get("status") != "ok"
-    ]
-    if failed:
-        report_dict["failed_sessions"] = failed[:8]
-    return report_dict
-
-
 def run_internvlu_generality_validation(
     model_dir: Path,
     vendor_dir: Path,
@@ -412,10 +360,13 @@ def run_internvlu_generality_validation(
     total_gpu_gib: float | None = None,
     smoke_1gpu: bool = False,
     bench_root: Path | None = None,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Drive `InternVL-U` (`bridge_mllm_dit`) across Regime A (40GB burst) & Regime B (strict `<= 12 GiB` quota)."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    tmp_base = _local_tmp_base()
+    tmp_base = local_tmp_base()
     eff_total_gib = _detect_gpu_total_gib(40.0) if total_gpu_gib is None else float(total_gpu_gib)
     eff_bench_root = Path(bench_root) if (bench_root is not None and Path(bench_root).is_dir()) else output_dir
 
@@ -429,7 +380,6 @@ def run_internvlu_generality_validation(
         highres_size=1024,
         bench_root=bench_root,
     )
-    # First 4 sessions span all 3 multi-turn templates (3-turn co-creation, 4-turn edit+inspect, 2-turn VQA)
     parity_slice = WorkloadSuite(
         name="internvlu_multiturn_parity_4",
         trace_source="deterministic",
@@ -439,6 +389,22 @@ def run_internvlu_generality_validation(
         warmup_s=0.0,
         steady_s=0.0,
         arrival_duration_s=0.0,
+    )
+    parity_run_opts = RunWindowOptions(
+        inter_turn_think_s_range=(0.0, 0.0),
+        think_time_dist="constant",
+        think_time_median_s=0.0,
+        think_time_sigma=0.0,
+        steady_window_mode="session_trim",
+        steady_state_trim_frac=0.0,
+    )
+
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=eff_bench_root,
+        tmp_root_base=tmp_base,
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
     )
 
     think_ov = _think_time_overrides(smoke_1gpu)
@@ -461,47 +427,39 @@ def run_internvlu_generality_validation(
             steady_window_s=suite_a.steady_s,
             **think_ov,
         )
-        eng = MorphServeClusterEngine(
-            policy=cfg,
-            model_dir=model_dir,
-            bench_root=eff_bench_root,
-            tmp_root=tmp_base / f"ms_ivlu_a_{pol_name}",
-        )
-        try:
-            eng.start()
+        with runner.session(cfg, tmp_tag=f"ms_ivlu_a_{pol_name}") as sess:
             if smoke_1gpu:
                 p_dir = tmp_base / f"ivlu_parity_{pol_name}"
-                p_rep = eng.run_suite(parity_slice, target_qps=0.5, save_outputs_dir=p_dir)
-                d = _strip_sessions_keep_failures(p_rep.to_dict())
+                p_rep, d = sess.run_compact(
+                    parity_slice,
+                    target_qps=0.5,
+                    save_outputs_dir=p_dir,
+                    run_options=parity_run_opts,
+                    include_failed_sessions=True,
+                    attach_init_shmem=False,
+                )
                 d["regime"] = "smoke_1gpu_parity"
                 regime_a_results.append(d)
-                parity_outcomes[pol_name] = p_rep.sessions
+                parity_outcomes[pol_name] = list(p_rep.sessions)
             else:
-                rep = eng.run_suite(suite_a, target_qps=offered_qps)
-                d = _strip_sessions_keep_failures(rep.to_dict())
+                _, d = sess.run_compact(
+                    suite_a,
+                    target_qps=offered_qps,
+                    include_failed_sessions=True,
+                    attach_init_shmem=False,
+                )
                 d["regime"] = "regime_a_40gb_burst"
                 regime_a_results.append(d)
 
                 if pol_name in ("morphserve", "monolithic_dp"):
                     p_dir = tmp_base / f"ivlu_parity_{pol_name}"
-                    saved_policy = eng.policy
-                    eng.policy = replace(
-                        saved_policy,
-                        inter_turn_think_s_range=(0.0, 0.0),
-                        think_time_dist="constant",
-                        think_time_median_s=0.0,
-                        think_time_sigma=0.0,
-                        steady_window_mode="session_trim",
-                        steady_state_trim_frac=0.0,
+                    p_rep = sess.run_suite(
+                        parity_slice,
+                        target_qps=0.5,
+                        save_outputs_dir=p_dir,
+                        run_options=parity_run_opts,
                     )
-                    try:
-                        p_rep = eng.run_suite(parity_slice, target_qps=0.5, save_outputs_dir=p_dir)
-                    finally:
-                        eng.policy = saved_policy
-                    parity_outcomes[pol_name] = p_rep.sessions
-        finally:
-            eng.shutdown()
-            gc.collect()
+                    parity_outcomes[pol_name] = list(p_rep.sessions)
 
     # Regime B: Strict `12 GiB` Per-GPU Quota (`PyTorch reserved + VMM physical pool <= 12 GiB`)
     regime_b_qps = 0.5 if smoke_1gpu else round(offered_qps * 0.75, 2)
@@ -534,28 +492,16 @@ def run_internvlu_generality_validation(
         overrides["steady_window_s"] = suite_b.steady_s
 
         cfg = EnginePolicyConfig.from_preset(pol_name, num_gpus=num_gpus, **overrides)
-        eng = MorphServeClusterEngine(
-            policy=cfg,
-            model_dir=model_dir,
-            bench_root=eff_bench_root,
-            tmp_root=tmp_base / f"ms_ivlu_b_{pol_name}",
-        )
-        try:
-            eng.start()
-            rep = eng.run_suite(suite_b, target_qps=regime_b_qps)
-
-            async def _fetch_w_stats() -> list[dict[str, Any]]:
-                return list(await asyncio.gather(*(eng._rpc(g, {"op": "GET_STATS"}) for g in range(num_gpus))))
-
-            w_stats = asyncio.run(_fetch_w_stats())
-            d = _strip_sessions_keep_failures(rep.to_dict())
-            if w_stats and any("pytorch_reserved_mib" in st for st in w_stats):
-                d["pytorch_peak_reserved_mib"] = round(
-                    max(float(st.get("pytorch_reserved_mib", 0.0)) for st in w_stats), 2
-                )
-                d["vmm_physical_pool_mib"] = round(
-                    max(float(st.get("vmm_physical_pool_mib", 0.0)) for st in w_stats), 2
-                )
+        with runner.session(cfg, tmp_tag=f"ms_ivlu_b_{pol_name}") as sess:
+            rep, d = sess.run_compact(
+                suite_b,
+                target_qps=regime_b_qps,
+                include_failed_sessions=True,
+                attach_init_shmem=False,
+            )
+            # Consume canonical `ClusterRunReport` memory fields directly (no private worker RPCs).
+            d["peak_pytorch_reserved_mib"] = round(float(rep.peak_pytorch_reserved_mib), 2)
+            d["vmm_physical_pool_mib"] = round(float(rep.vmm_physical_pool_mib), 2)
             d["regime"] = f"regime_b_{int(constrained_gib)}gib_capped"
             d["quota_budget_plan"] = budget_plan
             audit = verify_internvlu_memory_quota(d, cfg, constrained_gib=constrained_gib)
@@ -568,9 +514,6 @@ def run_internvlu_generality_validation(
                     and int(d.get("completed_sessions", 0)) == int(d.get("total_sessions", 0))
                 )
             regime_b_results.append(d)
-        finally:
-            eng.shutdown()
-            gc.collect()
 
     regime_a_ms = next((r for r in regime_a_results if r.get("policy_name") == "morphserve"), None)
     regime_a_morphserve_ok = bool(
@@ -622,7 +565,7 @@ def run_internvlu_generality_validation(
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MorphServe Unified InternVL-U Dual-Regime Multi-Turn Benchmark")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--vendor-dir", type=Path, required=True)
@@ -634,7 +577,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--constrained-gib", type=float, default=12.0)
     parser.add_argument("--total-gpu-gib", type=float, default=None)
     parser.add_argument("--smoke-1gpu", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
     rep = run_internvlu_generality_validation(
         model_dir=args.model_dir,
         vendor_dir=args.vendor_dir,

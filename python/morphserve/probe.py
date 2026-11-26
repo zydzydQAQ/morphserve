@@ -21,29 +21,6 @@ import urllib.error
 import urllib.request
 
 
-class TripoolStats(ctypes.Structure):
-    _fields_ = [
-        ("min_granularity_bytes", ctypes.c_uint64),
-        ("handle_bytes", ctypes.c_uint64),
-        ("pool_total_handles", ctypes.c_uint64),
-        ("pool_free_handles", ctypes.c_uint64),
-        ("mapped_handles_current", ctypes.c_uint64),
-        ("mapped_handles_peak", ctypes.c_uint64),
-        ("live_allocs_current", ctypes.c_uint64),
-        ("overflow_creates", ctypes.c_uint64),
-        ("alloc_calls", ctypes.c_uint64),
-        ("free_calls", ctypes.c_uint64),
-        ("scope_flushes", ctypes.c_uint64),
-        ("total_map_us", ctypes.c_double),
-        ("total_unmap_us", ctypes.c_double),
-        ("total_sync_us", ctypes.c_double),
-    ]
-
-
-def stats_to_dict(st: TripoolStats) -> dict:
-    return {name: getattr(st, name) for name, _ in TripoolStats._fields_}
-
-
 def run_cmd(args: list[str], timeout: int = 20) -> dict:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -330,26 +307,24 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
     if not (hasattr(torch.cuda, "CUDAPluggableAllocator") and hasattr(torch.cuda, "MemPool")):
         return {"status": "unsupported_pytorch_api"}
 
-    lib = ctypes.CDLL(str(so_path))
-    lib.tripool_init_ex.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
-    lib.tripool_init_ex.restype = ctypes.c_int
-    lib.tripool_scope_begin.argtypes = []
-    lib.tripool_scope_begin.restype = None
-    lib.tripool_scope_end.argtypes = [ctypes.c_void_p]
-    lib.tripool_scope_end.restype = ctypes.c_int
-    lib.tripool_get_stats.argtypes = [ctypes.POINTER(TripoolStats)]
-    lib.tripool_get_stats.restype = None
-    lib.tripool_shutdown.argtypes = []
-    lib.tripool_shutdown.restype = ctypes.c_int
+    from morphserve.vmm import TriPoolVMM
 
     device = torch.device("cuda:0")
-    torch.cuda.set_device(device)
-    _ = torch.zeros(1, device=device)
-    torch.cuda.synchronize()
-
-    rc = lib.tripool_init_ex(0, 6144, 16, handle_mib)
-    if rc != 0:
-        return {"status": "init_failed", "rc": rc}
+    try:
+        vmm = TriPoolVMM(
+            device=0,
+            super_pool_mib=6144,
+            fine_kv_pool_mib=64,
+            super_handle_mib=handle_mib,
+            transient_va_gib=16,
+            kv_va_gib=2,
+            allow_overflow=False,
+            so_path=so_path,
+            simulated=False,
+            init_torch_cuda=True,
+        )
+    except Exception as exc:
+        return {"status": "init_failed", "error": f"{type(exc).__name__}: {exc}"}
 
     try:
         torch.manual_seed(2026)
@@ -389,12 +364,7 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
                 ref_times.append((time.perf_counter() - t0) * 1000.0)
             ref_sha = _tensor_sha256(out_ref)
 
-            pluggable = torch.cuda.CUDAPluggableAllocator(
-                str(so_path), "tripool_alloc", "tripool_free"
-            )
-
-            st_before = TripoolStats()
-            lib.tripool_get_stats(ctypes.byref(st_before))
+            st_before = vmm.stats()
 
             vmm_times = []
             out_vmm = None
@@ -402,33 +372,20 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
             for _ in range(repeats + 1):  # 1 warmup + repeats measured
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
-                # Create a lightweight scoped MemPool per VAE invocation so exiting destroys
-                # ONLY this transient pool's block cache and triggers immediate bulk cuMemUnmap.
-                pool = torch.cuda.MemPool(pluggable.allocator())
-                lib.tripool_scope_begin()
-                with torch.cuda.use_mem_pool(pool):
-                    out_vmm_pooled = vae_like_forward(x_in)
-                out_vmm = out_vmm_pooled.clone()
-                del out_vmm_pooled
-                del pool
-                stream_ptr = ctypes.c_void_p(torch.cuda.current_stream(device).cuda_stream)
-                lib.tripool_scope_end(stream_ptr)
+                out_vmm = vmm.run_in_transient_scope(vae_like_forward, x_in)
                 torch.cuda.synchronize()
                 dt_ms = (time.perf_counter() - t0) * 1000.0
-                st_iter = TripoolStats()
-                lib.tripool_get_stats(ctypes.byref(st_iter))
-                all_reclaimed_each.append(st_iter.mapped_handles_current == 0)
+                st_iter = vmm.stats()
+                all_reclaimed_each.append(st_iter.transient_mapped_handles_current == 0)
                 vmm_times.append(dt_ms)
 
             vmm_cold_ms = vmm_times[0]
             vmm_steady_times = vmm_times[1:]
 
-            del pluggable
             gc.collect()
             torch.cuda.synchronize()
 
-            st_after = TripoolStats()
-            lib.tripool_get_stats(ctypes.byref(st_after))
+            st_after = vmm.stats()
 
             vmm_sha = _tensor_sha256(out_vmm)
             bit_exact = bool(torch.equal(out_ref, out_vmm) and ref_sha == vmm_sha)
@@ -436,8 +393,9 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
 
         ref_p50 = sorted(ref_times)[len(ref_times) // 2]
         vmm_p50 = sorted(vmm_steady_times)[len(vmm_steady_times) // 2]
+        all_reclaimed = st_after.transient_mapped_handles_current == 0 and all(all_reclaimed_each)
         return {
-            "status": "ok" if (bit_exact and st_after.mapped_handles_current == 0 and all(all_reclaimed_each)) else "check_failed",
+            "status": "ok" if (bit_exact and all_reclaimed) else "check_failed",
             "handle_mib": handle_mib,
             "bit_exact": bit_exact,
             "ref_sha256": ref_sha,
@@ -450,17 +408,17 @@ def run_pytorch_mempool_probe(so_path: Path, handle_mib: int = 128, repeats: int
             "ref_times_ms": [round(x, 3) for x in ref_times],
             "vmm_steady_times_ms": [round(x, 3) for x in vmm_steady_times],
             "peak_transient_mib": round(
-                (st_after.mapped_handles_peak * st_after.handle_bytes) / (1024**2), 2
+                (st_after.transient_mapped_handles_peak * st_after.super_handle_bytes) / (1024**2), 2
             ),
-            "all_pages_reclaimed": st_after.mapped_handles_current == 0 and all(all_reclaimed_each),
+            "all_pages_reclaimed": all_reclaimed,
             "zero_hotpath_overflow": st_after.overflow_creates == 0,
-            "stats_before": stats_to_dict(st_before),
-            "stats_after": stats_to_dict(st_after),
+            "stats_before": st_before.to_dict(),
+            "stats_after": st_after.to_dict(),
         }
     except Exception as exc:
         return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
     finally:
-        lib.tripool_shutdown()
+        vmm.shutdown()
 
 
 def main(argv: list[str] | None = None) -> int:

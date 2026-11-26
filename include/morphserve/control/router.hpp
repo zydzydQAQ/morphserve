@@ -64,6 +64,8 @@ struct RouteDecision {
 };
 
 // Stateful three-tier PCIe/Socket/RDMA Dual-Path Morphing Router and reservation ledger.
+// Live coordinators should use the router's internal authoritative worker ledger (`ext_workers = nullptr`);
+// `ext_workers` is intended for read-only simulation snapshots and offline batch routing.
 class DualPathMorphRouter {
 public:
     explicit DualPathMorphRouter(
@@ -79,6 +81,7 @@ public:
 
     const ClusterTopologyProfile& topology() const noexcept { return topology_; }
     std::shared_ptr<runtime::HalfNodeH2DPacer> pacer() const noexcept { return pacer_; }
+    const OperatorLatencyProfile& operator_profile() const noexcept { return operator_profile_; }
 
     std::map<int, WorkerState> init_workers(
         int num_gpus,
@@ -96,12 +99,17 @@ public:
         std::optional<int64_t> kv_free_bytes,
         std::optional<int> p2p_concurrent_links);
 
+    // Monotonic `telemetry_seq` and `inflight_kv_reserved_bytes_` reconciliation are enforced
+    // consistently whether updating the internal ledger or an external worker map.
     void update_worker_telemetry(
         int gpu_id,
         std::optional<double> expert_alpha,
         std::optional<int64_t> kv_free_bytes,
         std::optional<int64_t> telemetry_seq = std::nullopt,
         std::map<int, WorkerState>* ext_workers = nullptr);
+
+    void reserve_ar_queue(int gpu_id, double est_ar_ms);
+    void release_ar_queue(int gpu_id, double est_ar_ms);
 
     int select_initial_gpu(
         int num_gpus,
@@ -132,6 +140,17 @@ public:
         const std::vector<int>& static_und_ranks,
         const std::map<int, WorkerState>* ext_workers = nullptr,
         const std::map<int, bool>& gpu_busy = {}) const;
+
+    // Pure read-only transition planner with zero pacer side effects and zero worker mutation.
+    std::pair<RouteDecision, std::string> plan_transition_readonly(
+        const std::string& routing_mode,
+        const std::vector<int>& static_und_ranks,
+        const std::vector<int>& static_gen_ranks,
+        const CPTGRequestSpec& req,
+        double est_dit_ms,
+        const std::map<int, WorkerState>* ext_workers = nullptr,
+        const std::map<int, bool>& gpu_busy = {},
+        double now_ms = 0.0) const;
 
     std::pair<RouteDecision, std::string> plan_and_reserve_transition(
         const std::string& routing_mode,

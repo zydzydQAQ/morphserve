@@ -22,6 +22,12 @@ inline constexpr std::array<const char*, 6> kValidPolicies = {
     "naive_host_offload",
 };
 
+inline constexpr std::array<const char*, 3> kStaticSplitPolicies = {
+    "static_2und_6gen",
+    "static_4und_4gen",
+    "static_6und_2gen",
+};
+
 bool is_valid_policy_name(const std::string& policy_name) noexcept;
 
 struct PolicyConfig {
@@ -84,8 +90,12 @@ struct PolicyConfig {
         const nlohmann::json& overrides = nlohmann::json::object());
 };
 
-// Static split-ratio sensitivity (`2:6`, `4:4`, `6:2`) & 5-step ablation ladder.
-std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(int num_gpus = 8);
-std::vector<std::pair<std::string, PolicyConfig>> build_static_split_configs(int num_gpus = 8);
+// Static split-ratio sensitivity (`2:6`, `4:4`, `6:2`) & Leave-One-Out M1-M4 ablation suite.
+std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(
+    int num_gpus = 8,
+    const nlohmann::json& overrides = nlohmann::json::object());
+std::vector<std::pair<std::string, PolicyConfig>> build_static_split_configs(
+    int num_gpus = 8,
+    const nlohmann::json& overrides = nlohmann::json::object());
 
 }  // namespace morphserve::control

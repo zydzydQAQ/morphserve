@@ -1,5 +1,7 @@
 #pragma once
 
+#include "morphserve/control/hash_util.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -14,17 +16,6 @@ namespace morphserve::control {
 
 constexpr int64_t kMiB = 1024LL * 1024LL;
 constexpr int64_t kGiB = 1024LL * 1024LL * 1024LL;
-
-// Pure C++17 cryptographic/deterministic helpers (zero external OpenSSL dependency).
-std::string sha256_hex_bytes(const uint8_t* data, size_t len);
-std::string sha256_hex_file(const std::string& path);
-uint32_t md5_prefix_u32(const std::string& text);
-
-// Linear-interpolated percentile rounded to 2 decimal places (`morphserve/telemetry.py`).
-double percentile_rounded(const std::vector<double>& vals, double p);
-
-// Arithmetic-intensity gate for two-pass Cascade-CFG + fused LSE merge (`cfg_prefix_attn.py`).
-bool should_use_cascade_cfg_split(int q_len, int l_shared, int num_shared_branches) noexcept;
 
 struct OperatorLatencyProfile {
     double ar_prefill_ms = 64.8;
@@ -53,6 +44,9 @@ struct OperatorLatencyProfile {
     std::map<std::string, double> slo_thresholds_ms(
         double k = 2.0,
         const std::string& model_family = "bagel") const;
+
+    nlohmann::json to_json() const;
+    static OperatorLatencyProfile from_json(const nlohmann::json& j);
 };
 
 const OperatorLatencyProfile& default_operator_profile() noexcept;

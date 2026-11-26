@@ -8,7 +8,16 @@ import os
 from pathlib import Path
 import subprocess
 import threading
-from typing import Any
+from typing import Any, NoReturn
+
+MS_OK = 0
+MS_ERR_RUNTIME = 1
+MS_ERR_OOM = 2
+MS_ERR_INVALID_ARG = 3
+
+
+class VmmOutOfMemoryError(MemoryError):
+    """Typed VMM physical pool exhaustion exception raised across the C ABI (`MS_ERR_OOM`)."""
 
 
 class UnifiedVmmStatsC(ctypes.Structure):
@@ -172,6 +181,8 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     # Error & memory release
     L.ms_last_error.argtypes = []
     L.ms_last_error.restype = ctypes.c_char_p
+    L.ms_last_error_code.argtypes = []
+    L.ms_last_error_code.restype = ctypes.c_int
     L.ms_free_cstr.argtypes = [ctypes.c_void_p]
     L.ms_free_cstr.restype = None
     L.ms_free_bytes.argtypes = [ctypes.c_void_p]
@@ -217,6 +228,8 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_vmm_kv_session_destroy.restype = None
     L.ms_vmm_kv_session_touch.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     L.ms_vmm_kv_session_touch.restype = None
+    L.ms_vmm_kv_session_set_pinned.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+    L.ms_vmm_kv_session_set_pinned.restype = None
     L.ms_vmm_kv_session_mark_active.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_void_p]
     L.ms_vmm_kv_session_mark_active.restype = ctypes.c_int
     L.ms_vmm_kv_session_mark_thinking.argtypes = [
@@ -237,6 +250,15 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
         ctypes.c_void_p,
     ]
     L.ms_vmm_reclaim_thinking_kv_bytes.restype = ctypes.c_size_t
+    L.ms_vmm_reclaim_thinking_kv_bytes_multi.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    L.ms_vmm_reclaim_thinking_kv_bytes_multi.restype = ctypes.c_size_t
     L.ms_vmm_maybe_evict_watermark.argtypes = [
         ctypes.c_void_p,
         ctypes.c_int,
@@ -246,6 +268,16 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
         ctypes.c_void_p,
     ]
     L.ms_vmm_maybe_evict_watermark.restype = ctypes.c_size_t
+    L.ms_vmm_maybe_evict_watermark_multi.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    L.ms_vmm_maybe_evict_watermark_multi.restype = ctypes.c_size_t
 
     L.ms_vmm_kv_region_alloc.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint64]
     L.ms_vmm_kv_region_alloc.restype = ctypes.c_int32
@@ -312,11 +344,26 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_vmm_expert_is_resident.restype = ctypes.c_int
     L.ms_vmm_expert_resident_count.argtypes = [ctypes.c_void_p, ctypes.c_int]
     L.ms_vmm_expert_resident_count.restype = ctypes.c_int
+    L.ms_vmm_ensure_expert_headroom.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+    ]
+    L.ms_vmm_ensure_expert_headroom.restype = ctypes.c_size_t
 
     L.ms_cuda_memcpy_htod.argtypes = [ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_size_t]
     L.ms_cuda_memcpy_htod.restype = ctypes.c_int
     L.ms_cuda_memcpy_dtoh.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_size_t]
     L.ms_cuda_memcpy_dtoh.restype = ctypes.c_int
+
+    # PyTorch `CUDAPluggableAllocator` entrypoints
+    L.tripool_alloc.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
+    L.tripool_alloc.restype = ctypes.c_uint64
+    L.tripool_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
+    L.tripool_free.restype = None
 
     # NumaMemfdMirror (`ms_mirror_*`)
     L.ms_mirror_create.argtypes = [ctypes.c_size_t, ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
@@ -391,8 +438,6 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_pacer_release_process_flock.restype = None
 
     # PeerByteTransport (`ms_nccl_*`, `ms_tcp_*`, `ms_mem_bus_*`, `ms_transport_*`)
-    L.ms_find_free_tcp_port.argtypes = []
-    L.ms_find_free_tcp_port.restype = ctypes.c_int
     L.ms_nccl_generate_uid.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8)]
     L.ms_nccl_generate_uid.restype = ctypes.c_int
     L.ms_nccl_create.argtypes = [
@@ -403,8 +448,6 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
         ctypes.c_char_p,
     ]
     L.ms_nccl_create.restype = ctypes.c_void_p
-    L.ms_nccl_transfer_stream.argtypes = [ctypes.c_void_p]
-    L.ms_nccl_transfer_stream.restype = ctypes.c_uint64
 
     L.ms_tcp_create.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p]
     L.ms_tcp_create.restype = ctypes.c_void_p
@@ -497,9 +540,15 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     ]
     L.ms_edf_select_microbatch.restype = ctypes.c_int
 
-    # JSON-returning control/router/budget/sim C APIs (`restype = c_void_p` so `ms_free_cstr` frees heap string!)
+    # JSON-returning control/router/budget/sim C APIs (`restype = c_void_p` so `ms_free_cstr` frees heap string)
     L.ms_policy_from_preset_json.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
     L.ms_policy_from_preset_json.restype = ctypes.c_void_p
+    L.ms_policy_build_ablation_configs_json.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    L.ms_policy_build_ablation_configs_json.restype = ctypes.c_void_p
+    L.ms_policy_build_static_split_configs_json.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    L.ms_policy_build_static_split_configs_json.restype = ctypes.c_void_p
+    L.ms_topology_default_operator_profile_json.argtypes = []
+    L.ms_topology_default_operator_profile_json.restype = ctypes.c_void_p
     L.ms_topology_a100_default_json.argtypes = []
     L.ms_topology_a100_default_json.restype = ctypes.c_void_p
     L.ms_topology_multinode_json.argtypes = [
@@ -567,6 +616,10 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
         ctypes.c_int64,
     ]
     L.ms_router_update_telemetry.restype = None
+    L.ms_router_reserve_ar_queue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_double]
+    L.ms_router_reserve_ar_queue.restype = None
+    L.ms_router_release_ar_queue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_double]
+    L.ms_router_release_ar_queue.restype = None
     L.ms_router_select_initial_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     L.ms_router_select_initial_gpu.restype = ctypes.c_int
     L.ms_router_select_static_gen_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -575,6 +628,8 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_router_select_oom_retry_gpu.restype = ctypes.c_int
     L.ms_router_decide_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     L.ms_router_decide_json.restype = ctypes.c_void_p
+    L.ms_router_plan_transition_readonly_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    L.ms_router_plan_transition_readonly_json.restype = ctypes.c_void_p
     L.ms_router_plan_and_reserve_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     L.ms_router_plan_and_reserve_json.restype = ctypes.c_void_p
     L.ms_router_route_batch_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
@@ -603,6 +658,17 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     ]
     L.ms_router_crossover_kv_mib.restype = ctypes.c_double
 
+    # MorphControlEngine (`ms_ctrl_*`)
+    L.ms_ctrl_create.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p]
+    L.ms_ctrl_create.restype = ctypes.c_void_p
+    L.ms_ctrl_destroy.argtypes = [ctypes.c_void_p]
+    L.ms_ctrl_destroy.restype = None
+    L.ms_ctrl_plan_turn_transition_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    L.ms_ctrl_plan_turn_transition_json.restype = ctypes.c_void_p
+    L.ms_ctrl_plan_turn_transition_readonly_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    L.ms_ctrl_plan_turn_transition_readonly_json.restype = ctypes.c_void_p
+    L.ms_ctrl_evaluate_session_slos_json.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    L.ms_ctrl_evaluate_session_slos_json.restype = ctypes.c_void_p
     L.ms_ctrl_deterministic_think_s.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_double, ctypes.c_double]
     L.ms_ctrl_deterministic_think_s.restype = ctypes.c_double
     L.ms_ctrl_deterministic_think_dist_s.argtypes = [
@@ -626,6 +692,7 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     ]
     L.ms_ctrl_aggregate_report_json.restype = ctypes.c_void_p
 
+    # SimGpuMemoryLedger (`ms_ledger_*`)
     L.ms_ledger_create.argtypes = [ctypes.c_char_p]
     L.ms_ledger_create.restype = ctypes.c_void_p
     L.ms_ledger_destroy.argtypes = [ctypes.c_void_p]
@@ -651,6 +718,7 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_ledger_stats_json.argtypes = [ctypes.c_void_p]
     L.ms_ledger_stats_json.restype = ctypes.c_void_p
 
+    # ClusterSimulator (`ms_sim_*`)
     L.ms_sim_point_json.argtypes = [ctypes.c_char_p]
     L.ms_sim_point_json.restype = ctypes.c_void_p
     L.ms_sim_evaluate_real_json.argtypes = [ctypes.c_char_p]
@@ -659,34 +727,6 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_sim_h100_study_json.restype = ctypes.c_void_p
     L.ms_sim_sweep_json.argtypes = [ctypes.c_char_p]
     L.ms_sim_sweep_json.restype = ctypes.c_void_p
-
-    # Legacy `tripool_*` symbols (`CUDAPluggableAllocator` & direct C-ABI callers)
-    L.tripool_vmm_init.argtypes = [
-        ctypes.c_int,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_int,
-    ]
-    L.tripool_vmm_init.restype = ctypes.c_int
-    L.tripool_vmm_shutdown.argtypes = []
-    L.tripool_vmm_shutdown.restype = ctypes.c_int
-    L.tripool_vmm_get_stats.argtypes = [ctypes.POINTER(UnifiedVmmStatsC)]
-    L.tripool_vmm_get_stats.restype = None
-    L.tripool_host_register.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    L.tripool_host_register.restype = ctypes.c_int
-    L.tripool_host_unregister.argtypes = [ctypes.c_void_p]
-    L.tripool_host_unregister.restype = ctypes.c_int
-    L.tripool_scope_begin.argtypes = []
-    L.tripool_scope_begin.restype = None
-    L.tripool_scope_end.argtypes = [ctypes.c_void_p]
-    L.tripool_scope_end.restype = ctypes.c_int
-    L.tripool_alloc.argtypes = [ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
-    L.tripool_alloc.restype = ctypes.c_uint64
-    L.tripool_free.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p]
-    L.tripool_free.restype = None
 
 
 def load_core_lib(
@@ -717,6 +757,24 @@ def last_error(lib: ctypes.CDLL | None = None) -> str:
     return raw.decode("utf-8", errors="replace") if raw else "unknown C++ error"
 
 
+def last_error_code(lib: ctypes.CDLL | None = None) -> int:
+    L = lib if lib is not None else get_core_lib()
+    return int(L.ms_last_error_code())
+
+
+def raise_last_error(lib: ctypes.CDLL | None = None, prefix: str = "") -> NoReturn:
+    """Translate the thread-local C ABI `MsErrorCode` into the canonical Python exception type."""
+    L = lib if lib is not None else get_core_lib()
+    code = last_error_code(L)
+    err = last_error(L)
+    msg = f"{prefix}: {err}" if prefix else err
+    if code == MS_ERR_OOM:
+        raise VmmOutOfMemoryError(msg)
+    if code == MS_ERR_INVALID_ARG:
+        raise ValueError(msg)
+    raise RuntimeError(msg)
+
+
 def encode_json(obj: Any) -> bytes:
     return json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
@@ -724,10 +782,7 @@ def encode_json(obj: Any) -> bytes:
 def call_json(lib: ctypes.CDLL, fn: Any, *args: Any) -> Any:
     ptr = fn(*args)
     if not ptr:
-        err = last_error(lib)
-        if any(tok in err for tok in ("unknown", "unsupported", "must be", "requires", "invalid")):
-            raise ValueError(err)
-        raise RuntimeError(err)
+        raise_last_error(lib)
     try:
         raw_str = ctypes.string_at(ptr).decode("utf-8")
     finally:
@@ -739,15 +794,29 @@ def cuda_memcpy_htod(device: int, dst_va: int, src_ptr: int, nbytes: int) -> Non
     if nbytes <= 0:
         return
     L = get_core_lib()
-    rc = int(L.ms_cuda_memcpy_htod(int(device), ctypes.c_uint64(int(dst_va)), ctypes.c_void_p(int(src_ptr)), ctypes.c_size_t(int(nbytes))))
+    rc = int(
+        L.ms_cuda_memcpy_htod(
+            int(device),
+            ctypes.c_uint64(int(dst_va)),
+            ctypes.c_void_p(int(src_ptr)),
+            ctypes.c_size_t(int(nbytes)),
+        )
+    )
     if rc != 0:
-        raise RuntimeError(f"ms_cuda_memcpy_htod failed: {last_error(L)}")
+        raise_last_error(L, "ms_cuda_memcpy_htod failed")
 
 
 def cuda_memcpy_dtoh(device: int, dst_ptr: int, src_va: int, nbytes: int) -> None:
     if nbytes <= 0:
         return
     L = get_core_lib()
-    rc = int(L.ms_cuda_memcpy_dtoh(int(device), ctypes.c_void_p(int(dst_ptr)), ctypes.c_uint64(int(src_va)), ctypes.c_size_t(int(nbytes))))
+    rc = int(
+        L.ms_cuda_memcpy_dtoh(
+            int(device),
+            ctypes.c_void_p(int(dst_ptr)),
+            ctypes.c_uint64(int(src_va)),
+            ctypes.c_size_t(int(nbytes)),
+        )
+    )
     if rc != 0:
-        raise RuntimeError(f"ms_cuda_memcpy_dtoh failed: {last_error(L)}")
+        raise_last_error(L, "ms_cuda_memcpy_dtoh failed")

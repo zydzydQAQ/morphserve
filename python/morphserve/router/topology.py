@@ -1,30 +1,72 @@
-"""Three-tier PCIe/Socket/RDMA hardware topology profile and bandwidth modeling for MorphServe."""
+"""Three-tier PCIe/Socket/RDMA hardware topology profile and operator latency profile backed by C++17."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 
 @dataclass(frozen=True)
 class OperatorLatencyProfile:
-    """Single calibrated source of truth for solo unloaded A100 operator latencies (`T_unloaded`) & `k×` SLOs."""
+    """Calibrated solo unloaded operator latencies (`T_unloaded`) and `k×` SLO thresholds fetched from C++."""
 
-    ar_prefill_ms: float = 64.8
-    ar_tpot_ms: float = 62.82
-    prep_overhead_ms: float = 240.0
-    bagel_dit_512_step_ms: float = 287.0
-    bagel_dit_1024_step_ms: float = 1040.0
-    bagel_vae_512_ms: float = 140.0
-    bagel_vae_1024_ms: float = 680.0
-    bagel_expert_bytes: int = 12_446 * (1024**2)
-    internvlu_dit_512_step_ms: float = 145.0
-    internvlu_dit_1024_step_ms: float = 420.0
-    internvlu_vae_512_ms: float = 110.0
-    internvlu_vae_1024_ms: float = 340.0
-    internvlu_expert_bytes: int = 4_350 * (1024**2)
+    ar_prefill_ms: float
+    ar_tpot_ms: float
+    prep_overhead_ms: float
+    bagel_dit_512_step_ms: float
+    bagel_dit_1024_step_ms: float
+    bagel_vae_512_ms: float
+    bagel_vae_1024_ms: float
+    bagel_expert_bytes: int
+    internvlu_dit_512_step_ms: float
+    internvlu_dit_1024_step_ms: float
+    internvlu_vae_512_ms: float
+    internvlu_vae_1024_ms: float
+    internvlu_expert_bytes: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ar_prefill_ms": float(self.ar_prefill_ms),
+            "ar_tpot_ms": float(self.ar_tpot_ms),
+            "prep_overhead_ms": float(self.prep_overhead_ms),
+            "bagel_dit_512_step_ms": float(self.bagel_dit_512_step_ms),
+            "bagel_dit_1024_step_ms": float(self.bagel_dit_1024_step_ms),
+            "bagel_vae_512_ms": float(self.bagel_vae_512_ms),
+            "bagel_vae_1024_ms": float(self.bagel_vae_1024_ms),
+            "bagel_expert_bytes": int(self.bagel_expert_bytes),
+            "internvlu_dit_512_step_ms": float(self.internvlu_dit_512_step_ms),
+            "internvlu_dit_1024_step_ms": float(self.internvlu_dit_1024_step_ms),
+            "internvlu_vae_512_ms": float(self.internvlu_vae_512_ms),
+            "internvlu_vae_1024_ms": float(self.internvlu_vae_1024_ms),
+            "internvlu_expert_bytes": int(self.internvlu_expert_bytes),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "OperatorLatencyProfile":
+        return cls(
+            ar_prefill_ms=float(d["ar_prefill_ms"]),
+            ar_tpot_ms=float(d["ar_tpot_ms"]),
+            prep_overhead_ms=float(d["prep_overhead_ms"]),
+            bagel_dit_512_step_ms=float(d["bagel_dit_512_step_ms"]),
+            bagel_dit_1024_step_ms=float(d["bagel_dit_1024_step_ms"]),
+            bagel_vae_512_ms=float(d["bagel_vae_512_ms"]),
+            bagel_vae_1024_ms=float(d["bagel_vae_1024_ms"]),
+            bagel_expert_bytes=int(d["bagel_expert_bytes"]),
+            internvlu_dit_512_step_ms=float(d["internvlu_dit_512_step_ms"]),
+            internvlu_dit_1024_step_ms=float(d["internvlu_dit_1024_step_ms"]),
+            internvlu_vae_512_ms=float(d["internvlu_vae_512_ms"]),
+            internvlu_vae_1024_ms=float(d["internvlu_vae_1024_ms"]),
+            internvlu_expert_bytes=int(d["internvlu_expert_bytes"]),
+        )
+
+    @classmethod
+    def default(cls, **overrides: Any) -> "OperatorLatencyProfile":
+        """Fetch the canonical default `OperatorLatencyProfile` from C++ with optional field overrides."""
+        base = default_operator_profile()
+        return replace(base, **overrides) if overrides else base
 
     def step_ms(self, model_family: str, height: int) -> float:
         is_1024 = int(height) >= 1024
@@ -55,11 +97,19 @@ class OperatorLatencyProfile:
             "ar_tpot_slo_ms": round(fk * self.ar_tpot_ms, 2),
             "ar_ttft_slo_ms": round(750.0 * fk, 2),
             "dit_512_slo_ms": self.dit_turn_slo_ms(512, k=fk, model_family=model_family, steps=20),
-            "dit_1024_slo_ms": self.dit_turn_slo_ms(1024, k=fk, model_family=model_family, steps=16 if model_family == "internvl_u" else 20),
+            "dit_1024_slo_ms": self.dit_turn_slo_ms(
+                1024, k=fk, model_family=model_family, steps=16 if model_family == "internvl_u" else 20
+            ),
         }
 
 
-DEFAULT_OPERATOR_PROFILE = OperatorLatencyProfile()
+@lru_cache(maxsize=1)
+def default_operator_profile() -> OperatorLatencyProfile:
+    """Return the cached C++ authoritative default `OperatorLatencyProfile`."""
+    from morphserve._core import call_json, get_core_lib
+
+    L = get_core_lib()
+    return OperatorLatencyProfile.from_dict(call_json(L, L.ms_topology_default_operator_profile_json))
 
 
 @dataclass(frozen=True)
@@ -104,7 +154,9 @@ class ClusterTopologyProfile:
         return self.half_group_of(gpu_id).numa_node
 
     def same_half(self, gpu_a: int, gpu_b: int) -> bool:
-        return self.same_node(gpu_a, gpu_b) and (self.half_group_of(gpu_a).group_id == self.half_group_of(gpu_b).group_id)
+        return self.same_node(gpu_a, gpu_b) and (
+            self.half_group_of(gpu_a).group_id == self.half_group_of(gpu_b).group_id
+        )
 
     def fabric_tier(self, src_gpu: int, dst_gpu: int) -> str:
         if src_gpu == dst_gpu:
@@ -187,7 +239,7 @@ class ClusterTopologyProfile:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "ClusterTopologyProfile":
+    def from_dict(cls, d: Mapping[str, Any]) -> "ClusterTopologyProfile":
         return cls(
             num_gpus=int(d["num_gpus"]),
             gpu_names=[str(x) for x in d.get("gpu_names", [])],
@@ -196,23 +248,23 @@ class ClusterTopologyProfile:
                     group_id=int(g["group_id"]),
                     numa_node=int(g["numa_node"]),
                     gpu_ids=tuple(int(x) for x in g["gpu_ids"]),
-                    aggregate_h2d_gbps=float(g.get("aggregate_h2d_gbps", 10.35)),
-                    solo_h2d_gbps=float(g.get("solo_h2d_gbps", 8.75)),
+                    aggregate_h2d_gbps=float(g["aggregate_h2d_gbps"]),
+                    solo_h2d_gbps=float(g["solo_h2d_gbps"]),
                 )
                 for g in d.get("half_groups", [])
             ],
             p2p_bw_gbps=[[float(v) for v in row] for row in d.get("p2p_bw_gbps", [])],
-            intra_half_p2p_cap_gbps=float(d.get("intra_half_p2p_cap_gbps", 19.67)),
-            cross_half_p2p_cap_gbps=float(d.get("cross_half_p2p_cap_gbps", 9.98)),
-            inter_node_p2p_cap_gbps=float(d.get("inter_node_p2p_cap_gbps", 11.5)),
+            intra_half_p2p_cap_gbps=float(d["intra_half_p2p_cap_gbps"]),
+            cross_half_p2p_cap_gbps=float(d["cross_half_p2p_cap_gbps"]),
+            inter_node_p2p_cap_gbps=float(d["inter_node_p2p_cap_gbps"]),
             gpus_per_node=int(d.get("gpus_per_node", 8)),
-            intra_node_handoff_ms=float(d.get("intra_node_handoff_ms", 3.0)),
-            inter_node_handoff_ms=float(d.get("inter_node_handoff_ms", 8.0)),
+            intra_node_handoff_ms=float(d["intra_node_handoff_ms"]),
+            inter_node_handoff_ms=float(d["inter_node_handoff_ms"]),
         )
 
     @classmethod
     def a100_pcie_8gpu_default(cls) -> "ClusterTopologyProfile":
-        """Measured Job-0c ground-truth profile for 8x NVIDIA A100-PCIE-40GB (C++ `ClusterTopologyProfile`)."""
+        """Measured Job-0c ground-truth profile for 8x NVIDIA A100-PCIE-40GB fetched from C++."""
         from morphserve._core import call_json, get_core_lib
 
         L = get_core_lib()
@@ -226,14 +278,22 @@ class ClusterTopologyProfile:
         intra_bw: float,
         socket_bw: float,
         inter_bw: float,
-        solo_h2d_bw: float = 8.75,
-        agg_h2d_bw: float = 10.35,
+        solo_h2d_bw: float | None = None,
+        agg_h2d_bw: float | None = None,
         gpu_name: str = "NVIDIA A100-PCIE-40GB",
-        intra_handoff_ms: float = 3.0,
-        inter_handoff_ms: float = 8.0,
+        intra_handoff_ms: float | None = None,
+        inter_handoff_ms: float | None = None,
     ) -> "ClusterTopologyProfile":
         """Construct a 3-tier multi-node topology profile via C++ `ClusterTopologyProfile`."""
         from morphserve._core import call_json, get_core_lib
+
+        if solo_h2d_bw is None or agg_h2d_bw is None or intra_handoff_ms is None or inter_handoff_ms is None:
+            base = cls.a100_pcie_8gpu_default()
+            grp0 = base.half_groups[0]
+            solo_h2d_bw = grp0.solo_h2d_gbps if solo_h2d_bw is None else solo_h2d_bw
+            agg_h2d_bw = grp0.aggregate_h2d_gbps if agg_h2d_bw is None else agg_h2d_bw
+            intra_handoff_ms = base.intra_node_handoff_ms if intra_handoff_ms is None else intra_handoff_ms
+            inter_handoff_ms = base.inter_node_handoff_ms if inter_handoff_ms is None else inter_handoff_ms
 
         L = get_core_lib()
         return cls.from_dict(
@@ -260,6 +320,30 @@ class ClusterTopologyProfile:
 
         L = get_core_lib()
         return cls.from_dict(call_json(L, L.ms_topology_from_job0c_json, str(Path(path)).encode("utf-8")))
+
+
+def default_topology_for(num_gpus: int, gpus_per_node: int = 8) -> ClusterTopologyProfile:
+    """Single canonical default `ClusterTopologyProfile` constructor derived from C++ A100 baselines."""
+    n = max(1, int(num_gpus))
+    gpn = min(n, max(1, int(gpus_per_node)))
+    base = ClusterTopologyProfile.a100_pcie_8gpu_default()
+    if n == 8 and gpn == 8:
+        return base
+    intra_bw = float(base.p2p_bw_gbps[0][1])
+    socket_bw = float(base.p2p_bw_gbps[0][4])
+    grp0 = base.half_groups[0]
+    return ClusterTopologyProfile.from_multinode_measurements(
+        world_size=n,
+        gpus_per_node=gpn,
+        intra_bw=intra_bw,
+        socket_bw=socket_bw,
+        inter_bw=float(base.inter_node_p2p_cap_gbps),
+        solo_h2d_bw=float(grp0.solo_h2d_gbps),
+        agg_h2d_bw=float(grp0.aggregate_h2d_gbps),
+        gpu_name=base.gpu_names[0] if base.gpu_names else "NVIDIA A100-PCIE-40GB",
+        intra_handoff_ms=float(base.intra_node_handoff_ms),
+        inter_handoff_ms=float(base.inter_node_handoff_ms),
+    )
 
 
 def _read_gpu_numa_node_sysfs(bus_id: str) -> int:
@@ -300,12 +384,9 @@ def probe_live_topology(
     n = int(torch.cuda.device_count())
     names = [str(torch.cuda.get_device_name(i)) for i in range(n)]
     if n != 8:
-        half = max(1, n // 2)
-        groups = [PcieHalfGroup(group_id=0, numa_node=0, gpu_ids=tuple(range(half)))]
-        if n > half:
-            groups.append(PcieHalfGroup(group_id=1, numa_node=1, gpu_ids=tuple(range(half, n))))
-        p2p = [[0.0 if i == j else 10.0 for j in range(n)] for i in range(n)]
-        return ClusterTopologyProfile(num_gpus=n, gpu_names=names, half_groups=groups, p2p_bw_gbps=p2p, gpus_per_node=max(1, n))
+        topo = default_topology_for(n, gpus_per_node=max(1, n))
+        topo.gpu_names = names
+        return topo
 
     numa_map: dict[int, list[int]] = {}
     for i in range(n):
@@ -373,4 +454,23 @@ def probe_live_topology(
         cross_half_p2p_cap_gbps=base.cross_half_p2p_cap_gbps,
         inter_node_p2p_cap_gbps=base.inter_node_p2p_cap_gbps,
         gpus_per_node=n,
+        intra_node_handoff_ms=base.intra_node_handoff_ms,
+        inter_node_handoff_ms=base.inter_node_handoff_ms,
     )
+
+
+def __getattr__(name: str) -> Any:
+    if name == "DEFAULT_OPERATOR_PROFILE":
+        return default_operator_profile()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [
+    "ClusterTopologyProfile",
+    "DEFAULT_OPERATOR_PROFILE",
+    "OperatorLatencyProfile",
+    "PcieHalfGroup",
+    "default_operator_profile",
+    "default_topology_for",
+    "probe_live_topology",
+]

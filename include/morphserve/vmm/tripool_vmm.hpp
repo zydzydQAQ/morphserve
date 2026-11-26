@@ -10,6 +10,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <string>
 #include <sys/types.h>
 #include <thread>
 #include <unordered_map>
@@ -17,6 +19,13 @@
 #include <vector>
 
 namespace morphserve::vmm {
+
+// Typed out-of-memory error raised whenever physical pool or driver OOM prevents KV growth,
+// transient scratchpad allocation, expert layer load/wait, or KV swap-in.
+class VmmOutOfMemoryError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct UnifiedVmmStatsPod {
     uint64_t min_granularity_bytes;
@@ -124,6 +133,7 @@ public:
     uint64_t kv_session_create();
     void kv_session_destroy(uint64_t session_id);
     void kv_session_touch(uint64_t session_id);
+    void kv_session_set_pinned(uint64_t session_id, bool pinned);
     int kv_session_mark_active(uint64_t session_id, void* stream);
     size_t kv_session_mark_thinking(
         uint64_t session_id,
@@ -139,9 +149,24 @@ public:
         uint64_t exclude_session_id,
         void* stream);
 
+    size_t reclaim_thinking_kv_bytes_multi(
+        size_t target_reclaim_bytes,
+        bool sync,
+        const uint64_t* exclude_session_ids,
+        size_t num_excludes,
+        void* stream);
+
     size_t maybe_evict_thinking_kv_on_high_watermark(
         bool sync,
         uint64_t exclude_session_id,
+        size_t extra_needed_bytes,
+        bool for_dit,
+        void* stream);
+
+    size_t maybe_evict_thinking_kv_on_high_watermark_multi(
+        bool sync,
+        const uint64_t* exclude_session_ids,
+        size_t num_excludes,
         size_t extra_needed_bytes,
         bool for_dit,
         void* stream);
@@ -175,16 +200,17 @@ public:
     int expert_evict_range(int expert_id, int start_layer, int end_layer_exclusive, void* stream);
     int expert_is_resident(int expert_id, int layer_idx);
     int expert_resident_count(int expert_id);
+    size_t ensure_expert_headroom(
+        int expert_id,
+        size_t needed_bytes,
+        const uint64_t* exclude_session_ids,
+        size_t num_excludes,
+        void* stream);
 
     // Active CUDA device registry for `CUDAPluggableAllocator` (`tripool_alloc` / `tripool_free`)
     static void register_active_device_instance(int device, const std::shared_ptr<TriPoolVMM>& inst);
     static void unregister_active_device_instance(int device, const TriPoolVMM* inst);
     static std::shared_ptr<TriPoolVMM> active_device_instance(int device);
-
-    // Legacy C singleton slot (`tripool_vmm_init` / `tripool_vmm_shutdown`)
-    static std::shared_ptr<TriPoolVMM> legacy_singleton();
-    static int init_legacy_singleton(const TriPoolVMMConfig& cfg);
-    static int shutdown_legacy_singleton();
 
 private:
     enum class LayerState : int {
@@ -210,6 +236,9 @@ private:
     struct ExpertLayer {
         LayerState state = LayerState::EVICTED;
         bool needs_stream_wait = false;
+        bool failed = false;
+        bool failed_oom = false;
+        std::string failed_msg;
         size_t used_bytes = 0;
         std::vector<SuperSlot> slots;
         void* ready_event = nullptr;
@@ -225,7 +254,9 @@ private:
         uint8_t* host_pinned_base = nullptr;
         size_t host_bytes = 0;
         bool pinned = false;
-        bool host_accessible_va = false;
+        bool last_async_error = false;
+        bool last_async_error_oom = false;
+        std::string last_async_error_msg;
         void* last_h2d_event = nullptr;
         std::vector<ExpertLayer> layers;
     };
@@ -267,10 +298,21 @@ private:
         std::unordered_set<int32_t> region_ids;
     };
 
-    struct CapacitySnapshot {
+    struct KvBudgetSnapshot {
         uint64_t pool_total_bytes = 0;
         uint64_t pool_free_bytes = 0;
+        uint64_t inflight_swap_bytes = 0;
+        uint64_t active_kv_bytes = 0;
+        uint64_t transient_bytes = 0;
+        uint64_t expert_mapped_bytes = 0;
         uint64_t expert_unpinned_bytes = 0;
+        uint64_t expert_pinned_bytes = 0;
+        uint64_t dit_expert_full_bytes = 0;
+        uint64_t fixed_non_kv_bytes = 0;
+        uint64_t effective_pool_bytes = 0;
+        uint64_t kv_budget_bytes = 0;
+        uint64_t high_watermark_bytes = 0;
+        uint64_t low_watermark_bytes = 0;
         uint64_t kv_free_bytes = 0;
         uint64_t kv_dit_headroom_bytes = 0;
     };
@@ -280,8 +322,9 @@ private:
     void cleanup_failed_init_locked() noexcept;
     void reset_counters_locked();
 
-    CapacitySnapshot compute_kv_capacities_locked() const;
-    uint64_t clamp_by_max_pool_locked(uint64_t raw_free, const CapacitySnapshot& snap, bool for_dit) const;
+    KvBudgetSnapshot compute_kv_budget_locked(bool for_dit) const;
+    uint64_t clamp_by_max_pool_locked(uint64_t raw_free, const KvBudgetSnapshot& snap) const;
+    size_t compute_watermark_reclaim_target_locked(bool for_dit, size_t extra_needed_bytes) const;
 
     uint64_t pop_fine_handle_locked(
         void* stream,
@@ -316,7 +359,8 @@ private:
     size_t reclaim_thinking_kv_locked(
         size_t target_reclaim_bytes,
         bool sync,
-        uint64_t exclude_session_id,
+        const uint64_t* exclude_session_ids,
+        size_t num_excludes,
         void* stream,
         std::unique_lock<std::mutex>& lock);
 
@@ -354,7 +398,7 @@ private:
     size_t active_h2d_syncs_ = 0;
 
     bool initialized_ = false;
-    bool scope_active_ = false;
+    int scope_depth_ = 0;
     void* h2d_stream_ = nullptr;
     void* swap_stream_ = nullptr;
     void* compute_bridge_event_ = nullptr;
@@ -397,7 +441,6 @@ private:
 
     uint64_t transient_va_ = 0;
     size_t transient_va_handles_ = 0;
-    bool transient_host_accessible_ = true;
     std::vector<SuperSlot> transient_mapped_slots_;
     std::map<size_t, size_t> transient_free_blocks_;
     std::unordered_map<size_t, size_t> transient_live_allocs_;

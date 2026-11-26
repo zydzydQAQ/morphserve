@@ -15,13 +15,12 @@ from morphserve.models import bagel_ctx_nbytes, load_bagel_pipeline, pack_bagel_
 from morphserve.router import (
     CPTGRequestSpec,
     ClusterTopologyProfile,
-    DirectNcclMesh,
     DualPathMorphRouter,
     HalfNodeH2DPacer,
     WorkerState,
-    find_free_tcp_port,
     probe_live_topology,
 )
+from morphserve.runtime.peer_transport import DirectNcclMesh, find_free_tcp_port
 from morphserve.vmm import ExpertPartitionSpec, LayerExpertPager, NumaMemfdMirror, TriPoolVMM
 
 GIB = 1024**3

@@ -43,10 +43,8 @@ from pathlib import Path
 import shutil
 import sys
 
-from morphserve.bench.run_phase2_bagel_main import (
-    _compute_sustainable_qps_summary,
-    run_suite_a_lowqps_and_cdf,
-)
+from morphserve.bench.harness import compute_sustainable_qps_summary
+from morphserve.bench.run_phase2_bagel_main import run_suite_a_lowqps_and_cdf
 
 
 def main() -> None:
@@ -62,8 +60,8 @@ def main() -> None:
         output_dir=run_dir,
         num_gpus=8,
         qps_points=(0.05, 0.10, 0.15, 0.20, 0.25, 0.40, 1.10),
-        knee_sessions=48,
-        low_sessions=28,
+        min_sessions=28,
+        max_sessions=48,
         policies=("morphserve",),
         merge_suite_a_report=prev_suite_a if prev_suite_a.is_file() else None,
     )
@@ -88,7 +86,7 @@ def main() -> None:
                 combined_for_summary.append(old_r)
 
     rep["qps_sweep"] = merged_lowqps
-    rep["sustainable_qps_summary"] = _compute_sustainable_qps_summary(combined_for_summary)
+    rep["sustainable_qps_summary"] = compute_sustainable_qps_summary(combined_for_summary)
     rep["baseline_lowqps_source"] = str(base_lowqps) if base_lowqps.is_file() else None
     rep["suite_a_merge_source"] = str(prev_suite_a) if prev_suite_a.is_file() else None
     rep["status"] = "ok" if all(int(r.get("error_sessions", 0)) == 0 for r in merged_lowqps) else "check_failed"

@@ -1,7 +1,8 @@
-"""Pure session, turn, and arrival-schedule contracts consumed by `MorphServeClusterEngine`."""
+"""Pure session, turn, apportionment, and arrival-schedule contracts consumed by `MorphServeClusterEngine`."""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import json
@@ -103,6 +104,54 @@ class WorkloadSuite:
         return cls.from_dict(json.loads(path.read_text(encoding="utf-8")))
 
 
+def hamilton_apportion(
+    total: int,
+    weights: Mapping[str, float],
+    *,
+    caps: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Apportion `total` integer slots across `weights` using the largest-remainder (Hamilton) method."""
+    keys = list(weights.keys())
+    if not keys:
+        return {}
+    n_total = max(0, int(total))
+    pos_weights = {k: max(0.0, float(weights[k])) for k in keys}
+    w_sum = sum(pos_weights.values())
+    if n_total == 0 or w_sum <= 0.0:
+        return {k: 0 for k in keys}
+
+    exact = {k: n_total * (pos_weights[k] / w_sum) for k in keys}
+    counts: dict[str, int] = {}
+    for k in keys:
+        c = int(math.floor(exact[k]))
+        if caps is not None and k in caps:
+            c = min(max(0, int(caps[k])), c)
+        counts[k] = c
+
+    rem = n_total - sum(counts.values())
+    if rem > 0:
+        order = sorted(range(len(keys)), key=lambda idx: (-(exact[keys[idx]] - math.floor(exact[keys[idx]])), idx))
+        if caps is None:
+            for idx in order[:rem]:
+                counts[keys[idx]] += 1
+        else:
+            cursor = 0
+            while rem > 0:
+                progressed = False
+                for pos in range(len(order)):
+                    k = keys[order[(cursor + pos) % len(order)]]
+                    cap = max(0, int(caps[k])) if k in caps else n_total
+                    if counts[k] < cap:
+                        counts[k] += 1
+                        rem -= 1
+                        cursor = (cursor + pos + 1) % len(order)
+                        progressed = True
+                        break
+                if not progressed:
+                    break
+    return counts
+
+
 def scale_arrivals_to_qps(norm_deltas: list[float], target_qps: float, count: int) -> list[float]:
     """Convert normalized inter-arrival deltas (`mean=1.0`) into absolute arrival offsets in seconds."""
     if count <= 0:
@@ -195,14 +244,7 @@ def build_time_window_suite(
         by_quad.setdefault(s.quadrant, []).append(s)
 
     quads = list(by_quad.keys())
-    n_base = float(len(base_suite.sessions))
-    quotas = {q: (target_n * len(by_quad[q]) / n_base) for q in quads}
-    counts = {q: int(math.floor(quotas[q])) for q in quads}
-    rem = target_n - sum(counts.values())
-    if rem > 0:
-        order = sorted(range(len(quads)), key=lambda idx: (-(quotas[quads[idx]] - counts[quads[idx]]), idx))
-        for idx in order[:rem]:
-            counts[quads[idx]] += 1
+    counts = hamilton_apportion(target_n, {q: float(len(by_quad[q])) for q in quads})
 
     # Smooth proportional interleaving across quadrants keeps quadrant mix stationary across time windows.
     active_quads = [q for q in quads if counts[q] > 0]
@@ -259,5 +301,6 @@ __all__ = [
     "WorkloadSuite",
     "assign_dual_trace_arrivals",
     "build_time_window_suite",
+    "hamilton_apportion",
     "scale_arrivals_to_qps",
 ]

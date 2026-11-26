@@ -1,12 +1,13 @@
-"""Deep `CPTGModelAdapter` interface and local-substitutable `SyntheticCPTGAdapter`."""
+"""Deep `CPTGModelAdapter` interface, shared GPU adapter lifecycle mixin, and `SyntheticCPTGAdapter`."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from contextlib import contextmanager
-from dataclasses import dataclass, field
 import ctypes
+from dataclasses import dataclass, field
+import gc
 import json
 import os
 from pathlib import Path
@@ -17,38 +18,39 @@ from morphserve.vmm import (
     ExpertPartitionSpec,
     LayerExpertPager,
     LayerPackPlan,
+    NaiveHostOffloader,
     ParamSlice,
     SimulatedTriPoolBackend,
 )
+from morphserve.vmm.pager import StaticFissionDropper
+
+try:
+    from morphserve.vmm.tripool import VmmOutOfMemoryError
+except ImportError:  # pragma: no cover - seam fallback prior to Wave 2 tripool update
+
+    class VmmOutOfMemoryError(MemoryError):  # type: ignore[no-redef]
+        """Typed VMM physical pool exhaustion exception."""
+
 
 MIB = 1024**2
 GIB = 1024**3
 
 
 class SyntheticOutOfMemoryError(MemoryError):
-    """Deterministic CPU test exception treated identically to CUDA/FA3 OOM."""
+    """Deterministic CPU test exception treated identically to CUDA/VMM OOM."""
 
 
 def is_oom_exception(exc: BaseException) -> bool:
-    """Classify PyTorch CUDA OOM, VMM MemoryError, cuBLAS/cuDNN workspace OOM, and FA3 C++ dispatcher OOM."""
-    if isinstance(exc, MemoryError) or type(exc).__name__ == "OutOfMemoryError":
+    """Classify VMM/Python MemoryError, PyTorch CUDA OutOfMemoryError, and allocator OOM messages."""
+    if isinstance(exc, (MemoryError, VmmOutOfMemoryError)) or type(exc).__name__ == "OutOfMemoryError":
         return True
-    msg = str(exc)
-    low = msg.lower()
+    low = str(exc).lower()
     return (
         "out of memory" in low
         or "out of vmm memory" in low
-        or "memory allocation failed" in low
         or "cudaerrormemoryallocation" in low
         or "cublas_status_alloc_failed" in low
         or "cudnn_status_alloc_failed" in low
-        or "ms_vmm_expert_load_layers_sync failed" in low
-        or "ms_vmm_expert_wait_layer" in low
-        or "exhausted: need" in low
-        or "pool exhausted" in low
-        or 'torch_call_dispatcher( "aten::new_empty"' in msg
-        or 'torch_call_dispatcher( "aten::empty' in msg
-        or 'torch_call_dispatcher( "aten::resize_' in msg
     )
 
 
@@ -102,6 +104,15 @@ class CPTGModelAdapter(ABC):
     architecture: str = "tight_mot"
     num_expert_layers: int = 28
 
+    @staticmethod
+    def normalized_enqueue_time_s(cmd: dict[str, Any], default_s: float = 0.0) -> float:
+        """Return clock-skew-safe enqueue timestamp preferring worker-local `_worker_recv_s`."""
+        recv_s = float(cmd.get("_worker_recv_s", 0.0))
+        if recv_s > 0.0:
+            return recv_s
+        enq_s = float(cmd.get("enqueue_time_s", 0.0))
+        return enq_s if enq_s > 0.0 else float(default_s)
+
     @property
     @abstractmethod
     def total_mirror_bytes(self) -> int:
@@ -132,8 +143,7 @@ class CPTGModelAdapter(ABC):
         results: list[dict[str, Any]] = []
         for cmd in batch_cmds:
             cid = str(cmd["ctx_id"])
-            recv_s = float(cmd.get("_worker_recv_s", 0.0))
-            enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
+            enq_s = self.normalized_enqueue_time_s(cmd)
             t_start = time.perf_counter()
             self.prepare_turn(cid, cmd)
             out = self.decode_ar(cid, int(cmd.get("max_ar_tokens", 32)))
@@ -188,9 +198,9 @@ class CPTGModelAdapter(ABC):
         self.reset_peak_memory_stats()
         return alpha_now
 
+    @abstractmethod
     def available_kv_bytes(self, *, for_dit: bool = False) -> int:
         """Return current free + drop-clean reclaimable GPU KV capacity in bytes on this worker."""
-        return 0
 
     def evict_idle_kv_to_host(
         self,
@@ -213,6 +223,150 @@ class CPTGModelAdapter(ABC):
     @abstractmethod
     def close(self) -> None:
         """Release VMM, pager, hooks, and contexts cleanly."""
+
+
+class GpuCPTGAdapterMixin(CPTGModelAdapter):
+    """Shared GPU lifecycle, HWM/VMM accounting, and 3-way expert partition binding for production adapters."""
+
+    rank: int
+    policy: Any
+    device: Any
+    numa_node: int
+    pager: LayerExpertPager | None
+    naive_offloader: NaiveHostOffloader | None
+    fission_dropper: StaticFissionDropper | None
+    vmm: Any
+    pacer: Any
+    _ctx_store: dict[str, Any]
+    _vmm_initial_pool_mib: float
+    _max_reserved_mib: float
+    _max_driver_used_mib: float
+    _max_pytorch_reserved_mib: float
+
+    def _init_gpu_lifecycle_state(self) -> None:
+        self.pager = None
+        self.naive_offloader = None
+        self.fission_dropper = None
+        self.vmm = None
+        self.pacer = None
+        self._ctx_store = {}
+        self._vmm_initial_pool_mib = 0.0
+        self._max_reserved_mib = 0.0
+        self._max_driver_used_mib = 0.0
+        self._max_pytorch_reserved_mib = 0.0
+
+    def bind_expert_partition(
+        self,
+        spec: ExpertPartitionSpec,
+        *,
+        drop_for_fission: bool = False,
+        vae_output_cloner: Callable[[Any], Any] | None = None,
+    ) -> LayerExpertPager | None:
+        """Bind a secondary expert via 3-way policy dispatch (`StaticFissionDropper` / `NaiveHostOffloader` / `LayerExpertPager`)."""
+        if self.policy.routing_mode == "static_nccl_fission":
+            if drop_for_fission:
+                self.fission_dropper = StaticFissionDropper(spec, device=self.device)
+                self.fission_dropper.drop()
+            return None
+        if self.policy.use_naive_offload:
+            self.naive_offloader = NaiveHostOffloader(spec, device=self.device)
+            self.naive_offloader.offload_to_cpu()
+            return None
+        if self.policy.use_expert_pager:
+            self.pager = LayerExpertPager(
+                spec,
+                numa_node=self.numa_node,
+                vae_output_cloner=vae_output_cloner,
+            )
+            return self.pager
+        return None
+
+    def _vmm_physical_pool_mib(self) -> float:
+        if self.vmm is None:
+            return 0.0
+        st = self.vmm.stats_dict()
+        if "pool_total_bytes" in st:
+            return float(st["pool_total_bytes"]) / MIB
+        if "physical_pool_bytes" in st:
+            return float(st["physical_pool_bytes"]) / MIB
+        overflow_b = int(st.get("overflow_creates", 0)) * int(
+            st.get("super_handle_bytes", int(self.policy.super_handle_mib) * MIB)
+        )
+        return self._vmm_initial_pool_mib + float(overflow_b) / MIB
+
+    def reset_peak_memory_stats(self) -> None:
+        import torch
+
+        gc.collect()
+        if not torch.cuda.is_available() or getattr(self.device, "type", "cuda") != "cuda":
+            self._max_pytorch_reserved_mib = 0.0
+            self._max_driver_used_mib = self._vmm_physical_pool_mib()
+            self._max_reserved_mib = self._max_driver_used_mib
+            return
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(self.device)
+        pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        drv_used_mib = (
+            float((int(total_drv) - int(free_drv)) / MIB)
+            if int(total_drv) > 0
+            else (pt_mib + self._vmm_physical_pool_mib())
+        )
+        self._max_pytorch_reserved_mib = pt_mib
+        self._max_driver_used_mib = drv_used_mib
+        self._max_reserved_mib = drv_used_mib
+
+    def _update_hwm(self) -> None:
+        import torch
+
+        if not torch.cuda.is_available() or getattr(self.device, "type", "cuda") != "cuda":
+            return
+        cur = float(torch.cuda.memory_reserved(self.device) / MIB)
+        pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
+        pt_peak = max(cur, pk)
+        self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
+        # Sample instantaneous driver/NVML physical HBM (`cuMemGetInfo_v2`) so PyTorch peak at t1
+        # and VMM pool size at t2 are never double-counted across timestamps.
+        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        if int(total_drv) > 0:
+            drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB)
+            tot_mib = float(int(total_drv) / MIB)
+            inst_comb_mib = min(tot_mib, cur + self._vmm_physical_pool_mib())
+            phys_now = max(drv_used_mib, inst_comb_mib)
+            self._max_driver_used_mib = max(self._max_driver_used_mib, drv_used_mib)
+            self._max_reserved_mib = max(self._max_reserved_mib, phys_now)
+        else:
+            self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
+
+    def set_residency_alpha(self, alpha: float) -> float:
+        if self.pager is not None and self.vmm is not None:
+            self.pager.set_residency_alpha(float(alpha))
+        return self.resident_alpha()
+
+    def resident_alpha(self) -> float:
+        if self.pager is not None and self.vmm is not None:
+            return round(self.pager.resident_alpha(), 3)
+        return round(float(self.policy.initial_alphas.get(self.rank, 1.0)), 3)
+
+    def memory_and_vmm_stats(self) -> dict[str, Any]:
+        self._update_hwm()
+        vmm_st = self.vmm.stats_dict() if self.vmm is not None else {}
+        nvml_peak = self._max_driver_used_mib if self._max_driver_used_mib > 0.0 else self._max_reserved_mib
+        return {
+            "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "combined_physical_mib": round(self._max_reserved_mib, 2),
+            "nvml_peak_used_mib": round(nvml_peak, 2),
+            "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
+            "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
+            "vmm_stats": vmm_st,
+            "active_contexts": len(self._ctx_store),
+            "kv_free_bytes": self.available_kv_bytes(),
+            "swapped_kv_contexts": 0,
+            "kv_host_swap_outs": int(vmm_st.get("kv_swap_outs_total", 0)),
+            "kv_host_swap_ins": int(vmm_st.get("kv_swap_ins_total", 0)),
+            "kv_host_pinned_bytes": int(vmm_st.get("kv_swapped_bytes_current", 0)),
+        }
 
 
 class _FallbackHostMirror:
@@ -324,6 +478,7 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
                 hook_modules=[],
                 vae_module=self._vae if policy.use_scoped_vae else None,
                 install_module_hooks=False,
+                vae_encode_restore="none",
             )
             self._pager = LayerExpertPager(spec, numa_node=0)
 
@@ -337,14 +492,13 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
         from morphserve.vmm import NumaMemfdMirror
 
         if shared_mirror is not None:
-            self._pager.mirror = shared_mirror
-            self._pager._owns_mirror = False
+            self._pager.attach_mirror(shared_mirror, owns_mirror=False)
         elif hasattr(os, "memfd_create"):
-            self._pager.mirror = NumaMemfdMirror.create(nbytes=4 * MIB, numa_node=0, name=f"syn_m_{self.rank}")
-            self._pager._owns_mirror = True
+            mirror = NumaMemfdMirror.create(nbytes=4 * MIB, numa_node=0, name=f"syn_m_{self.rank}")
+            self._pager.attach_mirror(mirror, owns_mirror=True)
         else:
-            self._pager.mirror = _FallbackHostMirror(nbytes=4 * MIB, numa_node=0)
-            self._pager._owns_mirror = True
+            mirror = _FallbackHostMirror(nbytes=4 * MIB, numa_node=0)
+            self._pager.attach_mirror(mirror, owns_mirror=True)
 
     def bind_runtime_resources(self, pacer: Any | None = None) -> dict[str, Any]:
         if self.policy.use_tripool_vmm:
@@ -466,7 +620,6 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
                 and "kv_dit_headroom_bytes" not in self._vmm.stats_dict()
                 and self.available_kv_bytes(include_reclaimable_experts=False) < delta
             ):
-                # Reclaim fine pages from idle sessions before irreversible 1-way carving in non-coalescing sim
                 self.evict_idle_kv_to_host(
                     delta,
                     exclude_ctx_ids=(ctx_id,),
@@ -558,8 +711,7 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
         with self._pinned_ctx(*cids):
             for idx, cmd in enumerate(batch_cmds):
                 cid = str(cmd["ctx_id"])
-                recv_s = float(cmd.get("_worker_recv_s", 0.0))
-                enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
+                enq_s = self.normalized_enqueue_time_s(cmd)
                 if not cmd.get("_skip_prepare", False):
                     self.prepare_turn(cid, cmd)
                 out = self.decode_ar(cid, int(cmd.get("max_ar_tokens", 8)))
@@ -627,7 +779,6 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
             if self._pager is not None and self._vmm is not None:
                 with self._pager.generation_mode(prefetch_all=True):
                     _run_denoising()
-                # Run VAE decode OUTSIDE generation_mode so borrowed tail handles stay lazily unmapped!
                 spike_mib = (
                     (1_800 if height >= 1024 else 512)
                     if self.architecture == "bridge_mllm_dit"

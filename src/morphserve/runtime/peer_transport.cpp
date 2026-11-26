@@ -22,16 +22,34 @@ struct RawNcclUniqueId {
     char internal[128];
 };
 
+struct NcclLibCache {
+    std::mutex mu;
+    void* handle = nullptr;
+
+    void* get_or_open(const char* hint_path) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (handle) return handle;
+        if (hint_path && hint_path[0] != '\0') {
+            if (void* h = dlopen(hint_path, RTLD_LAZY | RTLD_LOCAL)) {
+                handle = h;
+                return handle;
+            }
+        }
+        for (const char* cand : {"libnccl.so.2", "libnccl.so"}) {
+            if (void* h = dlopen(cand, RTLD_LAZY | RTLD_LOCAL)) {
+                handle = h;
+                return handle;
+            }
+        }
+        const char* err = dlerror();
+        throw std::runtime_error(
+            std::string("Could not locate libnccl.so.2 for NcclPeerAdapter: ") + (err ? err : "not found"));
+    }
+};
+
 void* open_libnccl(const char* hint_path) {
-    if (hint_path && hint_path[0] != '\0') {
-        if (void* h = dlopen(hint_path, RTLD_LAZY | RTLD_LOCAL)) return h;
-    }
-    for (const char* cand : {"libnccl.so.2", "libnccl.so"}) {
-        if (void* h = dlopen(cand, RTLD_LAZY | RTLD_LOCAL)) return h;
-    }
-    const char* err = dlerror();
-    throw std::runtime_error(
-        std::string("Could not locate libnccl.so.2 for NcclPeerAdapter: ") + (err ? err : "not found"));
+    static NcclLibCache cache;
+    return cache.get_or_open(hint_path);
 }
 
 bool send_all_exact(int fd, const void* buf, size_t len) {
@@ -146,32 +164,35 @@ NcclPeerAdapter::NcclPeerAdapter(
     CUcontext ctx = nullptr;
     drv.check(drv.cuDevicePrimaryCtxRetain(&ctx, dev), "NcclPeerAdapter PrimaryCtxRetain");
     primary_ctx_ = ctx;
-    drv.check(drv.cuCtxSetCurrent(ctx), "NcclPeerAdapter cuCtxSetCurrent");
+    try {
+        drv.check(drv.cuCtxSetCurrent(ctx), "NcclPeerAdapter cuCtxSetCurrent");
 
-    CUstream st = nullptr;
-    drv.check(drv.cuStreamCreate(&st, CU_STREAM_NON_BLOCKING), "NcclPeerAdapter cuStreamCreate");
-    transfer_stream_ = st;
+        CUstream st = nullptr;
+        drv.check(drv.cuStreamCreate(&st, CU_STREAM_NON_BLOCKING), "NcclPeerAdapter cuStreamCreate");
+        transfer_stream_ = st;
 
-    nccl_lib_ = open_libnccl(hint_lib_path);
-    using InitRankFn = int (*)(void**, int, RawNcclUniqueId, int);
-    auto init_fn = reinterpret_cast<InitRankFn>(dlsym(nccl_lib_, "ncclCommInitRank"));
-    nccl_comm_destroy_ = reinterpret_cast<int (*)(void*)>(dlsym(nccl_lib_, "ncclCommDestroy"));
-    nccl_send_ = reinterpret_cast<int (*)(const void*, size_t, int, int, void*, void*)>(
-        dlsym(nccl_lib_, "ncclSend"));
-    nccl_recv_ = reinterpret_cast<int (*)(void*, size_t, int, int, void*, void*)>(
-        dlsym(nccl_lib_, "ncclRecv"));
+        nccl_lib_ = open_libnccl(hint_lib_path);
+        using InitRankFn = int (*)(void**, int, RawNcclUniqueId, int);
+        auto init_fn = reinterpret_cast<InitRankFn>(dlsym(nccl_lib_, "ncclCommInitRank"));
+        nccl_comm_destroy_ = reinterpret_cast<int (*)(void*)>(dlsym(nccl_lib_, "ncclCommDestroy"));
+        nccl_send_ = reinterpret_cast<int (*)(const void*, size_t, int, int, void*, void*)>(
+            dlsym(nccl_lib_, "ncclSend"));
+        nccl_recv_ = reinterpret_cast<int (*)(void*, size_t, int, int, void*, void*)>(
+            dlsym(nccl_lib_, "ncclRecv"));
 
-    if (!init_fn || !nccl_comm_destroy_ || !nccl_send_ || !nccl_recv_) {
+        if (!init_fn || !nccl_comm_destroy_ || !nccl_send_ || !nccl_recv_) {
+            throw std::runtime_error("missing required NCCL symbols in libnccl.so.2");
+        }
+
+        RawNcclUniqueId raw_uid = {};
+        std::memcpy(raw_uid.internal, uid_128, kUniqueIdBytes);
+        const int rc = init_fn(&comm_, world_size_, raw_uid, rank_);
+        if (rc != 0) {
+            throw std::runtime_error("ncclCommInitRank failed with ncclResult_t=" + std::to_string(rc));
+        }
+    } catch (...) {
         close();
-        throw std::runtime_error("missing required NCCL symbols in libnccl.so.2");
-    }
-
-    RawNcclUniqueId raw_uid = {};
-    std::memcpy(raw_uid.internal, uid_128, kUniqueIdBytes);
-    const int rc = init_fn(&comm_, world_size_, raw_uid, rank_);
-    if (rc != 0) {
-        close();
-        throw std::runtime_error("ncclCommInitRank failed with ncclResult_t=" + std::to_string(rc));
+        throw;
     }
 }
 
@@ -187,10 +208,19 @@ double NcclPeerAdapter::send_bytes(
     bool sync_stream) {
     auto t0 = std::chrono::steady_clock::now();
     if (nbytes > 0) {
+        if (!src_ptr) {
+            throw std::invalid_argument("NcclPeerAdapter::send_bytes requires non-null src_ptr");
+        }
         std::lock_guard<std::mutex> lock(comm_mu_);
+        if (!comm_ || !primary_ctx_) {
+            throw std::runtime_error("NcclPeerAdapter is closed");
+        }
         auto& drv = CudaDriver::instance();
         drv.check(drv.cuCtxSetCurrent(reinterpret_cast<CUcontext>(primary_ctx_)), "ncclSend ctx");
         void* eff_stream = cuda_stream ? cuda_stream : transfer_stream_;
+        if (!eff_stream) {
+            throw std::runtime_error("NcclPeerAdapter has no active CUDA transfer stream");
+        }
         const int rc = nccl_send_(src_ptr, nbytes, /*ncclInt8=*/0, dst_rank, comm_, eff_stream);
         if (rc != 0) {
             throw std::runtime_error("ncclSend failed with ncclResult_t=" + std::to_string(rc));
@@ -210,10 +240,19 @@ std::pair<size_t, double> NcclPeerAdapter::recv_bytes(
     bool sync_stream) {
     auto t0 = std::chrono::steady_clock::now();
     if (nbytes > 0) {
+        if (!dst_ptr) {
+            throw std::invalid_argument("NcclPeerAdapter::recv_bytes requires non-null dst_ptr");
+        }
         std::lock_guard<std::mutex> lock(comm_mu_);
+        if (!comm_ || !primary_ctx_) {
+            throw std::runtime_error("NcclPeerAdapter is closed");
+        }
         auto& drv = CudaDriver::instance();
         drv.check(drv.cuCtxSetCurrent(reinterpret_cast<CUcontext>(primary_ctx_)), "ncclRecv ctx");
         void* eff_stream = cuda_stream ? cuda_stream : transfer_stream_;
+        if (!eff_stream) {
+            throw std::runtime_error("NcclPeerAdapter has no active CUDA transfer stream");
+        }
         const int rc = nccl_recv_(dst_ptr, nbytes, /*ncclInt8=*/0, src_rank, comm_, eff_stream);
         if (rc != 0) {
             throw std::runtime_error("ncclRecv failed with ncclResult_t=" + std::to_string(rc));
@@ -244,6 +283,7 @@ void NcclPeerAdapter::close() noexcept {
             }
             primary_ctx_ = nullptr;
         }
+        nccl_lib_ = nullptr;
     } catch (...) {
     }
 }
@@ -396,6 +436,9 @@ double TcpPeerAdapter::send_bytes(
     const uint64_t net_len = host_to_be64(static_cast<uint64_t>(nbytes));
     if (!send_all_exact(sock, &net_len, sizeof(net_len)) ||
         (nbytes > 0 && !send_all_exact(sock, src_ptr, nbytes))) {
+        ::shutdown(sock, SHUT_RDWR);
+        ::close(sock);
+        out_socks_.erase(dst_rank);
         throw std::runtime_error("TcpPeerAdapter frame send failed");
     }
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -462,6 +505,9 @@ void TcpPeerAdapter::close() noexcept {
         in_socks_.clear();
     }
     for (auto& kv : inboxes_) {
+        {
+            std::lock_guard<std::mutex> ilock(kv.second->mu);
+        }
         kv.second->cv.notify_all();
     }
     if (accept_thread_.joinable()) {
@@ -484,6 +530,9 @@ InMemoryTransportBus::InMemoryTransportBus(int world_size)
 }
 
 std::unique_ptr<PeerByteTransport> InMemoryTransportBus::create_endpoint(int rank) {
+    if (rank < 0 || rank >= world_size_) {
+        throw std::invalid_argument("invalid InMemoryTransportBus rank=" + std::to_string(rank));
+    }
     return std::make_unique<InMemoryPeerAdapter>(shared_from_this(), rank);
 }
 

@@ -1,21 +1,11 @@
 #include "morphserve/control/budget_planner.hpp"
 
+#include "morphserve/control/hash_util.hpp"
+
 #include <algorithm>
 #include <cmath>
 
 namespace morphserve::control {
-
-namespace {
-
-inline double round_2(double x) noexcept {
-    return std::round(x * 100.0) / 100.0;
-}
-
-inline double round_6(double x) noexcept {
-    return std::round(x * 1000000.0) / 1000000.0;
-}
-
-}  // namespace
 
 nlohmann::json WorkerBudgetPlanner::compute_internvlu_memory_plan(
     double total_dev_mib,
@@ -228,8 +218,12 @@ nlohmann::json WorkerBudgetPlanner::verify_internvlu_memory_quota(
     double constrained_gib) {
     const double quota_limit_mib = round_2(constrained_gib * 1024.0);
     double vmm_physical_pool_mib = 0.0;
-    if (run_result.contains("vmm_physical_pool_mib") && run_result["vmm_physical_pool_mib"].is_number()) {
-        vmm_physical_pool_mib = round_2(run_result["vmm_physical_pool_mib"].get<double>());
+    const bool has_reported_vmm_pool =
+        run_result.contains("vmm_physical_pool_mib") && run_result["vmm_physical_pool_mib"].is_number();
+    const double reported_vmm_pool =
+        has_reported_vmm_pool ? round_2(run_result["vmm_physical_pool_mib"].get<double>()) : 0.0;
+    if (has_reported_vmm_pool && (reported_vmm_pool > 0.0 || !policy.use_tripool_vmm)) {
+        vmm_physical_pool_mib = reported_vmm_pool;
     } else if (policy.use_tripool_vmm) {
         const double base_vmm = static_cast<double>(policy.super_pool_mib + policy.fine_kv_pool_mib);
         const double ovf = static_cast<double>(run_result.value("vmm_overflow_creates", 0) * policy.super_handle_mib);
@@ -238,18 +232,22 @@ nlohmann::json WorkerBudgetPlanner::verify_internvlu_memory_quota(
 
     double pytorch_reserved_mib = 0.0;
     double combined_physical_mib = 0.0;
-    if ((run_result.contains("pytorch_peak_reserved_mib") && run_result["pytorch_peak_reserved_mib"].is_number()) ||
-        (run_result.contains("pytorch_reserved_mib") && run_result["pytorch_reserved_mib"].is_number())) {
-        const double pt_raw = run_result.contains("pytorch_peak_reserved_mib")
-                                  ? run_result["pytorch_peak_reserved_mib"].get<double>()
-                                  : run_result["pytorch_reserved_mib"].get<double>();
-        pytorch_reserved_mib = round_2(pt_raw);
+    std::optional<double> pt_raw;
+    for (const char* key : {"peak_pytorch_reserved_mib", "pytorch_peak_reserved_mib", "pytorch_reserved_mib"}) {
+        if (run_result.contains(key) && run_result[key].is_number()) {
+            pt_raw = run_result[key].get<double>();
+            break;
+        }
+    }
+    const double peak_gpu_res = run_result.value("peak_gpu_reserved_mib", 0.0);
+    if (pt_raw.has_value() && (*pt_raw > 0.0 || peak_gpu_res <= 0.0)) {
+        pytorch_reserved_mib = round_2(*pt_raw);
         combined_physical_mib = round_2(pytorch_reserved_mib + vmm_physical_pool_mib);
     } else if (policy.use_tripool_vmm) {
-        combined_physical_mib = round_2(run_result.value("peak_gpu_reserved_mib", 0.0));
+        combined_physical_mib = round_2(peak_gpu_res);
         pytorch_reserved_mib = round_2(std::max(0.0, combined_physical_mib - vmm_physical_pool_mib));
     } else {
-        pytorch_reserved_mib = round_2(run_result.value("peak_gpu_reserved_mib", 0.0));
+        pytorch_reserved_mib = round_2(peak_gpu_res);
         combined_physical_mib = pytorch_reserved_mib;
     }
 

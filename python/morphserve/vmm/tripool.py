@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 import ctypes
 import gc
@@ -12,11 +12,16 @@ from typing import Any, Callable
 import weakref
 
 from morphserve._core import (
+    MS_ERR_INVALID_ARG,
+    MS_ERR_OOM,
     MsVmmConfigC,
     UnifiedVmmStatsC,
+    VmmOutOfMemoryError,
     get_core_lib,
     last_error,
+    last_error_code,
     load_core_lib,
+    raise_last_error,
     resolve_core_so,
 )
 
@@ -61,55 +66,19 @@ def resolve_vmm_so(lib_dir: Path | str | None = None) -> Path:
 
 
 def _clone_outputs(obj: Any) -> Any:
-    if _TORCH is None:
-        return obj
-    if _TORCH.is_tensor(obj):
+    """Generic container cloner for plain torch tensors, dicts, lists, and tuples.
+
+    Model-specific output types (e.g. `diffusers.utils.BaseOutput`) are cloned via an explicit
+    `clone_fn` callback supplied by the caller (`CPTGModelAdapter` / `ExpertPartitionSpec`).
+    """
+    if _TORCH is not None and _TORCH.is_tensor(obj):
         return obj.clone()
-    # Check `diffusers.utils.BaseOutput` subclasses (`AutoencoderKLOutput`, `DecoderOutput`, ...)
-    # BEFORE `isinstance(obj, dict)`, since `BaseOutput` subclasses `OrderedDict` (`dict`).
-    if hasattr(obj, "latent_dist"):
-        ld = obj.latent_dist
-        for attr in ("parameters", "mean", "logvar", "std", "var"):
-            val = getattr(ld, attr, None)
-            if _TORCH.is_tensor(val):
-                setattr(ld, attr, val.clone())
-        if isinstance(obj, dict) and "latent_dist" in obj:
-            obj["latent_dist"] = ld
-        return obj
-    if hasattr(obj, "sample") and _TORCH.is_tensor(obj.sample):
-        cloned = obj.sample.clone()
-        obj.sample = cloned
-        if isinstance(obj, dict) and "sample" in obj:
-            obj["sample"] = cloned
-        return obj
-    if hasattr(obj, "latents") and _TORCH.is_tensor(obj.latents):
-        cloned = obj.latents.clone()
-        obj.latents = cloned
-        if isinstance(obj, dict) and "latents" in obj:
-            obj["latents"] = cloned
-        return obj
-    if any(_TORCH.is_tensor(getattr(obj, attr, None)) for attr in ("parameters", "mean", "logvar", "std", "var")):
-        for attr in ("parameters", "mean", "logvar", "std", "var"):
-            val = getattr(obj, attr, None)
-            if _TORCH.is_tensor(val):
-                setattr(obj, attr, val.clone())
-        return obj
     if isinstance(obj, tuple):
         return tuple(_clone_outputs(x) for x in obj)
     if isinstance(obj, list):
         return [_clone_outputs(x) for x in obj]
     if isinstance(obj, dict):
-        if type(obj) is dict:
-            return {k: _clone_outputs(v) for k, v in obj.items()}
-        for k, v in list(obj.items()):
-            cloned_v = _clone_outputs(v)
-            obj[k] = cloned_v
-            if hasattr(obj, k):
-                try:
-                    setattr(obj, k, cloned_v)
-                except Exception:
-                    pass
-        return obj
+        return {k: _clone_outputs(v) for k, v in obj.items()}
     return obj
 
 
@@ -169,10 +138,11 @@ class NumaMemfdMirror:
             )
             del pop_buf
             if h == 0:
+                code = last_error_code(self._lib)
                 err = last_error(self._lib)
-                if any(k in err for k in ("memfd_create", "ftruncate", "mmap", "open(")):
-                    raise OSError(err)
-                raise ValueError(err)
+                if code == MS_ERR_INVALID_ARG:
+                    raise ValueError(err)
+                raise OSError(err)
 
         self._handle = h
         self.ptr = int(self._lib.ms_mirror_ptr(ctypes.c_void_p(h)))
@@ -245,7 +215,7 @@ class NumaMemfdMirror:
             )
         )
         if rc != 0:
-            raise ValueError(last_error(self._lib))
+            raise_last_error(self._lib, "ms_mirror_write failed")
 
     def read_bytes(self, offset: int, nbytes: int) -> bytes:
         if not self._handle:
@@ -263,7 +233,7 @@ class NumaMemfdMirror:
             )
         )
         if rc != 0:
-            raise ValueError(last_error(self._lib))
+            raise_last_error(self._lib, "ms_mirror_read failed")
         return out.raw
 
     def pin_cuda(self, vmm: Any = None) -> None:
@@ -272,7 +242,7 @@ class NumaMemfdMirror:
         is_sim = bool(vmm is not None and getattr(vmm, "is_simulated", False))
         rc = int(self._lib.ms_mirror_pin_cuda_ex(ctypes.c_void_p(self._handle), 1 if is_sim else 0))
         if rc != 0:
-            raise RuntimeError(f"ms_mirror_pin_cuda_ex failed: {last_error(self._lib)}")
+            raise_last_error(self._lib, "ms_mirror_pin_cuda_ex failed")
         self.pinned = True
         if vmm is not None and hasattr(vmm, "_track_pinned_mirror"):
             vmm._track_pinned_mirror(self)
@@ -301,7 +271,7 @@ class NumaMemfdMirror:
             )
         )
         if gbps < 0.0:
-            raise RuntimeError(f"ms_mirror_stream_h2d_gbps failed: {last_error(self._lib)}")
+            raise_last_error(self._lib, "ms_mirror_stream_h2d_gbps failed")
         torch.cuda.synchronize(dst_u8.device)
         return gbps
 
@@ -352,8 +322,8 @@ class TriPoolVMM:
         self._handle: int = 0
         self._has_torch_cuda = False
         self._pluggable: Any = None
-        self._raw_transient_ptrs: list[tuple[int, int]] = []
-        self._in_scope = False
+        self._scope_depth: int = 0
+        self._raw_transient_frames: list[list[tuple[int, int]]] = []
         self._mu = threading.RLock()
         self._pinned_mirrors: dict[int, weakref.ReferenceType[NumaMemfdMirror]] = {}
 
@@ -402,7 +372,7 @@ class TriPoolVMM:
         )
         h = int(self.lib.ms_vmm_create(ctypes.byref(cfg)) or 0)
         if h == 0:
-            raise RuntimeError(f"ms_vmm_create failed: {last_error(self.lib)}")
+            raise_last_error(self.lib, "ms_vmm_create failed")
         self._handle = h
         self._closed = False
 
@@ -424,13 +394,51 @@ class TriPoolVMM:
                 pass
 
     def _torch_cuda_ready(self) -> bool:
-        return bool((not self.is_simulated) and _TORCH is not None and (self._has_torch_cuda or _TORCH.cuda.is_initialized()))
+        return bool(
+            (not self.is_simulated)
+            and _TORCH is not None
+            and (self._has_torch_cuda or _TORCH.cuda.is_initialized())
+        )
 
     def _current_stream_ptr(self) -> int:
         if self._torch_cuda_ready():
             assert _TORCH is not None
             return int(_TORCH.cuda.current_stream(self.device).cuda_stream)
         return 0
+
+    def _resolve_stream(self, stream: int = 0, stream_ptr: int | None = None) -> int:
+        if stream_ptr is not None:
+            return int(stream_ptr)
+        explicit = int(stream or 0)
+        return explicit if explicit != 0 else self._current_stream_ptr()
+
+    @staticmethod
+    def _collect_excluded_session_ids(
+        exclude_caches: Iterable[Any] = (),
+        exclude_session_ids: Iterable[int] = (),
+    ) -> list[int]:
+        seen: set[int] = set()
+        out: list[int] = []
+        for raw_sid in exclude_session_ids:
+            sid = int(raw_sid or 0)
+            if sid > 0 and sid not in seen:
+                seen.add(sid)
+                out.append(sid)
+        for cache in exclude_caches:
+            if cache is None:
+                continue
+            sid = int(getattr(cache, "session_id", 0) or getattr(cache, "_session_id", 0) or 0)
+            if sid > 0 and sid not in seen:
+                seen.add(sid)
+                out.append(sid)
+        return out
+
+    @staticmethod
+    def _to_u64_array(ids: Sequence[int]) -> tuple[Any, int]:
+        n = len(ids)
+        if n == 0:
+            return None, 0
+        return (ctypes.c_uint64 * n)(*(int(x) for x in ids)), n
 
     def stats(self) -> UnifiedVmmStats:
         st = UnifiedVmmStats()
@@ -443,44 +451,25 @@ class TriPoolVMM:
         d["physical_pool_bytes"] = int(d["pool_total_bytes"])
         return d
 
-    def _extra_driver_overflow_bytes(self, include_overflow: bool) -> int:
-        if (
-            not self.is_simulated
-            and include_overflow
-            and self.allow_overflow
-            and _TORCH is not None
-            and _TORCH.cuda.is_available()
-        ):
-            free_drv, total_drv = _TORCH.cuda.mem_get_info(self.device)
-            reserve = min(1536 * MIB, int(total_drv) // 16)
-            drv_extra = max(0, int(free_drv) - reserve)
-            if self.max_pool_bytes is not None and self.max_pool_bytes > 0:
-                cur_pool = int(self.stats().pool_total_bytes)
-                return min(drv_extra, max(0, int(self.max_pool_bytes) - cur_pool))
-            return drv_extra
-        return 0
-
-    def kv_free_bytes(self, for_dit: bool = False, include_overflow: bool = False) -> int:
+    def kv_free_bytes(self, for_dit: bool = False) -> int:
         if self._closed or not self._handle:
             return 0
-        extra = self._extra_driver_overflow_bytes(include_overflow)
         return int(
             self.lib.ms_vmm_kv_free_bytes(
                 ctypes.c_void_p(self._handle),
                 1 if for_dit else 0,
-                ctypes.c_uint64(extra),
+                ctypes.c_uint64(0),
             )
         )
 
-    def sync_kv_free_bytes(self, for_dit: bool = False, include_overflow: bool = False) -> int:
+    def sync_kv_free_bytes(self, for_dit: bool = False) -> int:
         if self._closed or not self._handle:
             return 0
-        extra = self._extra_driver_overflow_bytes(include_overflow)
         return int(
             self.lib.ms_vmm_sync_kv_free_bytes(
                 ctypes.c_void_p(self._handle),
                 1 if for_dit else 0,
-                ctypes.c_uint64(extra),
+                ctypes.c_uint64(0),
             )
         )
 
@@ -498,6 +487,14 @@ class TriPoolVMM:
         if not self._closed and self._handle and int(session_id) > 0:
             self.lib.ms_vmm_kv_session_touch(ctypes.c_void_p(self._handle), ctypes.c_uint64(int(session_id)))
 
+    def kv_session_set_pinned(self, session_id: int, pinned: bool) -> None:
+        if not self._closed and self._handle and int(session_id) > 0:
+            self.lib.ms_vmm_kv_session_set_pinned(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_uint64(int(session_id)),
+                1 if pinned else 0,
+            )
+
     def kv_session_mark_active(self, session_id: int, stream_ptr: int = 0) -> None:
         if self._closed or not self._handle or int(session_id) <= 0:
             return
@@ -509,7 +506,7 @@ class TriPoolVMM:
             )
         )
         if rc != 0:
-            raise MemoryError(f"ms_vmm_kv_session_mark_active({session_id}) failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_kv_session_mark_active({session_id}) failed (rc={rc})")
 
     def kv_session_mark_thinking(
         self,
@@ -537,55 +534,54 @@ class TriPoolVMM:
             )
         )
 
-    @staticmethod
-    def _first_excluded_session_id(exclude_caches: Iterable[Any]) -> int:
-        for c in exclude_caches:
-            if c is not None:
-                sid = int(getattr(c, "_session_id", 0) or 0)
-                if sid > 0:
-                    return sid
-        return 0
-
     def reclaim_thinking_kv_bytes(
         self,
         target_reclaim_bytes: int,
+        sync: bool = True,
+        exclude_caches: Sequence[Any] = (),
+        stream: int = 0,
         *,
-        sync: bool = False,
-        exclude_caches: Iterable[Any] = (),
+        exclude_session_ids: Sequence[int] = (),
         stream_ptr: int | None = None,
     ) -> int:
         if self._closed or not self._handle or int(target_reclaim_bytes) <= 0:
             return 0
-        excl_sid = self._first_excluded_session_id(exclude_caches)
-        s_ptr = int(stream_ptr) if stream_ptr is not None else self._current_stream_ptr()
+        excl = self._collect_excluded_session_ids(exclude_caches, exclude_session_ids)
+        excl_arr, excl_n = self._to_u64_array(excl)
+        s_ptr = self._resolve_stream(stream, stream_ptr)
         return int(
-            self.lib.ms_vmm_reclaim_thinking_kv_bytes(
+            self.lib.ms_vmm_reclaim_thinking_kv_bytes_multi(
                 ctypes.c_void_p(self._handle),
                 ctypes.c_size_t(int(target_reclaim_bytes)),
                 1 if sync else 0,
-                ctypes.c_uint64(excl_sid),
+                excl_arr,
+                ctypes.c_size_t(excl_n),
                 ctypes.c_void_p(s_ptr),
             )
         )
 
     def maybe_evict_thinking_kv_on_high_watermark(
         self,
-        *,
         sync: bool = False,
-        exclude_caches: Iterable[Any] = (),
+        exclude_caches: Sequence[Any] = (),
         extra_needed_bytes: int = 0,
         for_dit: bool = False,
+        stream: int = 0,
+        *,
+        exclude_session_ids: Sequence[int] = (),
         stream_ptr: int | None = None,
     ) -> int:
         if self._closed or not self._handle:
             return 0
-        excl_sid = self._first_excluded_session_id(exclude_caches)
-        s_ptr = int(stream_ptr) if stream_ptr is not None else self._current_stream_ptr()
+        excl = self._collect_excluded_session_ids(exclude_caches, exclude_session_ids)
+        excl_arr, excl_n = self._to_u64_array(excl)
+        s_ptr = self._resolve_stream(stream, stream_ptr)
         return int(
-            self.lib.ms_vmm_maybe_evict_watermark(
+            self.lib.ms_vmm_maybe_evict_watermark_multi(
                 ctypes.c_void_p(self._handle),
                 1 if sync else 0,
-                ctypes.c_uint64(excl_sid),
+                excl_arr,
+                ctypes.c_size_t(excl_n),
                 ctypes.c_size_t(max(0, int(extra_needed_bytes))),
                 1 if for_dit else 0,
                 ctypes.c_void_p(s_ptr),
@@ -599,7 +595,7 @@ class TriPoolVMM:
     def kv_alloc_page(self) -> int:
         slot = int(self.lib.ms_vmm_kv_alloc_page(ctypes.c_void_p(self._handle)))
         if slot < 0:
-            raise RuntimeError(f"ms_vmm_kv_alloc_page failed (rc={slot})")
+            raise_last_error(self.lib, f"ms_vmm_kv_alloc_page failed (rc={slot})")
         return slot
 
     def kv_free_page(self, slot_idx: int, stream_ptr: int = 0) -> None:
@@ -607,11 +603,13 @@ class TriPoolVMM:
             return
         rc = int(
             self.lib.ms_vmm_kv_free_page(
-                ctypes.c_void_p(self._handle), ctypes.c_int32(int(slot_idx)), ctypes.c_void_p(int(stream_ptr))
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int32(int(slot_idx)),
+                ctypes.c_void_p(int(stream_ptr)),
             )
         )
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_kv_free_page({slot_idx}) failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_kv_free_page({slot_idx}) failed (rc={rc})")
 
     def kv_page_tensor(self, slot_idx: int) -> Any:
         gran = int(self.stats().min_granularity_bytes)
@@ -633,7 +631,7 @@ class TriPoolVMM:
             )
         )
         if rid < 0:
-            raise RuntimeError(f"ms_vmm_kv_region_alloc({max_va_bytes}) failed (rc={rid})")
+            raise_last_error(self.lib, f"ms_vmm_kv_region_alloc({max_va_bytes}) failed (rc={rid})")
         return rid
 
     def kv_region_ensure(self, region_id: int, needed_bytes: int, stream_ptr: int = 0) -> int:
@@ -647,7 +645,14 @@ class TriPoolVMM:
             )
         )
         if va == 0:
-            raise MemoryError(f"ms_vmm_kv_region_ensure(region={region_id}, bytes={needed_bytes}) out of VMM memory")
+            if last_error_code(self.lib) != MS_ERR_OOM:
+                raise_last_error(
+                    self.lib,
+                    f"ms_vmm_kv_region_ensure(region={region_id}, bytes={needed_bytes}) failed",
+                )
+            raise VmmOutOfMemoryError(
+                f"ms_vmm_kv_region_ensure(region={region_id}, bytes={needed_bytes}): {last_error(self.lib)}"
+            )
         return va
 
     def kv_region_va(self, region_id: int) -> int:
@@ -703,7 +708,7 @@ class TriPoolVMM:
             )
         )
         if pages < 0:
-            raise RuntimeError(f"ms_vmm_kv_region_swap_out_async({region_id}) failed (rc={pages})")
+            raise_last_error(self.lib, f"ms_vmm_kv_region_swap_out_async({region_id}) failed (rc={pages})")
         return pages
 
     kv_region_swap_out = kv_region_swap_out_async
@@ -717,7 +722,7 @@ class TriPoolVMM:
             )
         )
         if pages < 0:
-            raise MemoryError(f"ms_vmm_kv_region_swap_in_async({region_id}) failed (rc={pages})")
+            raise_last_error(self.lib, f"ms_vmm_kv_region_swap_in_async({region_id}) failed (rc={pages})")
         return pages
 
     kv_region_swap_in = kv_region_swap_in_async
@@ -739,27 +744,33 @@ class TriPoolVMM:
             return
         rc = int(self.lib.ms_vmm_kv_flush_swaps(ctypes.c_void_p(self._handle)))
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_kv_flush_swaps failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_kv_flush_swaps failed (rc={rc})")
 
     def kv_region_free(self, region_id: int, stream_ptr: int = 0) -> None:
         if self._closed or not self._handle:
             return
         rc = int(
             self.lib.ms_vmm_kv_region_free(
-                ctypes.c_void_p(self._handle), ctypes.c_int32(int(region_id)), ctypes.c_void_p(int(stream_ptr))
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int32(int(region_id)),
+                ctypes.c_void_p(int(stream_ptr)),
             )
         )
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_kv_region_free({region_id}) failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_kv_region_free({region_id}) failed (rc={rc})")
 
     # --- Arena 2: Scoped Transient Scratchpad (VAE / DiT Spikes) ---
+    @property
+    def scope_depth(self) -> int:
+        return self._scope_depth
+
     def allocate_transient_mib(self, size_mib: int) -> int:
-        if self.is_simulated and not self._in_scope:
+        if self._scope_depth <= 0:
             raise RuntimeError("allocate_transient_mib requires an active transient scope")
         nbytes = max(4096, int(size_mib) * MIB)
         s_ptr = self._current_stream_ptr()
         self.maybe_evict_thinking_kv_on_high_watermark(
-            sync=self.is_simulated, extra_needed_bytes=nbytes, stream_ptr=s_ptr
+            sync=self.is_simulated, extra_needed_bytes=nbytes, stream=s_ptr
         )
         ptr = int(
             self.lib.ms_vmm_transient_alloc(
@@ -768,7 +779,7 @@ class TriPoolVMM:
             or 0
         )
         if ptr == 0:
-            self.reclaim_thinking_kv_bytes(nbytes, sync=True, stream_ptr=s_ptr)
+            self.reclaim_thinking_kv_bytes(nbytes, sync=True, stream=s_ptr)
             ptr = int(
                 self.lib.ms_vmm_transient_alloc(
                     ctypes.c_void_p(self._handle), ctypes.c_ssize_t(nbytes), ctypes.c_void_p(s_ptr)
@@ -776,15 +787,18 @@ class TriPoolVMM:
                 or 0
             )
         if ptr == 0:
-            if self.is_simulated:
-                raise RuntimeError(f"SimulatedTriPoolBackend exhausted for {size_mib} MiB transient allocation")
-            raise MemoryError(f"ms_vmm_transient_alloc({nbytes}) out of Arena-2 VMM memory")
-        self._raw_transient_ptrs.append((ptr, nbytes))
+            code = last_error_code(self.lib)
+            if code == MS_ERR_OOM:
+                raise_last_error(self.lib, f"ms_vmm_transient_alloc({nbytes}) failed")
+            raise VmmOutOfMemoryError(
+                f"ms_vmm_transient_alloc({nbytes}) exhausted Arena-2 VMM pool: {last_error(self.lib)}"
+            )
+        self._raw_transient_frames[-1].append((ptr, nbytes))
         return ptr
 
-    def _release_raw_transient_ptrs(self, stream_ptr: int) -> None:
-        while self._raw_transient_ptrs:
-            ptr, nbytes = self._raw_transient_ptrs.pop()
+    def _release_raw_transient_frame(self, frame: list[tuple[int, int]], stream_ptr: int) -> None:
+        while frame:
+            ptr, nbytes = frame.pop()
             self.lib.ms_vmm_transient_free(
                 ctypes.c_void_p(self._handle),
                 ctypes.c_void_p(ptr),
@@ -792,31 +806,79 @@ class TriPoolVMM:
                 ctypes.c_void_p(stream_ptr),
             )
 
-    def run_in_transient_scope(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        s_ptr = self._current_stream_ptr()
-        self.maybe_evict_thinking_kv_on_high_watermark(sync=False, stream_ptr=s_ptr)
+    @contextmanager
+    def transient_scope(self, stream: int = 0):
+        explicit_stream = int(stream or 0)
+        s_ptr = explicit_stream if explicit_stream != 0 else self._current_stream_ptr()
+        self.maybe_evict_thinking_kv_on_high_watermark(sync=False, stream=s_ptr)
+        frame: list[tuple[int, int]] = []
+        pool = (
+            _TORCH.cuda.MemPool(self._pluggable.allocator())
+            if (self._pluggable is not None and _TORCH is not None)
+            else None
+        )
+        self.lib.ms_vmm_scope_begin(ctypes.c_void_p(self._handle))
+        self._scope_depth += 1
+        self._raw_transient_frames.append(frame)
+        try:
+            if pool is not None:
+                assert _TORCH is not None
+                with _TORCH.cuda.use_mem_pool(pool):
+                    yield pool
+            else:
+                yield self
+        finally:
+            self._scope_depth = max(0, self._scope_depth - 1)
+            if self._raw_transient_frames:
+                popped = self._raw_transient_frames.pop()
+            else:
+                popped = frame
+            del pool
+            end_s_ptr = explicit_stream if explicit_stream != 0 else self._current_stream_ptr()
+            self._release_raw_transient_frame(popped, end_s_ptr)
+            self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(end_s_ptr))
+
+    def run_in_transient_scope(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        stream: int = 0,
+        clone_fn: Callable[[Any], Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        explicit_stream = int(stream or 0)
+        s_ptr = explicit_stream if explicit_stream != 0 else self._current_stream_ptr()
+        self.maybe_evict_thinking_kv_on_high_watermark(sync=False, stream=s_ptr)
+        cloner = clone_fn if clone_fn is not None else _clone_outputs
+        frame: list[tuple[int, int]] = []
+
         if self._pluggable is None or _TORCH is None:
             self.lib.ms_vmm_scope_begin(ctypes.c_void_p(self._handle))
-            self._in_scope = True
+            self._scope_depth += 1
+            self._raw_transient_frames.append(frame)
             try:
-                return fn(*args, **kwargs)
+                out = fn(*args, **kwargs)
+                return cloner(out)
             finally:
-                self._in_scope = False
-                self._release_raw_transient_ptrs(s_ptr)
-                self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(s_ptr))
+                self._scope_depth = max(0, self._scope_depth - 1)
+                popped = self._raw_transient_frames.pop() if self._raw_transient_frames else frame
+                end_s_ptr = explicit_stream if explicit_stream != 0 else self._current_stream_ptr()
+                self._release_raw_transient_frame(popped, end_s_ptr)
+                self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(end_s_ptr))
 
         pool = _TORCH.cuda.MemPool(self._pluggable.allocator())
         self.lib.ms_vmm_scope_begin(ctypes.c_void_p(self._handle))
-        self._in_scope = True
+        self._scope_depth += 1
+        self._raw_transient_frames.append(frame)
         pooled_out = None
         try:
             with _TORCH.cuda.use_mem_pool(pool):
                 pooled_out = fn(*args, **kwargs)
             try:
-                safe_out = _clone_outputs(pooled_out)
+                safe_out = cloner(pooled_out)
             except BaseException:
                 _TORCH.cuda.empty_cache()
-                safe_out = _clone_outputs(pooled_out)
+                safe_out = cloner(pooled_out)
         except BaseException as exc:
             pooled_out = None
             try:
@@ -829,41 +891,14 @@ class TriPoolVMM:
                 pass
             raise
         finally:
-            self._in_scope = False
+            self._scope_depth = max(0, self._scope_depth - 1)
+            popped = self._raw_transient_frames.pop() if self._raw_transient_frames else frame
             pooled_out = None
             del pool
-            end_s_ptr = self._current_stream_ptr()
-            self._release_raw_transient_ptrs(end_s_ptr)
+            end_s_ptr = explicit_stream if explicit_stream != 0 else self._current_stream_ptr()
+            self._release_raw_transient_frame(popped, end_s_ptr)
             self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(end_s_ptr))
         return safe_out
-
-    @contextmanager
-    def transient_scope(self):
-        s_ptr = self._current_stream_ptr()
-        self.maybe_evict_thinking_kv_on_high_watermark(sync=False, stream_ptr=s_ptr)
-        if self._pluggable is None or _TORCH is None:
-            self.lib.ms_vmm_scope_begin(ctypes.c_void_p(self._handle))
-            self._in_scope = True
-            try:
-                yield self
-            finally:
-                self._in_scope = False
-                self._release_raw_transient_ptrs(s_ptr)
-                self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(s_ptr))
-            return
-
-        pool = _TORCH.cuda.MemPool(self._pluggable.allocator())
-        self.lib.ms_vmm_scope_begin(ctypes.c_void_p(self._handle))
-        self._in_scope = True
-        try:
-            with _TORCH.cuda.use_mem_pool(pool):
-                yield pool
-        finally:
-            self._in_scope = False
-            del pool
-            end_s_ptr = self._current_stream_ptr()
-            self._release_raw_transient_ptrs(end_s_ptr)
-            self.lib.ms_vmm_scope_end(ctypes.c_void_p(self._handle), ctypes.c_void_p(end_s_ptr))
 
     # --- Arena 3: Opportunistic Expert Cache ---
     def register_expert(
@@ -890,7 +925,7 @@ class TriPoolVMM:
             )
         )
         if eid < 0:
-            raise RuntimeError(f"ms_vmm_expert_register failed (rc={eid})")
+            raise_last_error(self.lib, f"ms_vmm_expert_register failed (rc={eid})")
         return eid
 
     def expert_layer_va(self, expert_id: int, layer_idx: int) -> int:
@@ -917,7 +952,7 @@ class TriPoolVMM:
     def set_expert_pinned(self, expert_id: int, pinned: bool) -> None:
         rc = int(self.lib.ms_vmm_expert_set_pinned(ctypes.c_void_p(self._handle), int(expert_id), 1 if pinned else 0))
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_expert_set_pinned failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_expert_set_pinned failed (rc={rc})")
 
     def set_expert_layer_used_bytes(self, expert_id: int, layer_idx: int, used_bytes: int) -> None:
         rc = int(
@@ -929,7 +964,7 @@ class TriPoolVMM:
             )
         )
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_expert_set_layer_used_bytes failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_expert_set_layer_used_bytes failed (rc={rc})")
 
     def load_expert_layers_sync(self, expert_id: int, start_layer: int, end_layer: int) -> None:
         rc = int(
@@ -938,7 +973,7 @@ class TriPoolVMM:
             )
         )
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_expert_load_layers_sync failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_expert_load_layers_sync failed (rc={rc})")
 
     def prefetch_expert_async(self, expert_id: int, start_layer: int, end_layer: int) -> int:
         queued = int(
@@ -947,7 +982,7 @@ class TriPoolVMM:
             )
         )
         if queued < 0:
-            raise RuntimeError(f"ms_vmm_expert_prefetch_async failed (rc={queued})")
+            raise_last_error(self.lib, f"ms_vmm_expert_prefetch_async failed (rc={queued})")
         return queued
 
     def wait_expert_layer(self, expert_id: int, layer_idx: int, stream_ptr: int = 0) -> None:
@@ -960,14 +995,14 @@ class TriPoolVMM:
             )
         )
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_expert_wait_layer({expert_id}, {layer_idx}) failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_expert_wait_layer({expert_id}, {layer_idx}) failed (rc={rc})")
 
     def sync_expert_h2d(self, expert_id: int) -> None:
         if self._closed or not self._handle:
             return
         rc = int(self.lib.ms_vmm_expert_sync_h2d(ctypes.c_void_p(self._handle), int(expert_id)))
         if rc != 0:
-            raise RuntimeError(f"ms_vmm_expert_sync_h2d({expert_id}) failed (rc={rc})")
+            raise_last_error(self.lib, f"ms_vmm_expert_sync_h2d({expert_id}) failed (rc={rc})")
 
     def coalesce_fine_to_super(self, max_super: int = 0) -> int:
         if self._closed or not self._handle:
@@ -976,6 +1011,29 @@ class TriPoolVMM:
             self.lib.ms_vmm_coalesce_fine_to_super(
                 ctypes.c_void_p(self._handle),
                 ctypes.c_size_t(max(0, int(max_super))),
+            )
+        )
+
+    def ensure_expert_headroom(
+        self,
+        expert_id: int,
+        needed_bytes: int,
+        exclude_session_ids: Sequence[int] = (),
+        stream: int = 0,
+    ) -> int:
+        if self._closed or not self._handle or int(needed_bytes) <= 0:
+            return 0
+        excl = self._collect_excluded_session_ids(exclude_session_ids=exclude_session_ids)
+        excl_arr, excl_n = self._to_u64_array(excl)
+        s_ptr = self._resolve_stream(stream)
+        return int(
+            self.lib.ms_vmm_ensure_expert_headroom(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(expert_id)),
+                ctypes.c_size_t(int(needed_bytes)),
+                excl_arr,
+                ctypes.c_size_t(excl_n),
+                ctypes.c_void_p(s_ptr),
             )
         )
 
@@ -990,7 +1048,7 @@ class TriPoolVMM:
             )
         )
         if n < 0:
-            raise RuntimeError(f"ms_vmm_expert_evict_range failed (rc={n})")
+            raise_last_error(self.lib, f"ms_vmm_expert_evict_range failed (rc={n})")
         return n
 
     def expert_resident_count(self, expert_id: int) -> int:
@@ -1016,6 +1074,9 @@ class TriPoolVMM:
             self._pluggable = None
             mirrors = list(self._pinned_mirrors.values())
             self._pinned_mirrors.clear()
+            frames = list(self._raw_transient_frames)
+            self._raw_transient_frames.clear()
+            self._scope_depth = 0
 
         for ref in mirrors:
             m_obj = ref()
@@ -1028,11 +1089,11 @@ class TriPoolVMM:
             gc.collect()
 
         if h:
-            while self._raw_transient_ptrs:
-                ptr, nbytes = self._raw_transient_ptrs.pop()
-                self.lib.ms_vmm_transient_free(
-                    ctypes.c_void_p(h), ctypes.c_void_p(ptr), ctypes.c_ssize_t(nbytes), ctypes.c_void_p(0)
-                )
+            for frame in frames:
+                for ptr, nbytes in frame:
+                    self.lib.ms_vmm_transient_free(
+                        ctypes.c_void_p(h), ctypes.c_void_p(ptr), ctypes.c_ssize_t(nbytes), ctypes.c_void_p(0)
+                    )
             rc = int(self.lib.ms_vmm_shutdown(ctypes.c_void_p(h)))
             self.lib.ms_vmm_destroy(ctypes.c_void_p(h))
 
@@ -1044,7 +1105,7 @@ class TriPoolVMM:
 
 
 class SimulatedTriPoolBackend(TriPoolVMM):
-    """Local-substitutable CPU VMM backend executing identical C++17 `TriPoolVMM` via `HostMmapPageAdapter`."""
+    """Convenience `TriPoolVMM(simulated=True)` subclass executing identical C++17 `HostMmapPageAdapter`."""
 
     is_simulated = True
 

@@ -23,14 +23,6 @@ uint64_t mono_now_ns() noexcept {
 struct GlobalVmmRegistry {
     std::mutex mu;
     std::unordered_map<int, std::weak_ptr<TriPoolVMM>> by_device;
-    std::shared_ptr<TriPoolVMM> legacy_inst;
-
-    ~GlobalVmmRegistry() noexcept {
-        if (legacy_inst) {
-            legacy_inst->notify_atexit_teardown();
-            legacy_inst.reset();
-        }
-    }
 };
 
 GlobalVmmRegistry& registry() {
@@ -48,7 +40,7 @@ std::shared_ptr<TriPoolVMM> TriPoolVMM::create(const TriPoolVMMConfig& cfg) {
     }
     std::shared_ptr<TriPoolVMM> inst(new TriPoolVMM(cfg));
     inst->init_pools();
-    if (!inst->is_simulated()) {
+    if (!cfg.simulated) {
         register_active_device_instance(cfg.device, inst);
     }
     return inst;
@@ -89,7 +81,7 @@ void TriPoolVMM::init_pools() {
     std::lock_guard<std::mutex> lock(mu_);
     try {
         if (cfg_.simulated) {
-            backend_ = std::make_unique<HostMmapPageAdapter>(cfg_.device, 2ULL << 20);
+            backend_ = std::make_unique<HostMmapPageAdapter>(cfg_.device, 2ULL << 20, cfg_.materialize_sim_va);
         } else {
             backend_ = std::make_unique<CudaPageAdapter>(cfg_.device);
         }
@@ -97,7 +89,6 @@ void TriPoolVMM::init_pools() {
         const size_t req_super = (cfg_.super_handle_mib > 0 ? cfg_.super_handle_mib : 64) * (1ULL << 20);
         super_bytes_ = ((req_super + min_gran_ - 1) / min_gran_) * min_gran_;
         sub_pages_ = std::max<size_t>(1, super_bytes_ / min_gran_);
-        transient_host_accessible_ = (!backend_->is_simulated()) || cfg_.materialize_sim_va;
 
         h2d_stream_ = backend_->create_stream(/*high_priority=*/true);
         swap_stream_ = backend_->create_stream(/*high_priority=*/false);
@@ -137,9 +128,7 @@ void TriPoolVMM::init_pools() {
         atexit_teardown_.store(false, std::memory_order_relaxed);
         stop_streamer_ = false;
         streamer_error_ = false;
-        if (!backend_->is_simulated()) {
-            streamer_thread_ = std::thread(&TriPoolVMM::streamer_loop, this);
-        }
+        streamer_thread_ = std::thread(&TriPoolVMM::streamer_loop, this);
         initialized_ = true;
     } catch (...) {
         cleanup_failed_init_locked();
@@ -178,7 +167,7 @@ int TriPoolVMM::shutdown() {
                     backend_->unmap_range(
                         bank.va_base + static_cast<size_t>(l) * bank.layer_stride_bytes,
                         bank.layer_stride_bytes,
-                        bank.host_accessible_va);
+                        /*was_host_accessible=*/true);
                     for (auto& s : lyr.slots) release_super_slot_to_pool_locked(s);
                     lyr.slots.clear();
                 }
@@ -202,7 +191,7 @@ int TriPoolVMM::shutdown() {
             backend_->unmap_range(
                 transient_va_,
                 transient_mapped_slots_.size() * super_bytes_,
-                transient_host_accessible_);
+                /*was_host_accessible=*/true);
             for (auto& s : transient_mapped_slots_) release_super_slot_to_pool_locked(s);
             transient_mapped_slots_.clear();
         }
@@ -369,23 +358,27 @@ void TriPoolVMM::reset_counters_locked() {
     free_host_pinned_bytes_ = 0;
     evictable_clock_ = 0;
     last_compute_stream_ = nullptr;
-    scope_active_ = false;
+    scope_depth_ = 0;
     streamer_error_ = false;
 }
 
-TriPoolVMM::CapacitySnapshot TriPoolVMM::compute_kv_capacities_locked() const {
-    CapacitySnapshot s;
-    if (!initialized_) return s;
-    s.pool_total_bytes = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
-    s.pool_free_bytes = free_super_handles_.size() * super_bytes_ + free_fine_handles_.size() * min_gran_;
+TriPoolVMM::KvBudgetSnapshot TriPoolVMM::compute_kv_budget_locked(bool for_dit) const {
+    KvBudgetSnapshot b;
+    if (!initialized_) return b;
+    b.pool_total_bytes = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+    b.pool_free_bytes = free_super_handles_.size() * super_bytes_ + free_fine_handles_.size() * min_gran_;
 
-    uint64_t inflight_swap_bytes = 0;
     for (const auto& reg : kv_regions_) {
         if (reg.active &&
             (reg.state == KvRegionState::SWAP_OUT_QUEUED || reg.state == KvRegionState::SWAP_OUT_FINISHING)) {
-            inflight_swap_bytes += reg.handles.size() * min_gran_;
+            b.inflight_swap_bytes += reg.handles.size() * min_gran_;
         }
     }
+
+    const uint64_t raw_kv_mapped = kv_mapped_pages_ * min_gran_;
+    b.active_kv_bytes = (raw_kv_mapped > b.inflight_swap_bytes) ? (raw_kv_mapped - b.inflight_swap_bytes) : 0;
+    b.transient_bytes = transient_mapped_slots_.size() * super_bytes_;
+    b.expert_mapped_bytes = expert_mapped_handles_ * super_bytes_;
 
     uint64_t pinned_expert_va_bytes = 0;
     for (const auto& bank : experts_) {
@@ -393,76 +386,73 @@ TriPoolVMM::CapacitySnapshot TriPoolVMM::compute_kv_capacities_locked() const {
             pinned_expert_va_bytes += bank.va_bytes;
         } else {
             for (const auto& lyr : bank.layers) {
-                if ((lyr.state == LayerState::RESIDENT ||
-                     (backend_->is_simulated() && lyr.state == LayerState::QUEUED)) &&
-                    !lyr.slots.empty()) {
-                    s.expert_unpinned_bytes += bank.layer_stride_bytes;
+                if (lyr.state == LayerState::RESIDENT && !lyr.slots.empty()) {
+                    b.expert_unpinned_bytes += bank.layer_stride_bytes;
                 }
             }
         }
     }
-    const uint64_t dit_expert_full_bytes = std::max<uint64_t>(
+    b.expert_pinned_bytes =
+        (b.expert_mapped_bytes > b.expert_unpinned_bytes)
+            ? (b.expert_mapped_bytes - b.expert_unpinned_bytes)
+            : 0;
+    b.dit_expert_full_bytes = std::max<uint64_t>(
         experts_.empty() ? uint64_t{0} : static_cast<uint64_t>(experts_[0].va_bytes),
         pinned_expert_va_bytes);
 
-    const uint64_t sim_overflow_extra =
-        (backend_->is_simulated() && cfg_.allow_overflow) ? (8ULL << 30) : 0ULL;
+    b.fixed_non_kv_bytes = b.transient_bytes + (for_dit ? b.dit_expert_full_bytes : b.expert_pinned_bytes);
+    b.effective_pool_bytes =
+        (cfg_.max_pool_bytes > 0)
+            ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(b.pool_total_bytes, cfg_.max_pool_bytes))
+            : b.pool_total_bytes;
 
-    s.kv_free_bytes = s.pool_free_bytes + inflight_swap_bytes + s.expert_unpinned_bytes + sim_overflow_extra;
+    b.kv_budget_bytes =
+        (b.effective_pool_bytes > b.fixed_non_kv_bytes) ? (b.effective_pool_bytes - b.fixed_non_kv_bytes) : 0;
+    b.high_watermark_bytes =
+        static_cast<uint64_t>(static_cast<double>(b.kv_budget_bytes) * cfg_.kv_swap_high_watermark);
+    b.low_watermark_bytes =
+        static_cast<uint64_t>(static_cast<double>(b.kv_budget_bytes) * cfg_.kv_swap_low_watermark);
 
-    const uint64_t raw_kv_mapped = kv_mapped_pages_ * min_gran_;
-    const uint64_t active_kv_bytes =
-        (raw_kv_mapped > inflight_swap_bytes) ? (raw_kv_mapped - inflight_swap_bytes) : 0;
-    const uint64_t transient_bytes = transient_mapped_slots_.size() * super_bytes_;
-    const uint64_t committed_for_dit = active_kv_bytes + transient_bytes + dit_expert_full_bytes;
-    const uint64_t eff_total = s.pool_total_bytes + sim_overflow_extra;
-    s.kv_dit_headroom_bytes = (eff_total > committed_for_dit) ? (eff_total - committed_for_dit) : 0;
-    return s;
+    b.kv_free_bytes = b.pool_free_bytes + b.inflight_swap_bytes + b.expert_unpinned_bytes;
+    const uint64_t committed_for_dit = b.active_kv_bytes + b.transient_bytes + b.dit_expert_full_bytes;
+    b.kv_dit_headroom_bytes = (b.pool_total_bytes > committed_for_dit) ? (b.pool_total_bytes - committed_for_dit) : 0;
+    return b;
 }
 
 uint64_t TriPoolVMM::clamp_by_max_pool_locked(
     uint64_t raw_free,
-    const CapacitySnapshot& snap,
-    bool for_dit) const {
+    const KvBudgetSnapshot& b) const {
     if (cfg_.max_pool_bytes == 0) {
         return raw_free;
     }
-    uint64_t inflight_swap_bytes = 0;
-    for (const auto& reg : kv_regions_) {
-        if (reg.active &&
-            (reg.state == KvRegionState::SWAP_OUT_QUEUED || reg.state == KvRegionState::SWAP_OUT_FINISHING)) {
-            inflight_swap_bytes += reg.handles.size() * min_gran_;
-        }
-    }
-    const uint64_t raw_kv_mapped = kv_mapped_pages_ * min_gran_;
-    const uint64_t kv_used = (raw_kv_mapped > inflight_swap_bytes) ? (raw_kv_mapped - inflight_swap_bytes) : 0;
-    const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
-
-    uint64_t non_kv_fixed = tr_used;
-    if (for_dit) {
-        uint64_t pinned_va = 0;
-        for (const auto& bank : experts_) {
-            if (bank.pinned) pinned_va += bank.va_bytes;
-        }
-        non_kv_fixed += std::max<uint64_t>(
-            experts_.empty() ? uint64_t{0} : static_cast<uint64_t>(experts_[0].va_bytes), pinned_va);
-    } else {
-        const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
-        const uint64_t exp_pinned_b =
-            (exp_mapped_b > snap.expert_unpinned_bytes) ? (exp_mapped_b - snap.expert_unpinned_bytes) : 0;
-        non_kv_fixed += exp_pinned_b;
-    }
-    const uint64_t committed = kv_used + non_kv_fixed;
+    const uint64_t committed = b.active_kv_bytes + b.fixed_non_kv_bytes;
     const uint64_t soft_free = (cfg_.max_pool_bytes > committed) ? (cfg_.max_pool_bytes - committed) : 0;
     return std::min(raw_free, soft_free);
+}
+
+size_t TriPoolVMM::compute_watermark_reclaim_target_locked(bool for_dit, size_t extra_needed_bytes) const {
+    const KvBudgetSnapshot b = compute_kv_budget_locked(for_dit);
+    if (b.effective_pool_bytes == 0) return 0;
+    const uint64_t projected_kv = b.active_kv_bytes + static_cast<uint64_t>(extra_needed_bytes);
+    if (projected_kv <= b.high_watermark_bytes && projected_kv <= b.kv_budget_bytes) {
+        return 0;
+    }
+    if (projected_kv > b.low_watermark_bytes) {
+        return static_cast<size_t>(projected_kv - b.low_watermark_bytes);
+    }
+    return (extra_needed_bytes > 0) ? extra_needed_bytes : static_cast<size_t>(projected_kv);
 }
 
 uint64_t TriPoolVMM::kv_free_bytes(bool for_dit, uint64_t extra_driver_free_bytes) {
     std::lock_guard<std::mutex> lock(mu_);
     if (!initialized_) return 0;
-    const CapacitySnapshot snap = compute_kv_capacities_locked();
-    uint64_t raw = (for_dit ? snap.kv_dit_headroom_bytes : snap.kv_free_bytes) + extra_driver_free_bytes;
-    return clamp_by_max_pool_locked(raw, snap, for_dit);
+    const KvBudgetSnapshot b = compute_kv_budget_locked(for_dit);
+    uint64_t extra = extra_driver_free_bytes;
+    if (extra == 0 && cfg_.allow_overflow) {
+        extra = backend_->driver_free_overflow_bytes();
+    }
+    const uint64_t raw = (for_dit ? b.kv_dit_headroom_bytes : b.kv_free_bytes) + extra;
+    return clamp_by_max_pool_locked(raw, b);
 }
 
 uint64_t TriPoolVMM::sync_kv_free_bytes(bool for_dit, uint64_t extra_driver_free_bytes) {
@@ -474,14 +464,18 @@ uint64_t TriPoolVMM::sync_kv_free_bytes(bool for_dit, uint64_t extra_driver_free
 
 void TriPoolVMM::scope_begin() {
     std::lock_guard<std::mutex> lock(mu_);
-    scope_active_ = true;
+    ++scope_depth_;
 }
 
 int TriPoolVMM::scope_end(void* stream) {
     std::lock_guard<std::mutex> lock(mu_);
-    scope_active_ = false;
+    if (scope_depth_ <= 0) {
+        scope_depth_ = 0;
+        return initialized_ ? static_cast<int>(transient_live_allocs_.size()) : 0;
+    }
+    --scope_depth_;
     if (!initialized_) return 0;
-    if (transient_live_allocs_.empty() && !transient_mapped_slots_.empty()) {
+    if (scope_depth_ == 0 && transient_live_allocs_.empty() && !transient_mapped_slots_.empty()) {
         try {
             backend_->ensure_context();
             bulk_unmap_transient_locked(stream);
@@ -525,7 +519,7 @@ void* TriPoolVMM::transient_alloc(ssize_t req_size, void* stream) {
         const size_t need_bytes = (aligned > tail_free) ? (aligned - tail_free) : 0;
         const size_t add_handles = (need_bytes + super_bytes_ - 1) / super_bytes_;
         if (transient_mapped_slots_.size() + add_handles > transient_va_handles_) {
-            throw std::runtime_error("Transient VA exhausted");
+            throw VmmOutOfMemoryError("Transient VA exhausted");
         }
         extend_transient_mapped_locked(add_handles, stream, &lock);
 
@@ -539,6 +533,8 @@ void* TriPoolVMM::transient_alloc(ssize_t req_size, void* stream) {
         if (rem > 0) transient_free_blocks_[off + aligned] = rem;
         transient_live_allocs_[off] = aligned;
         return reinterpret_cast<void*>(transient_va_ + off);
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] transient_alloc(%zd) error: %s\n", req_size, e.what());
         return nullptr;
@@ -560,7 +556,7 @@ void TriPoolVMM::transient_free(void* ptr, ssize_t /*req_size*/, void* stream) {
         transient_live_allocs_.erase(it);
         insert_coalesce_transient_locked(off, sz);
 
-        if (!scope_active_ && transient_live_allocs_.empty() && !transient_mapped_slots_.empty()) {
+        if (scope_depth_ == 0 && transient_live_allocs_.empty() && !transient_mapped_slots_.empty()) {
             backend_->ensure_context();
             bulk_unmap_transient_locked(stream);
         }
@@ -616,7 +612,7 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
         const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
         const bool over_cap = (cfg_.max_pool_bytes > 0) && ((cur_pool_b + min_gran_) > cfg_.max_pool_bytes);
         if (!cfg_.allow_overflow || over_cap) {
-            throw std::runtime_error(
+            throw VmmOutOfMemoryError(
                 over_cap ? "TriPool physical pool reached max_pool_bytes cap for KV page"
                          : "TriPool physical pool exhausted for KV page (allow_overflow=0)");
         }
@@ -645,8 +641,8 @@ int32_t TriPoolVMM::kv_alloc_page() {
         uint64_t fh = 0;
         try {
             fh = pop_fine_handle_locked(nullptr, &lock);
-        } catch (...) {
-            reclaim_thinking_kv_locked(min_gran_, /*sync=*/true, /*exclude_session_id=*/0, nullptr, lock);
+        } catch (const VmmOutOfMemoryError&) {
+            reclaim_thinking_kv_locked(min_gran_, /*sync=*/true, nullptr, 0, nullptr, lock);
             fh = pop_fine_handle_locked(nullptr, &lock);
         }
         const int32_t slot = kv_free_slots_.back();
@@ -666,6 +662,8 @@ int32_t TriPoolVMM::kv_alloc_page() {
         ++kv_mapped_pages_;
         kv_mapped_pages_peak_ = std::max(kv_mapped_pages_peak_, kv_mapped_pages_);
         return slot;
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_alloc_page error: %s\n", e.what());
         return -3;
@@ -727,6 +725,26 @@ void TriPoolVMM::kv_session_touch(uint64_t session_id) {
     }
 }
 
+void TriPoolVMM::kv_session_set_pinned(uint64_t session_id, bool pinned) {
+    if (session_id == 0) return;
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = kv_sessions_.find(session_id);
+    if (it == kv_sessions_.end()) return;
+    it->second.pinned_active = pinned;
+    if (pinned) {
+        it->second.thinking = false;
+        it->second.last_access_ns = mono_now_ns();
+        for (int32_t rid : it->second.region_ids) {
+            if (rid >= 0 && static_cast<size_t>(rid) < kv_regions_.size()) {
+                auto& reg = kv_regions_[static_cast<size_t>(rid)];
+                if (reg.active) {
+                    reg.evictable = false;
+                }
+            }
+        }
+    }
+}
+
 int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
     if (session_id == 0) return 0;
     std::unique_lock<std::mutex> lock(mu_);
@@ -757,25 +775,9 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
 
     try {
         backend_->ensure_context();
-        const CapacitySnapshot snap = compute_kv_capacities_locked();
-        const uint64_t eff_pool =
-            (cfg_.max_pool_bytes > 0)
-                ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
-                : snap.pool_total_bytes;
-        if (eff_pool > 0) {
-            const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
-            const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
-            const uint64_t exp_pinned_b =
-                (exp_mapped_b > snap.expert_unpinned_bytes) ? (exp_mapped_b - snap.expert_unpinned_bytes) : 0;
-            const uint64_t kv_budget =
-                (eff_pool > tr_used + exp_pinned_b) ? (eff_pool - tr_used - exp_pinned_b) : 0;
-            const uint64_t proj_kv = kv_mapped_pages_ * min_gran_ + needed_restore_bytes;
-            const uint64_t hi_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_high_watermark);
-            const uint64_t lo_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_low_watermark);
-            if (proj_kv > hi_b || proj_kv > kv_budget) {
-                const size_t target = (proj_kv > lo_b) ? static_cast<size_t>(proj_kv - lo_b) : needed_restore_bytes;
-                reclaim_thinking_kv_locked(target, /*sync=*/true, session_id, stream, lock);
-            }
+        const size_t wm_target = compute_watermark_reclaim_target_locked(/*for_dit=*/false, needed_restore_bytes);
+        if (wm_target > 0) {
+            reclaim_thinking_kv_locked(wm_target, /*sync=*/true, &session_id, 1, stream, lock);
         }
 
         std::sort(swapped_rids.begin(), swapped_rids.end());
@@ -795,9 +797,9 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
                 } else if (reg.state == KvRegionState::SWAPPED) {
                     try {
                         swap_in_region_locked(rid, reg, stream, &lock);
-                    } catch (...) {
+                    } catch (const VmmOutOfMemoryError&) {
                         const size_t reclaimed = reclaim_thinking_kv_locked(
-                            std::max(min_gran_, needed_restore_bytes), /*sync=*/true, session_id, stream, lock);
+                            std::max(min_gran_, needed_restore_bytes), /*sync=*/true, &session_id, 1, stream, lock);
                         if (reclaimed > 0) {
                             swap_in_region_locked(rid, reg, stream, &lock);
                         } else {
@@ -817,6 +819,8 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
             throw;
         }
         return 0;
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_session_mark_active error: %s\n", e.what());
         return -3;
@@ -860,11 +864,25 @@ size_t TriPoolVMM::kv_session_mark_thinking(
 size_t TriPoolVMM::reclaim_thinking_kv_locked(
     size_t target_reclaim_bytes,
     bool sync,
-    uint64_t exclude_session_id,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
     void* stream,
     std::unique_lock<std::mutex>& lock) {
     if (!initialized_ || target_reclaim_bytes == 0) return 0;
     backend_->ensure_context();
+
+    std::unordered_set<uint64_t> excluded;
+    if (exclude_session_ids && num_excludes > 0) {
+        excluded.reserve(num_excludes);
+        for (size_t i = 0; i < num_excludes; ++i) {
+            if (exclude_session_ids[i] != 0) {
+                excluded.insert(exclude_session_ids[i]);
+            }
+        }
+    }
+    const auto is_excluded = [&](uint64_t sid) -> bool {
+        return sid != 0 && !excluded.empty() && excluded.find(sid) != excluded.end();
+    };
 
     const uint64_t now_ns = mono_now_ns();
     const uint64_t min_idle_ns = static_cast<uint64_t>(std::max(0.0, cfg_.kv_swap_min_idle_s) * 1e9);
@@ -878,7 +896,7 @@ size_t TriPoolVMM::reclaim_thinking_kv_locked(
     cands.reserve(kv_sessions_.size());
     for (const auto& kv : kv_sessions_) {
         const KvSession& s = kv.second;
-        if (s.session_id == exclude_session_id || s.pinned_active) continue;
+        if (is_excluded(s.session_id) || s.pinned_active) continue;
         const uint64_t idle_ns = (now_ns > s.last_access_ns) ? (now_ns - s.last_access_ns) : 0;
         if (!s.thinking && idle_ns < min_idle_ns) continue;
 
@@ -924,18 +942,23 @@ size_t TriPoolVMM::reclaim_thinking_kv_locked(
         }
     }
 
-    // Fallback: also reclaim standalone evictable regions not bound to a session
+    // Fallback: also reclaim standalone evictable regions not pinned or excluded
     while (reclaimed_bytes < target_reclaim_bytes) {
         int32_t best_rid = -1;
         uint64_t best_seq = UINT64_MAX;
         for (size_t idx = 0; idx < kv_regions_.size(); ++idx) {
             const auto& reg = kv_regions_[idx];
-            if (reg.active && reg.evictable && reg.state == KvRegionState::RESIDENT &&
-                !reg.handles.empty() && reg.session_id != exclude_session_id) {
-                if (reg.evictable_seq < best_seq) {
-                    best_seq = reg.evictable_seq;
-                    best_rid = static_cast<int32_t>(idx);
-                }
+            if (!reg.active || !reg.evictable || reg.state != KvRegionState::RESIDENT || reg.handles.empty()) {
+                continue;
+            }
+            if (is_excluded(reg.session_id)) continue;
+            if (reg.session_id != 0) {
+                auto sit = kv_sessions_.find(reg.session_id);
+                if (sit != kv_sessions_.end() && sit->second.pinned_active) continue;
+            }
+            if (reg.evictable_seq < best_seq) {
+                best_seq = reg.evictable_seq;
+                best_rid = static_cast<int32_t>(idx);
             }
         }
         if (best_rid < 0) break;
@@ -955,13 +978,41 @@ size_t TriPoolVMM::reclaim_thinking_kv_locked(
     return reclaimed_bytes;
 }
 
+size_t TriPoolVMM::reclaim_thinking_kv_bytes_multi(
+    size_t target_reclaim_bytes,
+    bool sync,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
+    void* stream) {
+    std::unique_lock<std::mutex> lock(mu_);
+    return reclaim_thinking_kv_locked(target_reclaim_bytes, sync, exclude_session_ids, num_excludes, stream, lock);
+}
+
 size_t TriPoolVMM::reclaim_thinking_kv_bytes(
     size_t target_reclaim_bytes,
     bool sync,
     uint64_t exclude_session_id,
     void* stream) {
+    return reclaim_thinking_kv_bytes_multi(
+        target_reclaim_bytes,
+        sync,
+        exclude_session_id ? &exclude_session_id : nullptr,
+        exclude_session_id ? 1 : 0,
+        stream);
+}
+
+size_t TriPoolVMM::maybe_evict_thinking_kv_on_high_watermark_multi(
+    bool sync,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
+    size_t extra_needed_bytes,
+    bool for_dit,
+    void* stream) {
     std::unique_lock<std::mutex> lock(mu_);
-    return reclaim_thinking_kv_locked(target_reclaim_bytes, sync, exclude_session_id, stream, lock);
+    if (!initialized_) return 0;
+    const size_t target_reclaim = compute_watermark_reclaim_target_locked(for_dit, extra_needed_bytes);
+    if (target_reclaim == 0) return 0;
+    return reclaim_thinking_kv_locked(target_reclaim, sync, exclude_session_ids, num_excludes, stream, lock);
 }
 
 size_t TriPoolVMM::maybe_evict_thinking_kv_on_high_watermark(
@@ -970,53 +1021,13 @@ size_t TriPoolVMM::maybe_evict_thinking_kv_on_high_watermark(
     size_t extra_needed_bytes,
     bool for_dit,
     void* stream) {
-    std::unique_lock<std::mutex> lock(mu_);
-    if (!initialized_) return 0;
-    const CapacitySnapshot snap = compute_kv_capacities_locked();
-    const uint64_t eff_pool =
-        (cfg_.max_pool_bytes > 0)
-            ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
-            : snap.pool_total_bytes;
-    if (eff_pool == 0) return 0;
-
-    uint64_t inflight_swap_bytes = 0;
-    for (const auto& reg : kv_regions_) {
-        if (reg.active &&
-            (reg.state == KvRegionState::SWAP_OUT_QUEUED || reg.state == KvRegionState::SWAP_OUT_FINISHING)) {
-            inflight_swap_bytes += reg.handles.size() * min_gran_;
-        }
-    }
-    const uint64_t raw_kv_mapped = kv_mapped_pages_ * min_gran_;
-    const uint64_t active_kv_used =
-        (raw_kv_mapped > inflight_swap_bytes) ? (raw_kv_mapped - inflight_swap_bytes) : 0;
-
-    const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
-    uint64_t fixed_non_kv = tr_used;
-    if (for_dit) {
-        uint64_t pinned_va = 0;
-        for (const auto& bank : experts_) {
-            if (bank.pinned) pinned_va += bank.va_bytes;
-        }
-        fixed_non_kv += std::max<uint64_t>(
-            experts_.empty() ? uint64_t{0} : static_cast<uint64_t>(experts_[0].va_bytes), pinned_va);
-    } else {
-        const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
-        const uint64_t exp_pinned_b =
-            (exp_mapped_b > snap.expert_unpinned_bytes) ? (exp_mapped_b - snap.expert_unpinned_bytes) : 0;
-        fixed_non_kv += exp_pinned_b;
-    }
-
-    const uint64_t kv_budget = (eff_pool > fixed_non_kv) ? (eff_pool - fixed_non_kv) : 0;
-    const uint64_t projected_kv = active_kv_used + extra_needed_bytes;
-    const uint64_t high_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_high_watermark);
-    const uint64_t low_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_low_watermark);
-
-    if (projected_kv <= high_b && projected_kv <= kv_budget) {
-        return 0;
-    }
-    const size_t target_reclaim =
-        (projected_kv > low_b) ? static_cast<size_t>(projected_kv - low_b) : static_cast<size_t>(projected_kv);
-    return reclaim_thinking_kv_locked(target_reclaim, sync, exclude_session_id, stream, lock);
+    return maybe_evict_thinking_kv_on_high_watermark_multi(
+        sync,
+        exclude_session_id ? &exclude_session_id : nullptr,
+        exclude_session_id ? 1 : 0,
+        extra_needed_bytes,
+        for_dit,
+        stream);
 }
 
 int32_t TriPoolVMM::kv_region_alloc(size_t max_va_bytes, uint64_t session_id) {
@@ -1119,25 +1130,11 @@ uint64_t TriPoolVMM::kv_region_ensure(int32_t region_id, size_t needed_bytes, vo
         const size_t delta_bytes = delta * min_gran_;
 
         // Proactive watermark reclamation before mapping delta pages
-        const CapacitySnapshot snap = compute_kv_capacities_locked();
-        const uint64_t eff_pool =
-            (cfg_.max_pool_bytes > 0)
-                ? (cfg_.allow_overflow ? cfg_.max_pool_bytes : std::min(snap.pool_total_bytes, cfg_.max_pool_bytes))
-                : snap.pool_total_bytes;
-        if (eff_pool > 0) {
-            const uint64_t tr_used = transient_mapped_slots_.size() * super_bytes_;
-            const uint64_t exp_mapped_b = expert_mapped_handles_ * super_bytes_;
-            const uint64_t exp_pinned_b =
-                (exp_mapped_b > snap.expert_unpinned_bytes) ? (exp_mapped_b - snap.expert_unpinned_bytes) : 0;
-            const uint64_t kv_budget =
-                (eff_pool > tr_used + exp_pinned_b) ? (eff_pool - tr_used + 0 - exp_pinned_b) : 0;
-            const uint64_t proj_kv = kv_mapped_pages_ * min_gran_ + delta_bytes;
-            const uint64_t hi_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_high_watermark);
-            const uint64_t lo_b = static_cast<uint64_t>(static_cast<double>(kv_budget) * cfg_.kv_swap_low_watermark);
-            if (proj_kv > hi_b || proj_kv > kv_budget) {
-                const size_t target = (proj_kv > lo_b) ? static_cast<size_t>(proj_kv - lo_b) : delta_bytes;
-                reclaim_thinking_kv_locked(target, /*sync=*/false, reg.session_id, stream, lock);
-            }
+        const size_t wm_target = compute_watermark_reclaim_target_locked(/*for_dit=*/false, delta_bytes);
+        if (wm_target > 0) {
+            const uint64_t ex_sid = reg.session_id;
+            reclaim_thinking_kv_locked(
+                wm_target, /*sync=*/false, ex_sid ? &ex_sid : nullptr, ex_sid ? 1 : 0, stream, lock);
         }
 
         std::vector<uint64_t> staged;
@@ -1147,9 +1144,15 @@ uint64_t TriPoolVMM::kv_region_ensure(int32_t region_id, size_t needed_bytes, vo
             for (size_t i = 0; i < delta; ++i) {
                 try {
                     staged.push_back(pop_fine_handle_locked(stream, &lock, region_id));
-                } catch (...) {
+                } catch (const VmmOutOfMemoryError&) {
+                    const uint64_t ex_sid = reg.session_id;
                     const size_t rec = reclaim_thinking_kv_locked(
-                        std::max(min_gran_, delta_bytes), /*sync=*/true, reg.session_id, stream, lock);
+                        std::max(min_gran_, delta_bytes),
+                        /*sync=*/true,
+                        ex_sid ? &ex_sid : nullptr,
+                        ex_sid ? 1 : 0,
+                        stream,
+                        lock);
                     if (rec > 0) {
                         staged.push_back(pop_fine_handle_locked(stream, &lock, region_id));
                     } else {
@@ -1180,6 +1183,8 @@ uint64_t TriPoolVMM::kv_region_ensure(int32_t region_id, size_t needed_bytes, vo
             for (auto h : staged) free_fine_handles_.push_back(h);
             throw;
         }
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_region_ensure error: %s\n", e.what());
         return 0;
@@ -1198,33 +1203,6 @@ int TriPoolVMM::submit_region_swap_out_locked(
     const size_t n_pages = reg.handles.size();
     const size_t mapped_bytes = n_pages * min_gran_;
     const size_t copy_bytes = std::min(valid_bytes, mapped_bytes);
-
-    if (backend_->is_simulated()) {
-        if (copy_bytes > 0) {
-            if (reg.swap_host_pinned && reg.swap_cap_bytes < copy_bytes) {
-                release_host_pinned_locked(reg.swap_host_pinned, reg.swap_cap_bytes);
-                reg.swap_host_pinned = nullptr;
-                reg.swap_cap_bytes = 0;
-            }
-            if (!reg.swap_host_pinned) {
-                reg.swap_host_pinned = acquire_host_pinned_locked(copy_bytes, reg.swap_cap_bytes);
-            }
-            backend_->memcpy_d2h_async(reg.swap_host_pinned, reg.va_base, copy_bytes, swap_stream_);
-        }
-        backend_->unmap_range(reg.va_base, mapped_bytes, /*was_host_accessible=*/true);
-        for (auto fh : reg.handles) free_fine_handles_.push_back(fh);
-        reg.handles.clear();
-        kv_mapped_pages_ = (kv_mapped_pages_ >= n_pages) ? (kv_mapped_pages_ - n_pages) : 0;
-        reg.swapped_valid_bytes = copy_bytes;
-        reg.swapped_pages = n_pages;
-        reg.state = KvRegionState::SWAPPED;
-        ++reg.generation;
-        kv_swapped_pages_ += n_pages;
-        kv_swapped_bytes_current_ += copy_bytes;
-        ++kv_swap_outs_total_;
-        kv_swap_d2h_bytes_total_ += copy_bytes;
-        return static_cast<int>(n_pages);
-    }
 
     if (copy_bytes == 0) {
         backend_->sync_stream(compute_stream);
@@ -1311,6 +1289,8 @@ int TriPoolVMM::kv_region_swap_in_async(int32_t region_id, void* target_stream) 
         const size_t pages = reg.swapped_pages;
         swap_in_region_locked(region_id, reg, target_stream, &lock);
         return static_cast<int>(pages);
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] kv_region_swap_in_async error: %s\n", e.what());
         return -3;
@@ -1399,15 +1379,7 @@ int TriPoolVMM::kv_region_free(int32_t region_id, void* stream) {
             kv_mapped_pages_ = (kv_mapped_pages_ >= n) ? (kv_mapped_pages_ - n) : 0;
         }
         if (reg.swap_host_pinned) {
-            if (backend_->is_simulated()) {
-                backend_->free_host_pinned(reg.swap_host_pinned);
-                kv_host_pinned_pool_bytes_ =
-                    (kv_host_pinned_pool_bytes_ >= reg.swap_cap_bytes)
-                        ? (kv_host_pinned_pool_bytes_ - reg.swap_cap_bytes)
-                        : 0;
-            } else {
-                release_host_pinned_locked(reg.swap_host_pinned, reg.swap_cap_bytes);
-            }
+            release_host_pinned_locked(reg.swap_host_pinned, reg.swap_cap_bytes);
             reg.swap_host_pinned = nullptr;
             reg.swap_cap_bytes = 0;
         }
@@ -1449,17 +1421,13 @@ int TriPoolVMM::expert_register(
     void* host_pinned_base,
     size_t host_bytes) {
     std::lock_guard<std::mutex> lock(mu_);
-    if (!initialized_ || num_layers <= 0) return -1;
-    if (!backend_->is_simulated() && !host_pinned_base) return -1;
+    if (!initialized_ || num_layers <= 0 || layer_stride_mib == 0) return -1;
     try {
         backend_->ensure_context();
         const size_t req_stride = layer_stride_mib * (1ULL << 20);
         const size_t aligned_stride = ((req_stride + super_bytes_ - 1) / super_bytes_) * super_bytes_;
         const size_t handles_per_layer = aligned_stride / super_bytes_;
         const size_t total_va = static_cast<size_t>(num_layers) * aligned_stride;
-        if (!backend_->is_simulated() && host_bytes < total_va) {
-            throw std::runtime_error("host_bytes < num_layers * aligned_stride");
-        }
 
         ExpertBank bank;
         bank.id = static_cast<int>(experts_.size());
@@ -1470,7 +1438,6 @@ int TriPoolVMM::expert_register(
         bank.host_pinned_base = static_cast<uint8_t*>(host_pinned_base);
         bank.host_bytes = host_bytes;
         bank.pinned = false;
-        bank.host_accessible_va = (!backend_->is_simulated()) || cfg_.materialize_sim_va;
         bank.va_base = backend_->reserve_va(total_va, super_bytes_);
         bank.layers.resize(static_cast<size_t>(num_layers));
         for (int l = 0; l < num_layers; ++l) {
@@ -1529,15 +1496,27 @@ int TriPoolVMM::expert_load_layers_sync(int expert_id, int start_layer, int end_
     end_layer_exclusive = std::min(bank.num_layers, end_layer_exclusive);
     try {
         backend_->ensure_context();
-        if (backend_->is_simulated()) {
+        bank.last_async_error = false;
+        bank.last_async_error_oom = false;
+        bank.last_async_error_msg.clear();
+
+        cv_ready_.wait(lock, [&] {
+            if (stop_streamer_ || streamer_error_) return true;
             for (int i = start_layer; i < end_layer_exclusive; ++i) {
-                auto& lyr = bank.layers[static_cast<size_t>(i)];
-                if (lyr.state == LayerState::QUEUED) {
-                    lyr.state = LayerState::RESIDENT;
-                    lyr.needs_stream_wait = false;
-                }
+                const auto st = bank.layers[static_cast<size_t>(i)].state;
+                if (st == LayerState::QUEUED || st == LayerState::STREAMING) return false;
             }
+            return true;
+        });
+        if (stop_streamer_ || streamer_error_) return -2;
+
+        for (int i = start_layer; i < end_layer_exclusive; ++i) {
+            auto& lyr = bank.layers[static_cast<size_t>(i)];
+            lyr.failed = false;
+            lyr.failed_oom = false;
+            lyr.failed_msg.clear();
         }
+
         int l = start_layer;
         while (l < end_layer_exclusive) {
             while (l < end_layer_exclusive &&
@@ -1558,6 +1537,8 @@ int TriPoolVMM::expert_load_layers_sync(int expert_id, int start_layer, int end_
             bank.layers[static_cast<size_t>(i)].needs_stream_wait = false;
         }
         return 0;
+    } catch (const VmmOutOfMemoryError&) {
+        throw;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] expert_load_layers_sync error: %s\n", e.what());
         return -2;
@@ -1571,30 +1552,18 @@ int TriPoolVMM::expert_prefetch_async(int expert_id, int start_layer, int end_la
     start_layer = std::max(0, start_layer);
     end_layer_exclusive = std::min(bank.num_layers, end_layer_exclusive);
 
-    if (backend_->is_simulated()) {
-        int queued = 0;
-        try {
-            for (int l = start_layer; l < end_layer_exclusive; ++l) {
-                auto& lyr = bank.layers[static_cast<size_t>(l)];
-                if (lyr.state != LayerState::EVICTED) continue;
-                map_and_submit_contiguous_locked(bank, l, l + 1, &lock);
-                // Mark QUEUED until `expert_wait_layer` or `load_layers_sync` observes completion
-                lyr.state = LayerState::QUEUED;
-                if (expert_resident_layers_ > 0) --expert_resident_layers_;
-                if (expert_prefetch_layers_completed_ > 0) --expert_prefetch_layers_completed_;
-                ++queued;
-            }
-            return queued;
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "[tripool_vmm] sim expert_prefetch_async error: %s\n", e.what());
-            return -2;
-        }
-    }
+    bank.last_async_error = false;
+    bank.last_async_error_oom = false;
+    bank.last_async_error_msg.clear();
 
     int queued = 0;
     for (int l = start_layer; l < end_layer_exclusive; ++l) {
-        if (bank.layers[static_cast<size_t>(l)].state == LayerState::EVICTED) {
-            bank.layers[static_cast<size_t>(l)].state = LayerState::QUEUED;
+        auto& lyr = bank.layers[static_cast<size_t>(l)];
+        if (lyr.state == LayerState::EVICTED) {
+            lyr.failed = false;
+            lyr.failed_oom = false;
+            lyr.failed_msg.clear();
+            lyr.state = LayerState::QUEUED;
             prefetch_queue_.push_back(PrefetchJob{expert_id, l});
             ++queued;
         }
@@ -1615,31 +1584,13 @@ int TriPoolVMM::expert_wait_layer(int expert_id, int layer_idx, void* compute_st
     auto& lyr = bank.layers[static_cast<size_t>(layer_idx)];
     last_compute_stream_ = compute_stream;
 
-    if (backend_->is_simulated()) {
-        if (lyr.state == LayerState::QUEUED) {
-            lyr.state = LayerState::RESIDENT;
-            lyr.needs_stream_wait = false;
-            ++expert_resident_layers_;
-            ++expert_prefetch_layers_completed_;
-            ++expert_wait_stalls_;
-            return 0;
-        }
-        if (lyr.state != LayerState::RESIDENT) {
-            try {
-                map_and_submit_contiguous_locked(bank, layer_idx, layer_idx + 1, &lock);
-                lyr.needs_stream_wait = false;
-                ++expert_wait_stalls_;
-            } catch (...) {
-                return -3;
-            }
-        }
-        return 0;
-    }
-
     if (lyr.state == LayerState::RESIDENT && !lyr.needs_stream_wait) {
         return 0;
     }
     if (lyr.state == LayerState::EVICTED) {
+        lyr.failed = false;
+        lyr.failed_oom = false;
+        lyr.failed_msg.clear();
         lyr.state = LayerState::QUEUED;
         prefetch_queue_.push_front(PrefetchJob{expert_id, layer_idx});
         cv_req_.notify_all();
@@ -1647,8 +1598,33 @@ int TriPoolVMM::expert_wait_layer(int expert_id, int layer_idx, void* compute_st
     if (lyr.state != LayerState::RESIDENT) {
         ++expert_wait_stalls_;
         cv_ready_.wait(lock, [&] {
-            return lyr.state == LayerState::RESIDENT || stop_streamer_ || streamer_error_;
+            return lyr.state == LayerState::RESIDENT ||
+                   lyr.state == LayerState::EVICTED ||
+                   lyr.failed || stop_streamer_ || streamer_error_;
         });
+        if (lyr.failed) {
+            const bool is_oom = lyr.failed_oom;
+            const std::string msg = lyr.failed_msg;
+            lyr.failed = false;
+            lyr.failed_oom = false;
+            lyr.failed_msg.clear();
+            bool any_other_failed = false;
+            for (const auto& other : bank.layers) {
+                if (other.failed) {
+                    any_other_failed = true;
+                    break;
+                }
+            }
+            if (!any_other_failed) {
+                bank.last_async_error = false;
+                bank.last_async_error_oom = false;
+                bank.last_async_error_msg.clear();
+            }
+            if (is_oom) {
+                throw VmmOutOfMemoryError(msg);
+            }
+            return -3;
+        }
         if (lyr.state != LayerState::RESIDENT) return -3;
     }
     if (lyr.needs_stream_wait) {
@@ -1669,7 +1645,6 @@ int TriPoolVMM::expert_sync_h2d(int expert_id) {
     {
         std::unique_lock<std::mutex> lock(mu_);
         if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
-        if (backend_->is_simulated()) return 0;
         auto& bank = experts_[static_cast<size_t>(expert_id)];
         cv_ready_.wait(lock, [&] {
             if (stop_streamer_ || streamer_error_) return true;
@@ -1679,6 +1654,22 @@ int TriPoolVMM::expert_sync_h2d(int expert_id) {
             return true;
         });
         if (stop_streamer_ || streamer_error_) return -2;
+        if (bank.last_async_error) {
+            const bool is_oom = bank.last_async_error_oom;
+            const std::string msg = bank.last_async_error_msg;
+            bank.last_async_error = false;
+            bank.last_async_error_oom = false;
+            bank.last_async_error_msg.clear();
+            for (auto& lyr : bank.layers) {
+                lyr.failed = false;
+                lyr.failed_oom = false;
+                lyr.failed_msg.clear();
+            }
+            if (is_oom) {
+                throw VmmOutOfMemoryError(msg);
+            }
+            return -2;
+        }
         ev = bank.last_h2d_event;
         if (!ev) return 0;
         ++active_h2d_syncs_;
@@ -1711,10 +1702,26 @@ size_t TriPoolVMM::coalesce_fine_to_super(size_t max_super) {
 }
 
 int TriPoolVMM::expert_evict_layer(int expert_id, int layer_idx, void* stream) {
-    std::lock_guard<std::mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
     if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
     auto& bank = experts_[static_cast<size_t>(expert_id)];
     if (layer_idx < 0 || layer_idx >= bank.num_layers) return -2;
+
+    auto& lyr = bank.layers[static_cast<size_t>(layer_idx)];
+    if (lyr.state == LayerState::QUEUED) {
+        prefetch_queue_.erase(
+            std::remove_if(prefetch_queue_.begin(), prefetch_queue_.end(), [&](const PrefetchJob& j) {
+                return j.expert_id == expert_id && j.layer_idx == layer_idx;
+            }),
+            prefetch_queue_.end());
+        lyr.state = LayerState::EVICTED;
+        cv_ready_.notify_all();
+        return 0;
+    }
+    if (lyr.state == LayerState::STREAMING) {
+        cv_ready_.wait(lock, [&] { return lyr.state != LayerState::STREAMING || stop_streamer_; });
+    }
+
     try {
         backend_->ensure_context();
         if (evict_layer_locked(bank, layer_idx, stream, /*is_auto=*/false, /*for_kv=*/false)) {
@@ -1734,26 +1741,29 @@ int TriPoolVMM::expert_evict_range(int expert_id, int start_layer, int end_layer
     start_layer = std::max(0, start_layer);
     end_layer_exclusive = std::min(bank.num_layers, end_layer_exclusive);
 
-    if (!backend_->is_simulated()) {
-        prefetch_queue_.erase(
-            std::remove_if(prefetch_queue_.begin(), prefetch_queue_.end(), [&](const PrefetchJob& j) {
-                if (j.expert_id == expert_id && j.layer_idx >= start_layer && j.layer_idx < end_layer_exclusive) {
-                    if (bank.layers[static_cast<size_t>(j.layer_idx)].state == LayerState::QUEUED) {
-                        bank.layers[static_cast<size_t>(j.layer_idx)].state = LayerState::EVICTED;
-                    }
-                    return true;
+    bool cancelled_any = false;
+    prefetch_queue_.erase(
+        std::remove_if(prefetch_queue_.begin(), prefetch_queue_.end(), [&](const PrefetchJob& j) {
+            if (j.expert_id == expert_id && j.layer_idx >= start_layer && j.layer_idx < end_layer_exclusive) {
+                if (bank.layers[static_cast<size_t>(j.layer_idx)].state == LayerState::QUEUED) {
+                    bank.layers[static_cast<size_t>(j.layer_idx)].state = LayerState::EVICTED;
+                    cancelled_any = true;
                 }
-                return false;
-            }),
-            prefetch_queue_.end());
-        cv_ready_.wait(lock, [&] {
-            if (stop_streamer_) return true;
-            for (int l = start_layer; l < end_layer_exclusive; ++l) {
-                if (bank.layers[static_cast<size_t>(l)].state == LayerState::STREAMING) return false;
+                return true;
             }
-            return true;
-        });
+            return false;
+        }),
+        prefetch_queue_.end());
+    if (cancelled_any) {
+        cv_ready_.notify_all();
     }
+    cv_ready_.wait(lock, [&] {
+        if (stop_streamer_) return true;
+        for (int l = start_layer; l < end_layer_exclusive; ++l) {
+            if (bank.layers[static_cast<size_t>(l)].state == LayerState::STREAMING) return false;
+        }
+        return true;
+    });
 
     try {
         backend_->ensure_context();
@@ -1788,6 +1798,72 @@ int TriPoolVMM::expert_resident_count(int expert_id) {
         if (lyr.state == LayerState::RESIDENT) ++cnt;
     }
     return cnt;
+}
+
+size_t TriPoolVMM::ensure_expert_headroom(
+    int expert_id,
+    size_t needed_bytes,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
+    void* stream) {
+    std::unique_lock<std::mutex> lock(mu_);
+    if (!initialized_ || needed_bytes == 0) return 0;
+    if (expert_id >= 0 && static_cast<size_t>(expert_id) >= experts_.size()) return 0;
+
+    auto compute_avail = [&](uint64_t& out_avail_now, uint64_t& out_inflight) {
+        const KvBudgetSnapshot snap = compute_kv_budget_locked(/*for_dit=*/true);
+        uint64_t other_unpinned_exp = 0;
+        for (const auto& bank : experts_) {
+            if (bank.pinned || bank.id == expert_id) continue;
+            for (const auto& lyr : bank.layers) {
+                if (lyr.state == LayerState::RESIDENT && !lyr.slots.empty()) {
+                    other_unpinned_exp += bank.layer_stride_bytes;
+                }
+            }
+        }
+        uint64_t growth_headroom = 0;
+        if (cfg_.allow_overflow) {
+            const uint64_t drv_free = backend_->driver_free_overflow_bytes();
+            if (cfg_.max_pool_bytes > 0) {
+                const uint64_t cap_rem =
+                    (cfg_.max_pool_bytes > snap.pool_total_bytes)
+                        ? (cfg_.max_pool_bytes - snap.pool_total_bytes)
+                        : 0;
+                growth_headroom = (drv_free > 0) ? std::min(cap_rem, drv_free) : cap_rem;
+            } else {
+                growth_headroom = drv_free;
+            }
+        }
+        out_avail_now = snap.pool_free_bytes + other_unpinned_exp + growth_headroom;
+        out_inflight = snap.inflight_swap_bytes;
+    };
+
+    size_t total_reclaimed = 0;
+    const size_t wm_target = compute_watermark_reclaim_target_locked(/*for_dit=*/true, /*extra_needed_bytes=*/0);
+    if (wm_target > 0) {
+        total_reclaimed += reclaim_thinking_kv_locked(
+            wm_target, /*sync=*/false, exclude_session_ids, num_excludes, stream, lock);
+    }
+
+    uint64_t avail_now = 0;
+    uint64_t inflight_swap = 0;
+    compute_avail(avail_now, inflight_swap);
+    if (avail_now + inflight_swap < needed_bytes) {
+        const size_t deficit = static_cast<size_t>(needed_bytes - (avail_now + inflight_swap));
+        total_reclaimed += reclaim_thinking_kv_locked(
+            deficit, /*sync=*/true, exclude_session_ids, num_excludes, stream, lock);
+        compute_avail(avail_now, inflight_swap);
+    }
+
+    if (avail_now < needed_bytes && (inflight_swap > 0 || has_finishing_swap_locked())) {
+        backend_->ensure_context();
+        while (drain_one_queued_swap_out_locked()) {
+        }
+        if (has_finishing_swap_locked()) {
+            cv_ready_.wait(lock, [&] { return !has_finishing_swap_locked() || stop_streamer_; });
+        }
+    }
+    return total_reclaimed;
 }
 
 void TriPoolVMM::get_stats(UnifiedVmmStatsPod* out) {
@@ -1829,12 +1905,14 @@ void TriPoolVMM::get_stats(UnifiedVmmStatsPod* out) {
     out->transient_fine_bundles_current = transient_fine_bundles_current_;
     out->expert_fine_bundles_current = expert_fine_bundles_current_;
 
-    const CapacitySnapshot snap = compute_kv_capacities_locked();
-    out->pool_total_bytes = snap.pool_total_bytes;
-    out->pool_free_bytes = snap.pool_free_bytes;
-    out->expert_unpinned_bytes = snap.expert_unpinned_bytes;
-    out->kv_free_bytes = clamp_by_max_pool_locked(snap.kv_free_bytes, snap, /*for_dit=*/false);
-    out->kv_dit_headroom_bytes = clamp_by_max_pool_locked(snap.kv_dit_headroom_bytes, snap, /*for_dit=*/true);
+    const KvBudgetSnapshot snap_ar = compute_kv_budget_locked(/*for_dit=*/false);
+    const KvBudgetSnapshot snap_dit = compute_kv_budget_locked(/*for_dit=*/true);
+    const uint64_t extra = (initialized_ && cfg_.allow_overflow) ? backend_->driver_free_overflow_bytes() : 0ULL;
+    out->pool_total_bytes = snap_ar.pool_total_bytes;
+    out->pool_free_bytes = snap_ar.pool_free_bytes;
+    out->expert_unpinned_bytes = snap_ar.expert_unpinned_bytes;
+    out->kv_free_bytes = clamp_by_max_pool_locked(snap_ar.kv_free_bytes + extra, snap_ar);
+    out->kv_dit_headroom_bytes = clamp_by_max_pool_locked(snap_dit.kv_dit_headroom_bytes + extra, snap_dit);
 
     out->kv_swapped_pages_current = kv_swapped_pages_;
     out->kv_swapped_bytes_current = kv_swapped_bytes_current_;
@@ -1868,13 +1946,6 @@ void TriPoolVMM::trim_idle_host_pinned_locked(size_t max_idle_bytes) {
 }
 
 void* TriPoolVMM::acquire_host_pinned_locked(size_t min_bytes, size_t& out_cap) {
-    if (backend_->is_simulated()) {
-        const size_t cap = std::max<size_t>(min_bytes, 1);
-        void* p = backend_->alloc_host_pinned(cap);
-        kv_host_pinned_pool_bytes_ += cap;
-        out_cap = cap;
-        return p;
-    }
     const size_t cap = ((std::max<size_t>(min_bytes, 1) + min_gran_ - 1) / min_gran_) * min_gran_;
     auto it = free_host_blocks_.lower_bound(cap);
     if (it != free_host_blocks_.end() && !it->second.empty() && it->first <= cap * 2) {
@@ -1898,12 +1969,6 @@ void* TriPoolVMM::acquire_host_pinned_locked(size_t min_bytes, size_t& out_cap) 
 
 void TriPoolVMM::release_host_pinned_locked(void* p, size_t cap) {
     if (!p || cap == 0) return;
-    if (backend_->is_simulated()) {
-        backend_->free_host_pinned(p);
-        kv_host_pinned_pool_bytes_ =
-            (kv_host_pinned_pool_bytes_ >= cap) ? (kv_host_pinned_pool_bytes_ - cap) : 0;
-        return;
-    }
     free_host_blocks_[cap].push_back(p);
     free_host_pinned_bytes_ += cap;
     trim_idle_host_pinned_locked(kMaxIdleHostPinnedBytes);
@@ -2098,9 +2163,10 @@ void TriPoolVMM::swap_in_region_locked(
 }
 
 size_t TriPoolVMM::try_coalesce_fine_to_super_locked(size_t max_super) {
+    const size_t limit = (max_super == 0) ? SIZE_MAX : max_super;
     size_t coalesced = 0;
-    while (coalesced < max_super &&
-           free_fine_handles_.size() >= base_fine_pages_ + sub_pages_ &&
+    while (coalesced < limit &&
+           free_fine_handles_.size() >= sub_pages_ &&
            fine_pool_total_ >= base_fine_pages_ + sub_pages_) {
         std::vector<uint64_t> batch;
         batch.reserve(sub_pages_);
@@ -2108,6 +2174,7 @@ size_t TriPoolVMM::try_coalesce_fine_to_super_locked(size_t max_super) {
             batch.push_back(free_fine_handles_.back());
             free_fine_handles_.pop_back();
         }
+        // Strictly release all fine handles BEFORE creating 1 super handle so peak `pool_total_bytes` never grows.
         for (uint64_t fh : batch) {
             backend_->release_phys_handle(fh, min_gran_);
         }
@@ -2171,9 +2238,7 @@ bool TriPoolVMM::evict_layer_locked(
     bool for_kv,
     bool already_synced) {
     auto& lyr = bank.layers[static_cast<size_t>(layer_idx)];
-    const bool was_resident = (lyr.state == LayerState::RESIDENT);
-    const bool was_queued_sim = (backend_->is_simulated() && lyr.state == LayerState::QUEUED);
-    if ((!was_resident && !was_queued_sim) || lyr.slots.empty()) return false;
+    if (lyr.state != LayerState::RESIDENT || lyr.slots.empty()) return false;
 
     if (!already_synced) {
         backend_->sync_stream(h2d_stream_);
@@ -2185,7 +2250,7 @@ bool TriPoolVMM::evict_layer_locked(
 
     const uint64_t base = bank.va_base + static_cast<size_t>(layer_idx) * bank.layer_stride_bytes;
     const auto t0 = std::chrono::steady_clock::now();
-    backend_->unmap_range(base, bank.layer_stride_bytes, bank.host_accessible_va);
+    backend_->unmap_range(base, bank.layer_stride_bytes, /*was_host_accessible=*/true);
     const auto t1 = std::chrono::steady_clock::now();
     expert_unmap_us_ += std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -2200,7 +2265,7 @@ bool TriPoolVMM::evict_layer_locked(
     lyr.needs_stream_wait = false;
     if (expert_mapped_handles_ >= n) expert_mapped_handles_ -= n;
     if (expert_fine_bundles_current_ >= bundles_freed) expert_fine_bundles_current_ -= bundles_freed;
-    if (was_resident && expert_resident_layers_ > 0) --expert_resident_layers_;
+    if (expert_resident_layers_ > 0) --expert_resident_layers_;
     if (is_auto) {
         if (for_kv) ++expert_auto_evictions_for_kv_;
         else ++expert_auto_evictions_for_transient_;
@@ -2214,8 +2279,7 @@ bool TriPoolVMM::evict_one_tail_expert_layer_locked(void* stream, bool for_kv, i
     for (auto& bank : experts_) {
         if (bank.pinned || bank.id == exclude_expert_id) continue;
         for (int l = bank.num_layers - 1; l >= 0; --l) {
-            const auto st = bank.layers[static_cast<size_t>(l)].state;
-            if (st == LayerState::RESIDENT || (backend_->is_simulated() && st == LayerState::QUEUED)) {
+            if (bank.layers[static_cast<size_t>(l)].state == LayerState::RESIDENT) {
                 if (evict_layer_locked(bank, l, stream, /*is_auto=*/true, for_kv)) {
                     return true;
                 }
@@ -2247,14 +2311,12 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
             free_super_handles_.pop_back();
             return SuperSlot{h, {}};
         }
-        if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
-            // Lazy hysteresis coalescing: only convert 32 x 2 MiB fine pages back into a
-            // 64 MiB super-handle when super handles are exhausted AND at least one full
-            // 64 MiB fine cushion remains, preventing carve<->coalesce driver call storms!
-            if (cfg_.allow_overflow &&
-                free_fine_handles_.size() >= base_fine_pages_ + 2 * sub_pages_ &&
-                try_coalesce_fine_to_super_locked(1) > 0 &&
-                !free_super_handles_.empty()) {
+        // Strict-cap safe lazy coalescing: allowed even when `allow_overflow == false` because
+        // `try_coalesce_fine_to_super_locked(1)` releases `sub_pages_` fine handles before creating
+        // 1 super handle, strictly preserving `max_pool_bytes`.
+        if (free_fine_handles_.size() >= sub_pages_ &&
+            fine_pool_total_ >= base_fine_pages_ + sub_pages_) {
+            if (try_coalesce_fine_to_super_locked(1) > 0 && !free_super_handles_.empty()) {
                 const uint64_t h = free_super_handles_.back();
                 free_super_handles_.pop_back();
                 return SuperSlot{h, {}};
@@ -2296,14 +2358,14 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
     }
 
     if (!cfg_.allow_overflow) {
-        throw std::runtime_error("TriPool super-handle pool exhausted (allow_overflow=0)");
+        throw VmmOutOfMemoryError("TriPool super-handle pool exhausted (allow_overflow=0)");
     }
     const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
     if (!free_fine_handles_.empty()) {
         const size_t deficit = sub_pages_ - free_fine_handles_.size();
         const uint64_t add_b = static_cast<uint64_t>(deficit) * min_gran_;
         if (cfg_.max_pool_bytes > 0 && (cur_pool_b + add_b > cfg_.max_pool_bytes)) {
-            throw std::runtime_error("TriPool super-handle pool reached max_pool_bytes cap");
+            throw VmmOutOfMemoryError("TriPool super-handle pool reached max_pool_bytes cap");
         }
         for (size_t j = 0; j < deficit; ++j) {
             free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
@@ -2313,7 +2375,7 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
         return pop_fine_bundle_locked();
     }
     if (cfg_.max_pool_bytes > 0 && (cur_pool_b + super_bytes_ > cfg_.max_pool_bytes)) {
-        throw std::runtime_error("TriPool super-handle pool reached max_pool_bytes cap");
+        throw VmmOutOfMemoryError("TriPool super-handle pool reached max_pool_bytes cap");
     }
     const uint64_t h = backend_->create_phys_handle(super_bytes_);
     ++super_pool_total_;
@@ -2343,10 +2405,10 @@ void TriPoolVMM::map_and_submit_contiguous_locked(
 
         const auto tm0 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < total_handles; ++i) {
-            map_super_slot_locked(batch_va + i * super_bytes_, all_slots[i], bank.host_accessible_va);
+            map_super_slot_locked(batch_va + i * super_bytes_, all_slots[i], /*host_access=*/true);
             ++mapped_slots;
         }
-        backend_->set_access_rw(batch_va, batch_bytes, bank.host_accessible_va);
+        backend_->set_access_rw(batch_va, batch_bytes, /*need_host_access=*/true);
         const auto tm1 = std::chrono::steady_clock::now();
         expert_map_us_ += std::chrono::duration<double, std::micro>(tm1 - tm0).count();
 
@@ -2361,14 +2423,14 @@ void TriPoolVMM::map_and_submit_contiguous_locked(
                     ? lyr.used_bytes
                     : bank.layer_stride_bytes;
 
-            if (!backend_->is_simulated()) {
-                backend_->memcpy_h2d_async(dst_va, bank.host_pinned_base + byte_off, copy_bytes, h2d_stream_);
-                backend_->record_event(lyr.ready_event, h2d_stream_);
-                bank.last_h2d_event = lyr.ready_event;
-            } else if (bank.host_accessible_va && bank.host_pinned_base && byte_off < bank.host_bytes) {
+            if (bank.host_pinned_base && byte_off < bank.host_bytes) {
                 const size_t avail = std::min(copy_bytes, bank.host_bytes - byte_off);
-                backend_->memcpy_h2d_async(dst_va, bank.host_pinned_base + byte_off, avail, h2d_stream_);
+                if (avail > 0) {
+                    backend_->memcpy_h2d_async(dst_va, bank.host_pinned_base + byte_off, avail, h2d_stream_);
+                }
             }
+            backend_->record_event(lyr.ready_event, h2d_stream_);
+            bank.last_h2d_event = lyr.ready_event;
 
             lyr.slots.clear();
             lyr.slots.reserve(bank.handles_per_layer);
@@ -2379,7 +2441,10 @@ void TriPoolVMM::map_and_submit_contiguous_locked(
                 lyr.slots.push_back(std::move(sl));
             }
             lyr.state = LayerState::RESIDENT;
-            lyr.needs_stream_wait = !backend_->is_simulated();
+            lyr.needs_stream_wait = true;
+            lyr.failed = false;
+            lyr.failed_oom = false;
+            lyr.failed_msg.clear();
             expert_mapped_handles_ += bank.handles_per_layer;
             expert_fine_bundles_current_ += layer_bundles;
             ++expert_resident_layers_;
@@ -2390,7 +2455,7 @@ void TriPoolVMM::map_and_submit_contiguous_locked(
         expert_h2d_submit_us_ += std::chrono::duration<double, std::micro>(th1 - th0).count();
     } catch (...) {
         if (mapped_slots > 0) {
-            backend_->unmap_range(batch_va, mapped_slots * super_bytes_, bank.host_accessible_va);
+            backend_->unmap_range(batch_va, mapped_slots * super_bytes_, /*was_host_accessible=*/true);
         }
         for (auto& s : all_slots) {
             release_super_slot_to_pool_locked(s);
@@ -2418,10 +2483,10 @@ void TriPoolVMM::extend_transient_mapped_locked(
 
         const auto t0 = std::chrono::steady_clock::now();
         for (size_t i = 0; i < add_handles; ++i) {
-            map_super_slot_locked(transient_va_ + (start_idx + i) * super_bytes_, acquired[i], transient_host_accessible_);
+            map_super_slot_locked(transient_va_ + (start_idx + i) * super_bytes_, acquired[i], /*host_access=*/true);
             ++mapped_now;
         }
-        backend_->set_access_rw(transient_va_ + old_end, add_bytes, transient_host_accessible_);
+        backend_->set_access_rw(transient_va_ + old_end, add_bytes, /*need_host_access=*/true);
         const auto t1 = std::chrono::steady_clock::now();
         transient_map_us_ += std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -2435,7 +2500,7 @@ void TriPoolVMM::extend_transient_mapped_locked(
         insert_coalesce_transient_locked(old_end, add_bytes);
     } catch (...) {
         if (mapped_now > 0) {
-            backend_->unmap_range(transient_va_ + old_end, mapped_now * super_bytes_, transient_host_accessible_);
+            backend_->unmap_range(transient_va_ + old_end, mapped_now * super_bytes_, /*was_host_accessible=*/true);
         }
         for (auto& s : acquired) {
             release_super_slot_to_pool_locked(s);
@@ -2465,7 +2530,7 @@ void TriPoolVMM::bulk_unmap_transient_locked(void* stream) {
     backend_->sync_stream(stream);
     const size_t total_bytes = transient_mapped_slots_.size() * super_bytes_;
     const auto t0 = std::chrono::steady_clock::now();
-    backend_->unmap_range(transient_va_, total_bytes, transient_host_accessible_);
+    backend_->unmap_range(transient_va_, total_bytes, /*was_host_accessible=*/true);
     const auto t1 = std::chrono::steady_clock::now();
     transient_unmap_us_ += std::chrono::duration<double, std::micro>(t1 - t0).count();
 
@@ -2530,13 +2595,34 @@ void TriPoolVMM::streamer_loop() {
             try {
                 backend_->ensure_context();
                 map_and_submit_contiguous_locked(bank, start_l, end_l, &lock);
+            } catch (const VmmOutOfMemoryError& e) {
+                std::fprintf(stderr, "[tripool_vmm] streamer layers [%d,%d) OOM: %s\n", start_l, end_l, e.what());
+                for (int l = start_l; l < end_l; ++l) {
+                    auto& lyr = bank.layers[static_cast<size_t>(l)];
+                    if (lyr.state != LayerState::RESIDENT) {
+                        lyr.state = LayerState::EVICTED;
+                        lyr.failed = true;
+                        lyr.failed_oom = true;
+                        lyr.failed_msg = e.what();
+                    }
+                }
+                bank.last_async_error = true;
+                bank.last_async_error_oom = true;
+                bank.last_async_error_msg = e.what();
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[tripool_vmm] streamer layers [%d,%d) error: %s\n", start_l, end_l, e.what());
                 for (int l = start_l; l < end_l; ++l) {
-                    if (bank.layers[static_cast<size_t>(l)].state != LayerState::RESIDENT) {
-                        bank.layers[static_cast<size_t>(l)].state = LayerState::EVICTED;
+                    auto& lyr = bank.layers[static_cast<size_t>(l)];
+                    if (lyr.state != LayerState::RESIDENT) {
+                        lyr.state = LayerState::EVICTED;
+                        lyr.failed = true;
+                        lyr.failed_oom = false;
+                        lyr.failed_msg = e.what();
                     }
                 }
+                bank.last_async_error = true;
+                bank.last_async_error_oom = false;
+                bank.last_async_error_msg = e.what();
                 streamer_error_ = true;
             }
             lock.unlock();
@@ -2603,7 +2689,7 @@ void TriPoolVMM::streamer_loop() {
     }
 }
 
-// ==================== Active Device & Legacy Singleton Registry ====================
+// ==================== Active Device Registry ====================
 
 void TriPoolVMM::register_active_device_instance(int device, const std::shared_ptr<TriPoolVMM>& inst) {
     auto& reg = registry();
@@ -2630,44 +2716,7 @@ std::shared_ptr<TriPoolVMM> TriPoolVMM::active_device_instance(int device) {
     if (it != reg.by_device.end()) {
         if (auto sp = it->second.lock()) return sp;
     }
-    return reg.legacy_inst;
-}
-
-std::shared_ptr<TriPoolVMM> TriPoolVMM::legacy_singleton() {
-    auto& reg = registry();
-    std::lock_guard<std::mutex> lock(reg.mu);
-    return reg.legacy_inst;
-}
-
-int TriPoolVMM::init_legacy_singleton(const TriPoolVMMConfig& cfg) {
-    auto& reg = registry();
-    std::lock_guard<std::mutex> lock(reg.mu);
-    if (reg.legacy_inst) {
-        return (reg.legacy_inst->device() == cfg.device) ? 0 : -1;
-    }
-    try {
-        std::shared_ptr<TriPoolVMM> inst(new TriPoolVMM(cfg));
-        inst->init_pools();
-        reg.legacy_inst = inst;
-        if (!inst->is_simulated()) {
-            reg.by_device[cfg.device] = inst;
-        }
-        return 0;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "[tripool_vmm] init_legacy_singleton error: %s\n", e.what());
-        return -2;
-    }
-}
-
-int TriPoolVMM::shutdown_legacy_singleton() {
-    std::shared_ptr<TriPoolVMM> inst;
-    {
-        auto& reg = registry();
-        std::lock_guard<std::mutex> lock(reg.mu);
-        inst = std::move(reg.legacy_inst);
-    }
-    if (!inst) return 0;
-    return inst->shutdown();
+    return nullptr;
 }
 
 }  // namespace morphserve::vmm

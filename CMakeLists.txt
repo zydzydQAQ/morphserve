@@ -22,12 +22,16 @@ add_library(morphserve_core SHARED
     src/morphserve/runtime/peer_transport.cpp
     src/morphserve/vmm/page_backend.cpp
     src/morphserve/vmm/tripool_vmm.cpp
+    src/morphserve/control/hash_util.cpp
     src/morphserve/control/topology.cpp
     src/morphserve/control/policy.cpp
     src/morphserve/control/budget_planner.cpp
     src/morphserve/control/preempt_edf.cpp
     src/morphserve/control/router.cpp
     src/morphserve/control/morph_controller.cpp
+    src/morphserve/control/sim_memory_ledger.cpp
+    src/morphserve/control/sim_trace_loader.cpp
+    src/morphserve/control/sim_calibration.cpp
     src/morphserve/control/simulator.cpp
     src/morphserve/c_api.cpp
 )
@@ -68,15 +72,17 @@ option(MORPHSERVE_BUILD_TESTS "Build MorphServe native C++17 CTest suites" ON)
 if(MORPHSERVE_BUILD_TESTS)
     enable_testing()
 
-    add_executable(test_vmm_and_runtime tests/cpp/test_vmm_and_runtime.cpp)
-    target_include_directories(test_vmm_and_runtime PRIVATE ${MORPHSERVE_INCLUDE_DIRS})
-    target_link_libraries(test_vmm_and_runtime PRIVATE morphserve_core)
-    add_test(NAME test_vmm_and_runtime COMMAND test_vmm_and_runtime
-             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-
-    add_executable(test_control_and_sim tests/cpp/test_control_and_sim.cpp)
-    target_include_directories(test_control_and_sim PRIVATE ${MORPHSERVE_INCLUDE_DIRS})
-    target_link_libraries(test_control_and_sim PRIVATE morphserve_core)
-    add_test(NAME test_control_and_sim COMMAND test_control_and_sim
-             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(test_name
+        test_tripool_vmm
+        test_runtime_transport
+        test_control_engine
+        test_cluster_simulator
+        test_c_api
+    )
+        add_executable(${test_name} "tests/cpp/${test_name}.cpp")
+        target_include_directories(${test_name} PRIVATE ${MORPHSERVE_INCLUDE_DIRS})
+        target_link_libraries(${test_name} PRIVATE morphserve_core)
+        add_test(NAME ${test_name} COMMAND ${test_name}
+                 WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    endforeach()
 endif()

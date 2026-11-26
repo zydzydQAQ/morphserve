@@ -28,7 +28,7 @@ def decode_latent_to_u8_gpu(
 
     Matches `pipeline_bagel.py:513-527`:
       `(image * 0.5 + 0.5).clamp(0, 1)[0] * 255 -> to(torch.uint8)`
-    WITHOUT transferring to CPU or constructing a PIL.Image / PNG byte stream!
+    WITHOUT transferring to CPU or constructing a PIL.Image / PNG byte stream.
     """
     import torch
 
@@ -43,7 +43,7 @@ def decode_latent_to_u8_gpu(
     lat = lat.to(vae_dtype)
 
     decoded = vae.decode(lat)  # [1, 3, H, W]
-    img_u8 = ((decoded * 0.5 + 0.5).clamp(0.0, 1.0)[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU!
+    img_u8 = ((decoded * 0.5 + 0.5).clamp(0.0, 1.0)[0] * 255.0).to(torch.uint8)  # [3, H, W] on GPU
     return img_u8
 
 
@@ -153,7 +153,6 @@ def _extract_target_hw(size_cfg: Any, h: int, w: int) -> tuple[int, int]:
         return h, w
     if isinstance(size_cfg, int):
         return int(size_cfg), int(size_cfg)
-    # Support both plain dict and transformers 5.x SizeDict / object attributes
     get_val = (lambda k: size_cfg.get(k)) if isinstance(size_cfg, dict) else (lambda k: getattr(size_cfg, k, None))
     th = get_val("height")
     tw = get_val("width")
@@ -169,7 +168,6 @@ def _extract_target_hw(size_cfg: Any, h: int, w: int) -> tuple[int, int]:
 
 
 _PIL_BICUBIC_WEIGHT_CACHE: dict[tuple[str, int, int], Any] = {}
-
 
 _PIL_BICUBIC_FIXED_BITS = 22
 _PIL_BICUBIC_FIXED_SCALE = float(1 << _PIL_BICUBIC_FIXED_BITS)
@@ -241,7 +239,7 @@ def pil_bicubic_resize_gpu(img_f32: Any, target_h: int, target_w: int) -> Any:
 
     Replicates `libImaging/Resample.c` 22-bit fixed-point horizontal-then-vertical integer accumulation
     losslessly in IEEE-754 float64 (`max_sum <= 255 * W * 2^22 << 2^53`), achieving 0 uint8 pixel difference
-    vs `PIL.Image.resize((target_w, target_h), Image.BICUBIC)` in <0.15ms on GPU!
+    vs `PIL.Image.resize((target_w, target_h), Image.BICUBIC)` in <0.15ms on GPU.
     """
     import torch
 
@@ -251,10 +249,10 @@ def pil_bicubic_resize_gpu(img_f32: Any, target_h: int, target_w: int) -> Any:
         return img_f32.to(out_dtype)
     x = torch.floor(img_f32.to(torch.float64) + 0.5).clamp(0.0, 255.0)
     if target_w != in_w:
-        w_w = _get_pil_bicubic_weights(in_w, target_w, x.device)  # [target_w, in_w]
+        w_w = _get_pil_bicubic_weights(in_w, target_w, x.device)
         x = torch.floor((torch.matmul(x, w_w.t()) + _PIL_BICUBIC_HALF_BIAS) * _PIL_BICUBIC_INV_SCALE).clamp(0.0, 255.0)
     if target_h != in_h:
-        w_h = _get_pil_bicubic_weights(in_h, target_h, x.device)  # [target_h, in_h]
+        w_h = _get_pil_bicubic_weights(in_h, target_h, x.device)
         x = torch.floor((torch.matmul(w_h, x) + _PIL_BICUBIC_HALF_BIAS) * _PIL_BICUBIC_INV_SCALE).clamp(0.0, 255.0)
     return x.to(out_dtype)
 
@@ -374,7 +372,7 @@ def _vit_preprocess_u8_gpu(img_u8: Any, image_processor: Any) -> Any:
         pv = out.pixel_values[0] if hasattr(out, "pixel_values") else out["pixel_values"][0]
         return pv.to(device=device, dtype=torch.float32)
 
-    x = img_u8.to(torch.float32)  # [3, H, W] in [0, 255]
+    x = img_u8.to(torch.float32)
 
     if do_resize and size_cfg is not None:
         _, h, w = x.shape
@@ -442,7 +440,6 @@ def prepare_vit_images_gpu(
 
         aligned = _stride_align_u8_gpu(img_u8, stride=stride, max_img_size=max_img_size)
         image_tensor = _vit_preprocess_u8_gpu(aligned, image_processor)
-        # Ensure divisible by vit_patch_size just in case
         H, W = int(image_tensor.shape[1]), int(image_tensor.shape[2])
         p = int(bagel.vit_patch_size)
         if H % p != 0 or W % p != 0:
@@ -488,17 +485,60 @@ def prepare_vit_images_gpu(
     return generation_input, newlens, new_rope
 
 
+def update_context_from_u8_gpu(
+    pipeline: Any,
+    ctx: dict[str, Any],
+    img_u8: Any,
+    *,
+    update_vae: bool = True,
+    update_vit: bool = True,
+) -> dict[str, Any]:
+    """Inject a GPU `[3, H, W]` uint8 image into `ctx['past_key_values']` via VAE + ViT, zero CPU round-trip."""
+    import torch
+
+    bagel = pipeline.bagel
+    vae = pipeline.vae
+    image_processor = pipeline.image_processor
+    new_token_ids = pipeline.new_token_ids
+    device = pipeline.device
+    dtype = pipeline.od_config.dtype
+    ac_enabled = device.type != "cpu"
+
+    with torch.inference_mode():
+        if update_vae:
+            vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
+            torch.manual_seed(vae_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(vae_seed)
+            vae_inp, new_lens, new_rope = prepare_vae_images_gpu(
+                bagel, [img_u8], ctx["kv_lens"], ctx["ropes"], new_token_ids
+            )
+            with torch.autocast(device_type=device.type, enabled=ac_enabled, dtype=dtype):
+                ctx["past_key_values"] = bagel.forward_cache_update_vae(vae, ctx["past_key_values"], **vae_inp)
+            ctx["kv_lens"] = new_lens
+            ctx["ropes"] = new_rope
+
+        if update_vit:
+            vit_inp, new_lens, new_rope = prepare_vit_images_gpu(
+                bagel,
+                image_processor,
+                [img_u8],
+                ctx["kv_lens"],
+                ctx["ropes"],
+                new_token_ids,
+            )
+            with torch.autocast(device_type=device.type, enabled=ac_enabled, dtype=dtype):
+                ctx["past_key_values"] = bagel.forward_cache_update_vit(ctx["past_key_values"], **vit_inp)
+            ctx["kv_lens"] = new_lens
+            ctx["ropes"] = new_rope
+    return ctx
+
+
 class GpuInPlaceLoopback:
-    """High-level GPU-only loopback controller for Interleaved Visual-CoT / Multi-Turn Editing."""
+    """Thin pipeline-bound facade over pure GPU in-place loopback functions."""
 
     def __init__(self, pipeline: Any) -> None:
         self.pipeline = pipeline
-        self.bagel = pipeline.bagel
-        self.vae = pipeline.vae
-        self.image_processor = pipeline.image_processor
-        self.new_token_ids = pipeline.new_token_ids
-        self.device = pipeline.device
-        self.dtype = pipeline.od_config.dtype
 
     def update_context_from_u8_gpu(
         self,
@@ -507,55 +547,10 @@ class GpuInPlaceLoopback:
         update_vae: bool = True,
         update_vit: bool = True,
     ) -> dict[str, Any]:
-        """Inject a GPU `[3, H, W]` uint8 image into `ctx['past_key_values']` via VAE + ViT, zero CPU round-trip."""
-        import torch
-
-        ac_enabled = self.device.type != "cpu"
-        with torch.inference_mode():
-            if update_vae:
-                vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
-                torch.manual_seed(vae_seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(vae_seed)
-                vae_inp, new_lens, new_rope = prepare_vae_images_gpu(
-                    self.bagel, [img_u8], ctx["kv_lens"], ctx["ropes"], self.new_token_ids
-                )
-                with torch.autocast(device_type=self.device.type, enabled=ac_enabled, dtype=self.dtype):
-                    ctx["past_key_values"] = self.bagel.forward_cache_update_vae(
-                        self.vae, ctx["past_key_values"], **vae_inp
-                    )
-                ctx["kv_lens"] = new_lens
-                ctx["ropes"] = new_rope
-
-            if update_vit:
-                vit_inp, new_lens, new_rope = prepare_vit_images_gpu(
-                    self.bagel,
-                    self.image_processor,
-                    [img_u8],
-                    ctx["kv_lens"],
-                    ctx["ropes"],
-                    self.new_token_ids,
-                )
-                with torch.autocast(device_type=self.device.type, enabled=ac_enabled, dtype=self.dtype):
-                    ctx["past_key_values"] = self.bagel.forward_cache_update_vit(
-                        ctx["past_key_values"], **vit_inp
-                    )
-                ctx["kv_lens"] = new_lens
-                ctx["ropes"] = new_rope
-        return ctx
-
-    def loopback_from_latent_gpu(
-        self,
-        ctx: dict[str, Any],
-        latent: Any,
-        image_shape: tuple[int, int],
-        update_vae: bool = True,
-        update_vit: bool = True,
-    ) -> tuple[dict[str, Any], Any]:
-        """Decode latent -> GPU uint8 -> inject VAE + ViT KV into `ctx` completely on GPU."""
-        import torch
-
-        with torch.inference_mode():
-            img_u8 = decode_latent_to_u8_gpu(self.bagel, self.vae, latent, image_shape)
-        self.update_context_from_u8_gpu(ctx, img_u8, update_vae=update_vae, update_vit=update_vit)
-        return ctx, img_u8
+        return update_context_from_u8_gpu(
+            self.pipeline,
+            ctx,
+            img_u8,
+            update_vae=update_vae,
+            update_vit=update_vit,
+        )

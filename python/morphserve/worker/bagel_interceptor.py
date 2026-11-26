@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-import threading
+import math
 import time
 from typing import Any, Callable, Sequence
 
-from morphserve.kernels import BagelSharedPrefixPatch, install_shared_prefix_bagel_hooks
+from morphserve.kernels import SharedPrefixCache, shared_prefix_cfg_attention
 from morphserve.vmm import VmmNaiveCache
 
 
@@ -42,60 +43,42 @@ def _sync_cuda_if_present(device: Any = None) -> None:
         pass
 
 
-def append_or_update_kv_cache(
-    past_key_values: Any | None,
-    layer_idx: int,
-    k_new: Any,
-    v_new: Any,
-    *,
-    update_past_key_values: bool = True,
-) -> tuple[Any, Any, int, bool]:
-    """Append `(k_new, v_new)` via `VmmNaiveCache.append_inplace` (or `torch.cat` for stock `NaiveCache`)."""
-    import torch
+_ACTIVE_CFG_INTERCEPTOR: ContextVar["BagelExecutionInterceptor | None"] = ContextVar(
+    "_ACTIVE_CFG_INTERCEPTOR", default=None
+)
+_ORIG_NAIVE_MERGE: Any = None
 
-    lidx = int(layer_idx)
-    if past_key_values is None:
-        return k_new, v_new, 0, False
 
-    if getattr(past_key_values, "_is_swapped", False) and callable(getattr(past_key_values, "ensure_resident", None)):
-        past_key_values.ensure_resident()
+def _ensure_contextvar_naive_merge_hook() -> None:
+    """Install one idempotent ContextVar-dispatched merge hook on `NaiveCache` (no cross-instance clobber)."""
+    global _ORIG_NAIVE_MERGE
+    if _ORIG_NAIVE_MERGE is not None:
+        return
+    try:
+        from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
+    except ImportError:
+        return
 
-    get_k = (
-        (lambda i: dict.get(past_key_values.key_cache, i))
-        if isinstance(past_key_values.key_cache, dict)
-        else (lambda i: past_key_values.key_cache[i])
-    )
-    get_v = (
-        (lambda i: dict.get(past_key_values.value_cache, i))
-        if isinstance(past_key_values.value_cache, dict)
-        else (lambda i: past_key_values.value_cache[i])
-    )
-    cache_k = get_k(lidx)
-    cache_v = get_v(lidx)
-    prev_len = int(cache_k.shape[0]) if cache_k is not None else 0
+    _ORIG_NAIVE_MERGE = NaiveCache.merge
 
-    if not update_past_key_values:
-        if cache_k is None:
-            return k_new, v_new, 0, False
-        return torch.cat([cache_k, k_new], dim=0), torch.cat([cache_v, v_new], dim=0), prev_len, False
+    def _dispatched_merge(caches: Sequence[Any]) -> Any:
+        interceptor = _ACTIVE_CFG_INTERCEPTOR.get()
+        if interceptor is None or not interceptor._cfg_active or len(caches) < 2:
+            return _ORIG_NAIVE_MERGE(caches)
+        sp = SharedPrefixCache.from_branch_caches(
+            caches,
+            min_shared_tokens=interceptor.cfg_min_shared_tokens,
+            verify_all_layers=True,
+        )
+        interceptor.merge_calls += 1
+        interceptor.last_shared_prefix_len = sp.shared_prefix_len
+        interceptor.max_shared_prefix_len = max(interceptor.max_shared_prefix_len, sp.shared_prefix_len)
+        interceptor.last_unique_kv_tokens = sp.unique_kv_tokens
+        interceptor.last_naive_kv_tokens = sp.naive_kv_tokens
+        interceptor.last_padded_naive_kv_tokens = sp.padded_naive_kv_tokens
+        return sp
 
-    if (
-        isinstance(past_key_values, VmmNaiveCache)
-        and past_key_values.vmm is not None
-        and not getattr(past_key_values, "_closed", False)
-    ):
-        fk, fv = past_key_values.append_inplace(lidx, k_new, v_new)
-        return fk, fv, prev_len, True
-
-    if cache_k is not None and prev_len > 0:
-        full_k = torch.cat([cache_k, k_new], dim=0)
-        full_v = torch.cat([cache_v, v_new], dim=0)
-    else:
-        full_k = k_new
-        full_v = v_new
-    past_key_values.key_cache[lidx] = full_k
-    past_key_values.value_cache[lidx] = full_v
-    return full_k, full_v, prev_len, False
+    NaiveCache.merge = staticmethod(_dispatched_merge)
 
 
 class BagelExecutionInterceptor:
@@ -103,10 +86,11 @@ class BagelExecutionInterceptor:
 
     Consolidates:
       1. `LayerExpertPager` block-level H2D wait gating via `pager.set_wait_gate(...)` (zero private pokes).
-      2. Step-0 `HalfNodeH2DPacer` slot release immediately after Step-0 completes.
+      2. Step-0 `HalfNodeH2DPacer` slot release delegated cleanly to `LayerExpertPager.generation_mode(...)`.
       3. `UnifiedPreemptiveScheduler` EDF block-chunk & step-boundary AR yields.
-      4. `BagelSharedPrefixPatch` `ContextVar`-scoped `SharedPrefixCache` + `FlashPrefix-CFG` attention.
-      5. Fair `mode == 'und'` `Q=1` mask-free SDPA + `VmmNaiveCache` in-place append + `[B, D]` packed GEMM AR batching.
+      4. `ContextVar`-scoped `SharedPrefixCache` (`LECP CoW`) + `FlashPrefix-CFG` attention with
+         instance-scoped workspace caches (zero module-global tensor caches).
+      5. Fair `mode == 'und'` `Q=1` mask-free SDPA + `VmmNaiveCache.append_kv` + `[B, D]` packed GEMM AR batching.
     """
 
     def __init__(self, pipeline: Any) -> None:
@@ -116,7 +100,6 @@ class BagelExecutionInterceptor:
         self.device = getattr(pipeline, "device", None)
 
         self.pager: Any = None
-        self.cfg_patch: BagelSharedPrefixPatch | None = None
         self._active_scheduler: Any = None
         self._step0_release_cb: Callable[[], None] | None = None
         self._step0_done: bool = False
@@ -125,6 +108,18 @@ class BagelExecutionInterceptor:
         self._orig_lm_forward: Any = None
         self._orig_bagel_forward: Any = None
         self._orig_forward_unds: list[tuple[Any, Any]] = []
+
+        # Shared-prefix CFG hooks & strictly instance-scoped workspace caches
+        self._cfg_enabled: bool = False
+        self._cfg_active: bool = False
+        self._cfg_hooks_installed: bool = False
+        self.cfg_min_shared_tokens: int = 32
+        self.cfg_allow_cascade_split: bool = True
+        self._orig_forward_gens: list[tuple[Any, Any]] = []
+        self._direct_ws_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._cu_seqlens_cache: dict[tuple[str, tuple[int, ...]], Any] = {}
+        self._attn_meta_cache: dict[tuple[str, tuple[int, ...]], Any] = {}
+        self.reset_cfg_telemetry()
 
         # AR fast-path & batching telemetry
         self.ar_q1_fast_attn_calls: int = 0
@@ -140,21 +135,23 @@ class BagelExecutionInterceptor:
         self.ar_batched_tokens_total = 0
         self.max_ar_batch_width_seen = 0
 
-    @property
-    def batched_ar_steps(self) -> int:
-        return self.ar_batched_step_calls
+    def reset_cfg_telemetry(self) -> None:
+        self.merge_calls: int = 0
+        self.shared_attn_calls: int = 0
+        self.cascade_split_calls: int = 0
+        self.unpadded_single_branch_calls: int = 0
+        self.last_shared_prefix_len: int = 0
+        self.max_shared_prefix_len: int = 0
+        self.last_unique_kv_tokens: int = 0
+        self.last_naive_kv_tokens: int = 0
+        self.last_padded_naive_kv_tokens: int = 0
 
-    @property
-    def batched_ar_tokens(self) -> int:
-        return self.ar_batched_tokens_total
-
-    @property
-    def vmm_inplace_kv_appends(self) -> int:
-        return self.ar_vmm_inplace_appends
-
-    @property
-    def mask_free_sdpa_calls(self) -> int:
-        return self.ar_q1_fast_attn_calls
+    def clear_workspace_caches(self) -> None:
+        """Release instance-scoped attention workspaces and clear `SharedPrefixCache` LECP memo."""
+        self._direct_ws_cache.clear()
+        self._cu_seqlens_cache.clear()
+        self._attn_meta_cache.clear()
+        SharedPrefixCache.clear_memo()
 
     @classmethod
     def for_pipeline(cls, pipeline: Any) -> "BagelExecutionInterceptor":
@@ -173,28 +170,264 @@ class BagelExecutionInterceptor:
         in_ar_yield = bool(sched is not None and getattr(sched, "in_ar_yield", False))
         return (self._gen_depth > 0) and (not in_ar_yield)
 
+    @property
+    def cfg_enabled(self) -> bool:
+        return self._cfg_enabled
+
     def bind_pager(self, pager: Any | None) -> None:
         """Bind `LayerExpertPager` so its layer waits are gated automatically on `mode == 'gen'`."""
         self.pager = pager
         if pager is not None and hasattr(pager, "set_wait_gate"):
             pager.set_wait_gate(lambda: self.is_gen_compute_active)
 
+    def _install_cfg_gen_hooks(self) -> None:
+        if self._cfg_hooks_installed:
+            return
+        _ensure_contextvar_naive_merge_hook()
+        interceptor = self
+        layers = getattr(self.lm_model, "layers", None) or []
+        for layer in layers:
+            attn_mod = getattr(layer, "self_attn", None)
+            orig_fwd_gen = getattr(attn_mod, "_forward_gen", None) if attn_mod is not None else None
+            if not callable(orig_fwd_gen):
+                continue
+            self._orig_forward_gens.append((attn_mod, orig_fwd_gen))
+
+            def _make_fwd_gen(mod: Any, orig_fn: Any):
+                def _wrapped_forward_gen(
+                    packed_query_sequence: Any,
+                    query_lens: Any,
+                    packed_query_position_embeddings: Any,
+                    past_key_values: Any,
+                    packed_vae_token_indexes: Any,
+                    packed_text_indexes: Any,
+                    update_past_key_values: bool = False,
+                ) -> tuple[Any, Any]:
+                    active_ic = _ACTIVE_CFG_INTERCEPTOR.get()
+                    use_cfg = (
+                        (active_ic is interceptor or (active_ic is None and interceptor._cfg_active))
+                        and interceptor._cfg_active
+                    )
+                    if (
+                        not use_cfg
+                        or not isinstance(past_key_values, SharedPrefixCache)
+                        or update_past_key_values
+                        or (callable(getattr(mod, "_is_sp_active", None)) and mod._is_sp_active())
+                    ):
+                        return orig_fn(
+                            packed_query_sequence=packed_query_sequence,
+                            query_lens=query_lens,
+                            packed_query_position_embeddings=packed_query_position_embeddings,
+                            past_key_values=past_key_values,
+                            packed_vae_token_indexes=packed_vae_token_indexes,
+                            packed_text_indexes=packed_text_indexes,
+                            update_past_key_values=update_past_key_values,
+                        )
+
+                    import torch
+
+                    text_indices = packed_text_indexes
+                    vae_indices = packed_vae_token_indexes
+                    packed_query_sequence = packed_query_sequence.to(torch.bfloat16)
+
+                    qkv, _ = mod.qkv_proj(packed_query_sequence, text_indices, vae_indices)
+                    q, k, v = qkv.split([mod.q_size, mod.kv_size, mod.kv_size], dim=-1)
+                    q = q.view(-1, mod.num_heads, mod.head_dim)
+                    k = k.view(-1, mod.num_kv_heads, mod.head_dim)
+                    v = v.view(-1, mod.num_kv_heads, mod.head_dim)
+
+                    q = mod.q_norm(q.to(torch.float32), text_indices, vae_indices)
+                    k = mod.k_norm(k.to(torch.float32), text_indices, vae_indices)
+
+                    cos, sin = [x[..., : mod.head_dim // 2] for x in packed_query_position_embeddings]
+                    q = mod.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+                    k = mod.rotary_op(k.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
+
+                    q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+                    text_q, text_k, text_v = q[text_indices], k[text_indices], v[text_indices]
+                    vae_q, vae_k, vae_v = q[vae_indices], k[vae_indices], v[vae_indices]
+
+                    num_branches = len(query_lens)
+                    text_per_branch = text_q.shape[0] // num_branches
+                    vae_per_branch = vae_q.shape[0] // num_branches
+
+                    q_list = [
+                        torch.cat([t, vx], dim=0)
+                        for t, vx in zip(
+                            text_q.split([text_per_branch] * num_branches),
+                            vae_q.split([vae_per_branch] * num_branches),
+                        )
+                    ]
+                    k_loc_list = [
+                        torch.cat([t, vx], dim=0)
+                        for t, vx in zip(
+                            text_k.split([text_per_branch] * num_branches),
+                            vae_k.split([vae_per_branch] * num_branches),
+                        )
+                    ]
+                    v_loc_list = [
+                        torch.cat([t, vx], dim=0)
+                        for t, vx in zip(
+                            text_v.split([text_per_branch] * num_branches),
+                            vae_v.split([vae_per_branch] * num_branches),
+                        )
+                    ]
+
+                    lidx = mod.layer_idx
+                    mode_backend = "cascade_cfg" if interceptor.cfg_allow_cascade_split else "lossless_varlen"
+                    call_stats: dict[str, int] = {}
+                    branch_outs = shared_prefix_cfg_attention(
+                        q_list=q_list,
+                        k_loc_list=k_loc_list,
+                        v_loc_list=v_loc_list,
+                        k_prefix=past_key_values.shared_prefix_k[lidx],
+                        v_prefix=past_key_values.shared_prefix_v[lidx],
+                        shared_branch_ids=past_key_values.shared_branch_ids,
+                        k_suffix_list=[past_key_values.branch_suffix_k[b][lidx] for b in range(num_branches)],
+                        v_suffix_list=[past_key_values.branch_suffix_v[b][lidx] for b in range(num_branches)],
+                        sm_scale=1.0 / math.sqrt(mod.head_dim),
+                        attn_noncausal=mod.attn_noncausal,
+                        backend=mode_backend,
+                        stats_out=call_stats,
+                        direct_ws_cache=interceptor._direct_ws_cache,
+                        cu_seqlens_cache=interceptor._cu_seqlens_cache,
+                        attn_meta_cache=interceptor._attn_meta_cache,
+                    )
+                    if past_key_values.shared_prefix_len > 0:
+                        interceptor.shared_attn_calls += 1
+                        interceptor.cascade_split_calls += int(call_stats.get("cascade_split_executed", 0))
+                    interceptor.unpadded_single_branch_calls += len(past_key_values.unshared_branch_ids)
+
+                    attn_out = torch.stack(branch_outs, dim=0).reshape(num_branches, -1, mod.q_size)
+                    text_attn = attn_out[:, :text_per_branch].reshape(-1, mod.q_size)
+                    vae_attn = attn_out[:, text_per_branch:].reshape(-1, mod.q_size)
+                    text_len = text_attn.shape[0]
+
+                    local_packed = torch.cat([text_attn, vae_attn], dim=0)
+                    local_text_idx = torch.arange(text_len, device=local_packed.device)
+                    local_vae_idx = torch.arange(text_len, text_len + vae_attn.shape[0], device=local_packed.device)
+                    local_out, _ = mod.o_proj(local_packed, local_text_idx, local_vae_idx)
+
+                    full_output = local_out.new_zeros((packed_query_sequence.shape[0], mod.hidden_size))
+                    full_output[packed_text_indexes] = local_out[:text_len]
+                    full_output[packed_vae_token_indexes] = local_out[text_len:]
+                    return full_output, past_key_values
+
+                return _wrapped_forward_gen
+
+            attn_mod._forward_gen = _make_fwd_gen(attn_mod, orig_fwd_gen)
+
+        self._cfg_hooks_installed = True
+
     def enable_shared_prefix_cfg(
         self,
         min_shared_tokens: int = 32,
         allow_cascade_split: bool = True,
-    ) -> BagelSharedPrefixPatch:
-        """Install and bind `BagelSharedPrefixPatch` under this execution coordinator."""
-        if self.cfg_patch is None:
-            self.cfg_patch = install_shared_prefix_bagel_hooks(
-                self.pipeline,
-                min_shared_tokens=min_shared_tokens,
-                allow_cascade_split=allow_cascade_split,
+    ) -> "BagelExecutionInterceptor":
+        """Install and configure `SharedPrefixCache` + `FlashPrefix-CFG` hooks directly on this interceptor."""
+        self.cfg_min_shared_tokens = int(min_shared_tokens)
+        self.cfg_allow_cascade_split = bool(allow_cascade_split)
+        self._cfg_enabled = True
+        self._install_cfg_gen_hooks()
+        return self
+
+    @contextmanager
+    def shared_prefix_cfg_scope(
+        self,
+        *,
+        reset_stats: bool = True,
+        allow_cascade_split: bool | None = None,
+    ):
+        """Activate `ContextVar`-scoped `SharedPrefixCache` + `FlashPrefix-CFG` for one generation pass."""
+        if not self._cfg_hooks_installed:
+            self._install_cfg_gen_hooks()
+        if reset_stats:
+            self.reset_cfg_telemetry()
+        prev_active = self._cfg_active
+        prev_split = self.cfg_allow_cascade_split
+        if allow_cascade_split is not None:
+            self.cfg_allow_cascade_split = bool(allow_cascade_split)
+        tok = _ACTIVE_CFG_INTERCEPTOR.set(self)
+        self._cfg_active = True
+        try:
+            yield self
+        finally:
+            self._cfg_active = prev_active
+            self.cfg_allow_cascade_split = prev_split
+            _ACTIVE_CFG_INTERCEPTOR.reset(tok)
+            SharedPrefixCache.clear_memo()
+
+    @staticmethod
+    def _project_und_qkv_rope(
+        attn_mod: Any,
+        hidden: Any,
+        cos_half: Any,
+        sin_half: Any,
+        *,
+        num_rows: int = -1,
+    ) -> tuple[Any, Any, Any]:
+        """Shared QKV projection, FP32 QK-norm, RoPE, and dtype alignment for `mode == 'und'`."""
+        import torch
+
+        qkv, _ = attn_mod.qkv_proj(hidden)
+        q, k, v = qkv.split([attn_mod.q_size, attn_mod.kv_size, attn_mod.kv_size], dim=-1)
+        q = q.view(num_rows, attn_mod.num_heads, attn_mod.head_dim)
+        k = k.view(num_rows, attn_mod.num_kv_heads, attn_mod.head_dim)
+        v = v.view(num_rows, attn_mod.num_kv_heads, attn_mod.head_dim)
+
+        q = attn_mod.q_norm(q.to(torch.float32))
+        k = attn_mod.k_norm(k.to(torch.float32))
+
+        q = attn_mod.rotary_op(q.to(cos_half.dtype).unsqueeze(0), cos_half, sin_half).squeeze(0)
+        k = attn_mod.rotary_op(k.to(cos_half.dtype).unsqueeze(0), cos_half, sin_half).squeeze(0)
+
+        out_dt = v.dtype
+        return q.to(out_dt), k.to(out_dt), v
+
+    def _append_cache_kv(
+        self,
+        cache: Any | None,
+        layer_idx: int,
+        k_new: Any,
+        v_new: Any,
+        *,
+        update_past_key_values: bool = True,
+    ) -> tuple[Any, Any, int]:
+        """Delegate KV append to `VmmNaiveCache.append_kv` or stock `NaiveCache` concat cleanly."""
+        if cache is None:
+            return k_new, v_new, 0
+
+        if isinstance(cache, VmmNaiveCache):
+            fk, fv = cache.append_kv(
+                layer_idx,
+                k_new,
+                v_new,
+                update_past_key_values=update_past_key_values,
             )
+            if update_past_key_values and cache.uses_vmm_backing:
+                self.ar_vmm_inplace_appends += 1
+            delta = 1 if getattr(k_new, "ndim", 3) == 2 else int(k_new.shape[0])
+            prev_len = max(0, int(fk.shape[0]) - delta)
+            return fk, fv, prev_len
+
+        import torch
+
+        lidx = int(layer_idx)
+        get_k = cache.key_cache.get if isinstance(cache.key_cache, dict) else (lambda i: cache.key_cache[i])
+        get_v = cache.value_cache.get if isinstance(cache.value_cache, dict) else (lambda i: cache.value_cache[i])
+        ck = get_k(lidx)
+        cv = get_v(lidx)
+        prev_len = int(ck.shape[0]) if ck is not None else 0
+        if ck is not None and prev_len > 0:
+            fk = torch.cat([ck, k_new], dim=0)
+            fv = torch.cat([cv, v_new], dim=0)
         else:
-            self.cfg_patch.min_shared_tokens = int(min_shared_tokens)
-            self.cfg_patch.allow_cascade_split = bool(allow_cascade_split)
-        return self.cfg_patch
+            fk = k_new
+            fv = v_new
+        if update_past_key_values:
+            cache.key_cache[lidx] = fk
+            cache.value_cache[lidx] = fv
+        return fk, fv, prev_len
 
     def _supports_packed_ar_gemm(self) -> bool:
         lm = self.lm_model
@@ -225,13 +458,7 @@ class BagelExecutionInterceptor:
         update_past_key_values: bool = True,
         return_logits: bool = False,
     ) -> tuple[Any, list[Any]]:
-        """Execute ONE `[B, D]` packed GEMM causal AR step across `B >= 1` concurrent requests.
-
-        Reads every text projection (`embed_tokens`, `qkv_proj`, `o_proj`, `mlp.gate_up_proj`,
-        `mlp.down_proj`, `lm_head`) ONCE for the whole `[B, D]` batch, appends each request's
-        new `[1, H_kv, D_h]` K/V slice in-place on `VmmNaiveCache` (or `NaiveCache`), and runs
-        mask-free `Q=1` SDPA per request with exact mathematical equivalence to `PackedAttentionMoT._forward_und`.
-        """
+        """Execute ONE `[B, D]` packed GEMM causal AR step across `B >= 1` concurrent requests."""
         import torch
         import torch.nn.functional as F
 
@@ -285,20 +512,14 @@ class BagelExecutionInterceptor:
         lm_head = self.bagel.language_model.lm_head
         hidden_states = lm.embed_tokens(packed_ids)  # [B, D]
         cos, sin = lm.rotary_emb(hidden_states, packed_pos.unsqueeze(0))
-        cos = cos.squeeze(0)  # [B, head_dim]
-        sin = sin.squeeze(0)  # [B, head_dim]
+        cos = cos.squeeze(0)
+        sin = sin.squeeze(0)
 
         updated_caches = list(kv_caches)
         if do_update:
             for cache in updated_caches:
-                if (
-                    isinstance(cache, VmmNaiveCache)
-                    and not cache._fast_ar_active
-                    and cache.vmm is not None
-                    and not cache._closed
-                    and not cache._swapped_flag
-                ):
-                    cache.prepare_fast_ar_decode(reserve_tokens=128)
+                if isinstance(cache, VmmNaiveCache) and not cache.fast_ar_active:
+                    cache.set_fast_ar_mode(True, reserve_tokens=128)
 
         first_half_d = lm.layers[0].self_attn.head_dim // 2
         cos_h0 = cos[..., :first_half_d]
@@ -309,43 +530,18 @@ class BagelExecutionInterceptor:
             normed = decoder_layer.input_layernorm(hidden_states)
             attn_mod = decoder_layer.self_attn
 
-            qkv, _ = attn_mod.qkv_proj(normed)
-            q, k, v = qkv.split([attn_mod.q_size, attn_mod.kv_size, attn_mod.kv_size], dim=-1)
-            q = q.view(batch_size, attn_mod.num_heads, attn_mod.head_dim)
-            k = k.view(batch_size, attn_mod.num_kv_heads, attn_mod.head_dim)
-            v = v.view(batch_size, attn_mod.num_kv_heads, attn_mod.head_dim)
-
-            q = attn_mod.q_norm(q.to(torch.float32))
-            k = attn_mod.k_norm(k.to(torch.float32))
-
             half_d = attn_mod.head_dim // 2
-            if half_d == first_half_d:
-                cos_h = cos_h0
-                sin_h = sin_h0
-            else:
-                cos_h = cos[..., :half_d]
-                sin_h = sin[..., :half_d]
-            q = attn_mod.rotary_op(q.to(cos_h.dtype).unsqueeze(0), cos_h, sin_h).squeeze(0)
-            k = attn_mod.rotary_op(k.to(cos_h.dtype).unsqueeze(0), cos_h, sin_h).squeeze(0)
-
-            out_dt = v.dtype
-            q = q.to(out_dt)
-            k = k.to(out_dt)
+            cos_h = cos_h0 if half_d == first_half_d else cos[..., :half_d]
+            sin_h = sin_h0 if half_d == first_half_d else sin[..., :half_d]
+            q, k, v = self._project_und_qkv_rope(attn_mod, normed, cos_h, sin_h, num_rows=batch_size)
 
             sm_scale = 1.0 / (attn_mod.head_dim**0.5)
             use_gqa = attn_mod.num_heads != attn_mod.num_kv_heads
 
             if batch_size == 1:
-                c0 = updated_caches[0]
-                if do_update and isinstance(c0, VmmNaiveCache) and c0._fast_ar_active:
-                    full_k, full_v = c0.append_ar_token_fast(layer_idx, k, v)
-                    self.ar_vmm_inplace_appends += 1
-                else:
-                    full_k, full_v, _, used_vmm = append_or_update_kv_cache(
-                        c0, layer_idx, k, v, update_past_key_values=do_update
-                    )
-                    if used_vmm:
-                        self.ar_vmm_inplace_appends += 1
+                full_k, full_v, _ = self._append_cache_kv(
+                    updated_caches[0], layer_idx, k, v, update_past_key_values=do_update
+                )
                 self.ar_q1_fast_attn_calls += 1
                 attn_4d = F.scaled_dot_product_attention(
                     q.unsqueeze(0).permute(0, 2, 1, 3),
@@ -359,27 +555,19 @@ class BagelExecutionInterceptor:
                 )
                 attn_packed = attn_4d.permute(0, 2, 1, 3).reshape(1, attn_mod.q_size)
             else:
-                attn_packed = torch.empty((batch_size, attn_mod.q_size), dtype=out_dt, device=q.device)
+                attn_packed = torch.empty((batch_size, attn_mod.q_size), dtype=v.dtype, device=q.device)
                 for b in range(batch_size):
-                    kb = k[b : b + 1]
-                    vb = v[b : b + 1]
-                    cb = updated_caches[b]
-                    if do_update and isinstance(cb, VmmNaiveCache) and cb._fast_ar_active:
-                        full_kb, full_vb = cb.append_ar_token_fast(layer_idx, kb, vb)
-                        self.ar_vmm_inplace_appends += 1
-                    else:
-                        full_kb, full_vb, _, used_vmm = append_or_update_kv_cache(
-                            cb, layer_idx, kb, vb, update_past_key_values=do_update
-                        )
-                        if used_vmm:
-                            self.ar_vmm_inplace_appends += 1
-                    qb_4d = q[b : b + 1].unsqueeze(0).permute(0, 2, 1, 3)
-                    kb_4d = full_kb.unsqueeze(0).permute(0, 2, 1, 3)
-                    vb_4d = full_vb.unsqueeze(0).permute(0, 2, 1, 3)
+                    full_kb, full_vb, _ = self._append_cache_kv(
+                        updated_caches[b],
+                        layer_idx,
+                        k[b : b + 1],
+                        v[b : b + 1],
+                        update_past_key_values=do_update,
+                    )
                     ob_4d = F.scaled_dot_product_attention(
-                        qb_4d,
-                        kb_4d,
-                        vb_4d,
+                        q[b : b + 1].unsqueeze(0).permute(0, 2, 1, 3),
+                        full_kb.unsqueeze(0).permute(0, 2, 1, 3),
+                        full_vb.unsqueeze(0).permute(0, 2, 1, 3),
                         attn_mask=None,
                         dropout_p=0.0,
                         is_causal=False,
@@ -426,44 +614,25 @@ class BagelExecutionInterceptor:
                     import torch
                     import torch.nn.functional as F
 
-                    qkv, _ = mod.qkv_proj(packed_query_sequence)
-                    q, k, v = qkv.split([mod.q_size, mod.kv_size, mod.kv_size], dim=-1)
-                    q = q.view(-1, mod.num_heads, mod.head_dim)
-                    k = k.view(-1, mod.num_kv_heads, mod.head_dim)
-                    v = v.view(-1, mod.num_kv_heads, mod.head_dim)
-
-                    q = mod.q_norm(q.to(torch.float32))
-                    k = mod.k_norm(k.to(torch.float32))
-
-                    cos, sin = [x[..., : mod.head_dim // 2] for x in packed_query_position_embeddings]
-                    q = mod.rotary_op(q.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
-                    k = mod.rotary_op(k.to(cos.dtype).unsqueeze(0), cos, sin).squeeze(0)
-
-                    out_dt = v.dtype
-                    q = q.to(out_dt)
-                    k = k.to(out_dt)
-
-                    full_k, full_v, cache_len, used_vmm = append_or_update_kv_cache(
+                    cos_h, sin_h = [x[..., : mod.head_dim // 2] for x in packed_query_position_embeddings]
+                    q, k, v = interceptor._project_und_qkv_rope(
+                        mod, packed_query_sequence, cos_h, sin_h, num_rows=-1
+                    )
+                    full_k, full_v, cache_len = interceptor._append_cache_kv(
                         past_key_values,
                         mod.layer_idx,
                         k,
                         v,
                         update_past_key_values=bool(update_past_key_values),
                     )
-                    if used_vmm:
-                        interceptor.ar_vmm_inplace_appends += 1
 
                     q_len = int(q.shape[0])
                     if q_len == 1:
-                        # Single-token decode attends to all [0 .. cache_len] keys with zero mask allocation
                         interceptor.ar_q1_fast_attn_calls += 1
-                        q_4d = q.unsqueeze(0).permute(0, 2, 1, 3)
-                        k_4d = full_k.unsqueeze(0).permute(0, 2, 1, 3)
-                        v_4d = full_v.unsqueeze(0).permute(0, 2, 1, 3)
                         attn_out_4d = F.scaled_dot_product_attention(
-                            q_4d,
-                            k_4d,
-                            v_4d,
+                            q.unsqueeze(0).permute(0, 2, 1, 3),
+                            full_k.unsqueeze(0).permute(0, 2, 1, 3),
+                            full_v.unsqueeze(0).permute(0, 2, 1, 3),
                             attn_mask=None,
                             dropout_p=0.0,
                             is_causal=False,
@@ -478,13 +647,10 @@ class BagelExecutionInterceptor:
                         mask = arange_k > (cache_len + arange_q)
                         attn_bias = torch.zeros(q_len, k_len, dtype=q.dtype, device=q.device)
                         attn_bias.masked_fill_(mask, float("-inf"))
-                        q_4d = q.unsqueeze(0).permute(0, 2, 1, 3)
-                        k_4d = full_k.unsqueeze(0).permute(0, 2, 1, 3)
-                        v_4d = full_v.unsqueeze(0).permute(0, 2, 1, 3)
                         attn_out_4d = F.scaled_dot_product_attention(
-                            q_4d,
-                            k_4d,
-                            v_4d,
+                            q.unsqueeze(0).permute(0, 2, 1, 3),
+                            full_k.unsqueeze(0).permute(0, 2, 1, 3),
+                            full_v.unsqueeze(0).permute(0, 2, 1, 3),
                             attn_mask=attn_bias.unsqueeze(0).unsqueeze(0),
                             dropout_p=0.0,
                             is_causal=False,
@@ -631,12 +797,14 @@ class BagelExecutionInterceptor:
         self._installed = True
 
     def uninstall(self) -> None:
-        if self.cfg_patch is not None:
-            try:
-                self.cfg_patch.uninstall()
-            except Exception:
-                pass
-            self.cfg_patch = None
+        self._cfg_active = False
+        self._cfg_enabled = False
+        for attn_mod, orig_gen in self._orig_forward_gens:
+            attn_mod._forward_gen = orig_gen
+        self._orig_forward_gens.clear()
+        self._cfg_hooks_installed = False
+        self.clear_workspace_caches()
+
         for attn_mod, orig_und in self._orig_forward_unds:
             attn_mod._forward_und = orig_und
         self._orig_forward_unds.clear()
@@ -655,71 +823,39 @@ class BagelExecutionInterceptor:
         self,
         *,
         pager: Any | None = None,
-        cfg_patch: Any | None = None,
         use_cfg_patch: bool = True,
         scheduler: Any | None = None,
-        pacer_slot_cm: Any | None = None,
+        pacer: Any | None = None,
+        rank: int = 0,
         prefetch_all: bool = True,
         reset_cfg_stats: bool = True,
+        exclude_session_ids: Sequence[int] = (),
     ):
-        """Coordinate Pager + Pacer + CFG Patch + EDF Scheduler over DiT denoising steps."""
+        """Coordinate Pager + Pacer + SharedPrefix-CFG + EDF Scheduler over DiT denoising steps."""
         self.install()
         eff_pager = pager if pager is not None else self.pager
         if eff_pager is not None:
             self.bind_pager(eff_pager)
-        eff_cfg = cfg_patch if cfg_patch is not None else (self.cfg_patch if use_cfg_patch else None)
 
         prev_sched = self._active_scheduler
         prev_cb = self._step0_release_cb
         prev_done = self._step0_done
-        pacer_lock = threading.Lock()
-        pacer_active = {"held": False}
-        h2d_release_thread: threading.Thread | None = None
-
-        def _release_pacer_once(*, sync_before_release: bool = False) -> None:
-            with pacer_lock:
-                if pacer_slot_cm is None or not pacer_active["held"]:
-                    return
-                if sync_before_release:
-                    _sync_cuda_if_present(self.device)
-                pacer_active["held"] = False
-                pacer_slot_cm.__exit__(None, None, None)
 
         with ExitStack() as stack:
-            if pacer_slot_cm is not None:
-                pacer_slot_cm.__enter__()
-                pacer_active["held"] = True
-                self._step0_release_cb = lambda: _release_pacer_once(sync_before_release=True)
-                self._step0_done = False
             if eff_pager is not None:
-                stack.enter_context(eff_pager.generation_mode(prefetch_all=prefetch_all))
-                # Release `HalfNodeH2DPacer` immediately once H2D DMA finishes on `h2d_stream_`
-                # rather than holding the half-node flock across the entire Step-0 compute!
-                vmm_obj = getattr(eff_pager, "vmm", None)
-                if (
-                    pacer_slot_cm is not None
-                    and vmm_obj is not None
-                    and callable(getattr(vmm_obj, "sync_expert_h2d", None))
-                    and not bool(getattr(vmm_obj, "is_simulated", False))
-                ):
-                    eid = int(eff_pager.expert_id)
-
-                    def _wait_h2d_and_release() -> None:
-                        try:
-                            vmm_obj.sync_expert_h2d(eid)
-                        except Exception:
-                            pass
-                        finally:
-                            _release_pacer_once(sync_before_release=False)
-
-                    h2d_release_thread = threading.Thread(
-                        target=_wait_h2d_and_release,
-                        name=f"ms-h2d-pacer-rel-{eid}",
-                        daemon=True,
+                stack.enter_context(
+                    eff_pager.generation_mode(
+                        prefetch_all=prefetch_all,
+                        pacer=pacer,
+                        rank=rank,
+                        exclude_session_ids=exclude_session_ids,
                     )
-                    h2d_release_thread.start()
-            if eff_cfg is not None:
-                stack.enter_context(eff_cfg.active(reset_stats=reset_cfg_stats))
+                )
+                if pacer is not None and callable(getattr(eff_pager, "release_active_pacer", None)):
+                    self._step0_release_cb = lambda: eff_pager.release_active_pacer(sync_stream=True)
+                    self._step0_done = False
+            if use_cfg_patch and self._cfg_enabled:
+                stack.enter_context(self.shared_prefix_cfg_scope(reset_stats=reset_cfg_stats))
             if scheduler is not None:
                 scheduler.begin_session_clock()
                 self._active_scheduler = scheduler
@@ -729,6 +865,4 @@ class BagelExecutionInterceptor:
                 self._active_scheduler = prev_sched
                 self._step0_release_cb = prev_cb
                 self._step0_done = prev_done
-                if h2d_release_thread is not None:
-                    h2d_release_thread.join(timeout=10.0)
-                _release_pacer_once(sync_before_release=False)
+                SharedPrefixCache.clear_memo()

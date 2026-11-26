@@ -14,7 +14,6 @@ from morphserve.kernels import (
     GpuInPlaceLoopback,
     SharedPrefixCache,
     cow_fork_context,
-    install_shared_prefix_bagel_hooks,
     rebind_cow_prefix,
 )
 from morphserve.models import load_bagel_pipeline
@@ -416,9 +415,9 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
     ref_turn1_img = _run_dit(pipeline, turn1_ctx, turn1_cfg_text, turn1_cfg_img, edit_prompt, steps=12, seed=77)
 
-    cfg_patch = install_shared_prefix_bagel_hooks(pipeline, min_shared_tokens=32)
+    interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=True)
     SharedPrefixCache.clear_memo()
-    with cfg_patch.active(reset_stats=True):
+    with interceptor.shared_prefix_cfg_scope(reset_stats=True):
         _ = _run_dit(pipeline, turn1_ctx, turn1_cfg_text, turn1_cfg_img, edit_prompt, steps=2, seed=77)
     SharedPrefixCache.clear_memo()
 
@@ -482,7 +481,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     ts0 = time.perf_counter()
     # `stack_sched.run_session()` already enters `pager.generation_mode(prefetch_all=True)` via `interceptor`;
     # avoid nesting non-reentrant `pager.generation_mode` twice!
-    with cfg_patch.active(reset_stats=True), stack_sched.run_session():
+    with interceptor.shared_prefix_cfg_scope(reset_stats=True), stack_sched.run_session():
         stack_img = _run_dit(pipeline, turn1_ctx, turn1_cfg_text, turn1_cfg_img, edit_prompt, steps=12, seed=77)
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             stack_sched.drain_remaining_ar_tasks()
@@ -500,8 +499,8 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
         "m1_transient_reclaimed": st_vmm["transient_mapped_handles_current"] == 0,
         "m1_overflow_creates": st_vmm["overflow_creates"],
         "m1_vmm_inplace_ar_appends": interceptor.ar_vmm_inplace_appends,
-        "m3_shared_prefix_len": cfg_patch.last_shared_prefix_len,
-        "m3_shared_triton_calls": cfg_patch.shared_attn_calls,
+        "m3_shared_prefix_len": interceptor.last_shared_prefix_len,
+        "m3_shared_triton_calls": interceptor.shared_attn_calls,
         "m4_yield_count": stack_sched.yield_count,
         "m4_ar_tpot_p99_ms": _pct(stack_tpots, 99),
         "m4_ar_ttft_ms": round(stack_ar.ttft_ms(), 2),
@@ -510,7 +509,6 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     }
 
     stack_ar.kv_cache.close()
-    cfg_patch.uninstall()
     interceptor.uninstall()
     pager.close()
     vmm.shutdown()

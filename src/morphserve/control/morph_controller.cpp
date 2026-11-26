@@ -1,45 +1,16 @@
 #include "morphserve/control/morph_controller.hpp"
 
+#include "morphserve/control/hash_util.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <map>
 #include <vector>
 
 namespace morphserve::control {
 
 namespace {
-
-inline double round_1(double x) noexcept { return std::round(x * 10.0) / 10.0; }
-inline double round_2(double x) noexcept { return std::round(x * 100.0) / 100.0; }
-inline double round_3(double x) noexcept { return std::round(x * 1000.0) / 1000.0; }
-inline double round_4(double x) noexcept { return std::round(x * 10000.0) / 10000.0; }
-
-double percentile_raw(const std::vector<double>& vals, double p) {
-    if (vals.empty()) {
-        return 0.0;
-    }
-    std::vector<double> s = vals;
-    std::sort(s.begin(), s.end());
-    const double idx = static_cast<double>(s.size() - 1) * (p / 100.0);
-    const size_t lo = static_cast<size_t>(std::floor(idx));
-    const size_t hi = std::min(s.size() - 1, static_cast<size_t>(std::ceil(idx)));
-    if (lo == hi) {
-        return s[lo];
-    }
-    const double frac = idx - static_cast<double>(lo);
-    return s[lo] * (1.0 - frac) + s[hi] * frac;
-}
-
-double mean_raw(const std::vector<double>& vals) {
-    if (vals.empty()) {
-        return 0.0;
-    }
-    double sum = 0.0;
-    for (double v : vals) {
-        sum += v;
-    }
-    return sum / static_cast<double>(vals.size());
-}
 
 struct ArTpotFlags {
     bool p95_ok = true;
@@ -103,7 +74,7 @@ bool select_ar_slo_by_mode(const ArTpotFlags& f, const std::string& mode) noexce
     if (mode == "turn_mean") {
         return f.mean_ok;
     }
-    if (mode == "token_max") {
+    if (mode == "token_max" || mode == "strict_max") {
         return f.strict_max_ok;
     }
     return f.p95_ok;
@@ -111,7 +82,7 @@ bool select_ar_slo_by_mode(const ArTpotFlags& f, const std::string& mode) noexce
 
 std::vector<double> parse_double_array(const nlohmann::json& j, const char* key) {
     std::vector<double> out;
-    if (j.contains(key) && j[key].is_array()) {
+    if (j.is_object() && j.contains(key) && j[key].is_array()) {
         out.reserve(j[key].size());
         for (const auto& v : j[key]) {
             if (v.is_number()) {
@@ -122,9 +93,22 @@ std::vector<double> parse_double_array(const nlohmann::json& j, const char* key)
     return out;
 }
 
+std::vector<int> parse_int_array(const nlohmann::json& j, const char* key) {
+    std::vector<int> out;
+    if (j.is_object() && j.contains(key) && j[key].is_array()) {
+        out.reserve(j[key].size());
+        for (const auto& v : j[key]) {
+            if (v.is_number()) {
+                out.push_back(v.get<int>());
+            }
+        }
+    }
+    return out;
+}
+
 std::vector<std::vector<double>> parse_nested_double_array(const nlohmann::json& j, const char* key) {
     std::vector<std::vector<double>> out;
-    if (j.contains(key) && j[key].is_array()) {
+    if (j.is_object() && j.contains(key) && j[key].is_array()) {
         out.reserve(j[key].size());
         for (const auto& row : j[key]) {
             if (!row.is_array()) continue;
@@ -141,35 +125,86 @@ std::vector<std::vector<double>> parse_nested_double_array(const nlohmann::json&
     return out;
 }
 
-bool evaluate_outcome_at_k(const PolicyConfig& policy, const nlohmann::json& out, double k_ar, double k_dit) {
-    if (out.value("status", "") != "ok") {
+std::optional<double> first_number_opt(const nlohmann::json& j, std::initializer_list<const char*> keys) {
+    if (!j.is_object()) return std::nullopt;
+    for (const char* k : keys) {
+        if (j.contains(k) && j[k].is_number()) {
+            return j[k].get<double>();
+        }
+    }
+    return std::nullopt;
+}
+
+double sample_think_dist_s(
+    const std::string& hash_key,
+    double lo_s,
+    double hi_s,
+    const std::string& dist,
+    double median_s,
+    double sigma) {
+    if (hi_s <= lo_s) {
+        return std::max(0.0, lo_s);
+    }
+    const double eff_lo = std::max(0.0, lo_s);
+    const double eff_hi = std::max(eff_lo, hi_s);
+    if (dist == "constant") {
+        return std::clamp(std::max(0.0, median_s), eff_lo, eff_hi);
+    }
+    if (dist == "uniform") {
+        const uint32_t h = md5_prefix_u32(hash_key);
+        const double frac = static_cast<double>(h % 10000U) / 10000.0;
+        return lo_s + frac * (hi_s - lo_s);
+    }
+    constexpr double kPi = 3.14159265358979323846;
+    const uint32_t h1 = md5_prefix_u32(hash_key + ":a");
+    const uint32_t h2 = md5_prefix_u32(hash_key + ":b");
+    const double u1 = std::clamp(static_cast<double>(h1) / 4294967296.0, 1e-6, 1.0 - 1e-6);
+    const double u2 = std::clamp(static_cast<double>(h2) / 4294967296.0, 1e-6, 1.0 - 1e-6);
+    const double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * kPi * u2);
+    const double val = std::max(1e-6, median_s) * std::exp(std::max(0.0, sigma) * z);
+    return std::clamp(val, eff_lo, eff_hi);
+}
+
+int default_dit_steps_for(const PolicyConfig& policy, int height) noexcept {
+    return (policy.model_family == "internvl_u" && height >= 1024) ? 16 : 20;
+}
+
+bool evaluate_dit_turns_ok(
+    const PolicyConfig& policy,
+    const std::vector<double>& dit_turns_ms,
+    const std::vector<int>& dit_heights,
+    const std::vector<int>& dit_steps,
+    std::optional<double> k_dit_opt,
+    double slo_time_scale) {
+    for (size_t i = 0; i < dit_turns_ms.size(); ++i) {
+        const int h = (i < dit_heights.size() && dit_heights[i] > 0) ? dit_heights[i] : 512;
+        const int st = (i < dit_steps.size() && dit_steps[i] > 0) ? dit_steps[i] : default_dit_steps_for(policy, h);
+        const double cap = policy.dit_turn_slo_for(h, st, k_dit_opt) * slo_time_scale;
+        if (dit_turns_ms[i] > cap) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool evaluate_outcome_at_k(
+    const PolicyConfig& policy,
+    const SessionOutcomeInput& out,
+    double k_ar,
+    double k_dit,
+    double slo_time_scale) {
+    if (out.status != "ok") {
         return false;
     }
     const std::string fam = (policy.model_family == "internvl_u") ? "internvl_u" : "bagel";
     const auto slo = default_operator_profile().slo_thresholds_ms(k_ar, fam);
-    const double ttft_cap = slo.at("ar_ttft_slo_ms");
-    const double tpot_cap = slo.at("ar_tpot_slo_ms");
-    const auto ttfts = parse_double_array(out, "ar_ttfts_ms");
-    const auto tpots = parse_double_array(out, "ar_tpots_ms");
-    const auto turn_tpots = parse_nested_double_array(out, "ar_turn_tpots_ms");
-    const ArTpotFlags ar_flags = eval_ar_slos(ttfts, tpots, turn_tpots, ttft_cap, tpot_cap);
+    const double ttft_cap = slo.at("ar_ttft_slo_ms") * slo_time_scale;
+    const double tpot_cap = slo.at("ar_tpot_slo_ms") * slo_time_scale;
+    const ArTpotFlags ar_flags = eval_ar_slos(out.ar_ttfts_ms, out.ar_tpots_ms, out.ar_turn_tpots_ms, ttft_cap, tpot_cap);
     if (!select_ar_slo_by_mode(ar_flags, policy.ar_tpot_slo_mode)) {
         return false;
     }
-    if (out.contains("dit_turns_ms") && out["dit_turns_ms"].is_array()) {
-        const auto& lats = out["dit_turns_ms"];
-        const auto& hs = out.value("dit_turn_heights", nlohmann::json::array());
-        const auto& sts = out.value("dit_turn_steps", nlohmann::json::array());
-        for (size_t i = 0; i < lats.size(); ++i) {
-            if (!lats[i].is_number()) continue;
-            const int h = (i < hs.size() && hs[i].is_number()) ? hs[i].get<int>() : 512;
-            const int st = (i < sts.size() && sts[i].is_number()) ? sts[i].get<int>() : 20;
-            if (lats[i].get<double>() > policy.dit_turn_slo_for(h, st, k_dit)) {
-                return false;
-            }
-        }
-    }
-    return true;
+    return evaluate_dit_turns_ok(policy, out.dit_turns_ms, out.dit_turn_heights, out.dit_turn_steps, k_dit, slo_time_scale);
 }
 
 struct TurnSloEval {
@@ -183,20 +218,16 @@ struct TurnSloEval {
 
 TurnSloEval evaluate_turn_record_slo(
     const PolicyConfig& policy,
-    const nlohmann::json& tr,
+    const TurnRecordInput& tr,
     double ar_ttft_cap,
     double ar_tpot_cap,
-    std::optional<double> k_dit_opt) {
+    std::optional<double> k_dit_opt,
+    double slo_time_scale) {
     TurnSloEval ev;
-    const std::string plan = tr.value("modality_plan", "");
-    const bool has_ttft = (tr.contains("ar_ttft_ms") && tr["ar_ttft_ms"].is_number()) ||
-                          (tr.contains("ttft_ms") && tr["ttft_ms"].is_number());
-    const bool has_dit_num = (tr.contains("dit_ms") && tr["dit_ms"].is_number()) ||
-                             (tr.contains("dit_turn_ms") && tr["dit_turn_ms"].is_number()) ||
-                             (tr.contains("dit_lat_ms") && tr["dit_lat_ms"].is_number());
-    ev.has_ar = (plan == "ar_only" || plan == "cot_then_dit" || has_ttft);
-    ev.has_dit = (plan == "dit_t2i" || plan == "dit_edit" || plan == "cot_then_dit" || has_dit_num);
-    if (tr.value("status", "ok") != "ok") {
+    ev.has_ar = (tr.modality_plan == "ar_only" || tr.modality_plan == "cot_then_dit" || tr.ar_ttft_ms.has_value());
+    ev.has_dit = (tr.modality_plan == "dit_t2i" || tr.modality_plan == "dit_edit" ||
+                  tr.modality_plan == "cot_then_dit" || tr.dit_ms.has_value());
+    if (tr.status != "ok") {
         ev.is_ok = false;
         ev.ar_ok = false;
         ev.dit_ok = false;
@@ -205,56 +236,31 @@ TurnSloEval evaluate_turn_record_slo(
     }
     ev.is_ok = true;
     if (ev.has_ar) {
-        double ttft = 0.0;
-        if (tr.contains("ar_ttft_ms") && tr["ar_ttft_ms"].is_number()) {
-            ttft = tr["ar_ttft_ms"].get<double>();
-        } else if (tr.contains("ttft_ms") && tr["ttft_ms"].is_number()) {
-            ttft = tr["ttft_ms"].get<double>();
-        }
+        const double ttft = tr.ar_ttft_ms.value_or(0.0);
         bool tpot_ok = true;
-        if (tr.contains("ar_tpots_ms") && tr["ar_tpots_ms"].is_array() && !tr["ar_tpots_ms"].empty()) {
-            std::vector<double> tps;
-            for (const auto& v : tr["ar_tpots_ms"]) {
-                if (v.is_number()) tps.push_back(v.get<double>());
+        if (!tr.ar_tpots_ms.empty()) {
+            if (policy.ar_tpot_slo_mode == "turn_mean") {
+                tpot_ok = mean_raw(tr.ar_tpots_ms) <= ar_tpot_cap;
+            } else if (policy.ar_tpot_slo_mode == "token_max" || policy.ar_tpot_slo_mode == "strict_max") {
+                tpot_ok = *std::max_element(tr.ar_tpots_ms.begin(), tr.ar_tpots_ms.end()) <= ar_tpot_cap;
+            } else {
+                tpot_ok = percentile_raw(tr.ar_tpots_ms, 95.0) <= ar_tpot_cap;
             }
-            if (!tps.empty()) {
-                if (policy.ar_tpot_slo_mode == "turn_mean") {
-                    tpot_ok = mean_raw(tps) <= ar_tpot_cap;
-                } else if (policy.ar_tpot_slo_mode == "token_max" || policy.ar_tpot_slo_mode == "strict_max") {
-                    tpot_ok = *std::max_element(tps.begin(), tps.end()) <= ar_tpot_cap;
-                } else {
-                    tpot_ok = percentile_raw(tps, 95.0) <= ar_tpot_cap;
-                }
-            }
-        } else if (policy.ar_tpot_slo_mode == "turn_mean" &&
-                   tr.contains("ar_tpot_mean_ms") && tr["ar_tpot_mean_ms"].is_number()) {
-            tpot_ok = tr["ar_tpot_mean_ms"].get<double>() <= ar_tpot_cap;
+        } else if (policy.ar_tpot_slo_mode == "turn_mean" && tr.ar_tpot_mean_ms.has_value()) {
+            tpot_ok = *tr.ar_tpot_mean_ms <= ar_tpot_cap;
         } else if ((policy.ar_tpot_slo_mode == "token_max" || policy.ar_tpot_slo_mode == "strict_max") &&
-                   tr.contains("ar_tpot_strict_max_ms") && tr["ar_tpot_strict_max_ms"].is_number()) {
-            tpot_ok = tr["ar_tpot_strict_max_ms"].get<double>() <= ar_tpot_cap;
-        } else if (tr.contains("ar_tpot_p95_ms") && tr["ar_tpot_p95_ms"].is_number()) {
-            tpot_ok = tr["ar_tpot_p95_ms"].get<double>() <= ar_tpot_cap;
-        } else if (tr.contains("ar_tpot_ms") && tr["ar_tpot_ms"].is_number()) {
-            tpot_ok = tr["ar_tpot_ms"].get<double>() <= ar_tpot_cap;
+                   tr.ar_tpot_strict_max_ms.has_value()) {
+            tpot_ok = *tr.ar_tpot_strict_max_ms <= ar_tpot_cap;
+        } else if (tr.ar_tpot_p95_ms.has_value()) {
+            tpot_ok = *tr.ar_tpot_p95_ms <= ar_tpot_cap;
         }
         ev.ar_ok = (ttft <= ar_ttft_cap) && tpot_ok;
     }
     if (ev.has_dit) {
-        double dit_lat = 0.0;
-        if (tr.contains("dit_ms") && tr["dit_ms"].is_number()) {
-            dit_lat = tr["dit_ms"].get<double>();
-        } else if (tr.contains("dit_turn_ms") && tr["dit_turn_ms"].is_number()) {
-            dit_lat = tr["dit_turn_ms"].get<double>();
-        } else if (tr.contains("dit_lat_ms") && tr["dit_lat_ms"].is_number()) {
-            dit_lat = tr["dit_lat_ms"].get<double>();
-        }
-        const int h = (tr.contains("height") && tr["height"].is_number() && tr["height"].get<int>() > 0)
-                          ? tr["height"].get<int>()
-                          : 512;
-        const int st = (tr.contains("dit_steps") && tr["dit_steps"].is_number() && tr["dit_steps"].get<int>() > 0)
-                           ? tr["dit_steps"].get<int>()
-                           : 20;
-        ev.dit_ok = (dit_lat <= policy.dit_turn_slo_for(h, st, k_dit_opt));
+        const int h = (tr.height > 0) ? tr.height : 512;
+        const int st = (tr.dit_steps > 0) ? tr.dit_steps : default_dit_steps_for(policy, h);
+        const double cap = policy.dit_turn_slo_for(h, st, k_dit_opt) * slo_time_scale;
+        ev.dit_ok = (tr.dit_ms.value_or(0.0) <= cap);
     }
     ev.joint_ok = (!ev.has_ar || ev.ar_ok) && (!ev.has_dit || ev.dit_ok);
     return ev;
@@ -272,33 +278,24 @@ struct SessionTurnCounts {
 
 SessionTurnCounts evaluate_session_turn_counts(
     const PolicyConfig& policy,
-    const nlohmann::json& out,
+    const SessionOutcomeInput& out,
     double ar_ttft_cap,
     double ar_tpot_cap,
     std::optional<double> k_dit_opt,
+    double slo_time_scale,
     bool fallback_session_joint_ok,
     bool fallback_session_ar_ok,
     bool fallback_session_dit_ok) {
     SessionTurnCounts c;
-    const bool has_trecs = out.contains("turn_records") && out["turn_records"].is_array() && !out["turn_records"].empty();
-    const size_t n_rec = has_trecs ? out["turn_records"].size() : 0;
-    const size_t raw_planned =
-        (out.contains("planned_turns") && out["planned_turns"].is_number() && out["planned_turns"].get<int>() > 0)
-            ? static_cast<size_t>(out["planned_turns"].get<int>())
-            : 0;
-    if (!has_trecs) {
+    const size_t n_rec = out.turn_records.size();
+    const size_t raw_planned = (out.planned_turns > 0) ? static_cast<size_t>(out.planned_turns) : 0;
+    if (n_rec == 0) {
         c.planned_turns = std::max<size_t>(1, raw_planned);
-        const bool is_ok = (out.value("status", "error") == "ok");
+        const bool is_ok = (out.status == "ok");
         c.completed_turns = is_ok ? c.planned_turns : 0;
         c.joint_ok_turns = (is_ok && fallback_session_joint_ok) ? c.planned_turns : 0;
-        const auto ttfts = parse_double_array(out, "ar_ttfts_ms");
-        const auto dits = parse_double_array(out, "dit_turns_ms");
-        c.planned_ar_turns = (out.contains("planned_ar_turns") && out["planned_ar_turns"].is_number())
-                                 ? static_cast<size_t>(std::max(0, out["planned_ar_turns"].get<int>()))
-                                 : ttfts.size();
-        c.planned_dit_turns = (out.contains("planned_dit_turns") && out["planned_dit_turns"].is_number())
-                                  ? static_cast<size_t>(std::max(0, out["planned_dit_turns"].get<int>()))
-                                  : dits.size();
+        c.planned_ar_turns = (out.planned_ar_turns >= 0) ? static_cast<size_t>(out.planned_ar_turns) : out.ar_ttfts_ms.size();
+        c.planned_dit_turns = (out.planned_dit_turns >= 0) ? static_cast<size_t>(out.planned_dit_turns) : out.dit_turns_ms.size();
         c.ar_ok_turns = (is_ok && fallback_session_ar_ok) ? c.planned_ar_turns : 0;
         c.dit_ok_turns = (is_ok && fallback_session_dit_ok) ? c.planned_dit_turns : 0;
         return c;
@@ -306,9 +303,8 @@ SessionTurnCounts evaluate_session_turn_counts(
 
     size_t seen_ar = 0;
     size_t seen_dit = 0;
-    for (const auto& tr : out["turn_records"]) {
-        if (!tr.is_object()) continue;
-        const TurnSloEval ev = evaluate_turn_record_slo(policy, tr, ar_ttft_cap, ar_tpot_cap, k_dit_opt);
+    for (const auto& tr : out.turn_records) {
+        const TurnSloEval ev = evaluate_turn_record_slo(policy, tr, ar_ttft_cap, ar_tpot_cap, k_dit_opt, slo_time_scale);
         if (ev.is_ok) ++c.completed_turns;
         if (ev.joint_ok) ++c.joint_ok_turns;
         if (ev.has_ar) {
@@ -320,19 +316,96 @@ SessionTurnCounts evaluate_session_turn_counts(
             if (ev.dit_ok) ++c.dit_ok_turns;
         }
     }
-    // D2: Planned turns form the denominator; OOM turn and all unexecuted follow-up turns count as misses.
+    // D2: Planned turns form the denominator; OOM turns and unexecuted follow-up turns count as misses.
     c.planned_turns = std::max(n_rec, raw_planned);
-    const size_t raw_ar =
-        (out.contains("planned_ar_turns") && out["planned_ar_turns"].is_number() && out["planned_ar_turns"].get<int>() >= 0)
-            ? static_cast<size_t>(out["planned_ar_turns"].get<int>())
-            : seen_ar;
-    const size_t raw_dit =
-        (out.contains("planned_dit_turns") && out["planned_dit_turns"].is_number() && out["planned_dit_turns"].get<int>() >= 0)
-            ? static_cast<size_t>(out["planned_dit_turns"].get<int>())
-            : seen_dit;
+    const size_t raw_ar = (out.planned_ar_turns >= 0) ? static_cast<size_t>(out.planned_ar_turns) : seen_ar;
+    const size_t raw_dit = (out.planned_dit_turns >= 0) ? static_cast<size_t>(out.planned_dit_turns) : seen_dit;
     c.planned_ar_turns = std::max(seen_ar, raw_ar);
     c.planned_dit_turns = std::max(seen_dit, raw_dit);
     return c;
+}
+
+struct PreparedTransition {
+    CPTGRequestSpec req;
+    double est_dit_ms = 0.0;
+    int gamma = 1;
+    bool is_tight_mot = true;
+};
+
+PreparedTransition prepare_transition_request(
+    const PolicyConfig& policy,
+    const OperatorLatencyProfile& op_prof,
+    const std::string& session_id,
+    int turn_idx,
+    int attempt,
+    int src_gpu,
+    int64_t state_bytes,
+    const std::string& modality_plan,
+    int height,
+    int dit_steps,
+    bool has_more_edits,
+    std::optional<int64_t> gen_expert_bytes_override,
+    std::optional<double> dit_step1_ms_override,
+    std::optional<double> est_dit_ms_override) {
+    PreparedTransition prep;
+    const std::string arch = policy.cptg_architecture();
+    prep.is_tight_mot = (arch == "tight_mot");
+    const std::string fam = (arch == "bridge_mllm_dit") ? "internvl_u" : "bagel";
+    prep.gamma = (modality_plan == "dit_edit" && has_more_edits) ? 2 : 1;
+
+    prep.req.req_id = session_id + "_t" + std::to_string(turn_idx) + "_a" + std::to_string(attempt);
+    prep.req.src_gpu = src_gpu;
+    prep.req.architecture = arch;
+    prep.req.gen_expert_bytes = gen_expert_bytes_override.value_or(op_prof.expert_bytes(fam));
+    prep.req.dit_step1_ms = dit_step1_ms_override.value_or(op_prof.step_ms(fam, height));
+    prep.req.dit_total_steps = dit_steps;
+    prep.req.resolution = height;
+    prep.req.interleaved_roundtrip_gamma = prep.gamma;
+    if (arch == "bridge_mllm_dit") {
+        const int64_t eff = std::max<int64_t>(state_bytes, 64LL * 1024LL);
+        prep.req.kv_bytes = eff;
+        prep.req.bridge_bytes = eff;
+    } else {
+        prep.req.kv_bytes = std::max<int64_t>(state_bytes, 1LL * kMiB);
+    }
+
+    const std::string est_fam = (policy.model_family == "internvl_u") ? "internvl_u" : "bagel";
+    prep.est_dit_ms = est_dit_ms_override.value_or(op_prof.unloaded_dit_turn_ms(est_fam, height, dit_steps));
+    return prep;
+}
+
+TurnTransitionPlan finalize_transition_plan(
+    RouteDecision dec,
+    const std::string& ship_mode,
+    const PreparedTransition& prep,
+    const std::string& base_ctx_id,
+    int turn_idx,
+    int src_gpu,
+    bool has_more_turns) {
+    const int dst_gpu = dec.dst_gpu;
+    const bool ephemeral_gen_ctx = (ship_mode == "nccl_static" || ship_mode == "shm_static");
+    const bool needs_return_ship = ephemeral_gen_ctx && has_more_turns && prep.is_tight_mot;
+    bool release_src = false;
+    if (ship_mode == "nccl_dual") {
+        release_src = true;
+    } else if (ephemeral_gen_ctx) {
+        release_src = prep.is_tight_mot ? true : (!has_more_turns);
+    }
+
+    TurnTransitionPlan out;
+    out.decision = std::move(dec);
+    out.ship_mode = ship_mode;
+    out.src_gpu = src_gpu;
+    out.dst_gpu = dst_gpu;
+    out.est_dit_ms = prep.est_dit_ms;
+    out.reserved_kv_bytes = (ship_mode != "none" && dst_gpu != src_gpu) ? prep.req.effective_state_bytes() : 0;
+    out.interleaved_roundtrip_gamma = prep.gamma;
+    out.ephemeral_gen_ctx = ephemeral_gen_ctx;
+    out.needs_return_ship = needs_return_ship;
+    out.release_src_on_fwd = release_src;
+    out.include_cfg_dup_on_wire = (ship_mode == "shm_static");
+    out.dit_ctx_id = ephemeral_gen_ctx ? (base_ctx_id + "_gen_t" + std::to_string(turn_idx)) : base_ctx_id;
+    return out;
 }
 
 }  // namespace
@@ -345,12 +418,159 @@ nlohmann::json TurnTransitionPlan::to_json() const {
         {"dst_gpu", dst_gpu},
         {"est_dit_ms", est_dit_ms},
         {"reserved_kv_bytes", reserved_kv_bytes},
+        {"interleaved_roundtrip_gamma", interleaved_roundtrip_gamma},
         {"ephemeral_gen_ctx", ephemeral_gen_ctx},
         {"needs_return_ship", needs_return_ship},
         {"release_src_on_fwd", release_src_on_fwd},
         {"include_cfg_dup_on_wire", include_cfg_dup_on_wire},
         {"dit_ctx_id", dit_ctx_id},
     };
+}
+
+TurnRecordInput TurnRecordInput::from_json(const nlohmann::json& j, int default_turn_idx) {
+    TurnRecordInput tr;
+    tr.turn_idx = default_turn_idx;
+    if (!j.is_object()) {
+        return tr;
+    }
+    tr.turn_idx = j.value("turn_idx", default_turn_idx);
+    tr.modality_plan = j.value("modality_plan", "");
+    tr.status = j.value("status", "ok");
+    tr.ar_ttft_ms = first_number_opt(j, {"ar_ttft_ms", "ttft_ms"});
+    tr.ar_tpots_ms = parse_double_array(j, "ar_tpots_ms");
+    tr.ar_tpot_p95_ms = first_number_opt(j, {"ar_tpot_p95_ms", "ar_tpot_ms"});
+    tr.ar_tpot_mean_ms = first_number_opt(j, {"ar_tpot_mean_ms"});
+    tr.ar_tpot_strict_max_ms = first_number_opt(j, {"ar_tpot_strict_max_ms"});
+    tr.dit_ms = first_number_opt(j, {"dit_ms", "dit_turn_ms", "dit_lat_ms"});
+    tr.height = (j.contains("height") && j["height"].is_number()) ? j["height"].get<int>() : 0;
+    tr.dit_steps = (j.contains("dit_steps") && j["dit_steps"].is_number()) ? j["dit_steps"].get<int>() : 0;
+    if (j.contains("kv_mib") && j["kv_mib"].is_number()) {
+        tr.kv_mib = j["kv_mib"].get<double>();
+    } else if (j.contains("kv_bytes") && j["kv_bytes"].is_number()) {
+        tr.kv_mib = j["kv_bytes"].get<double>() / static_cast<double>(kMiB);
+    }
+    return tr;
+}
+
+SessionOutcomeInput SessionOutcomeInput::from_json(const nlohmann::json& j) {
+    SessionOutcomeInput o;
+    if (!j.is_object()) {
+        return o;
+    }
+    o.status = j.value("status", "error");
+    if (j.contains("phase_label") && j["phase_label"].is_string()) {
+        o.phase_label = j["phase_label"].get<std::string>();
+    }
+    if (j.contains("arrival_offset_s") && j["arrival_offset_s"].is_number()) {
+        o.arrival_offset_s = j["arrival_offset_s"].get<double>();
+    }
+    if (j.contains("e2e_ms") && j["e2e_ms"].is_number()) {
+        o.e2e_ms = j["e2e_ms"].get<double>();
+    }
+    if (j.contains("active_jct_ms") && j["active_jct_ms"].is_number()) {
+        o.active_jct_ms = std::max(0.0, j["active_jct_ms"].get<double>());
+    }
+    if (j.contains("think_time_ms") && j["think_time_ms"].is_number()) {
+        o.think_time_ms = j["think_time_ms"].get<double>();
+    }
+    if (j.contains("planned_turns") && j["planned_turns"].is_number()) {
+        o.planned_turns = j["planned_turns"].get<int>();
+    }
+    if (j.contains("planned_ar_turns") && j["planned_ar_turns"].is_number()) {
+        o.planned_ar_turns = j["planned_ar_turns"].get<int>();
+    }
+    if (j.contains("planned_dit_turns") && j["planned_dit_turns"].is_number()) {
+        o.planned_dit_turns = j["planned_dit_turns"].get<int>();
+    }
+    o.ar_ttfts_ms = parse_double_array(j, "ar_ttfts_ms");
+    o.ar_tpots_ms = parse_double_array(j, "ar_tpots_ms");
+    o.ar_turn_tpots_ms = parse_nested_double_array(j, "ar_turn_tpots_ms");
+    o.dit_turns_ms = parse_double_array(j, "dit_turns_ms");
+    o.dit_turn_heights = parse_int_array(j, "dit_turn_heights");
+    o.dit_turn_steps = parse_int_array(j, "dit_turn_steps");
+
+    if (j.contains("ar_slo_met") && j["ar_slo_met"].is_boolean()) {
+        o.ar_slo_met = j["ar_slo_met"].get<bool>();
+    }
+    if (j.contains("ar_slo_mean_tpot_met") && j["ar_slo_mean_tpot_met"].is_boolean()) {
+        o.ar_slo_mean_tpot_met = j["ar_slo_mean_tpot_met"].get<bool>();
+    }
+    if (j.contains("ar_slo_strict_max_tpot_met") && j["ar_slo_strict_max_tpot_met"].is_boolean()) {
+        o.ar_slo_strict_max_tpot_met = j["ar_slo_strict_max_tpot_met"].get<bool>();
+    }
+    if (j.contains("dit_slo_met") && j["dit_slo_met"].is_boolean()) {
+        o.dit_slo_met = j["dit_slo_met"].get<bool>();
+    }
+    if (j.contains("joint_slo_met") && j["joint_slo_met"].is_boolean()) {
+        o.joint_slo_met = j["joint_slo_met"].get<bool>();
+    }
+    if (j.contains("resident_alpha_sample") && j["resident_alpha_sample"].is_number()) {
+        o.resident_alpha_sample = j["resident_alpha_sample"].get<double>();
+    }
+    o.path_a_ships = j.value("path_a_ships", 0);
+    o.path_b_morphs = j.value("path_b_morphs", 0);
+    o.preempted_ar_turns = j.value("preempted_ar_turns", 0);
+    o.total_yields = j.value("total_yields", 0);
+    o.oom_retries = j.value("oom_retries", 0);
+    o.cross_node_ships = j.value("cross_node_ships", 0);
+    if (j.contains("cross_node_ship_bytes_list") && j["cross_node_ship_bytes_list"].is_array()) {
+        for (const auto& b : j["cross_node_ship_bytes_list"]) {
+            if (b.is_number()) {
+                o.max_cross_node_ship_bytes = std::max(o.max_cross_node_ship_bytes, b.get<int64_t>());
+            }
+        }
+    }
+    if (j.contains("turn_records") && j["turn_records"].is_array()) {
+        o.turn_records.reserve(j["turn_records"].size());
+        for (size_t pos = 0; pos < j["turn_records"].size(); ++pos) {
+            if (j["turn_records"][pos].is_object()) {
+                o.turn_records.push_back(TurnRecordInput::from_json(j["turn_records"][pos], static_cast<int>(pos)));
+            }
+        }
+    }
+    return o;
+}
+
+WorkerStatsInput WorkerStatsInput::from_json(const nlohmann::json& st) {
+    WorkerStatsInput w;
+    if (!st.is_object()) {
+        return w;
+    }
+    const double nvml_pk = first_number_opt(st, {"nvml_peak_used_mib"}).value_or(0.0);
+    const double comb = (nvml_pk > 0.0)
+                            ? nvml_pk
+                            : first_number_opt(st, {"combined_physical_mib", "peak_reserved_mib"}).value_or(0.0);
+    const double pt = first_number_opt(st, {"pytorch_reserved_mib", "peak_reserved_mib"}).value_or(0.0);
+    w.nvml_peak_used_mib = (nvml_pk > 0.0) ? nvml_pk : comb;
+    w.combined_physical_mib = comb;
+    w.pytorch_reserved_mib = pt;
+
+    if (st.contains("vmm_physical_pool_mib") && st["vmm_physical_pool_mib"].is_number()) {
+        w.vmm_physical_pool_mib = st["vmm_physical_pool_mib"].get<double>();
+    } else if (st.contains("vmm_stats") && st["vmm_stats"].is_object() &&
+               st["vmm_stats"].contains("pool_total_bytes") && st["vmm_stats"]["pool_total_bytes"].is_number()) {
+        w.vmm_physical_pool_mib = st["vmm_stats"]["pool_total_bytes"].get<double>() / static_cast<double>(kMiB);
+    }
+
+    w.oom_count = st.value("oom_count", 0);
+    if (st.contains("kv_host_swap_outs") && st["kv_host_swap_outs"].is_number()) {
+        w.kv_host_swap_outs = st["kv_host_swap_outs"].get<int>();
+    } else if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
+        w.kv_host_swap_outs = st["vmm_stats"].value("kv_swap_outs_total", 0);
+    }
+    if (st.contains("kv_host_swap_ins") && st["kv_host_swap_ins"].is_number()) {
+        w.kv_host_swap_ins = st["kv_host_swap_ins"].get<int>();
+    } else if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
+        w.kv_host_swap_ins = st["vmm_stats"].value("kv_swap_ins_total", 0);
+    }
+    if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
+        const auto& vs = st["vmm_stats"];
+        w.overflow_creates = vs.value("overflow_creates", 0);
+        w.super_to_fine_carves = vs.value("super_to_fine_carves", 0);
+        w.expert_auto_evictions_for_kv = vs.value("expert_auto_evictions_for_kv", 0);
+        w.expert_auto_evictions_for_transient = vs.value("expert_auto_evictions_for_transient", 0);
+    }
+    return w;
 }
 
 MorphControlEngine::MorphControlEngine(
@@ -361,17 +581,31 @@ MorphControlEngine::MorphControlEngine(
       topology_(std::move(topology)),
       router_(router ? std::move(router) : std::make_shared<DualPathMorphRouter>(topology_)) {}
 
+PreemptEdfController MorphControlEngine::make_edf_controller(
+    int num_layers,
+    double tpot_slo_ms,
+    double init_layer_ms,
+    double init_ar_step_ms,
+    double time_scale,
+    int max_microbatch_cap) noexcept {
+    constexpr double kDefaultGuardMs = 14.0;
+    const double eff_scale = (time_scale > 0.0) ? time_scale : 1.0;
+    return PreemptEdfController(
+        num_layers,
+        tpot_slo_ms,
+        kDefaultGuardMs * eff_scale,
+        init_layer_ms,
+        init_ar_step_ms,
+        max_microbatch_cap);
+}
+
 double MorphControlEngine::deterministic_think_s(
     const std::string& session_id,
     int turn_idx,
     double lo_s,
     double hi_s) {
-    if (hi_s <= lo_s) {
-        return std::max(0.0, lo_s);
-    }
-    const uint32_t h = md5_prefix_u32(session_id + ":" + std::to_string(turn_idx));
-    const double frac = static_cast<double>(h % 10000U) / 10000.0;
-    return lo_s + frac * (hi_s - lo_s);
+    return sample_think_dist_s(
+        session_id + ":" + std::to_string(turn_idx), lo_s, hi_s, "uniform", 0.0, 0.0);
 }
 
 double MorphControlEngine::deterministic_think_ms_sim(
@@ -379,14 +613,9 @@ double MorphControlEngine::deterministic_think_ms_sim(
     int turn_idx,
     double lo_s,
     double hi_s) {
-    const double lo_ms = lo_s * 1000.0;
-    const double hi_ms = hi_s * 1000.0;
-    if (hi_ms <= lo_ms) {
-        return std::max(0.0, lo_ms);
-    }
-    const uint32_t h = md5_prefix_u32("sim_" + std::to_string(sid) + "_" + std::to_string(turn_idx));
-    const double frac = static_cast<double>(h % 10000U) / 10000.0;
-    return lo_ms + frac * (hi_ms - lo_ms);
+    return sample_think_dist_s(
+               "sim_" + std::to_string(sid) + "_" + std::to_string(turn_idx), lo_s, hi_s, "uniform", 0.0, 0.0) *
+           1000.0;
 }
 
 double MorphControlEngine::deterministic_think_dist_s(
@@ -397,26 +626,8 @@ double MorphControlEngine::deterministic_think_dist_s(
     const std::string& dist,
     double median_s,
     double sigma) {
-    if (hi_s <= lo_s) {
-        return std::max(0.0, lo_s);
-    }
-    const double eff_lo = std::max(0.0, lo_s);
-    const double eff_hi = std::max(eff_lo, hi_s);
-    if (dist == "constant") {
-        return std::clamp(std::max(0.0, median_s), eff_lo, eff_hi);
-    }
-    if (dist == "uniform") {
-        return deterministic_think_s(session_id, turn_idx, lo_s, hi_s);
-    }
-    constexpr double kPi = 3.14159265358979323846;
-    const std::string key = session_id + ":" + std::to_string(turn_idx);
-    const uint32_t h1 = md5_prefix_u32(key + ":a");
-    const uint32_t h2 = md5_prefix_u32(key + ":b");
-    const double u1 = std::clamp(static_cast<double>(h1) / 4294967296.0, 1e-6, 1.0 - 1e-6);
-    const double u2 = std::clamp(static_cast<double>(h2) / 4294967296.0, 1e-6, 1.0 - 1e-6);
-    const double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * kPi * u2);
-    const double val = std::max(1e-6, median_s) * std::exp(std::max(0.0, sigma) * z);
-    return std::clamp(val, eff_lo, eff_hi);
+    return sample_think_dist_s(
+        session_id + ":" + std::to_string(turn_idx), lo_s, hi_s, dist, median_s, sigma);
 }
 
 double MorphControlEngine::deterministic_think_dist_ms_sim(
@@ -427,26 +638,9 @@ double MorphControlEngine::deterministic_think_dist_ms_sim(
     const std::string& dist,
     double median_s,
     double sigma) {
-    if (hi_s <= lo_s) {
-        return std::max(0.0, lo_s) * 1000.0;
-    }
-    const double eff_lo = std::max(0.0, lo_s);
-    const double eff_hi = std::max(eff_lo, hi_s);
-    if (dist == "constant") {
-        return std::clamp(std::max(0.0, median_s), eff_lo, eff_hi) * 1000.0;
-    }
-    if (dist == "uniform") {
-        return deterministic_think_ms_sim(sid, turn_idx, lo_s, hi_s);
-    }
-    constexpr double kPi = 3.14159265358979323846;
-    const std::string key = "sim_" + std::to_string(sid) + "_" + std::to_string(turn_idx);
-    const uint32_t h1 = md5_prefix_u32(key + ":a");
-    const uint32_t h2 = md5_prefix_u32(key + ":b");
-    const double u1 = std::clamp(static_cast<double>(h1) / 4294967296.0, 1e-6, 1.0 - 1e-6);
-    const double u2 = std::clamp(static_cast<double>(h2) / 4294967296.0, 1e-6, 1.0 - 1e-6);
-    const double z = std::sqrt(-2.0 * std::log(u1)) * std::cos(2.0 * kPi * u2);
-    const double val = std::max(1e-6, median_s) * std::exp(std::max(0.0, sigma) * z);
-    return std::clamp(val, eff_lo, eff_hi) * 1000.0;
+    return sample_think_dist_s(
+               "sim_" + std::to_string(sid) + "_" + std::to_string(turn_idx), lo_s, hi_s, dist, median_s, sigma) *
+           1000.0;
 }
 
 TurnTransitionPlan MorphControlEngine::plan_turn_transition(
@@ -463,65 +657,81 @@ TurnTransitionPlan MorphControlEngine::plan_turn_transition(
     bool has_more_edits,
     double now_ms,
     const std::map<int, bool>& gpu_busy) {
-    const std::string arch = policy_.cptg_architecture();
-    const bool is_tight_mot = (arch == "tight_mot");
-    const std::string fam = (arch == "bridge_mllm_dit") ? "internvl_u" : "bagel";
-    const auto& op_prof = default_operator_profile();
-    const int gamma = (modality_plan == "dit_edit" && has_more_edits) ? 2 : 1;
+    const PreparedTransition prep = prepare_transition_request(
+        policy_,
+        router_->operator_profile(),
+        session_id,
+        turn_idx,
+        attempt,
+        src_gpu,
+        state_bytes,
+        modality_plan,
+        height,
+        dit_steps,
+        has_more_edits,
+        std::nullopt,
+        std::nullopt,
+        std::nullopt);
 
-    CPTGRequestSpec req;
-    req.req_id = session_id + "_t" + std::to_string(turn_idx) + "_a" + std::to_string(attempt);
-    req.src_gpu = src_gpu;
-    req.architecture = arch;
-    req.gen_expert_bytes = op_prof.expert_bytes(fam);
-    req.dit_step1_ms = op_prof.step_ms(fam, height);
-    req.dit_total_steps = dit_steps;
-    req.resolution = height;
-    req.interleaved_roundtrip_gamma = gamma;
-    if (arch == "bridge_mllm_dit") {
-        const int64_t eff = std::max<int64_t>(state_bytes, 64LL * 1024LL);
-        req.kv_bytes = eff;
-        req.bridge_bytes = eff;
-    } else {
-        req.kv_bytes = std::max<int64_t>(state_bytes, 1LL * kMiB);
-    }
-
-    const std::string est_fam = (policy_.model_family == "internvl_u") ? "internvl_u" : "bagel";
-    const double est_dit_ms = op_prof.unloaded_dit_turn_ms(est_fam, height, dit_steps);
     auto [dec, ship_mode] = router_->plan_and_reserve_transition(
         policy_.routing_mode,
         policy_.static_und_ranks,
         policy_.static_gen_ranks,
-        req,
-        est_dit_ms,
+        prep.req,
+        prep.est_dit_ms,
         nullptr,
         gpu_busy,
         policy_.use_h2d_pacer,
         now_ms);
 
-    const int dst_gpu = dec.dst_gpu;
-    const bool ephemeral_gen_ctx = (ship_mode == "nccl_static" || ship_mode == "shm_static");
-    const bool needs_return_ship = ephemeral_gen_ctx && has_more_turns && is_tight_mot;
-    bool release_src = false;
-    if (ship_mode == "nccl_dual") {
-        release_src = true;
-    } else if (ephemeral_gen_ctx) {
-        release_src = is_tight_mot ? true : (!has_more_turns);
-    }
+    return finalize_transition_plan(std::move(dec), ship_mode, prep, base_ctx_id, turn_idx, src_gpu, has_more_turns);
+}
 
-    TurnTransitionPlan out;
-    out.decision = std::move(dec);
-    out.ship_mode = ship_mode;
-    out.src_gpu = src_gpu;
-    out.dst_gpu = dst_gpu;
-    out.est_dit_ms = est_dit_ms;
-    out.reserved_kv_bytes = (ship_mode != "none" && dst_gpu != src_gpu) ? req.effective_state_bytes() : 0;
-    out.ephemeral_gen_ctx = ephemeral_gen_ctx;
-    out.needs_return_ship = needs_return_ship;
-    out.release_src_on_fwd = release_src;
-    out.include_cfg_dup_on_wire = (ship_mode == "shm_static");
-    out.dit_ctx_id = ephemeral_gen_ctx ? (base_ctx_id + "_gen_t" + std::to_string(turn_idx)) : base_ctx_id;
-    return out;
+TurnTransitionPlan MorphControlEngine::plan_turn_transition_readonly(
+    const std::string& session_id,
+    const std::string& base_ctx_id,
+    int turn_idx,
+    int attempt,
+    int src_gpu,
+    int64_t state_bytes,
+    const std::string& modality_plan,
+    int height,
+    int dit_steps,
+    bool has_more_turns,
+    bool has_more_edits,
+    double now_ms,
+    const std::map<int, WorkerState>* ext_workers,
+    const std::map<int, bool>& gpu_busy,
+    std::optional<int64_t> gen_expert_bytes_override,
+    std::optional<double> dit_step1_ms_override,
+    std::optional<double> est_dit_ms_override) const {
+    const PreparedTransition prep = prepare_transition_request(
+        policy_,
+        router_->operator_profile(),
+        session_id,
+        turn_idx,
+        attempt,
+        src_gpu,
+        state_bytes,
+        modality_plan,
+        height,
+        dit_steps,
+        has_more_edits,
+        gen_expert_bytes_override,
+        dit_step1_ms_override,
+        est_dit_ms_override);
+
+    auto [dec, ship_mode] = router_->plan_transition_readonly(
+        policy_.routing_mode,
+        policy_.static_und_ranks,
+        policy_.static_gen_ranks,
+        prep.req,
+        prep.est_dit_ms,
+        ext_workers,
+        gpu_busy,
+        now_ms);
+
+    return finalize_transition_plan(std::move(dec), ship_mode, prep, base_ctx_id, turn_idx, src_gpu, has_more_turns);
 }
 
 nlohmann::json MorphControlEngine::evaluate_session_slos(
@@ -531,20 +741,17 @@ nlohmann::json MorphControlEngine::evaluate_session_slos(
     const std::vector<double>& dit_turns_ms,
     const std::vector<int>& dit_heights,
     const std::vector<int>& dit_steps,
-    const std::vector<std::vector<double>>& ar_turn_tpots_ms) {
+    const std::vector<std::vector<double>>& ar_turn_tpots_ms,
+    double slo_time_scale) {
+    const double scale = (slo_time_scale > 0.0) ? slo_time_scale : 1.0;
     const ArTpotFlags ar_flags = eval_ar_slos(
-        ar_ttfts_ms, ar_tpots_ms, ar_turn_tpots_ms, policy.ar_ttft_slo_ms, policy.ar_tpot_slo_ms);
+        ar_ttfts_ms,
+        ar_tpots_ms,
+        ar_turn_tpots_ms,
+        policy.ar_ttft_slo_ms * scale,
+        policy.ar_tpot_slo_ms * scale);
     const bool ar_ok = select_ar_slo_by_mode(ar_flags, policy.ar_tpot_slo_mode);
-
-    bool dit_ok = true;
-    for (size_t i = 0; i < dit_turns_ms.size(); ++i) {
-        const int h = (i < dit_heights.size()) ? dit_heights[i] : 512;
-        const int st = (i < dit_steps.size()) ? dit_steps[i] : 20;
-        if (dit_turns_ms[i] > policy.dit_turn_slo_for(h, st)) {
-            dit_ok = false;
-            break;
-        }
-    }
+    const bool dit_ok = evaluate_dit_turns_ok(policy, dit_turns_ms, dit_heights, dit_steps, std::nullopt, scale);
     return {
         {"ar_slo_met", ar_ok},
         {"ar_slo_p95_tpot_met", ar_flags.p95_ok},
@@ -562,70 +769,55 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     double wall_seconds,
     double host_shmem_delta_gib,
     const nlohmann::json& outcomes_array,
-    const nlohmann::json& worker_stats_array) {
+    const nlohmann::json& worker_stats_array,
+    double slo_time_scale,
+    const nlohmann::json& sim_extra_fields,
+    bool include_sessions) {
+    const double scale = (slo_time_scale > 0.0) ? slo_time_scale : 1.0;
+    const double eff_ar_ttft_slo_ms = policy.ar_ttft_slo_ms * scale;
+    const double eff_ar_tpot_slo_ms = policy.ar_tpot_slo_ms * scale;
+
     double peak_res_mib = 0.0;
     double peak_nvml_mib = 0.0;
     double peak_pytorch_res_mib = 0.0;
+    double max_vmm_pool_mib = 0.0;
     int worker_ooms = 0;
     int kv_host_swap_outs = 0;
+    int kv_host_swap_ins = 0;
     int overflow_creates = 0;
     int carves = 0;
     int evict_kv = 0;
     int evict_tr = 0;
 
     if (worker_stats_array.is_array()) {
-        for (const auto& st : worker_stats_array) {
-            const double nvml_pk =
-                (st.contains("nvml_peak_used_mib") && st["nvml_peak_used_mib"].is_number())
-                    ? st["nvml_peak_used_mib"].get<double>()
-                    : 0.0;
-            const double comb =
-                (nvml_pk > 0.0)
-                    ? nvml_pk
-                    : ((st.contains("combined_physical_mib") && st["combined_physical_mib"].is_number())
-                           ? st["combined_physical_mib"].get<double>()
-                           : ((st.contains("peak_reserved_mib") && st["peak_reserved_mib"].is_number())
-                                  ? st["peak_reserved_mib"].get<double>()
-                                  : 0.0));
-            const double pt =
-                (st.contains("pytorch_reserved_mib") && st["pytorch_reserved_mib"].is_number())
-                    ? st["pytorch_reserved_mib"].get<double>()
-                    : ((st.contains("peak_reserved_mib") && st["peak_reserved_mib"].is_number())
-                           ? st["peak_reserved_mib"].get<double>()
-                           : 0.0);
-            peak_res_mib = std::max(peak_res_mib, comb);
-            peak_nvml_mib = std::max(peak_nvml_mib, (nvml_pk > 0.0) ? nvml_pk : comb);
-            peak_pytorch_res_mib = std::max(peak_pytorch_res_mib, pt);
-            worker_ooms += st.value("oom_count", 0);
-            if (st.contains("kv_host_swap_outs") && st["kv_host_swap_outs"].is_number()) {
-                kv_host_swap_outs += st["kv_host_swap_outs"].get<int>();
-            } else if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
-                kv_host_swap_outs += st["vmm_stats"].value("kv_swap_outs_total", 0);
-            }
-            if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
-                const auto& vs = st["vmm_stats"];
-                overflow_creates += vs.value("overflow_creates", 0);
-                carves += vs.value("super_to_fine_carves", 0);
-                evict_kv += vs.value("expert_auto_evictions_for_kv", 0);
-                evict_tr += vs.value("expert_auto_evictions_for_transient", 0);
-            }
+        for (const auto& raw_st : worker_stats_array) {
+            const WorkerStatsInput ws = WorkerStatsInput::from_json(raw_st);
+            peak_res_mib = std::max(peak_res_mib, ws.combined_physical_mib);
+            peak_nvml_mib = std::max(peak_nvml_mib, ws.nvml_peak_used_mib);
+            peak_pytorch_res_mib = std::max(peak_pytorch_res_mib, ws.pytorch_reserved_mib);
+            max_vmm_pool_mib = std::max(max_vmm_pool_mib, ws.vmm_physical_pool_mib);
+            worker_ooms += ws.oom_count;
+            kv_host_swap_outs += ws.kv_host_swap_outs;
+            kv_host_swap_ins += ws.kv_host_swap_ins;
+            overflow_creates += ws.overflow_creates;
+            carves += ws.super_to_fine_carves;
+            evict_kv += ws.expert_auto_evictions_for_kv;
+            evict_tr += ws.expert_auto_evictions_for_transient;
         }
     }
 
     const size_t n_outcomes = outcomes_array.is_array() ? outcomes_array.size() : 0;
     const size_t n_tot = std::max<size_t>(1, n_outcomes);
 
-    std::vector<double> arrival_offsets(n_outcomes, 0.0);
+    std::vector<SessionOutcomeInput> parsed_outcomes;
+    parsed_outcomes.reserve(n_outcomes);
     double max_arrival = 0.0;
     for (size_t i = 0; i < n_outcomes; ++i) {
-        const auto& o = outcomes_array[i];
-        const double arr = (o.contains("arrival_offset_s") && o["arrival_offset_s"].is_number())
-                               ? o["arrival_offset_s"].get<double>()
-                               : 0.0;
-        arrival_offsets[i] = arr;
-        if (arr > max_arrival) {
-            max_arrival = arr;
+        SessionOutcomeInput o = SessionOutcomeInput::from_json(outcomes_array[i]);
+        if (o.arrival_offset_s > max_arrival) {
+            max_arrival = o.arrival_offset_s;
         }
+        parsed_outcomes.push_back(std::move(o));
     }
 
     std::vector<size_t> core_indices;
@@ -638,7 +830,8 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         const double ws_s = policy.warmup_window_s;
         const double we_s = policy.warmup_window_s + policy.steady_window_s;
         for (size_t i = 0; i < n_outcomes; ++i) {
-            if (arrival_offsets[i] >= ws_s - 1e-9 && arrival_offsets[i] <= we_s + 1e-9) {
+            const double arr = parsed_outcomes[i].arrival_offset_s;
+            if (arr >= ws_s - 1e-9 && arr <= we_s + 1e-9) {
                 core_indices.push_back(i);
             }
         }
@@ -661,8 +854,8 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
             core_indices.push_back(i);
         }
         if (!core_indices.empty()) {
-            win_start_s = arrival_offsets[core_indices.front()];
-            win_end_s = arrival_offsets[core_indices.back()];
+            win_start_s = parsed_outcomes[core_indices.front()].arrival_offset_s;
+            win_end_s = parsed_outcomes[core_indices.back()].arrival_offset_s;
         }
     }
 
@@ -678,15 +871,9 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     size_t oom_cnt = 0;
     size_t err_cnt = 0;
     size_t joint_cnt = 0;
-    size_t ar_cnt = 0;
-    size_t dit_cnt = 0;
     size_t total_planned_turns = 0;
     size_t total_completed_turns = 0;
     size_t total_turn_joint_ok = 0;
-    size_t total_planned_ar_turns = 0;
-    size_t total_turn_ar_ok = 0;
-    size_t total_planned_dit_turns = 0;
-    size_t total_turn_dit_ok = 0;
     int path_a_ships = 0;
     int path_b_morphs = 0;
     int preempted_ar = 0;
@@ -695,7 +882,7 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     int cross_node_ships = 0;
     int64_t max_xnode_bytes = 0;
 
-    // Steady-state core accumulators (D5: Turn-level and Session-level share the exact same core cohort)
+    // Steady-state core accumulators (D5: turn-level and session-level share the exact same core cohort)
     size_t core_ok_cnt = 0;
     size_t core_oom_cnt = 0;
     size_t core_err_cnt = 0;
@@ -747,16 +934,10 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     std::map<int, BucketAcc> ts_buckets;
 
     for (size_t i = 0; i < n_outcomes; ++i) {
-        const auto& o = outcomes_array[i];
-        const std::string status = o.value("status", "error");
-        const bool is_ok = (status == "ok");
-        const bool is_oom = (status == "oom");
+        const auto& o = parsed_outcomes[i];
+        const bool is_ok = (o.status == "ok");
+        const bool is_oom = (o.status == "oom");
         const bool core = (in_core[i] != 0);
-
-        const auto o_ttfts = parse_double_array(o, "ar_ttfts_ms");
-        const auto o_tpots = parse_double_array(o, "ar_tpots_ms");
-        const auto o_turn_tpots = parse_nested_double_array(o, "ar_turn_tpots_ms");
-        const auto o_dits = parse_double_array(o, "dit_turns_ms");
 
         bool ar_primary_ok = false;
         bool ar_mean_ok = false;
@@ -766,26 +947,16 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
 
         if (is_ok) {
             const ArTpotFlags ar_flags = eval_ar_slos(
-                o_ttfts, o_tpots, o_turn_tpots, policy.ar_ttft_slo_ms, policy.ar_tpot_slo_ms);
-            ar_primary_ok = (o.contains("ar_slo_met") && o["ar_slo_met"].is_boolean())
-                                ? o["ar_slo_met"].get<bool>()
-                                : select_ar_slo_by_mode(ar_flags, policy.ar_tpot_slo_mode);
-            ar_mean_ok = (o.contains("ar_slo_mean_tpot_met") && o["ar_slo_mean_tpot_met"].is_boolean())
-                             ? o["ar_slo_mean_tpot_met"].get<bool>()
-                             : ar_flags.mean_ok;
-            ar_strict_max_ok =
-                (o.contains("ar_slo_strict_max_tpot_met") && o["ar_slo_strict_max_tpot_met"].is_boolean())
-                    ? o["ar_slo_strict_max_tpot_met"].get<bool>()
-                    : ar_flags.strict_max_ok;
-            dit_ok = o.value("dit_slo_met", false);
-            joint_ok = (o.contains("joint_slo_met") && o["joint_slo_met"].is_boolean())
-                           ? o["joint_slo_met"].get<bool>()
-                           : (ar_primary_ok && dit_ok);
+                o.ar_ttfts_ms, o.ar_tpots_ms, o.ar_turn_tpots_ms, eff_ar_ttft_slo_ms, eff_ar_tpot_slo_ms);
+            ar_primary_ok = o.ar_slo_met.value_or(select_ar_slo_by_mode(ar_flags, policy.ar_tpot_slo_mode));
+            ar_mean_ok = o.ar_slo_mean_tpot_met.value_or(ar_flags.mean_ok);
+            ar_strict_max_ok = o.ar_slo_strict_max_tpot_met.value_or(ar_flags.strict_max_ok);
+            dit_ok = o.dit_slo_met.value_or(
+                evaluate_dit_turns_ok(policy, o.dit_turns_ms, o.dit_turn_heights, o.dit_turn_steps, std::nullopt, scale));
+            joint_ok = o.joint_slo_met.value_or(ar_primary_ok && dit_ok);
 
             ++ok_cnt;
             if (joint_ok) ++joint_cnt;
-            if (ar_primary_ok) ++ar_cnt;
-            if (dit_ok) ++dit_cnt;
 
             if (core) {
                 ++core_ok_cnt;
@@ -795,24 +966,19 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
                 if (ar_strict_max_ok) ++core_ar_strict_max_cnt;
                 if (dit_ok) ++core_dit_cnt;
 
-                if (o.contains("e2e_ms") && o["e2e_ms"].is_number()) {
-                    const double e2e = o["e2e_ms"].get<double>();
-                    core_ok_e2es.push_back(e2e);
-                    if (o.contains("active_jct_ms") && o["active_jct_ms"].is_number()) {
-                        core_ok_active_jcts.push_back(std::max(0.0, o["active_jct_ms"].get<double>()));
+                if (o.e2e_ms.has_value()) {
+                    core_ok_e2es.push_back(*o.e2e_ms);
+                    if (o.active_jct_ms.has_value()) {
+                        core_ok_active_jcts.push_back(*o.active_jct_ms);
                     } else {
-                        const double think_ms =
-                            (o.contains("think_time_ms") && o["think_time_ms"].is_number())
-                                ? o["think_time_ms"].get<double>()
-                                : 0.0;
-                        core_ok_active_jcts.push_back(std::max(0.0, e2e - think_ms));
+                        core_ok_active_jcts.push_back(std::max(0.0, *o.e2e_ms - o.think_time_ms));
                     }
-                } else if (o.contains("active_jct_ms") && o["active_jct_ms"].is_number()) {
-                    core_ok_active_jcts.push_back(std::max(0.0, o["active_jct_ms"].get<double>()));
+                } else if (o.active_jct_ms.has_value()) {
+                    core_ok_active_jcts.push_back(*o.active_jct_ms);
                 }
-                for (double v : o_ttfts) core_ok_ttfts.push_back(v);
-                for (double v : o_tpots) core_ok_tpots.push_back(v);
-                for (double v : o_dits) core_ok_dits.push_back(v);
+                for (double v : o.ar_ttfts_ms) core_ok_ttfts.push_back(v);
+                for (double v : o.ar_tpots_ms) core_ok_tpots.push_back(v);
+                for (double v : o.dit_turns_ms) core_ok_dits.push_back(v);
             }
         } else if (is_oom) {
             ++oom_cnt;
@@ -825,19 +991,16 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         const SessionTurnCounts tc = evaluate_session_turn_counts(
             policy,
             o,
-            policy.ar_ttft_slo_ms,
-            policy.ar_tpot_slo_ms,
+            eff_ar_ttft_slo_ms,
+            eff_ar_tpot_slo_ms,
             std::nullopt,
+            scale,
             joint_ok,
             ar_primary_ok,
             dit_ok);
         total_planned_turns += tc.planned_turns;
         total_completed_turns += tc.completed_turns;
         total_turn_joint_ok += tc.joint_ok_turns;
-        total_planned_ar_turns += tc.planned_ar_turns;
-        total_turn_ar_ok += tc.ar_ok_turns;
-        total_planned_dit_turns += tc.planned_dit_turns;
-        total_turn_dit_ok += tc.dit_ok_turns;
         if (core) {
             core_planned_turns += tc.planned_turns;
             core_completed_turns += tc.completed_turns;
@@ -848,100 +1011,69 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
             core_turn_dit_ok += tc.dit_ok_turns;
         }
 
-        const int o_ships = o.value("path_a_ships", 0);
-        const int o_morphs = o.value("path_b_morphs", 0);
-        const int o_yields = o.value("total_yields", 0);
-        path_a_ships += o_ships;
-        path_b_morphs += o_morphs;
-        preempted_ar += o.value("preempted_ar_turns", 0);
-        total_yields += o_yields;
-        oom_retries += o.value("oom_retries", 0);
-        cross_node_ships += o.value("cross_node_ships", 0);
-        if (o.contains("cross_node_ship_bytes_list") && o["cross_node_ship_bytes_list"].is_array()) {
-            for (const auto& b : o["cross_node_ship_bytes_list"]) {
-                if (b.is_number()) {
-                    max_xnode_bytes = std::max(max_xnode_bytes, b.get<int64_t>());
-                }
-            }
-        }
+        path_a_ships += o.path_a_ships;
+        path_b_morphs += o.path_b_morphs;
+        preempted_ar += o.preempted_ar_turns;
+        total_yields += o.total_yields;
+        oom_retries += o.oom_retries;
+        cross_node_ships += o.cross_node_ships;
+        max_xnode_bytes = std::max(max_xnode_bytes, o.max_cross_node_ship_bytes);
 
         // Per-turn stats strictly over steady-state core outcomes
-        if (core && o.contains("turn_records") && o["turn_records"].is_array()) {
-            const auto& trecs = o["turn_records"];
-            for (size_t pos = 0; pos < trecs.size(); ++pos) {
-                const auto& tr = trecs[pos];
-                if (!tr.is_object()) continue;
-                const int tidx = tr.value("turn_idx", static_cast<int>(pos));
-                auto& ta = turn_accs[tidx];
+        if (core) {
+            for (const auto& tr : o.turn_records) {
+                auto& ta = turn_accs[tr.turn_idx];
                 ++ta.total;
-                const std::string t_st = tr.value("status", "ok");
-                if (t_st == "ok") {
+                if (tr.status == "ok") {
                     ++ta.ok;
                     const TurnSloEval tev = evaluate_turn_record_slo(
-                        policy, tr, policy.ar_ttft_slo_ms, policy.ar_tpot_slo_ms, std::nullopt);
+                        policy, tr, eff_ar_ttft_slo_ms, eff_ar_tpot_slo_ms, std::nullopt, scale);
                     if (tev.joint_ok) {
                         ++ta.slo_met;
                     }
-                    if (tr.contains("ar_ttft_ms") && tr["ar_ttft_ms"].is_number()) {
-                        ta.ttfts.push_back(tr["ar_ttft_ms"].get<double>());
-                    } else if (tr.contains("ttft_ms") && tr["ttft_ms"].is_number()) {
-                        ta.ttfts.push_back(tr["ttft_ms"].get<double>());
+                    if (tr.ar_ttft_ms.has_value()) {
+                        ta.ttfts.push_back(*tr.ar_ttft_ms);
                     }
-                    if (tr.contains("ar_tpots_ms") && tr["ar_tpots_ms"].is_array()) {
-                        for (const auto& v : tr["ar_tpots_ms"]) {
-                            if (v.is_number()) ta.tpots.push_back(v.get<double>());
-                        }
-                    } else if (tr.contains("ar_tpot_p95_ms") && tr["ar_tpot_p95_ms"].is_number()) {
-                        ta.tpots.push_back(tr["ar_tpot_p95_ms"].get<double>());
-                    } else if (tr.contains("ar_tpot_ms") && tr["ar_tpot_ms"].is_number()) {
-                        ta.tpots.push_back(tr["ar_tpot_ms"].get<double>());
+                    if (!tr.ar_tpots_ms.empty()) {
+                        for (double v : tr.ar_tpots_ms) ta.tpots.push_back(v);
+                    } else if (tr.ar_tpot_p95_ms.has_value()) {
+                        ta.tpots.push_back(*tr.ar_tpot_p95_ms);
                     }
-                    if (tr.contains("dit_ms") && tr["dit_ms"].is_number()) {
-                        ta.dits.push_back(tr["dit_ms"].get<double>());
-                    } else if (tr.contains("dit_turn_ms") && tr["dit_turn_ms"].is_number()) {
-                        ta.dits.push_back(tr["dit_turn_ms"].get<double>());
-                    } else if (tr.contains("dit_lat_ms") && tr["dit_lat_ms"].is_number()) {
-                        ta.dits.push_back(tr["dit_lat_ms"].get<double>());
+                    if (tr.dit_ms.has_value()) {
+                        ta.dits.push_back(*tr.dit_ms);
                     }
-                    if (tr.contains("kv_mib") && tr["kv_mib"].is_number()) {
-                        ta.kv_mibs.push_back(tr["kv_mib"].get<double>());
-                    } else if (tr.contains("kv_bytes") && tr["kv_bytes"].is_number()) {
-                        ta.kv_mibs.push_back(tr["kv_bytes"].get<double>() / static_cast<double>(kMiB));
+                    if (tr.kv_mib.has_value()) {
+                        ta.kv_mibs.push_back(*tr.kv_mib);
                     }
-                } else if (t_st == "oom") {
+                } else if (tr.status == "oom") {
                     ++ta.oom;
                 }
             }
         }
 
-        // 10-second time-series bucket over ALL outcomes
-        const int bidx = static_cast<int>(std::floor(std::max(0.0, arrival_offsets[i]) / 10.0));
+        // 10-second time-series bucket over all outcomes
+        const int bidx = static_cast<int>(std::floor(std::max(0.0, o.arrival_offset_s) / 10.0));
         auto& ba = ts_buckets[bidx];
         ++ba.sessions;
         if (is_ok) ++ba.ok;
         if (is_oom) ++ba.oom;
         if (joint_ok) ++ba.slo_met;
-        if (o.contains("resident_alpha_sample") && o["resident_alpha_sample"].is_number()) {
-            ba.alpha_sum += o["resident_alpha_sample"].get<double>();
+        if (o.resident_alpha_sample.has_value()) {
+            ba.alpha_sum += *o.resident_alpha_sample;
             ++ba.alpha_cnt;
         }
-        ba.path_a_ships += o_ships;
-        ba.path_b_morphs += o_morphs;
-        ba.yields += o_yields;
-        if (o.contains("phase_label") && o["phase_label"].is_string()) {
-            const auto& pl = o["phase_label"].get_ref<const std::string&>();
-            if (!pl.empty()) {
-                ++ba.phase_counts[pl];
-            }
+        ba.path_a_ships += o.path_a_ships;
+        ba.path_b_morphs += o.path_b_morphs;
+        ba.yields += o.total_yields;
+        if (!o.phase_label.empty()) {
+            ++ba.phase_counts[o.phase_label];
         }
         if (is_ok) {
-            for (double v : o_ttfts) ba.ttfts.push_back(v);
-            for (double v : o_dits) ba.dits.push_back(v);
+            for (double v : o.ar_ttfts_ms) ba.ttfts.push_back(v);
+            for (double v : o.dit_turns_ms) ba.dits.push_back(v);
         }
     }
 
-    // Improper empirical CDF F_all(t) over steady-state core requests/turns (OOM/failed mass placed at +inf):
-    // if target quantile `q_pct > survival_pct`, F_all^{-1}(q) = +inf (`nullptr` in JSON).
     auto failure_aware_quantile = [](const std::vector<double>& survivors, size_t total_units, double q_pct) -> nlohmann::json {
         if (total_units == 0 || survivors.empty()) {
             return nullptr;
@@ -987,22 +1119,24 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
             : (static_cast<double>(core_planned_turns) / static_cast<double>(steady_sessions_cnt));
 
     const std::string eff_fam = (policy.model_family == "internvl_u") ? "internvl_u" : "bagel";
+    const int eff_steps_1024 = (eff_fam == "internvl_u") ? 16 : 20;
+
     nlohmann::json slo_curve = nlohmann::json::object();
     for (const auto& [k_label, k_val] : std::vector<std::pair<std::string, double>>{
              {"1.5x", 1.5}, {"2.0x", 2.0}, {"2.5x", 2.5}, {"3.0x", 3.0}}) {
         const auto slo_k = default_operator_profile().slo_thresholds_ms(k_val, eff_fam);
-        const double ttft_k = slo_k.at("ar_ttft_slo_ms");
-        const double tpot_k = slo_k.at("ar_tpot_slo_ms");
+        const double ttft_k = slo_k.at("ar_ttft_slo_ms") * scale;
+        const double tpot_k = slo_k.at("ar_tpot_slo_ms") * scale;
         size_t k_cnt = 0;
         size_t k_turn_ok = 0;
         size_t k_turn_tot = 0;
         for (size_t idx : core_indices) {
-            const bool s_ok = evaluate_outcome_at_k(policy, outcomes_array[idx], k_val, k_val);
+            const bool s_ok = evaluate_outcome_at_k(policy, parsed_outcomes[idx], k_val, k_val, scale);
             if (s_ok) {
                 ++k_cnt;
             }
             const auto tck = evaluate_session_turn_counts(
-                policy, outcomes_array[idx], ttft_k, tpot_k, k_val, s_ok, s_ok, s_ok);
+                policy, parsed_outcomes[idx], ttft_k, tpot_k, k_val, scale, s_ok, s_ok, s_ok);
             k_turn_ok += tck.joint_ok_turns;
             k_turn_tot += tck.planned_turns;
         }
@@ -1016,11 +1150,12 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
             {"goodput_rps", eff_rps},
             {"turn_attainment_pct", round_1(100.0 * t_frac)},
             {"turn_goodput_rps", t_rps},
+            {"dit_512_slo_ms", round_2(policy.dit_turn_slo_for(512, 20, k_val) * scale)},
+            {"dit_1024_slo_ms", round_2(policy.dit_turn_slo_for(1024, eff_steps_1024, k_val) * scale)},
         };
     }
 
-    // D4: Decoupled DiT sensitivity table (`k_AR` fixed at `policy.ar_ttft_slo_ms`/`policy.ar_tpot_slo_ms`,
-    // `k_DiT in {2.0x, 3.0x, 4.0x}`) reporting both Turn-level (primary) and Session-level attainment.
+    // D4: Decoupled DiT sensitivity table (`k_AR` fixed at policy AR thresholds, `k_DiT in {2.0x, 3.0x, 4.0x}`).
     nlohmann::json slo_curve_by_dit_k = nlohmann::json::object();
     for (const auto& [k_label, k_dit] : std::vector<std::pair<std::string, double>>{
              {"2.0x", 2.0}, {"3.0x", 3.0}, {"4.0x", 4.0}}) {
@@ -1028,27 +1163,26 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         size_t t_ok_cnt = 0;
         size_t t_tot_cnt = 0;
         for (size_t idx : core_indices) {
-            const bool s_ok = evaluate_outcome_at_k(policy, outcomes_array[idx], policy.slo_scale_k, k_dit);
+            const bool s_ok = evaluate_outcome_at_k(policy, parsed_outcomes[idx], policy.slo_scale_k, k_dit, scale);
             if (s_ok) {
                 ++s_ok_cnt;
             }
             const auto tck = evaluate_session_turn_counts(
-                policy, outcomes_array[idx], policy.ar_ttft_slo_ms, policy.ar_tpot_slo_ms, k_dit, s_ok, s_ok, s_ok);
+                policy, parsed_outcomes[idx], eff_ar_ttft_slo_ms, eff_ar_tpot_slo_ms, k_dit, scale, s_ok, s_ok, s_ok);
             t_ok_cnt += tck.joint_ok_turns;
             t_tot_cnt += tck.planned_turns;
         }
         const double s_frac = static_cast<double>(s_ok_cnt) / static_cast<double>(n_core);
         const double t_frac = static_cast<double>(t_ok_cnt) / static_cast<double>(std::max<size_t>(1, t_tot_cnt));
-        const int steps_1024 = (eff_fam == "internvl_u") ? 16 : 20;
         slo_curve_by_dit_k[k_label] = {
             {"turn_attainment_pct", round_1(100.0 * t_frac)},
             {"turn_goodput_rps", round_4(offered_qps * t_frac)},
             {"session_attainment_pct", round_1(100.0 * s_frac)},
             {"session_goodput_rps", round_4(offered_qps * s_frac)},
-            {"ar_ttft_slo_ms", policy.ar_ttft_slo_ms},
-            {"ar_tpot_slo_ms", policy.ar_tpot_slo_ms},
-            {"dit_512_slo_ms", policy.dit_turn_slo_for(512, 20, k_dit)},
-            {"dit_1024_slo_ms", policy.dit_turn_slo_for(1024, steps_1024, k_dit)},
+            {"ar_ttft_slo_ms", round_2(eff_ar_ttft_slo_ms)},
+            {"ar_tpot_slo_ms", round_2(eff_ar_tpot_slo_ms)},
+            {"dit_512_slo_ms", round_2(policy.dit_turn_slo_for(512, 20, k_dit) * scale)},
+            {"dit_1024_slo_ms", round_2(policy.dit_turn_slo_for(1024, eff_steps_1024, k_dit) * scale)},
         };
     }
 
@@ -1108,8 +1242,15 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     }
 
     const double wall_s = std::max(1e-6, wall_seconds);
-    const double eff_slo_throughput_rps =
-        round_4(offered_qps * (static_cast<double>(core_joint_cnt) / static_cast<double>(n_core)));
+    const double steady_joint_frac = static_cast<double>(core_joint_cnt) / static_cast<double>(n_core);
+    const double full_joint_frac = static_cast<double>(joint_cnt) / static_cast<double>(n_tot);
+    const double steady_joint_goodput_rps = round_4(offered_qps * steady_joint_frac);
+    const double steady_joint_att_pct = round_1(100.0 * steady_joint_frac);
+    const double full_trace_goodput_rps = round_4(offered_qps * full_joint_frac);
+    const double full_trace_joint_att_pct = round_1(100.0 * full_joint_frac);
+    const double steady_ar_att_pct = round_1(100.0 * static_cast<double>(core_ar_cnt) / static_cast<double>(n_core));
+    const double steady_dit_att_pct = round_1(100.0 * static_cast<double>(core_dit_cnt) / static_cast<double>(n_core));
+
     const double steady_turn_att_frac = static_cast<double>(core_turn_joint_ok) / static_cast<double>(n_core_turns);
     const double steady_turn_goodput_rps = round_4(offered_qps * steady_turn_att_frac);
     const double steady_turn_goodput_tps = round_4(offered_qps * mean_turns_per_core_sess * steady_turn_att_frac);
@@ -1126,21 +1267,21 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         (core_planned_dit_turns == 0)
             ? 100.0
             : round_1(100.0 * static_cast<double>(core_turn_dit_ok) / static_cast<double>(core_planned_dit_turns));
-    const int eff_steps_1024 = (eff_fam == "internvl_u") ? 16 : 20;
+
     const nlohmann::json slo_config = {
         {"k_ar", policy.slo_scale_k},
         {"k_dit", policy.dit_slo_scale_k},
-        {"ar_ttft_slo_ms", policy.ar_ttft_slo_ms},
-        {"ar_tpot_slo_ms", policy.ar_tpot_slo_ms},
+        {"ar_ttft_slo_ms", round_2(eff_ar_ttft_slo_ms)},
+        {"ar_tpot_slo_ms", round_2(eff_ar_tpot_slo_ms)},
         {"ar_tpot_slo_mode", policy.ar_tpot_slo_mode},
-        {"dit_512_slo_ms", policy.dit_turn_slo_for(512, 20)},
-        {"dit_1024_slo_ms", policy.dit_turn_slo_for(1024, eff_steps_1024)},
+        {"dit_512_slo_ms", round_2(policy.dit_turn_slo_for(512, 20) * scale)},
+        {"dit_1024_slo_ms", round_2(policy.dit_turn_slo_for(1024, eff_steps_1024) * scale)},
         {"cot_dit_decoupled", true},
         {"primary_granularity", "turn_level"},
         {"turn_oom_accounting", "planned_turns_denominator"},
     };
 
-    return {
+    nlohmann::json report = {
         {"policy_name", policy.policy_name},
         {"suite_name", suite_name},
         {"num_gpus", policy.num_gpus},
@@ -1170,23 +1311,26 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"steady_turn_slo_goodput_rps", steady_turn_goodput_rps},
         {"steady_turn_goodput_tps", steady_turn_goodput_tps},
         {"dit_turn_survival_pct", dit_survival_pct},
-        {"joint_slo_goodput_rps", round_4(offered_qps * (static_cast<double>(joint_cnt) / static_cast<double>(n_tot)))},
+        // Unified canonical steady-state Joint SLO semantics across live coordinator and simulator:
+        {"joint_slo_goodput_rps", steady_joint_goodput_rps},
+        {"steady_joint_slo_goodput_rps", steady_joint_goodput_rps},
+        {"effective_slo_throughput_rps", steady_joint_goodput_rps},
+        {"steady_state_goodput_rps", steady_joint_goodput_rps},
+        {"full_trace_goodput_rps", full_trace_goodput_rps},
         {"raw_wall_goodput_rps", round_4(static_cast<double>(joint_cnt) / wall_s)},
-        {"effective_slo_throughput_rps", eff_slo_throughput_rps},
-        {"steady_state_goodput_rps", eff_slo_throughput_rps},
-        {"steady_state_attainment_pct",
-         round_1(100.0 * static_cast<double>(core_joint_cnt) / static_cast<double>(n_core))},
-        {"steady_ar_slo_attainment_pct",
-         round_1(100.0 * static_cast<double>(core_ar_cnt) / static_cast<double>(n_core))},
+        {"joint_slo_attainment_pct", steady_joint_att_pct},
+        {"steady_joint_slo_attainment_pct", steady_joint_att_pct},
+        {"steady_state_attainment_pct", steady_joint_att_pct},
+        {"full_trace_joint_slo_attainment_pct", full_trace_joint_att_pct},
+        {"full_trace_attainment_pct", full_trace_joint_att_pct},
+        {"steady_ar_slo_attainment_pct", steady_ar_att_pct},
         {"steady_ar_slo_mean_pct",
          round_1(100.0 * static_cast<double>(core_ar_mean_cnt) / static_cast<double>(n_core))},
         {"steady_ar_slo_strict_max_pct",
          round_1(100.0 * static_cast<double>(core_ar_strict_max_cnt) / static_cast<double>(n_core))},
-        {"steady_dit_slo_attainment_pct",
-         round_1(100.0 * static_cast<double>(core_dit_cnt) / static_cast<double>(n_core))},
-        {"joint_slo_attainment_pct", round_1(100.0 * static_cast<double>(joint_cnt) / static_cast<double>(n_tot))},
-        {"ar_slo_attainment_pct", round_1(100.0 * static_cast<double>(ar_cnt) / static_cast<double>(n_tot))},
-        {"dit_slo_attainment_pct", round_1(100.0 * static_cast<double>(dit_cnt) / static_cast<double>(n_tot))},
+        {"steady_dit_slo_attainment_pct", steady_dit_att_pct},
+        {"ar_slo_attainment_pct", steady_ar_att_pct},
+        {"dit_slo_attainment_pct", steady_dit_att_pct},
         {"ar_ttft_p50_ms", percentile_rounded(core_ok_ttfts, 50.0)},
         {"ar_ttft_p95_ms", percentile_rounded(core_ok_ttfts, 95.0)},
         {"ar_ttft_p99_ms", percentile_rounded(core_ok_ttfts, 99.0)},
@@ -1217,8 +1361,10 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"peak_gpu_reserved_mib", round_2(peak_res_mib)},
         {"peak_nvml_used_mib", round_2(peak_nvml_mib)},
         {"peak_pytorch_reserved_mib", round_2(peak_pytorch_res_mib)},
+        {"vmm_physical_pool_mib", round_2(max_vmm_pool_mib)},
         {"host_shmem_delta_gib", host_shmem_delta_gib},
         {"kv_host_swap_outs", kv_host_swap_outs},
+        {"kv_host_swap_ins", kv_host_swap_ins},
         {"vmm_overflow_creates", overflow_creates},
         {"vmm_super_to_fine_carves", carves},
         {"vmm_expert_evictions_for_kv", evict_kv},
@@ -1237,8 +1383,17 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"per_turn_stats", per_turn_stats},
         {"time_series_10s", time_series_10s},
         {"status", (err_cnt == 0) ? "ok" : "check_failed"},
-        {"sessions", outcomes_array},
     };
+
+    if (include_sessions) {
+        report["sessions"] = outcomes_array;
+    }
+    if (sim_extra_fields.is_object()) {
+        for (auto it = sim_extra_fields.begin(); it != sim_extra_fields.end(); ++it) {
+            report[it.key()] = it.value();
+        }
+    }
+    return report;
 }
 
 }  // namespace morphserve::control

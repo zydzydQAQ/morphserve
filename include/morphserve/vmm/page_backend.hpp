@@ -2,9 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace morphserve::vmm {
 
@@ -17,6 +19,7 @@ public:
     virtual bool is_simulated() const noexcept = 0;
     virtual int device() const noexcept = 0;
     virtual size_t min_granularity_bytes() const noexcept = 0;
+    virtual uint64_t driver_free_overflow_bytes() const noexcept { return 0; }
 
     virtual void ensure_context() = 0;
     virtual void sync_context() = 0;
@@ -57,6 +60,7 @@ public:
     bool is_simulated() const noexcept override { return false; }
     int device() const noexcept override { return device_; }
     size_t min_granularity_bytes() const noexcept override { return min_gran_; }
+    uint64_t driver_free_overflow_bytes() const noexcept override;
 
     void ensure_context() override;
     void sync_context() override;
@@ -97,12 +101,16 @@ private:
 
 class HostMmapPageAdapter final : public PageBackend {
 public:
-    explicit HostMmapPageAdapter(int device = 0, size_t min_gran_bytes = (2ULL << 20));
+    explicit HostMmapPageAdapter(
+        int device = 0,
+        size_t min_gran_bytes = (2ULL << 20),
+        bool materialize_va = true);
     ~HostMmapPageAdapter() noexcept override;
 
     bool is_simulated() const noexcept override { return true; }
     int device() const noexcept override { return device_; }
     size_t min_granularity_bytes() const noexcept override { return min_gran_; }
+    bool materialize_va() const noexcept { return materialize_va_; }
 
     void ensure_context() override {}
     void sync_context() override {}
@@ -135,11 +143,19 @@ public:
     void memcpy_d2h_async(void* dst_host, uint64_t src_va, size_t bytes, void* stream) override;
 
 private:
+    void add_rw_range_locked(uint64_t start, uint64_t end);
+    bool remove_rw_range_locked(uint64_t start, uint64_t end);
+    bool is_rw_covered_locked(uint64_t start, uint64_t end) const;
+
     int device_ = 0;
     size_t min_gran_ = 2ULL << 20;
-    std::mutex mu_;
+    bool materialize_va_ = true;
+    mutable std::mutex mu_;
     uint64_t next_id_ = 1;
     std::unordered_map<uint64_t, size_t> reserved_vas_;
+    std::map<uint64_t, uint64_t> mapped_rw_ranges_;
+    std::unordered_set<uint64_t> active_streams_;
+    std::unordered_map<uint64_t, uint64_t> event_epochs_;
 };
 
 }  // namespace morphserve::vmm

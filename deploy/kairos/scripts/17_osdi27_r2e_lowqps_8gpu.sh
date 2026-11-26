@@ -50,8 +50,7 @@ python3 -m morphserve.bench.run_phase2_bagel_main \
   --num-gpus 8 \
   "${MERGE_ARGS[@]}" \
   ${MORPHSERVE_QPS_POINTS:+--qps-points "${MORPHSERVE_QPS_POINTS}"} \
-  ${MORPHSERVE_LOW_SESSIONS:+--low-sessions "${MORPHSERVE_LOW_SESSIONS}"} \
-  ${MORPHSERVE_KNEE_SESSIONS:+--knee-sessions "${MORPHSERVE_KNEE_SESSIONS}"} \
+  ${MORPHSERVE_MIN_SESSIONS:+--min-sessions "${MORPHSERVE_MIN_SESSIONS}"} \
   ${MORPHSERVE_MAX_SESSIONS:+--max-sessions "${MORPHSERVE_MAX_SESSIONS}"}
 
 kairos_check_shared_storage

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import gc
 import math
+import threading
 from typing import Any, Callable
 
 from .tripool import NumaMemfdMirror
 
 ALIGN_BYTES = 512
 MIB = 1024**2
+_VALID_VAE_ENCODE_RESTORE = ("none", "async", "sync")
 
 
 @dataclass
@@ -93,6 +96,14 @@ class ExpertPartitionSpec:
     vae_module: Any | None = None
     extra_hook_methods: tuple[str, ...] = ()
     install_module_hooks: bool = True
+    vae_encode_restore: str = "none"
+    vae_output_cloner: Callable[[Any], Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.vae_encode_restore not in _VALID_VAE_ENCODE_RESTORE:
+            raise ValueError(
+                f"vae_encode_restore must be one of {_VALID_VAE_ENCODE_RESTORE}, got {self.vae_encode_restore!r}"
+            )
 
     @property
     def num_layers(self) -> int:
@@ -110,6 +121,7 @@ class ExpertPartitionSpec:
         super_handle_mib: int = 64,
         wrap_vae: bool = True,
         install_module_hooks: bool = True,
+        vae_encode_restore: str = "sync",
     ) -> "ExpertPartitionSpec":
         layers = list(pipeline.bagel.language_model.model.layers)
         plans, stride_bytes = build_layer_pack_plans(layers, role=role, super_handle_mib=super_handle_mib)
@@ -121,6 +133,7 @@ class ExpertPartitionSpec:
             vae_module=pipeline.vae if wrap_vae else None,
             extra_hook_methods=("forward_inference", "forward_train"),
             install_module_hooks=install_module_hooks,
+            vae_encode_restore=vae_encode_restore,
         )
 
     @classmethod
@@ -130,6 +143,8 @@ class ExpertPartitionSpec:
         super_handle_mib: int = 64,
         wrap_vae: bool = True,
         install_module_hooks: bool = True,
+        vae_encode_restore: str = "none",
+        vae_output_cloner: Callable[[Any], Any] | None = None,
     ) -> "ExpertPartitionSpec":
         decoder = pipeline.generation_decoder
         dec_inner = getattr(decoder, "decoder", decoder)
@@ -181,6 +196,8 @@ class ExpertPartitionSpec:
             vae_module=pipeline.vae if wrap_vae else None,
             extra_hook_methods=(),
             install_module_hooks=install_module_hooks,
+            vae_encode_restore=vae_encode_restore,
+            vae_output_cloner=vae_output_cloner,
         )
 
     @classmethod
@@ -190,7 +207,7 @@ class ExpertPartitionSpec:
         super_handle_mib: int = 16,
         install_module_hooks: bool = False,
     ) -> "ExpertPartitionSpec":
-        """Build balanced FFD `LayerPackPlan` bins for `InternVL-U` VLM stage co-paging (`Decision 2`)."""
+        """Build balanced FFD `LayerPackPlan` bins for `InternVL-U` VLM stage co-paging."""
         vlm = pipeline.vlm
         seen_ids: set[int] = set()
         unique_params: list[tuple[int, str, Any, int, int]] = []
@@ -206,8 +223,6 @@ class ExpertPartitionSpec:
         target_min_stride = max(max_param_aligned, 256 * MIB)
         stride_bytes = max(super_bytes, int(math.ceil(target_min_stride / super_bytes)) * super_bytes)
 
-        # First-Fit Decreasing (FFD) bin packing keeps `num_layers * stride_bytes` tightly bounded
-        # (~4.6–4.9 GiB for 4.48 GiB VLM weights even with 594–742 MiB vocabulary embeddings).
         sorted_params = sorted(unique_params, key=lambda x: (-x[4], x[0]))
         bin_offsets: list[int] = []
         bin_entries: list[list[ParamSlice]] = []
@@ -250,6 +265,7 @@ class ExpertPartitionSpec:
             vae_module=None,
             extra_hook_methods=(),
             install_module_hooks=install_module_hooks,
+            vae_encode_restore="none",
         )
 
 
@@ -264,6 +280,16 @@ def _current_cuda_stream_ptr(device: Any) -> int:
     return 0
 
 
+def _sync_cuda_stream(device: Any) -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.current_stream(device).synchronize()
+    except Exception:
+        pass
+
+
 class LayerExpertPager:
     """Unified TriPool-VMM 64 MiB super-handle pager with async Step-1 H2D streaming & scoped VAE restoration."""
 
@@ -272,6 +298,7 @@ class LayerExpertPager:
         spec: ExpertPartitionSpec,
         numa_node: int = 0,
         should_wait_predicate: Callable[[], bool] | None = None,
+        vae_output_cloner: Callable[[Any], Any] | None = None,
     ) -> None:
         self.spec = spec
         self.numa_node = int(numa_node)
@@ -281,6 +308,7 @@ class LayerExpertPager:
         self.layer_stride_mib = spec.layer_stride_mib
         self.total_mirror_bytes = self.num_layers * self.layer_stride_bytes
         self._should_wait_predicate = should_wait_predicate
+        self._vae_output_cloner = vae_output_cloner if vae_output_cloner is not None else spec.vae_output_cloner
 
         self.mirror: NumaMemfdMirror | None = None
         self._owns_mirror = False
@@ -295,10 +323,41 @@ class LayerExpertPager:
         self._all_resident_synced = False
         self._has_pending_async_prefetch = False
         self._waited_layers: set[int] = set()
+        self._active_pacer_release_cb: Callable[[bool], None] | None = None
         self.layer_hook_calls: int = 0
         self.hook_methods_triggered: set[str] = set()
         self._packed_params_count = 0
         self._packed_data_bytes = 0
+
+    @property
+    def is_generation_active(self) -> bool:
+        return self._generation_active
+
+    @property
+    def all_resident_synced(self) -> bool:
+        return self._all_resident_synced
+
+    @property
+    def owns_mirror(self) -> bool:
+        return self._owns_mirror
+
+    def attach_mirror(
+        self,
+        mirror: Any,
+        *,
+        owns_mirror: bool = False,
+        mirror_offset: int = 0,
+    ) -> None:
+        """Bind a pre-populated host weight mirror cleanly without mutating private fields."""
+        self.mirror = mirror
+        self._owns_mirror = bool(owns_mirror)
+        self._mirror_offset = max(0, int(mirror_offset))
+
+    def release_active_pacer(self, *, sync_stream: bool = False) -> None:
+        """Release any held `HalfNodeH2DPacer` slot for the active `generation_mode` scope."""
+        cb = self._active_pacer_release_cb
+        if cb is not None:
+            cb(bool(sync_stream))
 
     def _populate_and_drop_gpu_weights(self, mirror: NumaMemfdMirror, populate: bool) -> dict[str, Any]:
         packed_params_count = 0
@@ -350,14 +409,13 @@ class LayerExpertPager:
 
     def offload_to_host_mirror(self) -> dict[str, Any]:
         """Step 1 (Single-Process): Allocate NUMA memfd mirror, copy expert weights, and drop GPU tensors."""
-        self.mirror = NumaMemfdMirror.create(
+        mirror = NumaMemfdMirror.create(
             nbytes=self.total_mirror_bytes,
             numa_node=self.numa_node,
             name=f"ms_{self.spec.name}",
         )
-        self._owns_mirror = True
-        self._mirror_offset = 0
-        return self._populate_and_drop_gpu_weights(self.mirror, populate=True)
+        self.attach_mirror(mirror, owns_mirror=True, mirror_offset=0)
+        return self._populate_and_drop_gpu_weights(mirror, populate=True)
 
     def offload_to_shared_mirror(
         self,
@@ -372,15 +430,13 @@ class LayerExpertPager:
                 f"shared_mirror ({shared_mirror.nbytes} B) too small for {self.spec.name} at offset {off} "
                 f"({self.total_mirror_bytes} B)"
             )
-        self.mirror = shared_mirror
-        self._owns_mirror = False
-        self._mirror_offset = off
+        self.attach_mirror(shared_mirror, owns_mirror=False, mirror_offset=off)
         return self._populate_and_drop_gpu_weights(shared_mirror, populate=populate)
 
     def bind_vmm(self, vmm: Any, initial_alpha: float = 1.0) -> dict[str, Any]:
         """Step 2: Pin mirror, reserve Expert VA, bind parameter views, load `initial_alpha`, and install hooks."""
         if self.mirror is None:
-            raise RuntimeError("call offload_to_host_mirror() or offload_to_shared_mirror() before bind_vmm()")
+            raise RuntimeError("call offload_to_host_mirror(), offload_to_shared_mirror(), or attach_mirror() before bind_vmm()")
         if not 0.0 <= float(initial_alpha) <= 1.0:
             raise ValueError("initial_alpha must be in [0.0, 1.0]")
 
@@ -478,11 +534,20 @@ class LayerExpertPager:
                     setattr(mod, meth_name, _make_method_wrapper(layer_idx, meth_name, orig_fn))
                     self._wrapped_layer_methods.append((mod, meth_name, orig_fn))
 
-    def _wrap_vae_callable(self, orig_fn: Callable[..., Any], *, is_decode: bool) -> Callable[..., Any]:
+    def _wrap_vae_callable(
+        self,
+        orig_fn: Callable[..., Any],
+        *,
+        is_decode: bool,
+        output_cloner: Callable[[Any], Any] | None = None,
+    ) -> Callable[..., Any]:
+        eff_cloner = output_cloner if output_cloner is not None else self._vae_output_cloner
+
         def _wrapped(*args: Any, **kwargs: Any) -> Any:
             assert self.vmm is not None
             vmm = self.vmm
             was_gen_active = self._generation_active
+            had_pending_prefetch = self._has_pending_async_prefetch
             prev_res = vmm.expert_resident_count(self.expert_id)
             self._generation_active = False
             self._all_resident_synced = False
@@ -490,32 +555,41 @@ class LayerExpertPager:
             vmm.set_expert_pinned(self.expert_id, False)
             completed_ok = False
             try:
-                out = vmm.run_in_transient_scope(orig_fn, *args, **kwargs)
+                if eff_cloner is not None:
+                    out = vmm.run_in_transient_scope(orig_fn, *args, clone_fn=eff_cloner, **kwargs)
+                else:
+                    out = vmm.run_in_transient_scope(orig_fn, *args, **kwargs)
                 completed_ok = True
                 return out
             finally:
-                # Asymmetric lazy residency (`e27bce5`):
-                # - After `vae.decode`, leave borrowed tail expert slices unmapped so `expert_alpha`
-                #   naturally reflects demand-driven HBM pressure; the next DiT turn's
-                #   `generation_mode(prefetch_all=True)` reloads them asynchronously during Step-1.
-                # - After `vae.encode`: when inside `generation_mode`, queue async background prefetch;
-                #   when outside `generation_mode` (e.g. `forward_cache_update_vae` right before
-                #   `language_model(mode="gen")` runs without wait hooks), load ALL missing layers
-                #   synchronously ONCE now that `run_in_transient_scope` has released Arena-2 handles!
                 try:
                     if completed_ok and (not is_decode):
+                        policy = self.spec.vae_encode_restore
                         cur_res = vmm.expert_resident_count(self.expert_id)
                         if was_gen_active:
+                            target_res = self.num_layers if had_pending_prefetch else prev_res
+                            if cur_res < target_res:
+                                if policy == "sync" and not (self.spec.install_module_hooks and self.spec.hook_modules):
+                                    self._ensure_expert_headroom(target_res - cur_res)
+                                    vmm.load_expert_layers_sync(self.expert_id, 0, target_res)
+                                    self._has_pending_async_prefetch = False
+                                elif policy != "none" or (self.spec.install_module_hooks and self.spec.hook_modules):
+                                    vmm.prefetch_expert_async(self.expert_id, 0, target_res)
+                                    self._has_pending_async_prefetch = True
+                                    if cur_res == 0:
+                                        s_ptr = _current_cuda_stream_ptr(vmm.device)
+                                        vmm.wait_expert_layer(self.expert_id, 0, s_ptr)
+                        elif policy == "sync":
+                            target_res = self.num_layers
+                            if cur_res < target_res:
+                                self._ensure_expert_headroom(target_res - cur_res)
+                                vmm.load_expert_layers_sync(self.expert_id, 0, target_res)
+                                self._has_pending_async_prefetch = False
+                        elif policy == "async":
                             if cur_res < prev_res:
                                 vmm.prefetch_expert_async(self.expert_id, 0, prev_res)
                                 self._has_pending_async_prefetch = True
-                        else:
-                            target_res = self.num_layers
-                            if cur_res < target_res:
-                                missing = target_res - cur_res
-                                self._ensure_expert_headroom(missing)
-                                vmm.load_expert_layers_sync(self.expert_id, 0, target_res)
-                                self._has_pending_async_prefetch = False
+                        # `policy == "none"` outside `generation_mode` leaves borrowed slices lazily unmapped.
                 finally:
                     self._generation_active = was_gen_active
                     if was_gen_active:
@@ -531,52 +605,46 @@ class LayerExpertPager:
         for meth_name in ("decode", "encode"):
             orig_fn = getattr(vae_mod, meth_name, None)
             if callable(orig_fn):
-                setattr(vae_mod, meth_name, self._wrap_vae_callable(orig_fn, is_decode=(meth_name == "decode")))
+                setattr(
+                    vae_mod,
+                    meth_name,
+                    self._wrap_vae_callable(
+                        orig_fn,
+                        is_decode=(meth_name == "decode"),
+                        output_cloner=self._vae_output_cloner,
+                    ),
+                )
                 self._orig_vae_methods.append((vae_mod, meth_name, orig_fn))
 
-    def _ensure_expert_headroom(self, missing_layers: int, *, for_dit: bool = True) -> None:
+    def _ensure_expert_headroom(
+        self,
+        missing_layers: int,
+        *,
+        exclude_session_ids: Sequence[int] = (),
+    ) -> int:
         if self.vmm is None or missing_layers <= 0:
-            return
-        missing_bytes = int(missing_layers) * self.layer_stride_bytes
+            return 0
+        needed_bytes = int(missing_layers) * self.layer_stride_bytes
         s_ptr = _current_cuda_stream_ptr(self.vmm.device)
-        opt_s = s_ptr if s_ptr != 0 else None
-        if for_dit and hasattr(self.vmm, "maybe_evict_thinking_kv_on_high_watermark"):
-            self.vmm.maybe_evict_thinking_kv_on_high_watermark(
-                sync=True,
-                for_dit=True,
-                stream_ptr=opt_s,
+        return int(
+            self.vmm.ensure_expert_headroom(
+                self.expert_id,
+                needed_bytes,
+                exclude_session_ids=exclude_session_ids,
+                stream=s_ptr,
             )
-        st = self.vmm.stats_dict()
-        pool_free = int(st.get("pool_free_bytes", 0))
-        pool_total = int(st.get("pool_total_bytes", 0))
-        max_pool = int(getattr(self.vmm, "max_pool_bytes", None) or 0)
-        growth_headroom = (
-            max(0, max_pool - pool_total)
-            if (bool(getattr(self.vmm, "allow_overflow", False)) and max_pool > 0)
-            else 0
         )
-        self_unpinned = int(self.vmm.expert_resident_count(self.expert_id)) * self.layer_stride_bytes
-        other_unpinned = max(0, int(st.get("expert_unpinned_bytes", 0)) - self_unpinned)
-        non_self_pool_free = pool_free + growth_headroom + other_unpinned
-        if non_self_pool_free < missing_bytes and hasattr(self.vmm, "reclaim_thinking_kv_bytes"):
-            self.vmm.reclaim_thinking_kv_bytes(
-                missing_bytes - non_self_pool_free,
-                sync=True,
-                stream_ptr=opt_s,
-            )
-        elif pool_free < missing_bytes and hasattr(self.vmm, "flush_kv_swaps"):
-            self.vmm.flush_kv_swaps()
 
     def resident_alpha(self) -> float:
         if self.vmm is None or self.num_layers <= 0:
             return 0.0
         return self.vmm.expert_resident_count(self.expert_id) / float(self.num_layers)
 
-    def ensure_all_resident_sync(self) -> None:
+    def ensure_all_resident_sync(self, *, exclude_session_ids: Sequence[int] = ()) -> None:
         if self.vmm is not None:
             cur = self.vmm.expert_resident_count(self.expert_id)
             if cur < self.num_layers:
-                self._ensure_expert_headroom(self.num_layers - cur)
+                self._ensure_expert_headroom(self.num_layers - cur, exclude_session_ids=exclude_session_ids)
                 self.vmm.load_expert_layers_sync(self.expert_id, 0, self.num_layers)
             self._has_pending_async_prefetch = False
             self._waited_layers.clear()
@@ -597,7 +665,7 @@ class LayerExpertPager:
             self.vmm.evict_expert_range(self.expert_id, target, self.num_layers, s_ptr)
         cur = self.vmm.expert_resident_count(self.expert_id)
         if target > cur:
-            self._ensure_expert_headroom(target - cur, for_dit=(target == self.num_layers))
+            self._ensure_expert_headroom(target - cur)
         if target > 0:
             self.vmm.load_expert_layers_sync(self.expert_id, 0, target)
         res = int(self.vmm.expert_resident_count(self.expert_id))
@@ -605,33 +673,106 @@ class LayerExpertPager:
         return res
 
     @contextmanager
-    def generation_mode(self, prefetch_all: bool = True):
+    def generation_mode(
+        self,
+        prefetch_all: bool = True,
+        pacer: Any = None,
+        rank: int = 0,
+        *,
+        exclude_session_ids: Sequence[int] = (),
+    ):
+        """Pin expert weights, optionally acquire `HalfNodeH2DPacer` with async H2D release, and prefetch blocks."""
         assert self.vmm is not None
-        cur = self.vmm.expert_resident_count(self.expert_id)
-        if prefetch_all and cur < self.num_layers:
-            self._ensure_expert_headroom(self.num_layers - cur)
-        self.vmm.set_expert_pinned(self.expert_id, True)
-        self._generation_active = True
-        self._waited_layers.clear()
-        cur_pinned = self.vmm.expert_resident_count(self.expert_id)
-        if cur_pinned == self.num_layers and not self._has_pending_async_prefetch:
-            self._all_resident_synced = True
-        else:
-            self._all_resident_synced = False
-            if prefetch_all:
-                if self.spec.install_module_hooks and self.spec.hook_modules or self._should_wait_predicate is not None:
-                    queued = self.vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
-                    if queued > 0:
-                        self._has_pending_async_prefetch = True
-                else:
-                    self.ensure_all_resident_sync()
+        vmm = self.vmm
+        cur = vmm.expert_resident_count(self.expert_id)
+
+        pacer_cm: Any = None
+        if pacer is not None and prefetch_all and cur < self.num_layers:
+            if hasattr(pacer, "acquire_process_slot"):
+                pacer_cm = pacer.acquire_process_slot(int(rank))
+            elif hasattr(pacer, "__enter__") and hasattr(pacer, "__exit__"):
+                pacer_cm = pacer
+
+        pacer_lock = threading.Lock() if pacer_cm is not None else None
+        pacer_held = False
+        h2d_release_thread: threading.Thread | None = None
+        prev_release_cb = self._active_pacer_release_cb
+
+        def _release_pacer_once(sync_stream: bool = False) -> None:
+            nonlocal pacer_held
+            if pacer_cm is None or pacer_lock is None:
+                return
+            with pacer_lock:
+                if not pacer_held:
+                    return
+                if sync_stream:
+                    _sync_cuda_stream(vmm.device)
+                pacer_held = False
+                pacer_cm.__exit__(None, None, None)
+
+        if pacer_cm is not None:
+            pacer_cm.__enter__()
+            pacer_held = True
+            self._active_pacer_release_cb = _release_pacer_once
+
+        pinned_entered = False
         try:
+            if prefetch_all and cur < self.num_layers:
+                self._ensure_expert_headroom(self.num_layers - cur, exclude_session_ids=exclude_session_ids)
+            vmm.set_expert_pinned(self.expert_id, True)
+            pinned_entered = True
+            self._generation_active = True
+            self._waited_layers.clear()
+            cur_pinned = vmm.expert_resident_count(self.expert_id)
+            if cur_pinned == self.num_layers and not self._has_pending_async_prefetch:
+                self._all_resident_synced = True
+                _release_pacer_once(False)
+            else:
+                self._all_resident_synced = False
+                if prefetch_all:
+                    if (self.spec.install_module_hooks and self.spec.hook_modules) or self._should_wait_predicate is not None:
+                        queued = vmm.prefetch_expert_async(self.expert_id, 0, self.num_layers)
+                        if queued > 0:
+                            self._has_pending_async_prefetch = True
+                            if (
+                                pacer_cm is not None
+                                and callable(getattr(vmm, "sync_expert_h2d", None))
+                                and not bool(getattr(vmm, "is_simulated", False))
+                            ):
+                                eid = int(self.expert_id)
+
+                                def _wait_h2d_and_release() -> None:
+                                    try:
+                                        vmm.sync_expert_h2d(eid)
+                                    except Exception:
+                                        pass
+                                    finally:
+                                        _release_pacer_once(False)
+
+                                h2d_release_thread = threading.Thread(
+                                    target=_wait_h2d_and_release,
+                                    name=f"ms-h2d-pacer-rel-{eid}",
+                                    daemon=True,
+                                )
+                                h2d_release_thread.start()
+                        else:
+                            _release_pacer_once(False)
+                    else:
+                        self.ensure_all_resident_sync(exclude_session_ids=exclude_session_ids)
+                        _release_pacer_once(False)
+                else:
+                    _release_pacer_once(False)
             yield self
         finally:
+            self._active_pacer_release_cb = prev_release_cb
+            if h2d_release_thread is not None:
+                h2d_release_thread.join(timeout=10.0)
+            _release_pacer_once(False)
             self._generation_active = False
             self._all_resident_synced = False
             self._waited_layers.clear()
-            self.vmm.set_expert_pinned(self.expert_id, False)
+            if pinned_entered:
+                vmm.set_expert_pinned(self.expert_id, False)
 
     def unbind_vmm_keep_mirror(self) -> None:
         """Detach hooks and VA views while keeping host mirror ready for rebinding to a new VMM instance."""
@@ -682,6 +823,22 @@ def drop_partition_weights(spec: ExpertPartitionSpec, device: Any | None = None)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return dropped_bytes
+
+
+class StaticFissionDropper:
+    """Baseline `static_nccl_fission` secondary-expert dropper driven declaratively by `ExpertPartitionSpec`."""
+
+    def __init__(self, spec: ExpertPartitionSpec, device: Any | None = None) -> None:
+        self.spec = spec
+        self.device = device
+        self.dropped_bytes: int = 0
+
+    def drop(self) -> int:
+        self.dropped_bytes = drop_partition_weights(self.spec, device=self.device)
+        return self.dropped_bytes
+
+    def close(self) -> None:
+        return None
 
 
 class NaiveHostOffloader:

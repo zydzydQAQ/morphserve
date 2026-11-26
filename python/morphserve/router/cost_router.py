@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from morphserve._core import call_json, encode_json, get_core_lib, last_error
 
-from .topology import ClusterTopologyProfile, DEFAULT_OPERATOR_PROFILE, OperatorLatencyProfile
+from .topology import ClusterTopologyProfile, OperatorLatencyProfile, default_operator_profile
 
 MIB = 1024**2
 GIB = 1024**3
@@ -26,11 +26,20 @@ class CPTGRequestSpec:
     architecture: str = "tight_mot"  # "tight_mot" | "bridge_mllm_dit"
     kv_bytes: int = 0
     bridge_bytes: int = 0
-    gen_expert_bytes: int = DEFAULT_OPERATOR_PROFILE.bagel_expert_bytes
-    dit_step1_ms: float = DEFAULT_OPERATOR_PROFILE.bagel_dit_512_step_ms
+    gen_expert_bytes: int | None = None
+    dit_step1_ms: float | None = None
     dit_total_steps: int = 20
     resolution: int = 512
     interleaved_roundtrip_gamma: int = 1
+
+    def __post_init__(self) -> None:
+        if self.gen_expert_bytes is None or self.dit_step1_ms is None:
+            prof = default_operator_profile()
+            fam = "internvl_u" if self.architecture == "bridge_mllm_dit" else "bagel"
+            if self.gen_expert_bytes is None:
+                self.gen_expert_bytes = prof.expert_bytes(fam)
+            if self.dit_step1_ms is None:
+                self.dit_step1_ms = prof.step_ms(fam, self.resolution)
 
     def effective_state_bytes(self) -> int:
         if self.architecture == "bridge_mllm_dit":
@@ -46,8 +55,8 @@ class CPTGRequestSpec:
             "architecture": self.architecture,
             "kv_bytes": int(self.kv_bytes),
             "bridge_bytes": int(self.bridge_bytes),
-            "gen_expert_bytes": int(self.gen_expert_bytes),
-            "dit_step1_ms": float(self.dit_step1_ms),
+            "gen_expert_bytes": int(self.gen_expert_bytes or 0),
+            "dit_step1_ms": float(self.dit_step1_ms or 0.0),
             "dit_total_steps": int(self.dit_total_steps),
             "resolution": int(self.resolution),
             "interleaved_roundtrip_gamma": int(self.interleaved_roundtrip_gamma),
@@ -56,7 +65,7 @@ class CPTGRequestSpec:
 
 @dataclass
 class WorkerState:
-    """Instantaneous HBM residency, queue backlog, and H2D state of one GPU worker."""
+    """Instantaneous HBM residency, queue backlog, and H2D state snapshot of one GPU worker."""
 
     gpu_id: int
     role: str = "hybrid"  # "und" | "gen" | "hybrid"
@@ -76,6 +85,18 @@ class WorkerState:
             "kv_free_bytes": int(self.kv_free_bytes),
             "p2p_concurrent_links": int(self.p2p_concurrent_links),
         }
+
+    @classmethod
+    def from_dict(cls, d: Mapping[str, Any]) -> "WorkerState":
+        return cls(
+            gpu_id=int(d["gpu_id"]),
+            role=str(d.get("role", "hybrid")),
+            expert_alpha=float(d["expert_alpha"]),
+            queue_wait_ms=float(d["queue_wait_ms"]),
+            active_h2d_transfers=int(d["active_h2d_transfers"]),
+            kv_free_bytes=int(d["kv_free_bytes"]),
+            p2p_concurrent_links=int(d["p2p_concurrent_links"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -148,6 +169,9 @@ class HalfNodeH2DPacer:
         self._handle = h
 
     def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
         h = getattr(self, "_handle", 0)
         if h:
             self._handle = 0
@@ -160,7 +184,9 @@ class HalfNodeH2DPacer:
         _ = self.topology.half_group_of(gpu_id)
         return float(
             self._lib.ms_pacer_predicted_wait_ms(
-                ctypes.c_void_p(self._handle), ctypes.c_int(int(gpu_id)), ctypes.c_double(float(now_ms))
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_double(float(now_ms)),
             )
         )
 
@@ -193,7 +219,9 @@ class HalfNodeH2DPacer:
         out_gid = ctypes.c_int(-1)
         fd = int(
             self._lib.ms_pacer_acquire_process_flock(
-                ctypes.c_void_p(self._handle), ctypes.c_int(int(gpu_id)), ctypes.byref(out_gid)
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.byref(out_gid),
             )
         )
         if fd < 0:
@@ -205,13 +233,13 @@ class HalfNodeH2DPacer:
 
 
 class DualPathMorphRouter:
-    """Stateful placement, queue reservation, and Dual-Path AR->DiT router backed by C++17 `DualPathMorphRouter`."""
+    """Stateful placement, reservation ledger, and Dual-Path AR->DiT router owned directly by C++17."""
 
     def __init__(
         self,
         topology: ClusterTopologyProfile,
         pacer: HalfNodeH2DPacer | None = None,
-        operator_profile: OperatorLatencyProfile = DEFAULT_OPERATOR_PROFILE,
+        operator_profile: OperatorLatencyProfile | None = None,
         state_handoff_ms: float | None = None,
         map_overhead_ms_full: float = 12.0,
         overlap_efficiency: float = 0.90,
@@ -221,7 +249,7 @@ class DualPathMorphRouter:
     ) -> None:
         self.topology = topology
         self.pacer = pacer if pacer is not None else HalfNodeH2DPacer(topology)
-        self.operator_profile = operator_profile
+        self.operator_profile = operator_profile if operator_profile is not None else default_operator_profile()
         self.state_handoff_ms = state_handoff_ms
         self.map_overhead_ms_full = float(map_overhead_ms_full)
         self.overlap_efficiency = float(overlap_efficiency)
@@ -229,12 +257,11 @@ class DualPathMorphRouter:
         self.allow_inter_node_state_ship = bool(allow_inter_node_state_ship)
         self.max_inter_node_state_bytes = int(max_inter_node_state_bytes)
 
-        self.worker_states: dict[int, WorkerState] = {}
-        self._synced_fields: dict[int, tuple[float, float, int, int, int]] = {}
         self._mu = threading.RLock()
         self._lib = get_core_lib()
 
         opts = {
+            "operator_profile": self.operator_profile.to_dict(),
             "state_handoff_ms": None if state_handoff_ms is None else float(state_handoff_ms),
             "map_overhead_ms_full": self.map_overhead_ms_full,
             "overlap_efficiency": self.overlap_efficiency,
@@ -255,6 +282,9 @@ class DualPathMorphRouter:
         self._handle = h
 
     def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
         h = getattr(self, "_handle", 0)
         if h:
             self._handle = 0
@@ -264,58 +294,55 @@ class DualPathMorphRouter:
                 pass
 
     @staticmethod
-    def _snap_tuple(w: WorkerState) -> tuple[float, float, int, int, int]:
-        return (
-            float(w.expert_alpha),
-            float(w.queue_wait_ms),
-            int(w.active_h2d_transfers),
-            int(w.kv_free_bytes),
-            int(w.p2p_concurrent_links),
-        )
+    def _parse_workers_obj(obj: Any) -> dict[int, WorkerState]:
+        items = obj.values() if isinstance(obj, Mapping) else obj
+        return {int(item["gpu_id"]): WorkerState.from_dict(item) for item in items}
 
-    def _push_python_mutations_locked(self) -> None:
-        for gid, w in self.worker_states.items():
-            cur = self._snap_tuple(w)
-            prev = self._synced_fields.get(gid)
-            if prev == cur:
-                continue
-            has_a = 1 if (prev is None or cur[0] != prev[0]) else 0
-            has_q = 1 if (prev is None or cur[1] != prev[1]) else 0
-            has_h = 1 if (prev is None or cur[2] != prev[2]) else 0
-            has_k = 1 if (prev is None or cur[3] != prev[3]) else 0
-            has_p = 1 if (prev is None or cur[4] != prev[4]) else 0
+    def worker_states_snapshot(self) -> dict[int, WorkerState]:
+        """Return a fresh snapshot of the C++ router's authoritative worker state ledger."""
+        with self._mu:
+            obj = call_json(self._lib, self._lib.ms_router_get_workers_json, ctypes.c_void_p(self._handle))
+            return self._parse_workers_obj(obj)
+
+    @property
+    def worker_states(self) -> dict[int, WorkerState]:
+        """Read-only snapshot view of the C++ worker state ledger."""
+        return self.worker_states_snapshot()
+
+    def get_worker_state(self, gpu_id: int) -> WorkerState:
+        """Return the current authoritative `WorkerState` for `gpu_id` from C++."""
+        gid = int(gpu_id)
+        snap = self.worker_states_snapshot()
+        if gid not in snap:
+            raise KeyError(f"gpu_id={gid} not initialized in DualPathMorphRouter")
+        return snap[gid]
+
+    def set_worker_state_fields(
+        self,
+        gpu_id: int,
+        *,
+        expert_alpha: float | None = None,
+        queue_wait_ms: float | None = None,
+        active_h2d_transfers: int | None = None,
+        kv_free_bytes: int | None = None,
+        p2p_concurrent_links: int | None = None,
+    ) -> None:
+        """Explicit write-through mutation of worker state fields directly in C++."""
+        with self._mu:
             self._lib.ms_router_set_worker_fields(
                 ctypes.c_void_p(self._handle),
-                ctypes.c_int(int(gid)),
-                has_a,
-                ctypes.c_double(cur[0]),
-                has_q,
-                ctypes.c_double(cur[1]),
-                has_h,
-                ctypes.c_int(cur[2]),
-                has_k,
-                ctypes.c_int64(cur[3]),
-                has_p,
-                ctypes.c_int(cur[4]),
+                ctypes.c_int(int(gpu_id)),
+                1 if expert_alpha is not None else 0,
+                ctypes.c_double(0.0 if expert_alpha is None else float(expert_alpha)),
+                1 if queue_wait_ms is not None else 0,
+                ctypes.c_double(0.0 if queue_wait_ms is None else float(queue_wait_ms)),
+                1 if active_h2d_transfers is not None else 0,
+                ctypes.c_int(0 if active_h2d_transfers is None else int(active_h2d_transfers)),
+                1 if kv_free_bytes is not None else 0,
+                ctypes.c_int64(0 if kv_free_bytes is None else int(kv_free_bytes)),
+                1 if p2p_concurrent_links is not None else 0,
+                ctypes.c_int(0 if p2p_concurrent_links is None else int(p2p_concurrent_links)),
             )
-            self._synced_fields[gid] = cur
-
-    def _pull_cpp_workers_locked(self) -> None:
-        obj = call_json(self._lib, self._lib.ms_router_get_workers_json, ctypes.c_void_p(self._handle))
-        items = obj.values() if isinstance(obj, Mapping) else obj
-        for item in items:
-            gid = int(item["gpu_id"])
-            w = self.worker_states.get(gid)
-            if w is None:
-                w = WorkerState(gpu_id=gid, role=str(item.get("role", "hybrid")))
-                self.worker_states[gid] = w
-            w.role = str(item.get("role", w.role))
-            w.expert_alpha = float(item["expert_alpha"])
-            w.queue_wait_ms = float(item["queue_wait_ms"])
-            w.active_h2d_transfers = int(item["active_h2d_transfers"])
-            w.kv_free_bytes = int(item["kv_free_bytes"])
-            w.p2p_concurrent_links = int(item["p2p_concurrent_links"])
-            self._synced_fields[gid] = self._snap_tuple(w)
 
     def init_workers(
         self,
@@ -343,23 +370,7 @@ class DualPathMorphRouter:
                 ctypes.c_void_p(self._handle),
                 encode_json(payload),
             )
-            self.worker_states.clear()
-            self._synced_fields.clear()
-            items = obj.values() if isinstance(obj, Mapping) else obj
-            for item in items:
-                gid = int(item["gpu_id"])
-                w = WorkerState(
-                    gpu_id=gid,
-                    role=str(item["role"]),
-                    expert_alpha=float(item["expert_alpha"]),
-                    queue_wait_ms=float(item["queue_wait_ms"]),
-                    active_h2d_transfers=int(item["active_h2d_transfers"]),
-                    kv_free_bytes=int(item["kv_free_bytes"]),
-                    p2p_concurrent_links=int(item["p2p_concurrent_links"]),
-                )
-                self.worker_states[gid] = w
-                self._synced_fields[gid] = self._snap_tuple(w)
-            return self.worker_states
+            return self._parse_workers_obj(obj)
 
     def update_worker_telemetry(
         self,
@@ -368,23 +379,12 @@ class DualPathMorphRouter:
         expert_alpha: float | None = None,
         kv_free_bytes: int | None = None,
         telemetry_seq: int | None = None,
-        workers: dict[int, WorkerState] | None = None,
     ) -> None:
-        gid = int(gpu_id)
+        """Apply worker telemetry directly to C++ with monotonic `telemetry_seq` and inflight KV reconciliation."""
         with self._mu:
-            if workers is not None and workers is not self.worker_states:
-                w = workers.get(gid)
-                if w is None:
-                    return
-                if expert_alpha is not None:
-                    w.expert_alpha = float(expert_alpha)
-                if kv_free_bytes is not None:
-                    w.kv_free_bytes = max(0, int(kv_free_bytes))
-                return
-            self._push_python_mutations_locked()
             self._lib.ms_router_update_telemetry(
                 ctypes.c_void_p(self._handle),
-                ctypes.c_int(gid),
+                ctypes.c_int(int(gpu_id)),
                 1 if expert_alpha is not None else 0,
                 ctypes.c_double(0.0 if expert_alpha is None else float(expert_alpha)),
                 1 if kv_free_bytes is not None else 0,
@@ -392,7 +392,24 @@ class DualPathMorphRouter:
                 1 if telemetry_seq is not None else 0,
                 ctypes.c_int64(0 if telemetry_seq is None else int(telemetry_seq)),
             )
-            self._pull_cpp_workers_locked()
+
+    def reserve_ar_queue(self, gpu_id: int, est_ar_ms: float) -> None:
+        """Reserve estimated AR/prep queue latency on `gpu_id` directly in C++."""
+        with self._mu:
+            self._lib.ms_router_reserve_ar_queue(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_double(float(est_ar_ms)),
+            )
+
+    def release_ar_queue(self, gpu_id: int, est_ar_ms: float) -> None:
+        """Release estimated AR/prep queue latency on `gpu_id` directly in C++."""
+        with self._mu:
+            self._lib.ms_router_release_ar_queue(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_double(float(est_ar_ms)),
+            )
 
     def select_initial_gpu(
         self,
@@ -422,13 +439,9 @@ class DualPathMorphRouter:
                 "max_preemptions_per_gpu": int(max_preemptions_per_gpu),
                 "architecture": str(architecture),
             }
-            if workers is not None and workers is not self.worker_states:
+            if workers is not None:
                 req["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
-            else:
-                self._push_python_mutations_locked()
-            chosen = int(
-                self._lib.ms_router_select_initial_gpu(ctypes.c_void_p(self._handle), encode_json(req))
-            )
+            chosen = int(self._lib.ms_router_select_initial_gpu(ctypes.c_void_p(self._handle), encode_json(req)))
             if chosen < 0:
                 raise RuntimeError(f"ms_router_select_initial_gpu failed: {last_error(self._lib)}")
             return chosen
@@ -453,13 +466,9 @@ class DualPathMorphRouter:
                 "gpu_busy": {str(k): bool(v) for k, v in (gpu_busy or {}).items()},
                 "required_kv_bytes": int(required_kv_bytes),
             }
-            if workers is not None and workers is not self.worker_states:
+            if workers is not None:
                 req["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
-            else:
-                self._push_python_mutations_locked()
-            chosen = int(
-                self._lib.ms_router_select_static_gen_gpu(ctypes.c_void_p(self._handle), encode_json(req))
-            )
+            chosen = int(self._lib.ms_router_select_static_gen_gpu(ctypes.c_void_p(self._handle), encode_json(req)))
             if chosen < 0:
                 raise RuntimeError(f"ms_router_select_static_gen_gpu failed: {last_error(self._lib)}")
             return chosen
@@ -471,21 +480,55 @@ class DualPathMorphRouter:
         routing_mode: str,
         static_und_ranks: Sequence[int],
         failed_gpu: int,
+        workers: Mapping[int, WorkerState] | None = None,
         gpu_busy: Mapping[int, bool] | None = None,
     ) -> int:
         with self._mu:
-            self._push_python_mutations_locked()
-            req = {
+            req: dict[str, Any] = {
                 "num_gpus": int(num_gpus),
                 "routing_mode": str(routing_mode),
                 "static_und_ranks": [int(x) for x in static_und_ranks],
                 "failed_gpu": int(failed_gpu),
                 "gpu_busy": {str(k): bool(v) for k, v in (gpu_busy or {}).items()},
             }
-            chosen = int(
-                self._lib.ms_router_select_oom_retry_gpu(ctypes.c_void_p(self._handle), encode_json(req))
+            if workers is not None:
+                req["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
+            chosen = int(self._lib.ms_router_select_oom_retry_gpu(ctypes.c_void_p(self._handle), encode_json(req)))
+            return int(failed_gpu) if chosen < 0 else chosen
+
+    def plan_transition_readonly(
+        self,
+        *,
+        routing_mode: str,
+        static_und_ranks: Sequence[int],
+        static_gen_ranks: Sequence[int],
+        req: CPTGRequestSpec,
+        est_dit_ms: float = 0.0,
+        workers: Mapping[int, WorkerState] | None = None,
+        gpu_busy: Mapping[int, bool] | None = None,
+        now_ms: float = 0.0,
+    ) -> tuple[RouteDecision, str]:
+        """Pure read-only transition decision with zero pacer or worker-state mutation."""
+        _ = req.effective_state_bytes()
+        with self._mu:
+            payload: dict[str, Any] = {
+                "routing_mode": str(routing_mode),
+                "static_und_ranks": [int(x) for x in static_und_ranks],
+                "static_gen_ranks": [int(x) for x in static_gen_ranks],
+                "req": req.to_dict(),
+                "est_dit_ms": float(est_dit_ms),
+                "gpu_busy": {str(k): bool(v) for k, v in (gpu_busy or {}).items()},
+                "now_ms": float(now_ms),
+            }
+            if workers is not None:
+                payload["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
+            out = call_json(
+                self._lib,
+                self._lib.ms_router_plan_transition_readonly_json,
+                ctypes.c_void_p(self._handle),
+                encode_json(payload),
             )
-            return failed_gpu if chosen < 0 else chosen
+            return RouteDecision.from_dict(out["decision"]), str(out["ship_mode"])
 
     def plan_and_reserve_transition(
         self,
@@ -512,13 +555,8 @@ class DualPathMorphRouter:
                 "use_pacer": bool(use_pacer),
                 "now_ms": float(now_ms),
             }
-            ext_workers = workers is not None and workers is not self.worker_states
-            if ext_workers:
-                assert workers is not None
+            if workers is not None:
                 payload["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
-            else:
-                self._push_python_mutations_locked()
-
             out = call_json(
                 self._lib,
                 self._lib.ms_router_plan_and_reserve_json,
@@ -527,9 +565,8 @@ class DualPathMorphRouter:
             )
             dec = RouteDecision.from_dict(out["decision"])
             ship_mode = str(out["ship_mode"])
-            if ext_workers:
-                assert workers is not None
-                w_out = out.get("workers", {})
+            if workers is not None and "workers" in out:
+                w_out = out["workers"]
                 w_items = w_out.values() if isinstance(w_out, Mapping) else w_out
                 for item in w_items:
                     gid = int(item["gpu_id"])
@@ -537,31 +574,18 @@ class DualPathMorphRouter:
                         workers[gid].kv_free_bytes = int(item["kv_free_bytes"])
                         workers[gid].queue_wait_ms = float(item["queue_wait_ms"])
                         workers[gid].expert_alpha = float(item["expert_alpha"])
-            else:
-                self._pull_cpp_workers_locked()
             return dec, ship_mode
 
-    def reserve_kv_bytes(
-        self,
-        gpu_id: int,
-        reserved_kv_bytes: int,
-        *,
-        workers: dict[int, WorkerState] | None = None,
-    ) -> None:
-        gid = int(gpu_id)
+    def reserve_kv_bytes(self, gpu_id: int, reserved_kv_bytes: int) -> None:
         res_kv = max(0, int(reserved_kv_bytes))
         if res_kv <= 0:
             return
         with self._mu:
-            if workers is not None and workers is not self.worker_states:
-                if gid in workers:
-                    workers[gid].kv_free_bytes = max(0, int(workers[gid].kv_free_bytes) - res_kv)
-                return
-            self._push_python_mutations_locked()
             self._lib.ms_router_reserve_kv_bytes(
-                ctypes.c_void_p(self._handle), ctypes.c_int(gid), ctypes.c_int64(res_kv)
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_int64(res_kv),
             )
-            self._pull_cpp_workers_locked()
 
     def release_kv_reservation(
         self,
@@ -570,53 +594,32 @@ class DualPathMorphRouter:
         *,
         latest_kv_free_bytes: int | None = None,
         telemetry_seq: int | None = None,
-        workers: dict[int, WorkerState] | None = None,
     ) -> None:
-        gid = int(gpu_id)
         rel = max(0, int(reserved_kv_bytes))
         with self._mu:
-            if workers is not None and workers is not self.worker_states:
-                if gid in workers:
-                    if latest_kv_free_bytes is not None:
-                        workers[gid].kv_free_bytes = max(0, int(latest_kv_free_bytes))
-                    else:
-                        workers[gid].kv_free_bytes = max(0, int(workers[gid].kv_free_bytes) + rel)
-                return
-            self._push_python_mutations_locked()
             self._lib.ms_router_release_kv_reservation(
                 ctypes.c_void_p(self._handle),
-                ctypes.c_int(gid),
+                ctypes.c_int(int(gpu_id)),
                 ctypes.c_int64(rel),
                 1 if latest_kv_free_bytes is not None else 0,
                 ctypes.c_int64(0 if latest_kv_free_bytes is None else int(latest_kv_free_bytes)),
                 1 if telemetry_seq is not None else 0,
                 ctypes.c_int64(0 if telemetry_seq is None else int(telemetry_seq)),
             )
-            self._pull_cpp_workers_locked()
 
-    def release_dit_reservation(
-        self,
-        gpu_id: int,
-        est_dit_ms: float,
-        workers: dict[int, WorkerState] | None = None,
-    ) -> None:
-        gid = int(gpu_id)
+    def release_dit_reservation(self, gpu_id: int, est_dit_ms: float) -> None:
         with self._mu:
-            if workers is not None and workers is not self.worker_states:
-                if gid in workers:
-                    workers[gid].queue_wait_ms = max(0.0, float(workers[gid].queue_wait_ms) - max(0.0, float(est_dit_ms)))
-                return
-            self._push_python_mutations_locked()
             self._lib.ms_router_release_dit_reservation(
-                ctypes.c_void_p(self._handle), ctypes.c_int(gid), ctypes.c_double(float(est_dit_ms))
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_double(float(est_dit_ms)),
             )
-            self._pull_cpp_workers_locked()
 
     def analytical_crossover_kv_mib(
         self,
         alpha: float = 0.50,
-        gen_expert_bytes: int = DEFAULT_OPERATOR_PROFILE.bagel_expert_bytes,
-        dit_step1_ms: float = DEFAULT_OPERATOR_PROFILE.bagel_dit_512_step_ms,
+        gen_expert_bytes: int = 0,
+        dit_step1_ms: float = 0.0,
         src_gpu: int = 0,
         dst_gpu: int = 1,
     ) -> float:
@@ -640,10 +643,8 @@ class DualPathMorphRouter:
         _ = req.effective_state_bytes()
         with self._mu:
             payload: dict[str, Any] = {"req": req.to_dict(), "now_ms": float(now_ms)}
-            if workers is not None and workers is not self.worker_states:
+            if workers is not None:
                 payload["workers"] = {str(g): w.to_dict() for g, w in workers.items()}
-            else:
-                self._push_python_mutations_locked()
             out = call_json(
                 self._lib,
                 self._lib.ms_router_decide_json,
@@ -655,14 +656,15 @@ class DualPathMorphRouter:
     def route_batch(
         self,
         requests: list[CPTGRequestSpec],
-        workers: Mapping[int, WorkerState],
+        workers: Mapping[int, WorkerState] | None = None,
         now_ms: float = 0.0,
     ) -> list[RouteDecision]:
         for r in requests:
             _ = r.effective_state_bytes()
+        eff_workers = self.worker_states_snapshot() if workers is None else workers
         payload = {
             "requests": [r.to_dict() for r in requests],
-            "workers": {str(g): w.to_dict() for g, w in workers.items()},
+            "workers": {str(g): w.to_dict() for g, w in eff_workers.items()},
             "now_ms": float(now_ms),
         }
         arr = call_json(

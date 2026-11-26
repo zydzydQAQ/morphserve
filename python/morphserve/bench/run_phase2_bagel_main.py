@@ -4,32 +4,42 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from dataclasses import asdict, replace
-import gc
+from dataclasses import asdict
 import json
-import math
-import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any, Sequence
+from typing import Any, Callable
 
-from morphserve.bench.exactness import (
-    ExactnessEvaluator,
-    build_m3_active_accuracy_suite,
-    image_pair_metrics,
+from morphserve.bench.exactness import ExactnessEvaluator
+from morphserve.bench.harness import (
+    BenchmarkRunner,
+    SuiteRunSpec,
+    compute_phase_breakdown,
+    compute_sustainable_qps_summary,
+    effective_steady_window_s,
+    load_main_mix_suite,
+    local_tmp_base,
+    parse_csv_floats,
+    parse_csv_strings,
+    resolve_sources_dir,
 )
 from morphserve.bench.interleaved_bench import (
     InterleavedSession,
     InterleavedTurn,
     WorkloadSuite,
+    build_m3_active_accuracy_suite,
     build_online_phase_shift_suite,
     load_burstgpt_interarrivals,
     load_gentd26_interarrivals,
 )
-from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine, VALID_POLICIES
-from morphserve.engine.workload import build_time_window_suite
-from morphserve.telemetry import percentile as _pct
+from morphserve.engine.config import (
+    EnginePolicyConfig,
+    RunWindowOptions,
+    VALID_POLICIES,
+    build_ablation_configs,
+)
+from morphserve.engine.workload import build_time_window_suite, hamilton_apportion
 
 DEFAULT_MAIN_SESSIONS = 96
 DEFAULT_ABLATION_SESSIONS = 80
@@ -59,53 +69,6 @@ DEFAULT_PHASE_SHIFT_POLICIES = (
 )
 
 
-def _resolve_sources_dir(bench_root: Path) -> Path:
-    for cand in (bench_root / "sources", bench_root.parent / "bench_sources"):
-        if cand.is_dir():
-            return cand
-    return bench_root / "sources"
-
-
-def _load_main_mix_suite(bench_root: Path) -> WorkloadSuite:
-    for rel in ("suites/main_mix_v2_80.json", "suites/main_mix_80.json"):
-        cand = bench_root / rel
-        if cand.is_file():
-            return WorkloadSuite.load_json(cand)
-    raise FileNotFoundError(f"Missing main_mix_v2_80.json / main_mix_80.json under {bench_root / 'suites'}")
-
-
-def _hamilton_quadrant_counts(
-    by_quad: dict[str, list[InterleavedSession]],
-    n_tot: int,
-    target_sessions: int,
-    *,
-    cap_to_available: bool,
-) -> dict[str, int]:
-    quotas: list[tuple[str, int, float]] = []
-    used = 0
-    for q, items in sorted(by_quad.items()):
-        exact = target_sessions * (len(items) / float(max(1, n_tot)))
-        cnt = int(math.floor(exact))
-        if cap_to_available:
-            cnt = min(len(items), cnt)
-        quotas.append((q, cnt, exact - math.floor(exact)))
-        used += cnt
-
-    quotas.sort(key=lambda x: (-x[2], x[0]))
-    counts = {q: c for q, c, _ in quotas}
-    rem = target_sessions - used
-    idx = 0
-    while rem > 0 and quotas:
-        q = quotas[idx % len(quotas)][0]
-        if (not cap_to_available) or counts[q] < len(by_quad[q]):
-            counts[q] += 1
-            rem -= 1
-        elif all(counts[k] >= len(by_quad[k]) for k in counts):
-            break
-        idx += 1
-    return counts
-
-
 def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
     """Select a deterministic, quadrant-balanced slice of `suite` preserving arrival ordering."""
     if max_sessions <= 0 or len(suite.sessions) <= max_sessions:
@@ -114,10 +77,11 @@ def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
     for s in suite.sessions:
         by_quad[s.quadrant].append(s)
 
-    counts = _hamilton_quadrant_counts(by_quad, len(suite.sessions), max_sessions, cap_to_available=True)
+    weights = {q: float(len(items)) for q, items in sorted(by_quad.items())}
+    counts = hamilton_apportion(int(max_sessions), weights)
     picked: list[InterleavedSession] = []
     for q, items in sorted(by_quad.items()):
-        picked.extend(items[: counts[q]])
+        picked.extend(items[: counts.get(q, 0)])
     picked.sort(key=lambda s: (s.arrival_offset_s, s.session_id))
     return WorkloadSuite(
         name=f"{suite.name}_n{len(picked)}",
@@ -126,11 +90,6 @@ def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
         sessions=picked,
         schema=suite.schema,
     )
-
-
-def _local_tmp_base() -> Path:
-    raw = os.environ.get("MORPHSERVE_LOCAL_TMP", "").strip()
-    return Path(raw) if raw else Path("/tmp")
 
 
 def scale_suite_sessions(suite: WorkloadSuite, target_sessions: int) -> WorkloadSuite:
@@ -226,325 +185,6 @@ def _v2_time_window_policy_overrides(
     }
 
 
-def _build_policy_config(
-    policy_name: str,
-    num_gpus: int = 8,
-    **overrides: Any,
-) -> EnginePolicyConfig:
-    """Resolve standard presets plus asymmetric static split baselines (`static_2und_6gen`, `static_6und_2gen`)."""
-    n = int(num_gpus)
-    if policy_name in ("static_2und_6gen", "static_6und_2gen"):
-        base_static = EnginePolicyConfig.from_preset("static_nccl_fission", num_gpus=n, **overrides)
-        if n >= 4 and n % 4 == 0:
-            if n % 8 == 0:
-                und_1_3 = tuple(g for g in range(n) if (g % 8) in (0, 4))
-                und_3_1 = tuple(g for g in range(n) if (g % 8) in (0, 1, 2, 4, 5, 6))
-            else:
-                q = n // 4
-                und_1_3 = tuple(range(q))
-                und_3_1 = tuple(range(3 * q))
-            und_ranks = und_1_3 if policy_name == "static_2und_6gen" else und_3_1
-        elif n >= 2:
-            und_ranks = (0,) if policy_name == "static_2und_6gen" else tuple(range(n - 1))
-        else:
-            und_ranks = (0,)
-        gen_ranks = tuple(g for g in range(n) if g not in und_ranks) or (0,)
-        return replace(
-            base_static,
-            policy_name=policy_name,
-            static_und_ranks=und_ranks,
-            static_gen_ranks=gen_ranks,
-            initial_alphas={g: (0.0 if g in und_ranks else 1.0) for g in range(n)},
-        )
-    return EnginePolicyConfig.from_preset(policy_name, num_gpus=n, **overrides)
-
-
-def build_ablation_configs(num_gpus: int = 8, **policy_overrides: Any) -> list[tuple[str, EnginePolicyConfig]]:
-    """Construct strict single-variable Leave-One-Out M1-M4 ablations relative to `full_morphserve`."""
-    base_ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=num_gpus, **policy_overrides)
-    no_m4 = replace(base_ms, policy_name="no_m4_layer_chunk", preemption_mode="non_preemptive")
-    no_m3 = replace(base_ms, policy_name="no_m3_cow_loopback", use_module3_cow_loopback=False)
-    no_m2 = replace(
-        base_ms,
-        policy_name="no_m2_dual_path",
-        routing_mode="sticky_least_loaded",
-        use_h2d_pacer=False,
-        use_shared_numa_mirror=False,
-    )
-    no_m1 = replace(
-        base_ms,
-        policy_name="no_m1_tripool_vmm",
-        use_tripool_vmm=False,
-        use_expert_pager=False,
-        use_scoped_vae=False,
-        use_shared_numa_mirror=False,
-        use_h2d_pacer=False,
-    )
-    return [
-        ("full_morphserve", base_ms),
-        ("no_m4_layer_chunk", no_m4),
-        ("no_m3_cow_loopback", no_m3),
-        ("no_m2_dual_path", no_m2),
-        ("no_m1_tripool_vmm", no_m1),
-    ]
-
-
-def _interpolate_slo_threshold_qps(
-    points: list[tuple[float, float]],
-    threshold_pct: float,
-) -> float:
-    """Compute highest sustainable QPS where piecewise-linear `SLO Attainment (%) vs. QPS` >= `threshold_pct`."""
-    if not points:
-        return 0.0
-    pts = sorted(points, key=lambda x: float(x[0]))
-    best_q = 0.0
-    for idx, (q_cur, att_cur) in enumerate(pts):
-        if att_cur >= threshold_pct:
-            best_q = max(best_q, q_cur)
-            if idx + 1 < len(pts):
-                q_nxt, att_nxt = pts[idx + 1]
-                if att_nxt < threshold_pct and att_cur > att_nxt and q_nxt > q_cur:
-                    frac = (att_cur - threshold_pct) / (att_cur - att_nxt)
-                    best_q = max(best_q, q_cur + frac * (q_nxt - q_cur))
-    return round(best_q, 4)
-
-
-def _interpolate_zero_oom_slo_qps(
-    points: list[tuple[float, float, int]],
-    threshold_pct: float,
-) -> float:
-    """Highest sustainable QPS with strictly zero steady-state OOMs (`steady_oom_sessions == 0`).
-
-    Interpolates only between adjacent zero-OOM points; never interpolates into a point that suffered OOM.
-    """
-    if not points:
-        return 0.0
-    pts = sorted(points, key=lambda x: float(x[0]))
-    best_q = 0.0
-    for idx, (q_cur, att_cur, oom_cur) in enumerate(pts):
-        if oom_cur == 0 and att_cur >= threshold_pct:
-            best_q = max(best_q, q_cur)
-            if idx + 1 < len(pts):
-                q_nxt, att_nxt, oom_nxt = pts[idx + 1]
-                if oom_nxt == 0 and att_nxt < threshold_pct and att_cur > att_nxt and q_nxt > q_cur:
-                    frac = (att_cur - threshold_pct) / (att_cur - att_nxt)
-                    best_q = max(best_q, q_cur + frac * (q_nxt - q_cur))
-    return round(best_q, 4)
-
-
-def _compute_sustainable_qps_summary(qps_sweep_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Summarize steady-state `SLO Attainment (%) vs. QPS`, zero-OOM sustainable QPS & Active JCT curves."""
-    by_pol: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in qps_sweep_results:
-        by_pol[str(row["policy_name"])].append(row)
-    summary: dict[str, dict[str, Any]] = {}
-    for pol, rows in sorted(by_pol.items()):
-        rows_sorted = sorted(rows, key=lambda r: float(r["offered_qps"]))
-        steady_pts = [
-            (float(r["offered_qps"]), float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"])))
-            for r in rows_sorted
-        ]
-        steady_turn_pts = [
-            (
-                float(r["offered_qps"]),
-                float(
-                    r.get(
-                        "steady_turn_slo_attainment_pct",
-                        r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]),
-                    )
-                ),
-            )
-            for r in rows_sorted
-        ]
-        steady_zero_oom_pts = [
-            (
-                float(r["offered_qps"]),
-                float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"])),
-                int(r.get("steady_oom_sessions", r.get("oom_sessions", 0))),
-            )
-            for r in rows_sorted
-        ]
-        steady_turn_zero_oom_pts = [
-            (
-                float(r["offered_qps"]),
-                float(
-                    r.get(
-                        "steady_turn_slo_attainment_pct",
-                        r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]),
-                    )
-                ),
-                int(r.get("steady_oom_sessions", r.get("oom_sessions", 0))),
-            )
-            for r in rows_sorted
-        ]
-        full_pts = [
-            (float(r["offered_qps"]), float(r["joint_slo_attainment_pct"]))
-            for r in rows_sorted
-        ]
-        grid_80 = max((q for q, a in steady_pts if a >= 80.0), default=0.0)
-        grid_90 = max((q for q, a in steady_pts if a >= 90.0), default=0.0)
-        turn_grid_80 = max((q for q, a in steady_turn_pts if a >= 80.0), default=0.0)
-        turn_grid_90 = max((q for q, a in steady_turn_pts if a >= 90.0), default=0.0)
-        curve = []
-        for r in rows_sorted:
-            tot_s = max(1, int(r.get("total_sessions", 1)))
-            ok_s = int(r.get("completed_sessions", tot_s - int(r.get("oom_sessions", 0)) - int(r.get("error_sessions", 0))))
-            surv_pct = float(r.get("survival_rate_pct", round(100.0 * ok_s / tot_s, 1)))
-            steady_surv_pct = float(r.get("steady_state_survival_pct", surv_pct))
-            steady_oom = int(r.get("steady_oom_sessions", r.get("oom_sessions", 0)))
-            steady_att = float(r.get("steady_state_attainment_pct", r["joint_slo_attainment_pct"]))
-            steady_turn_att = float(r.get("steady_turn_slo_attainment_pct", steady_att))
-            curve.append(
-                {
-                    "offered_qps": float(r["offered_qps"]),
-                    "steady_turn_slo_attainment_pct": steady_turn_att,
-                    "steady_turn_slo_goodput_rps": float(
-                        r.get("steady_turn_slo_goodput_rps", r.get("steady_state_goodput_rps", 0.0))
-                    ),
-                    "steady_turn_survival_pct": float(r.get("steady_turn_survival_pct", steady_surv_pct)),
-                    "steady_planned_turns": int(r.get("steady_planned_turns", 0)),
-                    "steady_state_attainment_pct": steady_att,
-                    "joint_slo_attainment_pct": float(r["joint_slo_attainment_pct"]),
-                    "steady_state_survival_pct": steady_surv_pct,
-                    "survival_rate_pct": surv_pct,
-                    "steady_oom_sessions": steady_oom,
-                    "oom_sessions": int(r.get("oom_sessions", 0)),
-                    "steady_state_sessions": int(r.get("steady_state_sessions", tot_s)),
-                    "total_sessions": tot_s,
-                    "effective_slo_throughput_rps": float(
-                        r.get("effective_slo_throughput_rps", r.get("steady_state_goodput_rps", 0.0))
-                    ),
-                    "steady_state_goodput_rps": float(r.get("steady_state_goodput_rps", 0.0)),
-                    "ar_ttft_p95_ms": float(r.get("ar_ttft_p95_ms", 0.0)),
-                    "ar_tpot_p95_ms": float(r.get("ar_tpot_p95_ms", 0.0)),
-                    "survivor_dit_turn_p95_ms": float(r.get("dit_turn_p95_ms", 0.0)),
-                    "all_session_dit_p95_ms": r.get("all_session_dit_p95_ms"),
-                    "active_jct_p95_ms": r.get("active_jct_p95_ms"),
-                    "all_session_active_jct_p95_ms": r.get("all_session_active_jct_p95_ms"),
-                    "all_session_e2e_p95_ms": r.get("all_session_e2e_p95_ms"),
-                    "kv_host_swap_outs": int(r.get("kv_host_swap_outs", 0)),
-                    "peak_nvml_used_mib": float(r.get("peak_nvml_used_mib", r.get("peak_gpu_reserved_mib", 0.0))),
-                }
-            )
-        max_q_80 = _interpolate_slo_threshold_qps(steady_pts, 80.0)
-        max_q_90 = _interpolate_slo_threshold_qps(steady_pts, 90.0)
-        turn_max_q_80 = _interpolate_slo_threshold_qps(steady_turn_pts, 80.0)
-        turn_max_q_90 = _interpolate_slo_threshold_qps(steady_turn_pts, 90.0)
-        summary[pol] = {
-            "primary_metric": "steady_turn_slo_attainment_pct_vs_offered_qps",
-            "secondary_session_metric": "steady_state_slo_attainment_pct_vs_offered_qps",
-            "turn_max_sustainable_qps_80pct": turn_max_q_80,
-            "turn_max_sustainable_qps_90pct": turn_max_q_90,
-            "turn_max_sustainable_qps_zero_oom_80pct": _interpolate_zero_oom_slo_qps(steady_turn_zero_oom_pts, 80.0),
-            "turn_max_sustainable_qps_zero_oom_90pct": _interpolate_zero_oom_slo_qps(steady_turn_zero_oom_pts, 90.0),
-            "turn_max_grid_qps_80pct": round(turn_grid_80, 3),
-            "turn_max_grid_qps_90pct": round(turn_grid_90, 3),
-            "max_sustainable_qps_80pct": max_q_80,
-            "max_sustainable_qps_90pct": max_q_90,
-            "max_sustainable_qps_zero_oom_80pct": _interpolate_zero_oom_slo_qps(steady_zero_oom_pts, 80.0),
-            "max_sustainable_qps_zero_oom_90pct": _interpolate_zero_oom_slo_qps(steady_zero_oom_pts, 90.0),
-            "steady_max_sustainable_qps_80pct": max_q_80,
-            "steady_max_sustainable_qps_90pct": max_q_90,
-            "full_window_max_sustainable_qps_80pct": _interpolate_slo_threshold_qps(full_pts, 80.0),
-            "full_window_max_sustainable_qps_90pct": _interpolate_slo_threshold_qps(full_pts, 90.0),
-            "max_grid_qps_80pct": round(grid_80, 3),
-            "max_grid_qps_90pct": round(grid_90, 3),
-            "min_steady_survival_rate_pct": min((c["steady_state_survival_pct"] for c in curve), default=100.0),
-            "min_survival_rate_pct": min((c["survival_rate_pct"] for c in curve), default=100.0),
-            "total_steady_oom_sessions": sum(c["steady_oom_sessions"] for c in curve),
-            "total_oom_sessions": sum(c["oom_sessions"] for c in curve),
-            "max_nvml_peak_used_mib": max((c["peak_nvml_used_mib"] for c in curve), default=0.0),
-            "slo_attainment_curve": curve,
-        }
-    return summary
-
-
-def _extract_compact_report_dict(
-    rep: Any,
-    *,
-    init_info: dict[str, Any] | None = None,
-    include_cdf_outcomes: bool = True,
-) -> tuple[dict[str, Any], list[str]]:
-    d = rep.to_dict()
-    err_samples = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
-    if err_samples:
-        d["error_samples"] = err_samples
-    if include_cdf_outcomes:
-        d["cdf_outcomes"] = [
-            {
-                "status": s.get("status", "error"),
-                "quadrant": s.get("quadrant", ""),
-                "phase_label": s.get("phase_label", ""),
-                "e2e_ms": s.get("e2e_ms", 0.0),
-                "active_jct_ms": s.get("active_jct_ms", s.get("e2e_ms", 0.0)),
-                "dit_turns_ms": s.get("dit_turns_ms", []),
-                "ar_ttfts_ms": s.get("ar_ttfts_ms", []),
-            }
-            for s in rep.sessions
-        ]
-    d.pop("sessions", None)
-    if init_info is not None:
-        d["host_shmem_delta_gib"] = init_info.get("host_shmem_delta_gib", rep.host_shmem_delta_gib)
-    return d, err_samples
-
-
-def _compute_phase_breakdown(
-    suite_sessions: Sequence[InterleavedSession],
-    outcomes: Sequence[dict[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    """Aggregate per-phase metrics across the continuous 360s online phase-shift run."""
-    phase_by_sid = {s.session_id: (s.phase_label or "unlabeled") for s in suite_sessions}
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for row in outcomes:
-        pl = str(row.get("phase_label") or phase_by_sid.get(str(row.get("session_id", "")), "unlabeled"))
-        grouped[pl].append(row)
-
-    phase_order: list[str] = []
-    for s in suite_sessions:
-        pl = s.phase_label or "unlabeled"
-        if pl not in phase_order:
-            phase_order.append(pl)
-    for pl in sorted(grouped.keys()):
-        if pl not in phase_order:
-            phase_order.append(pl)
-
-    breakdown: dict[str, dict[str, Any]] = {}
-    for pl in phase_order:
-        rows = grouped.get(pl, [])
-        n_tot = len(rows)
-        ok = [r for r in rows if r.get("status") == "ok"]
-        oom = [r for r in rows if r.get("status") == "oom"]
-        err = [r for r in rows if r.get("status") == "error"]
-        joint_ok = [r for r in ok if r.get("joint_slo_met")]
-        ar_ok = [r for r in ok if r.get("ar_slo_met")]
-        dit_ok = [r for r in ok if r.get("dit_slo_met")]
-        e2es = [float(r.get("e2e_ms", 0.0)) for r in ok]
-        act_jcts = [float(r.get("active_jct_ms", r.get("e2e_ms", 0.0))) for r in ok]
-        ttfts = [float(v) for r in ok for v in r.get("ar_ttfts_ms", [])]
-        tpots = [float(v) for r in ok for v in r.get("ar_tpots_ms", [])]
-        dits = [float(v) for r in ok for v in r.get("dit_turns_ms", [])]
-        breakdown[pl] = {
-            "total_sessions": n_tot,
-            "completed_sessions": len(ok),
-            "oom_sessions": len(oom),
-            "error_sessions": len(err),
-            "survival_rate_pct": round(100.0 * len(ok) / max(1, n_tot), 1),
-            "joint_slo_attainment_pct": round(100.0 * len(joint_ok) / max(1, n_tot), 1),
-            "ar_slo_attainment_pct": round(100.0 * len(ar_ok) / max(1, n_tot), 1),
-            "dit_slo_attainment_pct": round(100.0 * len(dit_ok) / max(1, n_tot), 1),
-            "active_jct_p50_ms": _pct(act_jcts, 50),
-            "active_jct_p95_ms": _pct(act_jcts, 95),
-            "e2e_p95_ms": _pct(e2es, 95),
-            "ar_ttft_p95_ms": _pct(ttfts, 95),
-            "ar_tpot_p95_ms": _pct(tpots, 95),
-            "dit_turn_p95_ms": _pct(dits, 95),
-            "path_a_ships": sum(int(r.get("path_a_ships", 0)) for r in rows),
-            "path_b_morphs": sum(int(r.get("path_b_morphs", 0)) for r in rows),
-            "total_yields": sum(int(r.get("total_yields", 0)) for r in rows),
-        }
-    return breakdown
-
-
 def _load_or_build_phase_shift_suite(
     bench_root: Path,
     burst_deltas: list[float],
@@ -561,7 +201,7 @@ def _load_or_build_phase_shift_suite(
         ) < 1.0:
             return loaded
 
-    raw_main = _load_main_mix_suite(bench_root)
+    raw_main = load_main_mix_suite(bench_root)
     pools: dict[str, list[InterleavedSession]] = defaultdict(list)
     for s in raw_main.sessions:
         pools[s.quadrant].append(s)
@@ -573,13 +213,6 @@ def _load_or_build_phase_shift_suite(
         target_qps=target_qps,
         seed=2026,
     )
-
-
-def _effective_steady_window_s(suite: WorkloadSuite) -> float:
-    """Return `suite.steady_s`, expanding to `max_arrival - warmup_s` when `min_sessions` extends a low-QPS trace."""
-    max_arr = max((float(s.arrival_offset_s) for s in suite.sessions), default=0.0)
-    span_after_warmup = max(0.0, max_arr - float(suite.warmup_s))
-    return round(max(float(suite.steady_s), span_after_warmup), 3)
 
 
 def run_suite_a_qps_and_ablations(
@@ -595,12 +228,15 @@ def run_suite_a_qps_and_ablations(
     qps_points: tuple[float, ...] = DEFAULT_SUITE_A_QPS,
     ablation_qps: float = 0.80,
     policies: tuple[str, ...] = VALID_POLICIES,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Suite A (1x8 GPUs): Interleaved-Bench v2 240s time-windowed QPS sweep + LOO M1-M4 ablations."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_main = _load_main_mix_suite(bench_root)
+    raw_main = load_main_mix_suite(bench_root)
 
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
     gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
 
@@ -630,78 +266,100 @@ def run_suite_a_qps_and_ablations(
     )
 
     v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
-    tmp_base = _local_tmp_base()
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=local_tmp_base(),
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
+    )
     qps_sweep_results: list[dict[str, Any]] = []
 
     for preset in policies:
-        policy = _build_policy_config(preset, num_gpus=num_gpus, **v2_ov)
-        engine = MorphServeClusterEngine(
-            policy=policy,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=tmp_base / f"ms_m23a_{preset}",
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **v2_ov)
+        specs = [
+            SuiteRunSpec(
+                suite=suites_by_qps[float(qps)],
+                target_qps=float(qps),
+                run_options=RunWindowOptions(
+                    steady_window_mode="time",
+                    warmup_window_s=float(suites_by_qps[float(qps)].warmup_s),
+                    steady_window_s=effective_steady_window_s(suites_by_qps[float(qps)]),
+                ),
+            )
+            for qps in qps_points
+        ]
+
+        def _log_qps(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _preset: str = preset) -> None:
+            errs = compact.get("error_samples") or ()
+            print(
+                f"[M2.3-QPS-v2] policy={_preset} n={len(spec.suite.sessions)} qps={spec.target_qps} "
+                f"turn_slo={rep.steady_turn_slo_attainment_pct}% "
+                f"turn_gp={rep.steady_turn_slo_goodput_rps:.3f} "
+                f"sess_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                f"active_jct_p95={rep.active_jct_p95_ms}ms "
+                f"ar_tpot_p95={rep.ar_tpot_p95_ms}ms dit_p95={rep.dit_turn_p95_ms}ms "
+                f"swaps={rep.kv_host_swap_outs} "
+                f"steady_oom={rep.steady_oom_sessions} "
+                f"oom={rep.oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={errs[0]!r}" if errs else ""),
+                flush=True,
+            )
+
+        qps_sweep_results.extend(
+            runner.run_policy_sweep(
+                policy,
+                specs,
+                tmp_tag=f"ms_m23a_{preset}",
+                max_error_samples=5,
+                include_cdf_outcomes=True,
+                on_result=_log_qps,
+            )
         )
-        try:
-            init_info = engine.start()
-            for qps in qps_points:
-                active_suite = suites_by_qps[float(qps)]
-                engine.policy = replace(
-                    engine.policy,
-                    warmup_window_s=float(active_suite.warmup_s),
-                    steady_window_s=_effective_steady_window_s(active_suite),
-                )
-                rep = engine.run_suite(active_suite, target_qps=float(qps))
-                d, err_samples = _extract_compact_report_dict(rep, init_info=init_info, include_cdf_outcomes=True)
-                qps_sweep_results.append(d)
-                print(
-                    f"[M2.3-QPS-v2] policy={preset} n={len(active_suite.sessions)} qps={qps} "
-                    f"turn_slo={getattr(rep, 'steady_turn_slo_attainment_pct', rep.steady_state_attainment_pct)}% "
-                    f"turn_gp={getattr(rep, 'steady_turn_slo_goodput_rps', rep.steady_state_goodput_rps):.3f} "
-                    f"sess_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                    f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
-                    f"ar_tpot_p95={rep.ar_tpot_p95_ms}ms dit_p95={rep.dit_turn_p95_ms}ms "
-                    f"swaps={getattr(rep, 'kv_host_swap_outs', 0)} "
-                    f"steady_oom={getattr(rep, 'steady_oom_sessions', rep.oom_sessions)} "
-                    f"oom={rep.oom_sessions} err={rep.error_sessions}"
-                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
-                    flush=True,
-                )
-        finally:
-            engine.shutdown()
-            gc.collect()
 
     ablation_results: list[dict[str, Any]] = []
     ab_ov = _v2_time_window_policy_overrides(
         warmup_s=float(ablation_suite.warmup_s),
-        steady_s=_effective_steady_window_s(ablation_suite),
+        steady_s=effective_steady_window_s(ablation_suite),
+    )
+    ab_run_opts = RunWindowOptions(
+        steady_window_mode="time",
+        warmup_window_s=float(ablation_suite.warmup_s),
+        steady_window_s=effective_steady_window_s(ablation_suite),
     )
     for ab_name, ab_cfg in build_ablation_configs(num_gpus=num_gpus, **ab_ov):
-        engine = MorphServeClusterEngine(
-            policy=ab_cfg,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=tmp_base / f"ms_m23ab_{ab_name}",
-        )
-        try:
-            engine.start()
-            rep = engine.run_suite(ablation_suite, target_qps=float(ablation_qps))
-            d, err_samples = _extract_compact_report_dict(rep, include_cdf_outcomes=False)
-            d["ablation_name"] = ab_name
-            ablation_results.append(d)
+        def _log_ab(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _ab_name: str = ab_name) -> None:
+            errs = compact.get("error_samples") or ()
             print(
-                f"[M2.3-ABLATION-v2] {ab_name} n={len(ablation_suite.sessions)} qps={ablation_qps} "
-                f"eff_tput={getattr(rep, 'effective_slo_throughput_rps', rep.steady_state_goodput_rps):.3f} "
-                f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
+                f"[M2.3-ABLATION-v2] {_ab_name} n={len(spec.suite.sessions)} qps={ablation_qps} "
+                f"eff_tput={rep.joint_slo_goodput_rps:.3f} "
+                f"steady_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                f"active_jct_p95={rep.active_jct_p95_ms}ms "
                 f"ar_ttft_p99={rep.ar_ttft_p99_ms}ms peak_nvml={rep.peak_nvml_used_mib}MiB "
-                f"yields={rep.total_yields} swaps={getattr(rep, 'kv_host_swap_outs', 0)} "
-                f"steady_oom={getattr(rep, 'steady_oom_sessions', rep.oom_sessions)} err={rep.error_sessions}"
-                + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
+                f"yields={rep.total_yields} swaps={rep.kv_host_swap_outs} "
+                f"steady_oom={rep.steady_oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={errs[0]!r}" if errs else ""),
                 flush=True,
             )
-        finally:
-            engine.shutdown()
-            gc.collect()
+
+        ablation_results.extend(
+            runner.run_policy_sweep(
+                ab_cfg,
+                [
+                    SuiteRunSpec(
+                        suite=ablation_suite,
+                        target_qps=float(ablation_qps),
+                        run_options=ab_run_opts,
+                        extra_fields={"ablation_name": ab_name},
+                    )
+                ],
+                tmp_tag=f"ms_m23ab_{ab_name}",
+                max_error_samples=5,
+                include_cdf_outcomes=False,
+                attach_init_shmem=False,
+                on_result=_log_ab,
+            )
+        )
 
     all_off_ref = next(
         (
@@ -733,7 +391,7 @@ def run_suite_a_qps_and_ablations(
         },
         "qps_points": [float(q) for q in qps_points],
         "ablation_qps": float(ablation_qps),
-        "sustainable_qps_summary": _compute_sustainable_qps_summary(qps_sweep_results),
+        "sustainable_qps_summary": compute_sustainable_qps_summary(qps_sweep_results),
         "qps_sweep": qps_sweep_results,
         "ablations": ablation_results,
         "ablation_all_off_ref": all_off_ref,
@@ -758,12 +416,15 @@ def run_suite_a_lowqps_and_cdf(
     max_sessions: int | None = None,
     policies: tuple[str, ...] = VALID_POLICIES,
     merge_suite_a_report: Path | None = None,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Suite A Low-to-Knee QPS Sweep (`0.05..0.80` RPS) via time-windowed `build_time_window_suite`."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_main = _load_main_mix_suite(bench_root)
+    raw_main = load_main_mix_suite(bench_root)
 
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
     gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
 
@@ -783,43 +444,54 @@ def run_suite_a_lowqps_and_cdf(
         )
 
     v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
-    tmp_base = _local_tmp_base()
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=local_tmp_base(),
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
+    )
     qps_sweep_results: list[dict[str, Any]] = []
     for preset in policies:
-        policy = _build_policy_config(preset, num_gpus=num_gpus, **v2_ov)
-        engine = MorphServeClusterEngine(
-            policy=policy,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=tmp_base / f"ms_m23low_{preset}",
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **v2_ov)
+        specs = [
+            SuiteRunSpec(
+                suite=suites_by_qps[float(qps)],
+                target_qps=float(qps),
+                run_options=RunWindowOptions(
+                    steady_window_mode="time",
+                    warmup_window_s=float(suites_by_qps[float(qps)].warmup_s),
+                    steady_window_s=effective_steady_window_s(suites_by_qps[float(qps)]),
+                ),
+            )
+            for qps in qps_points
+        ]
+
+        def _log_low(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _preset: str = preset) -> None:
+            errs = compact.get("error_samples") or ()
+            print(
+                f"[M2.3-LOWQPS-v2] policy={_preset} n={len(spec.suite.sessions)} qps={spec.target_qps} "
+                f"steady_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                f"nvml_peak={rep.peak_nvml_used_mib}MiB "
+                f"active_jct_p95={rep.active_jct_p95_ms}ms "
+                f"all_active_jct_p95={rep.all_session_active_jct_p95_ms} "
+                f"all_dit_p95={rep.all_session_dit_p95_ms} "
+                f"steady_oom={rep.steady_oom_sessions} "
+                f"oom={rep.oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={errs[0]!r}" if errs else ""),
+                flush=True,
+            )
+
+        qps_sweep_results.extend(
+            runner.run_policy_sweep(
+                policy,
+                specs,
+                tmp_tag=f"ms_m23low_{preset}",
+                max_error_samples=5,
+                include_cdf_outcomes=True,
+                on_result=_log_low,
+            )
         )
-        try:
-            init_info = engine.start()
-            for qps in qps_points:
-                active_suite = suites_by_qps[float(qps)]
-                engine.policy = replace(
-                    engine.policy,
-                    warmup_window_s=float(active_suite.warmup_s),
-                    steady_window_s=_effective_steady_window_s(active_suite),
-                )
-                rep = engine.run_suite(active_suite, target_qps=float(qps))
-                d, err_samples = _extract_compact_report_dict(rep, init_info=init_info, include_cdf_outcomes=True)
-                qps_sweep_results.append(d)
-                print(
-                    f"[M2.3-LOWQPS-v2] policy={preset} n={len(active_suite.sessions)} qps={qps} "
-                    f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                    f"nvml_peak={rep.peak_nvml_used_mib}MiB "
-                    f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
-                    f"all_active_jct_p95={getattr(rep, 'all_session_active_jct_p95_ms', None)} "
-                    f"all_dit_p95={rep.all_session_dit_p95_ms} "
-                    f"steady_oom={getattr(rep, 'steady_oom_sessions', rep.oom_sessions)} "
-                    f"oom={rep.oom_sessions} err={rep.error_sessions}"
-                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
-                    flush=True,
-                )
-        finally:
-            engine.shutdown()
-            gc.collect()
 
     combined_sweep = list(qps_sweep_results)
     if merge_suite_a_report is not None and merge_suite_a_report.is_file():
@@ -833,7 +505,7 @@ def run_suite_a_lowqps_and_cdf(
     report = {
         "schema": "morphserve.osdi27.m23_lowqps_slo_cdf.v2",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "primary_metric": "steady_state_slo_attainment_pct_vs_offered_qps",
+        "primary_metric": "joint_slo_attainment_pct_vs_offered_qps",
         "num_gpus": num_gpus,
         "steady_window_mode": "time",
         "arrival_duration_s": float(arrival_duration_s),
@@ -842,7 +514,7 @@ def run_suite_a_lowqps_and_cdf(
         "min_sessions": int(min_sessions),
         "sessions_by_qps": {str(q): len(suites_by_qps[float(q)].sessions) for q in qps_points},
         "qps_points": [float(q) for q in qps_points],
-        "sustainable_qps_summary": _compute_sustainable_qps_summary(combined_sweep),
+        "sustainable_qps_summary": compute_sustainable_qps_summary(combined_sweep),
         "qps_sweep": qps_sweep_results,
         "status": "ok" if all(r["error_sessions"] == 0 for r in qps_sweep_results) else "check_failed",
     }
@@ -865,12 +537,15 @@ def run_think_time_sweep(
     min_sessions: int = DEFAULT_MIN_SESSIONS,
     max_sessions: int | None = None,
     policies: tuple[str, ...] = DEFAULT_THINK_TIME_POLICIES,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Fixed knee-QPS sweep of constant inter-turn think times `(0, 5, 20, 60)s` verifying KV residency & swap scaling."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    raw_main = _load_main_mix_suite(bench_root)
+    raw_main = load_main_mix_suite(bench_root)
 
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
     gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
 
@@ -885,71 +560,84 @@ def run_think_time_sweep(
         warmup_s=warmup_s,
         steady_s=steady_s,
     )
+    eff_steady_s = effective_steady_window_s(window_suite)
 
-    tmp_base = _local_tmp_base()
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=local_tmp_base(),
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
+    )
     sweep_results: list[dict[str, Any]] = []
     summary_by_policy: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
     for preset in policies:
         init_ov = _v2_time_window_policy_overrides(
             warmup_s=float(window_suite.warmup_s),
-            steady_s=_effective_steady_window_s(window_suite),
+            steady_s=eff_steady_s,
             think_range=(0.0, 0.0),
             think_dist="constant",
             think_median_s=0.0,
             think_sigma=0.0,
         )
-        policy = _build_policy_config(preset, num_gpus=num_gpus, **init_ov)
-        engine = MorphServeClusterEngine(
-            policy=policy,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=tmp_base / f"ms_m23think_{preset}",
-        )
-        try:
-            init_info = engine.start()
-            for t_think in think_times_s:
-                t_val = max(0.0, float(t_think))
-                engine.policy = replace(
-                    engine.policy,
-                    inter_turn_think_s_range=(t_val, t_val),
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **init_ov)
+        specs = [
+            SuiteRunSpec(
+                suite=window_suite,
+                target_qps=float(offered_qps),
+                run_options=RunWindowOptions(
+                    inter_turn_think_s_range=(max(0.0, float(t_think)), max(0.0, float(t_think))),
                     think_time_dist="constant",
-                    think_time_median_s=t_val,
+                    think_time_median_s=max(0.0, float(t_think)),
                     think_time_sigma=0.0,
                     steady_window_mode="time",
                     warmup_window_s=float(window_suite.warmup_s),
-                    steady_window_s=_effective_steady_window_s(window_suite),
-                )
-                rep = engine.run_suite(window_suite, target_qps=float(offered_qps))
-                d, err_samples = _extract_compact_report_dict(rep, init_info=init_info, include_cdf_outcomes=False)
-                d["think_time_s"] = t_val
-                sweep_results.append(d)
+                    steady_window_s=eff_steady_s,
+                ),
+                extra_fields={"think_time_s": max(0.0, float(t_think))},
+            )
+            for t_think in think_times_s
+        ]
 
-                row_summary = {
+        def _on_think(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _preset: str = preset) -> None:
+            t_val = float(spec.extra_fields["think_time_s"])
+            errs = compact.get("error_samples") or ()
+            summary_by_policy[_preset].append(
+                {
                     "think_time_s": t_val,
-                    "kv_host_swap_outs": int(getattr(rep, "kv_host_swap_outs", 0)),
-                    "steady_oom_sessions": int(getattr(rep, "steady_oom_sessions", rep.oom_sessions)),
+                    "kv_host_swap_outs": int(rep.kv_host_swap_outs),
+                    "kv_host_swap_ins": int(rep.kv_host_swap_ins),
+                    "steady_oom_sessions": int(rep.steady_oom_sessions),
                     "oom_sessions": int(rep.oom_sessions),
                     "steady_state_survival_pct": float(rep.steady_state_survival_pct),
-                    "steady_state_attainment_pct": float(rep.steady_state_attainment_pct),
-                    "active_jct_p95_ms": float(getattr(rep, "active_jct_p95_ms", 0.0)),
-                    "all_session_active_jct_p95_ms": getattr(rep, "all_session_active_jct_p95_ms", None),
-                    "per_turn_stats": getattr(rep, "per_turn_stats", {}),
+                    "joint_slo_attainment_pct": float(rep.joint_slo_attainment_pct),
+                    "active_jct_p95_ms": float(rep.active_jct_p95_ms),
+                    "all_session_active_jct_p95_ms": rep.all_session_active_jct_p95_ms,
+                    "per_turn_stats": rep.per_turn_stats,
                     "peak_nvml_used_mib": float(rep.peak_nvml_used_mib),
                 }
-                summary_by_policy[preset].append(row_summary)
-                print(
-                    f"[M2.3-THINK] policy={preset} qps={offered_qps} think_s={t_val:.1f} n={len(window_suite.sessions)} "
-                    f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                    f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
-                    f"swaps={getattr(rep, 'kv_host_swap_outs', 0)} nvml_peak={rep.peak_nvml_used_mib}MiB "
-                    f"steady_oom={getattr(rep, 'steady_oom_sessions', rep.oom_sessions)} err={rep.error_sessions}"
-                    + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
-                    flush=True,
-                )
-        finally:
-            engine.shutdown()
-            gc.collect()
+            )
+            print(
+                f"[M2.3-THINK] policy={_preset} qps={offered_qps} think_s={t_val:.1f} n={len(window_suite.sessions)} "
+                f"steady_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                f"active_jct_p95={rep.active_jct_p95_ms}ms "
+                f"swaps={rep.kv_host_swap_outs} nvml_peak={rep.peak_nvml_used_mib}MiB "
+                f"steady_oom={rep.steady_oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={errs[0]!r}" if errs else ""),
+                flush=True,
+            )
+
+        sweep_results.extend(
+            runner.run_policy_sweep(
+                policy,
+                specs,
+                tmp_tag=f"ms_m23think_{preset}",
+                max_error_samples=5,
+                include_cdf_outcomes=False,
+                on_result=_on_think,
+            )
+        )
 
     report = {
         "schema": "morphserve.osdi27.m23_think_time_sweep.v1",
@@ -988,14 +676,24 @@ def run_suite_b_skews_and_parity(
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
     min_sessions: int = DEFAULT_MIN_SESSIONS,
+    *,
+    engine_factory: Callable[..., Any] | None = None,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
     """Suite B (1x8 GPUs): Part 1 Continuous 360s Online Phase-Shift + Part 2 Two-Tier Accuracy & Lossless Suite."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     burst_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv")
     gentd_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv")
 
-    tmp_base = _local_tmp_base()
+    tmp_base = local_tmp_base()
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=tmp_base,
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
+    )
 
     # ---- Part 1: Continuous 360s Online Modality Phase-Shift (3 x 120s without restarting workers) ----
     phase_suite = _load_or_build_phase_shift_suite(
@@ -1012,35 +710,34 @@ def run_suite_b_skews_and_parity(
 
     phase_shift_results: list[dict[str, Any]] = []
     for preset in phase_shift_policies:
-        policy = _build_policy_config(preset, num_gpus=num_gpus, **phase_ov)
-        engine = MorphServeClusterEngine(
-            policy=policy,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=tmp_base / f"ms_m23b_ps_{preset}",
-        )
-        try:
-            init_info = engine.start()
-            # Pass `target_qps=None` and no deltas so `phase_suite`'s exact 3-phase arrival schedule is preserved!
-            rep = engine.run_suite(phase_suite)
-            per_phase = _compute_phase_breakdown(phase_suite.sessions, rep.sessions)
-            d, err_samples = _extract_compact_report_dict(rep, init_info=init_info, include_cdf_outcomes=False)
-            d["per_phase"] = per_phase
-            d["time_series_10s"] = list(getattr(rep, "time_series_10s", []))
-            phase_shift_results.append(d)
+        policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **phase_ov)
+
+        def _on_phase(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _preset: str = preset) -> None:
+            compact["per_phase"] = compute_phase_breakdown(rep.sessions, suite_sessions=spec.suite.sessions)
+            compact["time_series_10s"] = list(rep.time_series_10s)
+            errs = compact.get("error_samples") or ()
             print(
-                f"[M2.3-PHASE-SHIFT] policy={preset} n={len(phase_suite.sessions)} qps={phase_suite.base_qps} "
-                f"eff_tput={getattr(rep, 'effective_slo_throughput_rps', rep.steady_state_goodput_rps):.3f} "
-                f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
+                f"[M2.3-PHASE-SHIFT] policy={_preset} n={len(spec.suite.sessions)} qps={spec.suite.base_qps} "
+                f"eff_tput={rep.joint_slo_goodput_rps:.3f} "
+                f"steady_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                f"active_jct_p95={rep.active_jct_p95_ms}ms "
                 f"ship={rep.path_a_ships} morph={rep.path_b_morphs} "
-                f"steady_oom={getattr(rep, 'steady_oom_sessions', rep.oom_sessions)} err={rep.error_sessions}"
-                + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
+                f"steady_oom={rep.steady_oom_sessions} err={rep.error_sessions}"
+                + (f" sample_err={errs[0]!r}" if errs else ""),
                 flush=True,
             )
-        finally:
-            engine.shutdown()
-            gc.collect()
+
+        # Preserve `phase_suite`'s exact 3-phase arrival schedule (`target_qps=None`).
+        phase_shift_results.extend(
+            runner.run_policy_sweep(
+                policy,
+                [SuiteRunSpec(suite=phase_suite, target_qps=None)],
+                tmp_tag=f"ms_m23b_ps_{preset}",
+                max_error_samples=5,
+                include_cdf_outcomes=False,
+                on_result=_on_phase,
+            )
+        )
 
     # Optional static skew sweep when `--include-static-skews` is explicitly requested
     skew_results: list[dict[str, Any]] = []
@@ -1069,41 +766,45 @@ def run_suite_b_skews_and_parity(
         ]
         sk_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
         for preset in policies:
-            policy = _build_policy_config(preset, num_gpus=num_gpus, **sk_ov)
-            engine = MorphServeClusterEngine(
-                policy=policy,
-                model_dir=model_dir,
-                bench_root=bench_root,
-                tmp_root=tmp_base / f"ms_m23b_sk_{preset}",
-            )
-            try:
-                engine.start()
-                for skew_tag, sk_suite in skew_suites:
-                    engine.policy = replace(
-                        engine.policy,
+            policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **sk_ov)
+            sk_specs = [
+                SuiteRunSpec(
+                    suite=sk_suite,
+                    target_qps=float(skew_qps),
+                    run_options=RunWindowOptions(
+                        steady_window_mode="time",
                         warmup_window_s=float(sk_suite.warmup_s),
                         steady_window_s=float(sk_suite.steady_s),
-                    )
-                    rep = engine.run_suite(sk_suite, target_qps=float(skew_qps))
-                    d, err_samples = _extract_compact_report_dict(rep, include_cdf_outcomes=False)
-                    d["skew_tag"] = skew_tag
-                    skew_results.append(d)
-                    print(
-                        f"[M2.3-SKEW] policy={preset} skew={skew_tag} n={len(sk_suite.sessions)} "
-                        f"steady_goodput={rep.steady_state_goodput_rps:.3f} "
-                        f"steady_slo={rep.steady_state_attainment_pct}% ship={rep.path_a_ships} morph={rep.path_b_morphs} "
-                        f"oom={rep.oom_sessions} err={rep.error_sessions}"
-                        + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
-                        flush=True,
-                    )
-            finally:
-                engine.shutdown()
-                gc.collect()
+                    ),
+                    extra_fields={"skew_tag": skew_tag},
+                )
+                for skew_tag, sk_suite in skew_suites
+            ]
+
+            def _on_skew(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _preset: str = preset) -> None:
+                errs = compact.get("error_samples") or ()
+                print(
+                    f"[M2.3-SKEW] policy={_preset} skew={spec.extra_fields['skew_tag']} n={len(spec.suite.sessions)} "
+                    f"steady_goodput={rep.joint_slo_goodput_rps:.3f} "
+                    f"steady_slo={rep.joint_slo_attainment_pct}% ship={rep.path_a_ships} morph={rep.path_b_morphs} "
+                    f"oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={errs[0]!r}" if errs else ""),
+                    flush=True,
+                )
+
+            skew_results.extend(
+                runner.run_policy_sweep(
+                    policy,
+                    sk_specs,
+                    tmp_tag=f"ms_m23b_sk_{preset}",
+                    max_error_samples=5,
+                    include_cdf_outcomes=False,
+                    attach_init_shmem=False,
+                    on_result=_on_skew,
+                )
+            )
 
     # ---- Part 2: Two-Tier Accuracy & Lossless Suite (144 sessions across all 4 v2 quadrants) ----
-    #   1. `monolithic_dp` (reference)
-    #   2. `strict_lossless`: `morphserve` with `allow_cascade_cfg_split=False` (hard gate: 100% AR exact + SSIM == 1.0)
-    #   3. `cascade_cfg_fast`: `morphserve` with `allow_cascade_cfg_split=True` (quality-latency Pareto, non-gating on SHA256)
     acc_suite = build_m3_active_accuracy_suite(bench_root)
     tmp_acc_root = tmp_base / "ms_m23_parity_outputs"
     shutil.rmtree(tmp_acc_root, ignore_errors=True)
@@ -1114,6 +815,14 @@ def run_suite_b_skews_and_parity(
         ("monolithic_dp", "monolithic_dp", {"allow_cascade_cfg_split": False}),
         ("strict_lossless", "morphserve", {"allow_cascade_cfg_split": False}),
         ("cascade_cfg_fast", "morphserve", {"allow_cascade_cfg_split": True}),
+    )
+    acc_run_opts = RunWindowOptions(
+        inter_turn_think_s_range=(0.0, 0.0),
+        think_time_dist="constant",
+        think_time_median_s=0.0,
+        think_time_sigma=0.0,
+        steady_window_mode="session_trim",
+        steady_state_trim_frac=0.0,
     )
 
     try:
@@ -1129,18 +838,12 @@ def run_suite_b_skews_and_parity(
                 steady_state_trim_frac=0.0,
                 **extra_ov,
             )
-            eng = MorphServeClusterEngine(
-                policy=pol,
-                model_dir=model_dir,
-                bench_root=bench_root,
-                tmp_root=tmp_base / f"ms_m23_acc_{tier_label}",
-            )
-            try:
-                eng.start()
-                rep = eng.run_suite(
+            with runner.session(pol, tmp_tag=f"ms_m23_acc_{tier_label}") as sess:
+                rep = sess.run_suite(
                     acc_suite,
                     target_qps=0.20,
                     save_outputs_dir=tmp_acc_root / tier_label,
+                    run_options=acc_run_opts,
                 )
                 parity_runs[tier_label] = {s["session_id"]: s for s in rep.sessions}
                 tier_latencies[tier_label] = {
@@ -1155,8 +858,8 @@ def run_suite_b_skews_and_parity(
                     "ar_tpot_p95_ms": float(rep.ar_tpot_p95_ms),
                     "dit_turn_p50_ms": float(rep.dit_turn_p50_ms),
                     "dit_turn_p95_ms": float(rep.dit_turn_p95_ms),
-                    "active_jct_p50_ms": float(getattr(rep, "active_jct_p50_ms", rep.session_e2e_p50_ms)),
-                    "active_jct_p95_ms": float(getattr(rep, "active_jct_p95_ms", rep.session_e2e_p95_ms)),
+                    "active_jct_p50_ms": float(rep.active_jct_p50_ms),
+                    "active_jct_p95_ms": float(rep.active_jct_p95_ms),
                 }
                 acc_err = [str(s.get("error", ""))[:240] for s in rep.sessions if s.get("status") == "error"][:5]
                 print(
@@ -1167,9 +870,6 @@ def run_suite_b_skews_and_parity(
                     + (f" sample_err={acc_err[0]!r}" if acc_err else ""),
                     flush=True,
                 )
-            finally:
-                eng.shutdown()
-                gc.collect()
 
         evaluator = ExactnessEvaluator(
             bench_root=bench_root,
@@ -1184,20 +884,6 @@ def run_suite_b_skews_and_parity(
                 bench_root=bench_root,
                 strict_ssim_1=strict_ssim_1,
             )
-            geneval_metrics: list[dict[str, Any]] = []
-            for s in acc_suite.sessions:
-                if s.source_dataset != "geneval":
-                    continue
-                sid = s.session_id
-                ref_s = parity_runs["monolithic_dp"].get(sid, {})
-                ms_s = parity_runs[cand_key].get(sid, {})
-                ref_imgs = ref_s.get("image_paths_out") or []
-                ms_imgs = ms_s.get("image_paths_out") or []
-                if ref_imgs and ms_imgs and Path(ref_imgs[0]).is_file() and Path(ms_imgs[0]).is_file():
-                    m = image_pair_metrics(Path(ref_imgs[0]), Path(ms_imgs[0]))
-                    m["session_id"] = sid
-                    geneval_metrics.append(m)
-
             ref_errs = [
                 f"{sid}: {str(s.get('error', ''))[:200]}"
                 for sid, s in parity_runs["monolithic_dp"].items()
@@ -1228,9 +914,6 @@ def run_suite_b_skews_and_parity(
                 "visual_cot_highres_sessions": sum(
                     1 for s in acc_suite.sessions if s.quadrant in ("visual_cot_highres", "visual_cot")
                 ),
-                "geneval_sessions": len(geneval_metrics),
-                "geneval_sha256_exact_count": sum(1 for m in geneval_metrics if m["sha256_equal"]),
-                "geneval_pairs": geneval_metrics,
                 "latency": tier_latencies[cand_key],
             }
 
@@ -1299,21 +982,8 @@ def run_suite_b_skews_and_parity(
     return report
 
 
-def _parse_float_csv(raw: str | None) -> tuple[float, ...] | None:
-    if not raw:
-        return None
-    vals = tuple(float(x.strip()) for x in raw.split(",") if x.strip())
-    return vals if vals else None
-
-
-def _parse_str_csv(raw: str | None) -> tuple[str, ...] | None:
-    if not raw:
-        return None
-    vals = tuple(x.strip() for x in raw.split(",") if x.strip())
-    return vals if vals else None
-
-
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser for the Phase-2 M2.3 BAGEL-7B-MoT Interleaved-Bench v2 runner."""
     parser = argparse.ArgumentParser(description="MorphServe Phase-2 M2.3 BAGEL-7B-MoT Interleaved-Bench v2 Runner")
     parser.add_argument(
         "--mode",
@@ -1329,8 +999,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steady-s", type=float, default=DEFAULT_STEADY_S)
     parser.add_argument("--min-sessions", type=int, default=DEFAULT_MIN_SESSIONS)
     parser.add_argument("--max-sessions", type=int, default=None)
-    parser.add_argument("--low-sessions", type=int, default=None, help="Deprecated legacy option (kept for CLI compat)")
-    parser.add_argument("--knee-sessions", type=int, default=None, help="Deprecated legacy option (kept for CLI compat)")
     parser.add_argument("--qps-points", type=str, default=None)
     parser.add_argument("--ablation-qps", type=float, default=0.80)
     parser.add_argument("--policies", type=str, default=None)
@@ -1342,10 +1010,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--skew-sessions", type=int, default=None)
     parser.add_argument("--merge-suite-a-report", type=Path, default=None)
     parser.add_argument("--allow-eval-download", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
 
-    parsed_qps = _parse_float_csv(args.qps_points)
-    parsed_policies = _parse_str_csv(args.policies)
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
+
+    parsed_qps = tuple(parse_csv_floats(args.qps_points))
+    parsed_policies = tuple(parse_csv_strings(args.policies))
 
     if args.mode == "suite_a":
         rep = run_suite_a_qps_and_ablations(
@@ -1378,8 +1050,10 @@ def main(argv: list[str] | None = None) -> int:
             merge_suite_a_report=args.merge_suite_a_report,
         )
     elif args.mode == "think_time_sweep":
-        think_vals = _parse_float_csv(args.think_times) or DEFAULT_THINK_TIMES_S
-        eff_think_qps = float(args.think_qps) if args.think_qps is not None else (float(parsed_qps[0]) if parsed_qps else 0.60)
+        think_vals = tuple(parse_csv_floats(args.think_times)) or DEFAULT_THINK_TIMES_S
+        eff_think_qps = (
+            float(args.think_qps) if args.think_qps is not None else (float(parsed_qps[0]) if parsed_qps else 0.60)
+        )
         rep = run_think_time_sweep(
             model_dir=args.model_dir,
             bench_root=args.bench_root,
@@ -1395,8 +1069,10 @@ def main(argv: list[str] | None = None) -> int:
             policies=parsed_policies or DEFAULT_THINK_TIME_POLICIES,
         )
     else:
-        eff_skew = int(args.skew_sessions) if args.skew_sessions is not None else (
-            int(args.max_sessions) if args.max_sessions is not None else DEFAULT_SKEW_SESSIONS
+        eff_skew = (
+            int(args.skew_sessions)
+            if args.skew_sessions is not None
+            else (int(args.max_sessions) if args.max_sessions is not None else DEFAULT_SKEW_SESSIONS)
         )
         eff_ps_qps = (
             float(args.phase_shift_qps)

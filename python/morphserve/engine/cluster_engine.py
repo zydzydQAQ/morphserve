@@ -1,30 +1,31 @@
-"""Model-agnostic async coordinator managing `WorkerFleet`, stateful `DualPathMorphRouter` & Joint SLOs."""
+"""Model-agnostic async coordinator unifying `WorkerFleet`, C++ `MorphControlEngine`, `DualPathMorphRouter` & Joint SLOs."""
 
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, dataclass, field
-import hashlib
+from collections.abc import Mapping
+from contextlib import asynccontextmanager, contextmanager
+import ctypes
+from dataclasses import asdict, dataclass, field, fields
 import math
 import os
 from pathlib import Path
 import shutil
 import threading
 import time
-from typing import Any
+from typing import Any, Iterator
 
-from morphserve._core import call_json, encode_json, get_core_lib
+from morphserve._core import call_json, encode_json, get_core_lib, last_error
 from morphserve.router import (
-    CPTGRequestSpec,
     ClusterTopologyProfile,
-    DEFAULT_OPERATOR_PROFILE,
     DualPathMorphRouter,
     HalfNodeH2DPacer,
     WorkerState,
+    default_operator_profile,
+    default_topology_for,
 )
 
-from .config import EnginePolicyConfig
-from .multinode_fleet import serialize_policy_config
+from .config import EnginePolicyConfig, RunWindowOptions
 from .worker_proc import MpSpawnGpuWorkerFleet
 from .worker_runtime import WorkerFleet
 from .workload import (
@@ -39,7 +40,7 @@ GIB = 1024**3
 
 
 def _percentile(vals: list[float], p: float) -> float:
-    """Linear-interpolated percentile matching C++ `percentile_rounded` without premature rounding."""
+    """Linear-interpolated percentile matching C++ `percentile_raw` for per-turn summaries."""
     if not vals:
         return 0.0
     s = sorted(float(v) for v in vals)
@@ -78,35 +79,17 @@ def _deterministic_think_s(
         return max(0.0, lo_s)
 
     L = get_core_lib()
-    sid_b = str(session_id).encode("utf-8")
-    if hasattr(L, "ms_ctrl_deterministic_think_dist_s"):
-        return float(
-            L.ms_ctrl_deterministic_think_dist_s(
-                sid_b,
-                int(turn_idx),
-                lo_s,
-                hi_s,
-                eff_dist.encode("utf-8"),
-                eff_median,
-                eff_sigma,
-            )
+    return float(
+        L.ms_ctrl_deterministic_think_dist_s(
+            str(session_id).encode("utf-8"),
+            int(turn_idx),
+            lo_s,
+            hi_s,
+            eff_dist.encode("utf-8"),
+            eff_median,
+            eff_sigma,
         )
-
-    # Safe Python fallback when running against an un-rebuilt local `libmorphserve_core.so`.
-    eff_lo = max(0.0, lo_s)
-    eff_hi = max(eff_lo, hi_s)
-    if eff_dist == "constant":
-        return max(eff_lo, min(eff_hi, max(0.0, eff_median)))
-    if eff_dist == "uniform":
-        return float(L.ms_ctrl_deterministic_think_s(sid_b, int(turn_idx), lo_s, hi_s))
-    key = f"{session_id}:{int(turn_idx)}"
-    h1 = int(hashlib.md5(f"{key}:a".encode("utf-8")).hexdigest()[:8], 16)
-    h2 = int(hashlib.md5(f"{key}:b".encode("utf-8")).hexdigest()[:8], 16)
-    u1 = max(1e-6, min(1.0 - 1e-6, float(h1) / 4294967296.0))
-    u2 = max(1e-6, min(1.0 - 1e-6, float(h2) / 4294967296.0))
-    z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
-    val = max(1e-6, eff_median) * math.exp(max(0.0, eff_sigma) * z)
-    return max(eff_lo, min(eff_hi, val))
+    )
 
 
 @dataclass
@@ -155,7 +138,7 @@ class SessionOutcome:
 
 @dataclass
 class ClusterRunReport:
-    """Aggregated benchmark telemetry for one policy on one suite/QPS point."""
+    """Aggregated canonical benchmark telemetry emitted by C++ `MorphControlEngine::aggregate_cluster_run_report`."""
 
     policy_name: str
     suite_name: str
@@ -194,8 +177,14 @@ class ClusterRunReport:
     total_yields: int
     worker_oom_count: int
     oom_retry_count: int
+    steady_joint_slo_goodput_rps: float = 0.0
+    steady_joint_slo_attainment_pct: float = 0.0
+    full_trace_goodput_rps: float = 0.0
+    full_trace_joint_slo_attainment_pct: float = 0.0
+    full_trace_attainment_pct: float = 0.0
     peak_nvml_used_mib: float = 0.0
     peak_pytorch_reserved_mib: float = 0.0
+    vmm_physical_pool_mib: float = 0.0
     survival_rate_pct: float = 100.0
     steady_state_survival_pct: float = 100.0
     dit_turn_survival_pct: float = 100.0
@@ -247,15 +236,23 @@ class ClusterRunReport:
     all_session_active_jct_p95_ms: float | None = None
     active_jct_cdf_points: list[dict[str, Any]] = field(default_factory=list)
     kv_host_swap_outs: int = 0
+    kv_host_swap_ins: int = 0
     per_turn_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     time_series_10s: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "ClusterRunReport":
+        """Construct from C++ aggregate JSON while resiliently ignoring unknown forward-compatible keys."""
+        known = {f.name for f in fields(cls)}
+        filtered = {k: v for k, v in data.items() if k in known}
+        return cls(**filtered)
+
 
 class MorphServeClusterEngine:
-    """Central async coordinator driving `WorkerFleet` + stateful `DualPathMorphRouter`."""
+    """Central async coordinator driving `WorkerFleet` + C++17 `MorphControlEngine` + `DualPathMorphRouter`."""
 
     def __init__(
         self,
@@ -271,16 +268,22 @@ class MorphServeClusterEngine:
         self.model_dir = Path(model_dir)
         self.bench_root = Path(bench_root)
         self.tmp_root = Path(tmp_root)
-        self.topo = topology or self._default_topology(policy.num_gpus)
+        self.topo = topology or default_topology_for(
+            int(policy.num_gpus), gpus_per_node=min(8, max(1, int(policy.num_gpus)))
+        )
         self.pacer = HalfNodeH2DPacer(self.topo, max_concurrent_per_half=1) if policy.use_h2d_pacer else None
         self.router = DualPathMorphRouter(self.topo, pacer=self.pacer)
-        self.fleet: WorkerFleet = fleet or MpSpawnGpuWorkerFleet(policy, self.model_dir, self.bench_root)
+        self.fleet: WorkerFleet = fleet or MpSpawnGpuWorkerFleet(
+            policy, self.model_dir, self.bench_root, topology=self.topo
+        )
+        self._lib = get_core_lib()
+        self._ctrl_handle = self._create_ctrl_handle(self.policy)
 
         self._pending_futures: dict[str, tuple[int, asyncio.AbstractEventLoop, asyncio.Future]] = {}
+        self._faulted_ranks: dict[int, str] = {}
         self._fut_lock = threading.Lock()
         self._cmd_seq = 0
 
-        self.worker_states: dict[int, WorkerState] = {}
         self._gpu_locks: list[asyncio.Lock] = []
         self._xfer_locks: list[asyncio.Lock] = []
         self._dst_staging_sems: list[asyncio.Semaphore] = []
@@ -292,43 +295,66 @@ class MorphServeClusterEngine:
         self._started = False
         self.host_shmem_delta_gib = 0.0
 
-    @staticmethod
-    def _default_topology(num_gpus: int) -> ClusterTopologyProfile:
-        if num_gpus == 8:
-            return ClusterTopologyProfile.a100_pcie_8gpu_default()
-        return ClusterTopologyProfile.from_multinode_measurements(
-            world_size=num_gpus,
-            gpus_per_node=min(8, max(1, num_gpus)),
-            intra_bw=10.6,
-            socket_bw=9.55,
-            inter_bw=11.5,
-            solo_h2d_bw=8.75,
-            agg_h2d_bw=10.35,
+    def __del__(self) -> None:
+        h = getattr(self, "_ctrl_handle", 0)
+        if h:
+            self._ctrl_handle = 0
+            try:
+                self._lib.ms_ctrl_destroy(ctypes.c_void_p(h))
+            except Exception:
+                pass
+
+    def _create_ctrl_handle(self, policy: EnginePolicyConfig) -> int:
+        h = int(
+            self._lib.ms_ctrl_create(
+                encode_json(policy.to_dict()),
+                encode_json(self.topo.to_dict()),
+                ctypes.c_void_p(self.router._handle),
+            )
+            or 0
         )
+        if h == 0:
+            raise RuntimeError(f"ms_ctrl_create failed: {last_error(self._lib)}")
+        return h
+
+    @contextmanager
+    def _scoped_ctrl_handle(self, eff_policy: EnginePolicyConfig) -> Iterator[int]:
+        if eff_policy == self.policy:
+            yield self._ctrl_handle
+            return
+        h = self._create_ctrl_handle(eff_policy)
+        try:
+            yield h
+        finally:
+            self._lib.ms_ctrl_destroy(ctypes.c_void_p(h))
+
+    @property
+    def worker_states(self) -> dict[int, WorkerState]:
+        """Authoritative worker state snapshot owned by C++ `DualPathMorphRouter`."""
+        return self.router.worker_states_snapshot()
 
     def _next_cmd_id(self) -> str:
         self._cmd_seq += 1
         return f"cmd_{self._cmd_seq}"
 
-    def _handle_worker_ack(self, msg: dict[str, Any]) -> None:
-        if msg.get("op") == "NODE_DISCONNECTED":
-            dead_node = int(msg.get("node_rank", -1))
-            gpn = max(1, int(self.topo.gpus_per_node))
-            err_payload = {
-                "status": "error",
-                "error": str(msg.get("error", f"remote node {dead_node} disconnected")),
-            }
-            victims: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
-            with self._fut_lock:
-                for k, (rk, lp, ft) in list(self._pending_futures.items()):
-                    if (rk // gpn) == dead_node:
-                        self._pending_futures.pop(k, None)
-                        victims.append((lp, ft))
-            for lp, ft in victims:
-                if not lp.is_closed():
-                    lp.call_soon_threadsafe(lambda f=ft, m=err_payload: None if f.done() else f.set_result(m))
+    def _handle_worker_fault(self, ranks: list[int], reason: str) -> None:
+        dead = {int(r) for r in ranks}
+        if not dead:
             return
+        err_payload = {"status": "error", "error": str(reason)}
+        victims: list[tuple[asyncio.AbstractEventLoop, asyncio.Future]] = []
+        with self._fut_lock:
+            for r in dead:
+                self._faulted_ranks[r] = str(reason)
+            for k, (rk, lp, ft) in list(self._pending_futures.items()):
+                if rk in dead:
+                    self._pending_futures.pop(k, None)
+                    victims.append((lp, ft))
+        for lp, ft in victims:
+            if not lp.is_closed():
+                lp.call_soon_threadsafe(lambda f=ft, m=err_payload: None if f.done() else f.set_result(m))
 
+    def _handle_worker_ack(self, msg: dict[str, Any]) -> None:
         cid = msg.get("cmd_id")
         if cid is None:
             return
@@ -339,21 +365,33 @@ class MorphServeClusterEngine:
             if not loop.is_closed():
                 loop.call_soon_threadsafe(lambda f=fut, m=msg: None if f.done() else f.set_result(m))
 
-    def _sync_worker_telemetry(self, rank: int, msg: dict[str, Any]) -> None:
-        r = int(rank)
-        if r not in self.worker_states:
-            return
+    def _sync_worker_telemetry(self, rank: int, msg: Mapping[str, Any]) -> None:
         alpha = float(msg["resident_alpha"]) if "resident_alpha" in msg else None
         kv_free = int(msg["kv_free_bytes"]) if "kv_free_bytes" in msg else None
         t_seq = int(msg["telemetry_seq"]) if "telemetry_seq" in msg else None
         if alpha is not None or kv_free is not None:
             self.router.update_worker_telemetry(
-                r,
+                int(rank),
                 expert_alpha=alpha,
                 kv_free_bytes=kv_free,
                 telemetry_seq=t_seq,
-                workers=self.worker_states,
             )
+
+    def _init_router_workers_from_acks(self, workers_info: Mapping[Any, Mapping[str, Any]]) -> None:
+        n = int(self.policy.num_gpus)
+        free_est = 22 * GIB if self.policy.use_tripool_vmm else 10 * GIB
+        alphas: dict[int, float] = {}
+        kv_frees: dict[int, int] = {}
+        for rank in range(n):
+            info = workers_info.get(rank) or workers_info.get(str(rank)) or {}
+            alphas[rank] = float(info.get("resident_alpha", self.policy.initial_alphas.get(rank, 1.0)))
+            kv_frees[rank] = int(info.get("kv_free_bytes", free_est))
+        self.router.init_workers(
+            num_gpus=n,
+            role_of=self.policy.role_of,
+            initial_alphas=alphas,
+            kv_free_bytes=kv_frees,
+        )
 
     def _ensure_async_primitives(self) -> None:
         n_gpus = self.policy.num_gpus
@@ -374,32 +412,16 @@ class MorphServeClusterEngine:
         if self._started:
             return {}
         self.tmp_root.mkdir(parents=True, exist_ok=True)
-        init_summary = self.fleet.start(on_ack=self._handle_worker_ack)
+        with self._fut_lock:
+            self._faulted_ranks.clear()
+        init_summary = self.fleet.start(
+            on_ack=self._handle_worker_ack,
+            on_worker_fault=self._handle_worker_fault,
+        )
         self.host_shmem_delta_gib = float(init_summary.get("host_shmem_delta_gib", 0.0))
 
         n = self.policy.num_gpus
-        workers_info = init_summary.get("workers") or {}
-        free_est = 22 * GIB if self.policy.use_tripool_vmm else 10 * GIB
-        alphas = {
-            rank: float(
-                (workers_info.get(rank) or workers_info.get(str(rank)) or {}).get(
-                    "resident_alpha", self.policy.initial_alphas.get(rank, 1.0)
-                )
-            )
-            for rank in range(n)
-        }
-        kv_frees = {
-            rank: int(
-                (workers_info.get(rank) or workers_info.get(str(rank)) or {}).get("kv_free_bytes", free_est)
-            )
-            for rank in range(n)
-        }
-        self.worker_states = self.router.init_workers(
-            num_gpus=n,
-            role_of=self.policy.role_of,
-            initial_alphas=alphas,
-            kv_free_bytes=kv_frees,
-        )
+        self._init_router_workers_from_acks(init_summary.get("workers") or {})
         self._active_dit_ranks = {g: 0 for g in range(n)}
         self._active_preemptions = {g: 0 for g in range(n)}
         self._inflight_ar_on_gpu = {g: 0 for g in range(n)}
@@ -407,31 +429,35 @@ class MorphServeClusterEngine:
         return init_summary
 
     async def _rpc(self, rank: int, payload: dict[str, Any], timeout_s: float = 600.0) -> dict[str, Any]:
+        r = int(rank)
+        with self._fut_lock:
+            fault_reason = self._faulted_ranks.get(r)
+        if fault_reason is not None:
+            raise RuntimeError(f"worker rank {r} faulted prior to {payload.get('op')}: {fault_reason}")
+
         loop = asyncio.get_running_loop()
         cid = payload.get("cmd_id") or self._next_cmd_id()
         payload = dict(payload, cmd_id=cid)
         fut: asyncio.Future = loop.create_future()
         with self._fut_lock:
-            self._pending_futures[cid] = (int(rank), loop, fut)
-        self.fleet.send(rank, payload)
+            fault_reason = self._faulted_ranks.get(r)
+            if fault_reason is not None:
+                raise RuntimeError(f"worker rank {r} faulted prior to {payload.get('op')}: {fault_reason}")
+            self._pending_futures[cid] = (r, loop, fut)
+        self.fleet.send(r, payload)
         try:
             res = await asyncio.wait_for(fut, timeout=timeout_s)
         except Exception:
             with self._fut_lock:
                 self._pending_futures.pop(cid, None)
             raise
-        self._sync_worker_telemetry(int(rank), res)
+        self._sync_worker_telemetry(r, res)
         if res.get("status") == "error":
             err_txt = str(res.get("error", ""))
             if "cuda" in err_txt.lower():
-                self.router.update_worker_telemetry(
-                    int(rank),
-                    expert_alpha=0.0,
-                    kv_free_bytes=0,
-                    workers=self.worker_states,
-                )
+                self.router.update_worker_telemetry(r, expert_alpha=0.0, kv_free_bytes=0)
             raise RuntimeError(
-                f"worker rank {rank} error on {payload.get('op')}: {err_txt}\n{res.get('traceback', '')}"
+                f"worker rank {r} error on {payload.get('op')}: {err_txt}\n{res.get('traceback', '')}"
             )
         return res
 
@@ -444,22 +470,99 @@ class MorphServeClusterEngine:
             for g in range(self.policy.num_gpus)
         }
 
-    def _pick_initial_gpu(self, modality_plan: str) -> int:
+    def _pick_initial_gpu(self, eff_policy: EnginePolicyConfig, modality_plan: str) -> int:
         return self.router.select_initial_gpu(
-            num_gpus=self.policy.num_gpus,
-            routing_mode=self.policy.routing_mode,
-            preemption_mode=self.policy.preemption_mode,
-            static_und_ranks=self.policy.static_und_ranks,
+            num_gpus=eff_policy.num_gpus,
+            routing_mode=eff_policy.routing_mode,
+            preemption_mode=eff_policy.preemption_mode,
+            static_und_ranks=eff_policy.static_und_ranks,
             modality_plan=modality_plan,
-            workers=self.worker_states,
             gpu_busy=self._gpu_busy_map(),
             active_dit_ranks=self._active_dit_ranks,
             active_preemptions=self._active_preemptions,
-            architecture=self.policy.cptg_architecture,
+            architecture=eff_policy.cptg_architecture,
+        )
+
+    def _pick_oom_retry_gpu(self, eff_policy: EnginePolicyConfig, failed_gpu: int) -> int:
+        return self.router.select_oom_retry_gpu(
+            num_gpus=eff_policy.num_gpus,
+            routing_mode=eff_policy.routing_mode,
+            static_und_ranks=eff_policy.static_und_ranks,
+            failed_gpu=failed_gpu,
+            gpu_busy=self._gpu_busy_map(),
+        )
+
+    def _plan_turn_transition(
+        self,
+        ctrl_handle: int,
+        *,
+        session_id: str,
+        base_ctx_id: str,
+        turn_idx: int,
+        attempt: int,
+        src_gpu: int,
+        state_bytes: int,
+        modality_plan: str,
+        height: int,
+        dit_steps: int,
+        has_more_turns: bool,
+        has_more_edits: bool,
+        now_ms: float,
+    ) -> dict[str, Any]:
+        req = {
+            "session_id": str(session_id),
+            "base_ctx_id": str(base_ctx_id),
+            "turn_idx": int(turn_idx),
+            "attempt": int(attempt),
+            "src_gpu": int(src_gpu),
+            "state_bytes": int(state_bytes),
+            "modality_plan": str(modality_plan),
+            "height": int(height),
+            "dit_steps": int(dit_steps),
+            "has_more_turns": bool(has_more_turns),
+            "has_more_edits": bool(has_more_edits),
+            "now_ms": float(now_ms),
+            "gpu_busy": {str(k): bool(v) for k, v in self._gpu_busy_map().items()},
+        }
+        return call_json(
+            self._lib,
+            self._lib.ms_ctrl_plan_turn_transition_json,
+            ctypes.c_void_p(ctrl_handle),
+            encode_json(req),
+        )
+
+    def _evaluate_session_slos(
+        self,
+        eff_policy: EnginePolicyConfig,
+        *,
+        ar_ttfts_ms: list[float],
+        ar_tpots_ms: list[float],
+        ar_turn_tpots_ms: list[list[float]],
+        dit_turns_ms: list[float],
+        dit_turn_heights: list[int],
+        dit_turn_steps: list[int],
+    ) -> dict[str, Any]:
+        req = {
+            "ar_ttfts_ms": [float(x) for x in ar_ttfts_ms],
+            "ar_tpots_ms": [float(x) for x in ar_tpots_ms],
+            "ar_turn_tpots_ms": [[float(v) for v in row] for row in ar_turn_tpots_ms],
+            "dit_turns_ms": [float(x) for x in dit_turns_ms],
+            "dit_heights": [int(h) for h in dit_turn_heights],
+            "dit_turn_heights": [int(h) for h in dit_turn_heights],
+            "dit_steps": [int(st) for st in dit_turn_steps],
+            "dit_turn_steps": [int(st) for st in dit_turn_steps],
+            "slo_time_scale": 1.0,
+        }
+        return call_json(
+            self._lib,
+            self._lib.ms_ctrl_evaluate_session_slos_json,
+            encode_json(eff_policy.to_dict()),
+            encode_json(req),
         )
 
     async def _execute_ar_phase(
         self,
+        eff_policy: EnginePolicyConfig,
         resident_gpu: int,
         ctx_id: str,
         turn: InterleavedTurn,
@@ -469,7 +572,7 @@ class MorphServeClusterEngine:
     ) -> tuple[dict[str, Any], bool]:
         """Dispatch AR via mid-DiT preemption OR continuous-batched `EXEC_AR` without single-AR lock serialization."""
         can_preempt = (
-            self.policy.preemption_mode != "non_preemptive"
+            eff_policy.preemption_mode != "non_preemptive"
             and (self._gpu_locks[resident_gpu].locked() or self._active_dit_ranks.get(resident_gpu, 0) > 0)
             and self._active_preemptions.get(resident_gpu, 0) < 2
         )
@@ -486,7 +589,7 @@ class MorphServeClusterEngine:
                         "use_prev_image": bool(use_prev_image),
                         "prev_image_path": prev_image_path,
                         "max_ar_tokens": turn.max_ar_tokens,
-                        "tpot_slo_ms": self.policy.ar_tpot_slo_ms,
+                        "tpot_slo_ms": eff_policy.ar_tpot_slo_ms,
                         "prepare_for_dit": prepare_for_dit,
                     },
                 )
@@ -496,16 +599,15 @@ class MorphServeClusterEngine:
             return ar_res, was_mid_dit
 
         t_enq = time.perf_counter()
-        est_ar_ms = DEFAULT_OPERATOR_PROFILE.ar_tpot_ms * max(1, min(turn.max_ar_tokens, 16))
-        self.worker_states[resident_gpu].queue_wait_ms += est_ar_ms
+        est_ar_ms = default_operator_profile().ar_tpot_ms * max(1, min(turn.max_ar_tokens, 16))
+        self.router.reserve_ar_queue(resident_gpu, est_ar_ms)
         try:
             # Wait only if an exclusive DiT / NCCL operation holds `_gpu_locks`; multiple AR turns
-            # dispatch concurrently into `WorkerRuntime` so `decode_ar_batch` batches them!
+            # dispatch concurrently into `WorkerRuntime` so `decode_ar_batch` batches them.
             while self._gpu_locks[resident_gpu].locked():
                 async with self._gpu_locks[resident_gpu]:
                     pass
-            # Measure coordinator-side queue wait purely on the Coordinator's monotonic clock and add it
-            # to the worker's purely worker-local `ttft_ms` so multi-node `perf_counter()` skew is 0!
+            # Add coordinator-local queue wait to worker-local `ttft_ms` so multi-node `perf_counter` skew is 0.
             coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
             self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
             self._ar_drained_events[resident_gpu].clear()
@@ -532,11 +634,9 @@ class MorphServeClusterEngine:
                 ar_res = dict(ar_res, ttft_ms=round(float(ar_res.get("ttft_ms", 0.0)) + coord_queue_wait_ms, 2))
             return ar_res, False
         finally:
-            self.worker_states[resident_gpu].queue_wait_ms = max(
-                0.0, self.worker_states[resident_gpu].queue_wait_ms - est_ar_ms
-            )
+            self.router.release_ar_queue(resident_gpu, est_ar_ms)
 
-    async def _acquire_exclusive_gpu(self, gpu: int):
+    async def _acquire_exclusive_gpu(self, gpu: int) -> None:
         """Acquire exclusive GPU lock after any non-preempting standalone AR batch finishes draining."""
         await self._gpu_locks[gpu].acquire()
         try:
@@ -545,7 +645,8 @@ class MorphServeClusterEngine:
             self._gpu_locks[gpu].release()
             raise
 
-    async def _ship_nccl(
+    @asynccontextmanager
+    async def _nccl_transfer_guard(
         self,
         src_gpu: int,
         dst_gpu: int,
@@ -554,9 +655,13 @@ class MorphServeClusterEngine:
         include_cfg_dup: bool,
         *,
         release_src_ctx: bool = True,
-        defer_unpack: bool = False,
-    ) -> dict[str, Any]:
-        """Decoupled NCCL P2P transfer: pack on `src_gpu` & release lock immediately, then stream over `xfer_cmd_q`."""
+    ):
+        """Async context manager executing decoupled NCCL pack->send->recv->unpack while owning lock/semaphore lifetime.
+
+        When `ship["status"] == "ok"`, `_gpu_locks[dst_gpu]` remains exclusively held for the body so callers
+        may run `EXEC_DIT` atomically right after `UNPACK_CTX` without releasing/reacquiring the GPU lock.
+        All staging semaphores, destination locks, and temporary buffers are guaranteed released on exit.
+        """
         self._ensure_async_primitives()
 
         await self._acquire_exclusive_gpu(src_gpu)
@@ -574,7 +679,8 @@ class MorphServeClusterEngine:
             self._gpu_locks[src_gpu].release()
 
         if pack_res.get("status") != "ok":
-            return dict(pack_res, packed_ok=False)
+            yield dict(pack_res, packed_ok=False)
+            return
 
         packed_id = str(pack_res["packed_id"])
         meta = pack_res["meta"]
@@ -598,65 +704,47 @@ class MorphServeClusterEngine:
                     {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": False},
                 )
                 if alloc_res.get("status") != "ok":
-                    try:
-                        await self._rpc(src_gpu, {"op": "DROP_PACKED_CTX", "packed_id": packed_id})
-                        packed_consumed = True
-                    except Exception:
-                        pass
-                    return {"status": "oom", "packed_ok": True, "error": alloc_res.get("error", "alloc_recv_oom")}
+                    yield {"status": "oom", "packed_ok": True, "error": alloc_res.get("error", "alloc_recv_oom")}
+                    return
 
             recv_id = str(alloc_res["recv_id"])
             lo, hi = (src_gpu, dst_gpu) if src_gpu < dst_gpu else (dst_gpu, src_gpu)
             async with self._xfer_locks[lo]:
                 async with self._xfer_locks[hi]:
                     s_res, r_res = await asyncio.gather(
-                        self._rpc(
-                            src_gpu,
-                            {"op": "SEND_NCCL", "packed_id": packed_id, "dst_rank": dst_gpu},
-                        ),
-                        self._rpc(
-                            dst_gpu,
-                            {"op": "RECV_NCCL", "src_rank": src_gpu, "recv_id": recv_id, "meta": meta},
-                        ),
+                        self._rpc(src_gpu, {"op": "SEND_NCCL", "packed_id": packed_id, "dst_rank": dst_gpu}),
+                        self._rpc(dst_gpu, {"op": "RECV_NCCL", "src_rank": src_gpu, "recv_id": recv_id, "meta": meta}),
                     )
                     packed_consumed = True
 
             if s_res.get("status") != "ok" or r_res.get("status") != "ok":
-                try:
-                    await self._rpc(dst_gpu, {"op": "DROP_RECV_BUF", "recv_id": recv_id})
-                except Exception:
-                    pass
-                recv_id = None
-                return {"status": "oom", "packed_ok": True, "error": "nccl_xfer_oom"}
+                yield {"status": "oom", "packed_ok": True, "error": "nccl_xfer_oom"}
+                return
 
             ship_ms = max(float(s_res.get("ship_ms", 0.0)), float(r_res.get("ship_ms", 0.0)))
-            if defer_unpack:
-                out_d = {
-                    "status": "ok",
-                    "packed_ok": True,
-                    "ship_ms": ship_ms,
-                    "bytes": logical_bytes,
-                    "recv_id": recv_id,
-                    "meta": meta,
-                    "_holding_staging_sem": True,
-                    "_holding_dst_lock": holding_dst_lock,
-                }
-                holding_sem = False
-                holding_dst_lock = False
-                recv_id = None
-                return out_d
-
             if not holding_dst_lock:
                 await self._acquire_exclusive_gpu(dst_gpu)
                 holding_dst_lock = True
+
             u_res = await self._rpc(
                 dst_gpu,
                 {"op": "UNPACK_CTX", "recv_id": recv_id, "new_ctx_id": new_ctx_id, "meta": meta},
             )
             recv_id = None
+            staging_sem.release()
+            holding_sem = False
+
             if u_res.get("status") != "ok":
-                return {"status": "oom", "packed_ok": True, "error": u_res.get("error", "unpack_oom")}
-            return {
+                yield {
+                    "status": "oom",
+                    "packed_ok": True,
+                    "error": u_res.get("error", "unpack_oom"),
+                    "kv_free_bytes": u_res.get("kv_free_bytes"),
+                    "telemetry_seq": u_res.get("telemetry_seq"),
+                }
+                return
+
+            yield {
                 "status": "ok",
                 "packed_ok": True,
                 "ship_ms": ship_ms,
@@ -690,6 +778,11 @@ class MorphServeClusterEngine:
         include_cfg_dup: bool = True,
         release_src_ctx: bool = True,
     ) -> dict[str, Any]:
+        if not self.topo.same_node(src_gpu, dst_gpu):
+            raise ValueError(
+                f"SHM state shipping requires same-node GPUs, got cross-node transfer {src_gpu}->{dst_gpu} "
+                f"(node {self.topo.node_of(src_gpu)} -> node {self.topo.node_of(dst_gpu)})"
+            )
         self._ensure_async_primitives()
         shm_name = f"ms_shm_{os.getpid()}_{src_gpu}_{dst_gpu}_{self._next_cmd_id()}"
         await self._acquire_exclusive_gpu(src_gpu)
@@ -721,58 +814,103 @@ class MorphServeClusterEngine:
         finally:
             self._gpu_locks[dst_gpu].release()
 
-    def _build_cptg_spec(
+    async def _exec_dit_on_locked_gpu(
         self,
-        req_id: str,
-        src_gpu: int,
-        state_bytes: int,
+        dst_gpu: int,
+        dit_ctx_id: str,
         turn: InterleavedTurn,
-        gamma: int,
-    ) -> CPTGRequestSpec:
-        arch = self.policy.cptg_architecture
-        fam = "internvl_u" if arch == "bridge_mllm_dit" else "bagel"
-        step1_ms = DEFAULT_OPERATOR_PROFILE.step_ms(fam, turn.height)
-        exp_bytes = DEFAULT_OPERATOR_PROFILE.expert_bytes(fam)
-        if arch == "bridge_mllm_dit":
-            eff = max(state_bytes, 64 * 1024)
-            return CPTGRequestSpec(
-                req_id=req_id,
-                src_gpu=src_gpu,
-                architecture="bridge_mllm_dit",
-                kv_bytes=eff,
-                bridge_bytes=eff,
-                gen_expert_bytes=exp_bytes,
-                dit_step1_ms=step1_ms,
-                dit_total_steps=turn.dit_steps,
-                resolution=turn.height,
-                interleaved_roundtrip_gamma=gamma,
+        turn_idx: int,
+        *,
+        save_tmp: str | None,
+        ephemeral_gen_ctx: bool,
+        needs_return_ship: bool,
+    ) -> dict[str, Any]:
+        self._active_dit_ranks[dst_gpu] += 1
+        try:
+            dit_res = await self._rpc(
+                dst_gpu,
+                {
+                    "op": "EXEC_DIT",
+                    "ctx_id": dit_ctx_id,
+                    "prompt": turn.prompt,
+                    "height": turn.height,
+                    "width": turn.width,
+                    "dit_steps": turn.dit_steps,
+                    "seed": 52 + turn_idx,
+                    "save_tmp_image_path": save_tmp,
+                    "release_after_dit": ephemeral_gen_ctx and (not needs_return_ship),
+                },
             )
-        return CPTGRequestSpec(
-            req_id=req_id,
-            src_gpu=src_gpu,
-            architecture="tight_mot",
-            kv_bytes=max(state_bytes, 1 * MIB),
-            gen_expert_bytes=exp_bytes,
-            dit_step1_ms=step1_ms,
-            dit_total_steps=turn.dit_steps,
-            resolution=turn.height,
-            interleaved_roundtrip_gamma=gamma,
-        )
+            if ephemeral_gen_ctx and dit_res.get("status") != "ok":
+                try:
+                    await self._rpc(dst_gpu, {"op": "RELEASE_CTX", "ctx_id": dit_ctx_id})
+                except Exception:
+                    pass
+            return dit_res
+        finally:
+            self._active_dit_ranks[dst_gpu] -= 1
 
-    def _pick_oom_retry_gpu(self, failed_gpu: int, modality_plan: str) -> int:
-        del modality_plan
-        return self.router.select_oom_retry_gpu(
-            num_gpus=self.policy.num_gpus,
-            routing_mode=self.policy.routing_mode,
-            static_und_ranks=self.policy.static_und_ranks,
-            failed_gpu=failed_gpu,
-            gpu_busy=self._gpu_busy_map(),
+    async def _retry_or_fail_oom(
+        self,
+        *,
+        eff_policy: EnginePolicyConfig,
+        sess_id: str,
+        turn_idx: int,
+        turn: InterleavedTurn,
+        attempt: int,
+        oom_retries: int,
+        failed_gpu: int,
+        cleanup_targets: set[tuple[int | None, str]],
+        kv_bytes: int,
+        turn_records: list[dict[str, Any]],
+        ar_ttft_ms: float | None = None,
+        ar_tpots_ms: list[float] | None = None,
+        shipped: bool = False,
+        morphed: bool = False,
+    ) -> tuple[bool, int, int, int, str]:
+        """Release partial context(s), decide bounded Turn-0 OOM retry vs terminal OOM turn record."""
+        for g_clean, c_clean in cleanup_targets:
+            if g_clean is not None:
+                try:
+                    await self._rpc(g_clean, {"op": "RELEASE_CTX", "ctx_id": c_clean})
+                except Exception:
+                    pass
+
+        if attempt < eff_policy.max_oom_retries and turn_idx == 0:
+            next_attempt = attempt + 1
+            next_retries = oom_retries + 1
+            next_gpu = self._pick_oom_retry_gpu(eff_policy, failed_gpu)
+            next_ctx_id = f"ctx_{sess_id}_r{next_retries}"
+            return True, next_attempt, next_retries, next_gpu, next_ctx_id
+
+        tpots = ar_tpots_ms or []
+        plan = str(turn.modality_plan)
+        is_ar_only = plan == "ar_only"
+        turn_records.append(
+            {
+                "turn_idx": int(turn_idx),
+                "modality_plan": plan,
+                "status": "oom",
+                "ar_ttft_ms": round(ar_ttft_ms, 2) if ar_ttft_ms is not None else None,
+                "ar_tpot_p95_ms": round(_percentile(tpots, 95.0), 2) if tpots else None,
+                "ar_tpot_mean_ms": round(sum(tpots) / float(len(tpots)), 2) if tpots else None,
+                "ar_tpot_strict_max_ms": round(max(tpots), 2) if tpots else None,
+                "dit_ms": None,
+                "height": 0 if is_ar_only else int(turn.height),
+                "dit_steps": 0 if is_ar_only else int(turn.dit_steps),
+                "kv_bytes": int(kv_bytes),
+                "shipped": bool(shipped),
+                "morphed": bool(morphed),
+            }
         )
+        return False, attempt, oom_retries, failed_gpu, ""
 
     async def _run_session_coro(
         self,
         sess: InterleavedSession,
         suite_t0: float,
+        eff_policy: EnginePolicyConfig,
+        ctrl_handle: int,
         save_outputs_dir: Path | None = None,
     ) -> SessionOutcome:
         delay = (suite_t0 + sess.arrival_offset_s) - time.perf_counter()
@@ -806,18 +944,16 @@ class MorphServeClusterEngine:
         total_yields = 0
         oom_retries = 0
         think_time_ms = 0.0
-        is_tight_mot = self.policy.cptg_architecture == "tight_mot"
+        is_tight_mot = eff_policy.cptg_architecture == "tight_mot"
         cur_turn_idx = 0
         cur_turn_plan = ""
         cur_turn_height = 0
 
         def _sample_resident_alpha() -> float:
-            if not self.worker_states:
+            ws = self.router.worker_states_snapshot()
+            if not ws:
                 return 1.0
-            return round(
-                sum(float(w.expert_alpha) for w in self.worker_states.values()) / float(len(self.worker_states)),
-                4,
-            )
+            return round(sum(float(w.expert_alpha) for w in ws.values()) / float(len(ws)), 4)
 
         planned_turns = len(sess.turns)
         planned_ar_turns = sum(1 for t in sess.turns if t.modality_plan in ("ar_only", "cot_then_dit"))
@@ -831,12 +967,14 @@ class MorphServeClusterEngine:
             ar_mean_ok: bool = False,
             ar_strict_ok: bool = False,
             dit_ok: bool = False,
+            joint_ok: bool | None = None,
             error: str = "",
         ) -> SessionOutcome:
             now_pc = time.perf_counter()
             e2e_ms = round((now_pc - t_sess0) * 1000.0, 2)
             active_jct_ms = round(max(0.0, e2e_ms - think_time_ms), 2)
             completed_offset_s = round(max(0.0, now_pc - suite_t0), 3)
+            eff_joint = (ar_ok and dit_ok) if joint_ok is None else bool(joint_ok)
             return SessionOutcome(
                 session_id=sess.session_id,
                 quadrant=sess.quadrant,
@@ -849,7 +987,7 @@ class MorphServeClusterEngine:
                 dit_turn_steps=dit_steps_list,
                 ar_slo_met=ar_ok,
                 dit_slo_met=dit_ok,
-                joint_slo_met=(ar_ok and dit_ok) if status == "ok" else False,
+                joint_slo_met=eff_joint if status == "ok" else False,
                 path_a_ships=path_a_ships,
                 path_b_morphs=path_b_morphs,
                 cross_node_ships=cross_node_ships,
@@ -884,8 +1022,7 @@ class MorphServeClusterEngine:
                 cur_turn_plan = str(turn.modality_plan)
                 cur_turn_height = 0 if cur_turn_plan == "ar_only" else int(turn.height)
                 if ti > 0:
-                    # Realistic user think-time residency (`D1`) holding live KV across turns!
-                    think_s = _deterministic_think_s(sess.session_id, ti, self.policy)
+                    think_s = _deterministic_think_s(sess.session_id, ti, eff_policy)
                     if think_s > 0.0:
                         t_th0 = time.perf_counter()
                         await asyncio.sleep(think_s)
@@ -900,16 +1037,18 @@ class MorphServeClusterEngine:
                     bool(t.use_prev_image) or (t.modality_plan == "dit_edit") for t in sess.turns[ti + 1 :]
                 )
 
-                # Bounded OOM retry loop (`D3`: `max_oom_retries = 1` with user arrival clock running!)
                 attempt = 0
                 while True:
                     if resident_gpu is None:
-                        resident_gpu = self._pick_initial_gpu(plan)
-                    eff_prev_img = (None if (is_tight_mot and src_ctx_alive) else prev_tmp_img) if turn_use_prev_image else None
+                        resident_gpu = self._pick_initial_gpu(eff_policy, plan)
+                    eff_prev_img = (
+                        (None if (is_tight_mot and src_ctx_alive) else prev_tmp_img) if turn_use_prev_image else None
+                    )
 
                     # ---- Branch 1: Pure AR turn (VQA) ----
                     if plan == "ar_only":
                         ar_res, did_preempt = await self._execute_ar_phase(
+                            eff_policy,
                             resident_gpu,
                             ctx_id,
                             turn,
@@ -918,33 +1057,24 @@ class MorphServeClusterEngine:
                             prev_image_path=eff_prev_img,
                         )
                         if ar_res["status"] == "oom":
-                            try:
-                                await self._rpc(resident_gpu, {"op": "RELEASE_CTX", "ctx_id": ctx_id})
-                            except Exception:
-                                pass
                             src_ctx_alive = False
-                            if attempt < self.policy.max_oom_retries and ti == 0:
-                                attempt += 1
-                                oom_retries += 1
-                                resident_gpu = self._pick_oom_retry_gpu(resident_gpu, plan)
-                                ctx_id = f"ctx_{sess.session_id}_r{oom_retries}"
-                                continue
-                            turn_records.append(
-                                {
-                                    "turn_idx": int(ti),
-                                    "modality_plan": plan,
-                                    "status": "oom",
-                                    "ar_ttft_ms": None,
-                                    "ar_tpot_p95_ms": None,
-                                    "ar_tpot_mean_ms": None,
-                                    "dit_ms": None,
-                                    "height": 0,
-                                    "kv_bytes": int(kv_bytes),
-                                    "shipped": False,
-                                    "morphed": False,
-                                }
+                            should_retry, attempt, oom_retries, resident_gpu, next_cid = await self._retry_or_fail_oom(
+                                eff_policy=eff_policy,
+                                sess_id=sess.session_id,
+                                turn_idx=ti,
+                                turn=turn,
+                                attempt=attempt,
+                                oom_retries=oom_retries,
+                                failed_gpu=resident_gpu,
+                                cleanup_targets={(resident_gpu, ctx_id)},
+                                kv_bytes=kv_bytes,
+                                turn_records=turn_records,
                             )
+                            if should_retry:
+                                ctx_id = next_cid
+                                continue
                             return _make_outcome("oom", error=ar_res.get("error", "oom"))
+
                         src_ctx_alive = True
                         if did_preempt:
                             preempted_ar_turns += 1
@@ -977,16 +1107,16 @@ class MorphServeClusterEngine:
                         break
 
                     # ---- Branch 2: Visual-CoT / DiT Edit / High-Res T2I ----
-                    # D3: For `cot_then_dit`, decouple AR CoT timing from DiT stage timing (`t_dit0` starts
-                    # strictly when AR CoT completes, covering routing, transfer/morph, queue, denoising, VAE).
                     t_dit0 = time.perf_counter()
                     cot_text_pending: str | None = None
                     turn_ar_ttft: float | None = None
                     turn_ar_tpots: list[float] = []
                     turn_shipped = False
                     turn_morphed = False
+
                     if plan == "cot_then_dit":
                         cot_res, did_preempt = await self._execute_ar_phase(
+                            eff_policy,
                             resident_gpu,
                             ctx_id,
                             turn,
@@ -995,35 +1125,24 @@ class MorphServeClusterEngine:
                             prev_image_path=eff_prev_img,
                         )
                         if cot_res["status"] == "oom":
-                            try:
-                                await self._rpc(resident_gpu, {"op": "RELEASE_CTX", "ctx_id": ctx_id})
-                            except Exception:
-                                pass
                             src_ctx_alive = False
-                            if attempt < self.policy.max_oom_retries and ti == 0:
-                                attempt += 1
-                                oom_retries += 1
-                                resident_gpu = self._pick_oom_retry_gpu(resident_gpu, plan)
-                                ctx_id = f"ctx_{sess.session_id}_r{oom_retries}"
-                                continue
-                            turn_records.append(
-                                {
-                                    "turn_idx": int(ti),
-                                    "modality_plan": plan,
-                                    "status": "oom",
-                                    "ar_ttft_ms": None,
-                                    "ar_tpot_p95_ms": None,
-                                    "ar_tpot_mean_ms": None,
-                                    "ar_tpot_strict_max_ms": None,
-                                    "dit_ms": None,
-                                    "height": int(turn.height),
-                                    "dit_steps": int(turn.dit_steps),
-                                    "kv_bytes": int(kv_bytes),
-                                    "shipped": False,
-                                    "morphed": False,
-                                }
+                            should_retry, attempt, oom_retries, resident_gpu, next_cid = await self._retry_or_fail_oom(
+                                eff_policy=eff_policy,
+                                sess_id=sess.session_id,
+                                turn_idx=ti,
+                                turn=turn,
+                                attempt=attempt,
+                                oom_retries=oom_retries,
+                                failed_gpu=resident_gpu,
+                                cleanup_targets={(resident_gpu, ctx_id)},
+                                kv_bytes=kv_bytes,
+                                turn_records=turn_records,
                             )
+                            if should_retry:
+                                ctx_id = next_cid
+                                continue
                             return _make_outcome("oom", error=cot_res.get("error", "oom"))
+
                         src_ctx_alive = True
                         if did_preempt:
                             preempted_ar_turns += 1
@@ -1036,13 +1155,11 @@ class MorphServeClusterEngine:
                         cot_text_pending = str(cot_res.get("text", ""))
                         t_dit0 = time.perf_counter()
                     else:
-                        est_prep_ms = DEFAULT_OPERATOR_PROFILE.prep_overhead_ms
-                        self.worker_states[resident_gpu].queue_wait_ms += est_prep_ms
+                        est_prep_ms = default_operator_profile().prep_overhead_ms
+                        self.router.reserve_ar_queue(resident_gpu, est_prep_ms)
                         try:
                             await self._acquire_exclusive_gpu(resident_gpu)
                             try:
-                                # When `tight_mot` already holds live context (`last_img_u8` / `last_img_pil`),
-                                # pass `prev_image_path=None` so `GpuInPlaceLoopback` is never bypassed by disk PNGs!
                                 prep_res = await self._rpc(
                                     resident_gpu,
                                     {
@@ -1064,269 +1181,180 @@ class MorphServeClusterEngine:
                             finally:
                                 self._gpu_locks[resident_gpu].release()
                         finally:
-                            self.worker_states[resident_gpu].queue_wait_ms = max(
-                                0.0, self.worker_states[resident_gpu].queue_wait_ms - est_prep_ms
-                            )
+                            self.router.release_ar_queue(resident_gpu, est_prep_ms)
+
                         if prep_res["status"] == "oom":
-                            try:
-                                await self._rpc(resident_gpu, {"op": "RELEASE_CTX", "ctx_id": ctx_id})
-                            except Exception:
-                                pass
                             src_ctx_alive = False
-                            if attempt < self.policy.max_oom_retries and ti == 0:
-                                attempt += 1
-                                oom_retries += 1
-                                resident_gpu = self._pick_oom_retry_gpu(resident_gpu, plan)
-                                ctx_id = f"ctx_{sess.session_id}_r{oom_retries}"
-                                continue
-                            turn_records.append(
-                                {
-                                    "turn_idx": int(ti),
-                                    "modality_plan": plan,
-                                    "status": "oom",
-                                    "ar_ttft_ms": None,
-                                    "ar_tpot_p95_ms": None,
-                                    "ar_tpot_mean_ms": None,
-                                    "dit_ms": None,
-                                    "height": int(turn.height),
-                                    "kv_bytes": int(kv_bytes),
-                                    "shipped": False,
-                                    "morphed": False,
-                                }
+                            should_retry, attempt, oom_retries, resident_gpu, next_cid = await self._retry_or_fail_oom(
+                                eff_policy=eff_policy,
+                                sess_id=sess.session_id,
+                                turn_idx=ti,
+                                turn=turn,
+                                attempt=attempt,
+                                oom_retries=oom_retries,
+                                failed_gpu=resident_gpu,
+                                cleanup_targets={(resident_gpu, ctx_id)},
+                                kv_bytes=kv_bytes,
+                                turn_records=turn_records,
                             )
+                            if should_retry:
+                                ctx_id = next_cid
+                                continue
                             return _make_outcome("oom", error=prep_res.get("error", "oom"))
                         src_ctx_alive = True
                         kv_bytes = int(prep_res.get("kv_bytes", kv_bytes))
 
-                    # Route cross-paradigm transition & atomically reserve dst_gpu queue + KV + H2D pacer BEFORE shipping!
-                    gamma = 2 if (plan == "dit_edit" and has_more_edits) else 1
-                    req = self._build_cptg_spec(
-                        req_id=f"{sess.session_id}_t{ti}_a{attempt}",
+                    # Plan cross-paradigm transition & atomically reserve router/pacer state in C++ `MorphControlEngine`.
+                    now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
+                    trans = self._plan_turn_transition(
+                        ctrl_handle,
+                        session_id=sess.session_id,
+                        base_ctx_id=ctx_id,
+                        turn_idx=ti,
+                        attempt=attempt,
                         src_gpu=resident_gpu,
                         state_bytes=kv_bytes,
-                        turn=turn,
-                        gamma=gamma,
-                    )
-                    fam = "internvl_u" if self.policy.model_family == "internvl_u" else "bagel"
-                    est_dit_ms = DEFAULT_OPERATOR_PROFILE.unloaded_dit_turn_ms(fam, turn.height, steps=turn.dit_steps)
-                    now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
-                    dec, ship_mode = self.router.plan_and_reserve_transition(
-                        routing_mode=self.policy.routing_mode,
-                        static_und_ranks=self.policy.static_und_ranks,
-                        static_gen_ranks=self.policy.static_gen_ranks,
-                        req=req,
-                        est_dit_ms=est_dit_ms,
-                        workers=self.worker_states,
-                        gpu_busy=self._gpu_busy_map(),
-                        use_pacer=self.policy.use_h2d_pacer,
+                        modality_plan=plan,
+                        height=turn.height,
+                        dit_steps=turn.dit_steps,
+                        has_more_turns=has_more_turns,
+                        has_more_edits=has_more_edits,
                         now_ms=now_rel_ms,
                     )
-                    dst_gpu = dec.dst_gpu
+                    ship_mode = str(trans["ship_mode"])
+                    dst_gpu = int(trans["dst_gpu"])
+                    est_dit_ms = float(trans["est_dit_ms"])
+                    reserved_kv_b = int(trans["reserved_kv_bytes"])
+                    ephemeral_gen_ctx = bool(trans["ephemeral_gen_ctx"])
+                    needs_return_ship = bool(trans["needs_return_ship"])
+                    release_src_on_fwd = bool(trans["release_src_on_fwd"])
+                    include_cfg_dup = bool(trans["include_cfg_dup_on_wire"])
+                    dit_ctx_id = str(trans["dit_ctx_id"])
+
                     src_gpu_before_ship = resident_gpu
-                    reserved_kv_b = (
-                        int(req.effective_state_bytes()) if (ship_mode != "none" and dst_gpu != resident_gpu) else 0
-                    )
                     kv_res_released = reserved_kv_b == 0
-                    dit_ctx_id = ctx_id
-                    deferred_ship: dict[str, Any] | None = None
                     save_tmp: str | None = None
+                    if save_outputs_dir is not None:
+                        save_tmp = str(save_outputs_dir / f"{sess.session_id}_t{ti}.png")
+                    elif (
+                        has_future_prev_image
+                        and (not is_tight_mot)
+                        and eff_policy.routing_mode in ("twostage_shm", "static_nccl_fission")
+                    ):
+                        save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
+                        owned_tmp_imgs.append(save_tmp)
+
                     dit_res: dict[str, Any] = {"status": "error", "error": "not_run"}
-
-                    ephemeral_gen_ctx = ship_mode in ("nccl_static", "shm_static")
-                    needs_return_ship = ephemeral_gen_ctx and has_more_turns and is_tight_mot
-
                     try:
-                        if ship_mode == "nccl_dual":
-                            ship = await self._ship_nccl(
+                        if ship_mode in ("nccl_dual", "nccl_static"):
+                            async with self._nccl_transfer_guard(
                                 resident_gpu,
                                 dst_gpu,
                                 ctx_id,
-                                ctx_id,
-                                include_cfg_dup=False,
-                                release_src_ctx=True,
-                                defer_unpack=True,
-                            )
-                            if ship.get("packed_ok"):
-                                src_ctx_alive = False
-                            if ship["status"] != "ok":
-                                dit_res = {"status": "oom", "error": ship.get("error", "nccl_ship_oom")}
-                            else:
-                                deferred_ship = ship
-                                dit_ctx_id = ctx_id
-                        elif ship_mode == "nccl_static":
-                            gen_ctx_id = f"{ctx_id}_gen_t{ti}"
-                            release_src = True if is_tight_mot else (not has_more_turns)
-                            # Fair strong NCCL fission (`Decision 2/6`): non-duplicated CFG wire payload +
-                            # full post-DiT `Text + ViT + VAE` KV continuity across turns!
-                            ship = await self._ship_nccl(
-                                resident_gpu,
-                                dst_gpu,
-                                ctx_id,
-                                gen_ctx_id,
-                                include_cfg_dup=False,
-                                release_src_ctx=release_src,
-                                defer_unpack=True,
-                            )
-                            if release_src and ship.get("packed_ok"):
-                                src_ctx_alive = False
-                            if ship["status"] != "ok":
-                                dit_res = {"status": "oom", "error": ship.get("error", "static_ship_oom")}
-                            else:
-                                deferred_ship = ship
-                                dit_ctx_id = gen_ctx_id
-                        elif ship_mode == "shm_static":
-                            gen_ctx_id = f"{ctx_id}_gen_t{ti}"
-                            release_src = True if is_tight_mot else (not has_more_turns)
-                            ship = await self._ship_shm(
-                                resident_gpu,
-                                dst_gpu,
-                                ctx_id,
-                                gen_ctx_id,
-                                include_cfg_dup=True,
-                                release_src_ctx=release_src,
-                            )
-                            if release_src and ship.get("sent_ok"):
-                                src_ctx_alive = False
-                            self.router.release_kv_reservation(
-                                dst_gpu,
-                                reserved_kv_b,
-                                latest_kv_free_bytes=ship.get("kv_free_bytes"),
-                                telemetry_seq=ship.get("telemetry_seq"),
-                                workers=self.worker_states,
-                            )
-                            kv_res_released = True
-                            if ship["status"] != "ok":
-                                dit_res = {"status": "oom", "error": ship.get("error", "shm_ship_oom")}
-                            else:
-                                dit_ctx_id = gen_ctx_id
-                                path_a_ships += 1
-                                turn_shipped = True
-                                fwd_b = int(ship.get("bytes", kv_bytes))
-                                if not self.topo.same_node(src_gpu_before_ship, dst_gpu):
-                                    cross_node_ships += 1
-                                    cross_node_ship_bytes_list.append(fwd_b)
-                                ship_bytes_list.append(fwd_b)
-                        elif self.policy.routing_mode == "dual_path":
-                            path_b_morphs += 1
-                            turn_morphed = True
-
-                        if dit_res.get("status") != "oom":
-                            if save_outputs_dir is not None:
-                                save_tmp = str(save_outputs_dir / f"{sess.session_id}_t{ti}.png")
-                            elif (
-                                has_future_prev_image
-                                and (not is_tight_mot)
-                                and self.policy.routing_mode in ("twostage_shm", "static_nccl_fission")
-                            ):
-                                save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
-                                owned_tmp_imgs.append(save_tmp)
-
-                            already_locked = bool(deferred_ship and deferred_ship.get("_holding_dst_lock"))
-                            holding_sem = bool(deferred_ship and deferred_ship.get("_holding_staging_sem"))
-                            if not already_locked:
-                                try:
-                                    await self._acquire_exclusive_gpu(dst_gpu)
-                                except BaseException:
-                                    if deferred_ship is not None and deferred_ship.get("recv_id"):
-                                        try:
-                                            await self._rpc(
-                                                dst_gpu, {"op": "DROP_RECV_BUF", "recv_id": deferred_ship["recv_id"]}
-                                            )
-                                        except Exception:
-                                            pass
-                                    if holding_sem:
-                                        self._dst_staging_sems[dst_gpu].release()
-                                    raise
-
-                            try:
-                                if deferred_ship is not None:
-                                    try:
-                                        u_res = await self._rpc(
-                                            dst_gpu,
-                                            {
-                                                "op": "UNPACK_CTX",
-                                                "recv_id": deferred_ship["recv_id"],
-                                                "new_ctx_id": dit_ctx_id,
-                                                "meta": deferred_ship["meta"],
-                                            },
-                                        )
-                                    finally:
-                                        if holding_sem:
-                                            self._dst_staging_sems[dst_gpu].release()
-                                            holding_sem = False
-                                    self.router.release_kv_reservation(
+                                dit_ctx_id,
+                                include_cfg_dup=include_cfg_dup,
+                                release_src_ctx=release_src_on_fwd,
+                            ) as ship:
+                                if release_src_on_fwd and ship.get("packed_ok"):
+                                    src_ctx_alive = False
+                                self.router.release_kv_reservation(
+                                    dst_gpu,
+                                    reserved_kv_b,
+                                    latest_kv_free_bytes=ship.get("kv_free_bytes"),
+                                    telemetry_seq=ship.get("telemetry_seq"),
+                                )
+                                kv_res_released = True
+                                if ship.get("status") != "ok":
+                                    dit_res = {"status": "oom", "error": ship.get("error", f"{ship_mode}_oom")}
+                                else:
+                                    if ship_mode == "nccl_dual":
+                                        resident_gpu = dst_gpu
+                                        src_ctx_alive = True
+                                    path_a_ships += 1
+                                    turn_shipped = True
+                                    fwd_b = int(ship.get("bytes", kv_bytes))
+                                    if not self.topo.same_node(src_gpu_before_ship, dst_gpu):
+                                        cross_node_ships += 1
+                                        cross_node_ship_bytes_list.append(fwd_b)
+                                    ship_bytes_list.append(fwd_b)
+                                    ship_ms_list.append(float(ship.get("ship_ms", 0.0)))
+                                    dit_res = await self._exec_dit_on_locked_gpu(
                                         dst_gpu,
-                                        reserved_kv_b,
-                                        latest_kv_free_bytes=u_res.get("kv_free_bytes"),
-                                        telemetry_seq=u_res.get("telemetry_seq"),
-                                        workers=self.worker_states,
+                                        dit_ctx_id,
+                                        turn,
+                                        ti,
+                                        save_tmp=save_tmp,
+                                        ephemeral_gen_ctx=ephemeral_gen_ctx,
+                                        needs_return_ship=needs_return_ship,
                                     )
-                                    kv_res_released = True
-                                    if u_res.get("status") != "ok":
-                                        dit_res = {"status": "oom", "error": u_res.get("error", "unpack_oom")}
-                                    else:
-                                        if ship_mode == "nccl_dual":
-                                            resident_gpu = dst_gpu
-                                            src_ctx_alive = True
-                                        path_a_ships += 1
-                                        turn_shipped = True
-                                        fwd_b = int(deferred_ship.get("bytes", kv_bytes))
-                                        if not self.topo.same_node(src_gpu_before_ship, dst_gpu):
-                                            cross_node_ships += 1
-                                            cross_node_ship_bytes_list.append(fwd_b)
-                                        ship_bytes_list.append(fwd_b)
-                                        ship_ms_list.append(float(deferred_ship.get("ship_ms", 0.0)))
+                        else:
+                            if ship_mode == "shm_static":
+                                ship = await self._ship_shm(
+                                    resident_gpu,
+                                    dst_gpu,
+                                    ctx_id,
+                                    dit_ctx_id,
+                                    include_cfg_dup=include_cfg_dup,
+                                    release_src_ctx=release_src_on_fwd,
+                                )
+                                if release_src_on_fwd and ship.get("sent_ok"):
+                                    src_ctx_alive = False
+                                self.router.release_kv_reservation(
+                                    dst_gpu,
+                                    reserved_kv_b,
+                                    latest_kv_free_bytes=ship.get("kv_free_bytes"),
+                                    telemetry_seq=ship.get("telemetry_seq"),
+                                )
+                                kv_res_released = True
+                                if ship.get("status") != "ok":
+                                    dit_res = {"status": "oom", "error": ship.get("error", "shm_ship_oom")}
+                                else:
+                                    path_a_ships += 1
+                                    turn_shipped = True
+                                    fwd_b = int(ship.get("bytes", kv_bytes))
+                                    if not self.topo.same_node(src_gpu_before_ship, dst_gpu):
+                                        cross_node_ships += 1
+                                        cross_node_ship_bytes_list.append(fwd_b)
+                                    ship_bytes_list.append(fwd_b)
+                            elif eff_policy.routing_mode == "dual_path":
+                                path_b_morphs += 1
+                                turn_morphed = True
 
-                                if dit_res.get("status") != "oom":
-                                    self._active_dit_ranks[dst_gpu] += 1
-                                    try:
-                                        dit_res = await self._rpc(
-                                            dst_gpu,
-                                            {
-                                                "op": "EXEC_DIT",
-                                                "ctx_id": dit_ctx_id,
-                                                "prompt": turn.prompt,
-                                                "height": turn.height,
-                                                "width": turn.width,
-                                                "dit_steps": turn.dit_steps,
-                                                "seed": 52 + ti,
-                                                "save_tmp_image_path": save_tmp,
-                                                "release_after_dit": ephemeral_gen_ctx and (not needs_return_ship),
-                                            },
-                                        )
-                                        if ephemeral_gen_ctx and dit_res.get("status") != "ok":
-                                            try:
-                                                await self._rpc(dst_gpu, {"op": "RELEASE_CTX", "ctx_id": dit_ctx_id})
-                                            except Exception:
-                                                pass
-                                    finally:
-                                        self._active_dit_ranks[dst_gpu] -= 1
-                            finally:
-                                if holding_sem:
-                                    self._dst_staging_sems[dst_gpu].release()
-                                self._gpu_locks[dst_gpu].release()
+                            if dit_res.get("status") != "oom":
+                                await self._acquire_exclusive_gpu(dst_gpu)
+                                try:
+                                    dit_res = await self._exec_dit_on_locked_gpu(
+                                        dst_gpu,
+                                        dit_ctx_id,
+                                        turn,
+                                        ti,
+                                        save_tmp=save_tmp,
+                                        ephemeral_gen_ctx=ephemeral_gen_ctx,
+                                        needs_return_ship=needs_return_ship,
+                                    )
+                                finally:
+                                    self._gpu_locks[dst_gpu].release()
                     finally:
                         if not kv_res_released:
-                            self.router.release_kv_reservation(dst_gpu, reserved_kv_b, workers=self.worker_states)
-                        self.router.release_dit_reservation(dst_gpu, est_dit_ms, workers=self.worker_states)
+                            self.router.release_kv_reservation(dst_gpu, reserved_kv_b)
+                        self.router.release_dit_reservation(dst_gpu, est_dit_ms)
 
-                    # Return-ship updated post-DiT `main_ctx` (`Text + ViT + VAE` KV + `last_img`) back to `und` rank
-                    # for multi-turn `tight_mot` disaggregated policies (`static_nccl_fission`, `twostage_shm`).
+                    # Return-ship updated post-DiT `main_ctx` back to `und` rank for multi-turn `tight_mot` fission.
                     if dit_res.get("status") == "ok" and needs_return_ship:
                         ret_kv_b = max(0, int(dit_res.get("kv_bytes", kv_bytes)))
-                        self.router.reserve_kv_bytes(resident_gpu, ret_kv_b, workers=self.worker_states)
+                        self.router.reserve_kv_bytes(resident_gpu, ret_kv_b)
                         ret_ship: dict[str, Any] = {}
                         try:
                             if ship_mode == "nccl_static":
-                                ret_ship = await self._ship_nccl(
+                                async with self._nccl_transfer_guard(
                                     dst_gpu,
                                     resident_gpu,
                                     dit_ctx_id,
                                     ctx_id,
                                     include_cfg_dup=False,
                                     release_src_ctx=True,
-                                    defer_unpack=False,
-                                )
+                                ) as rs:
+                                    ret_ship = dict(rs)
                             else:
                                 ret_ship = await self._ship_shm(
                                     dst_gpu,
@@ -1342,7 +1370,6 @@ class MorphServeClusterEngine:
                                 ret_kv_b,
                                 latest_kv_free_bytes=ret_ship.get("kv_free_bytes"),
                                 telemetry_seq=ret_ship.get("telemetry_seq"),
-                                workers=self.worker_states,
                             )
                         if ret_ship.get("status") != "ok":
                             if not ret_ship.get("packed_ok") and not ret_ship.get("sent_ok"):
@@ -1364,41 +1391,26 @@ class MorphServeClusterEngine:
                                 )
 
                     if dit_res["status"] == "oom":
-                        for g_clean, c_clean in {(resident_gpu, ctx_id), (dst_gpu, dit_ctx_id)}:
-                            if g_clean is not None:
-                                try:
-                                    await self._rpc(g_clean, {"op": "RELEASE_CTX", "ctx_id": c_clean})
-                                except Exception:
-                                    pass
                         src_ctx_alive = False
-                        if attempt < self.policy.max_oom_retries and ti == 0:
-                            attempt += 1
-                            oom_retries += 1
-                            resident_gpu = self._pick_oom_retry_gpu(dst_gpu, plan)
-                            ctx_id = f"ctx_{sess.session_id}_r{oom_retries}"
-                            # Keep t_sess0 ticking so wasted OOM attempt counts toward latency!
-                            continue
-                        turn_records.append(
-                            {
-                                "turn_idx": int(ti),
-                                "modality_plan": plan,
-                                "status": "oom",
-                                "ar_ttft_ms": round(turn_ar_ttft, 2) if turn_ar_ttft is not None else None,
-                                "ar_tpot_p95_ms": (
-                                    round(_percentile(turn_ar_tpots, 95.0), 2) if turn_ar_tpots else None
-                                ),
-                                "ar_tpot_mean_ms": (
-                                    round(sum(turn_ar_tpots) / float(len(turn_ar_tpots)), 2) if turn_ar_tpots else None
-                                ),
-                                "ar_tpot_strict_max_ms": round(max(turn_ar_tpots), 2) if turn_ar_tpots else None,
-                                "dit_ms": None,
-                                "height": int(turn.height),
-                                "dit_steps": int(turn.dit_steps),
-                                "kv_bytes": int(kv_bytes),
-                                "shipped": turn_shipped,
-                                "morphed": turn_morphed,
-                            }
+                        should_retry, attempt, oom_retries, resident_gpu, next_cid = await self._retry_or_fail_oom(
+                            eff_policy=eff_policy,
+                            sess_id=sess.session_id,
+                            turn_idx=ti,
+                            turn=turn,
+                            attempt=attempt,
+                            oom_retries=oom_retries,
+                            failed_gpu=dst_gpu,
+                            cleanup_targets={(resident_gpu, ctx_id), (dst_gpu, dit_ctx_id)},
+                            kv_bytes=kv_bytes,
+                            turn_records=turn_records,
+                            ar_ttft_ms=turn_ar_ttft,
+                            ar_tpots_ms=turn_ar_tpots,
+                            shipped=turn_shipped,
+                            morphed=turn_morphed,
                         )
+                        if should_retry:
+                            ctx_id = next_cid
+                            continue
                         return _make_outcome("oom", error=dit_res.get("error", "oom"))
 
                     if cot_text_pending is not None:
@@ -1439,34 +1451,23 @@ class MorphServeClusterEngine:
                     )
                     break
 
-            ttft_ok = all(x <= self.policy.ar_ttft_slo_ms for x in ar_ttfts)
-            ar_p95_ok = ttft_ok and all(
-                _percentile(t_list, 95.0) <= self.policy.ar_tpot_slo_ms for t_list in ar_turn_tpots if t_list
-            )
-            ar_mean_ok = ttft_ok and all(
-                (sum(t_list) / float(len(t_list))) <= self.policy.ar_tpot_slo_ms
-                for t_list in ar_turn_tpots
-                if t_list
-            )
-            ar_strict_ok = ttft_ok and all(x <= self.policy.ar_tpot_slo_ms for x in ar_tpots)
-            ar_mode = str(self.policy.ar_tpot_slo_mode)
-            if ar_mode == "turn_mean":
-                ar_ok = ar_mean_ok
-            elif ar_mode in ("token_max", "strict_max"):
-                ar_ok = ar_strict_ok
-            else:
-                ar_ok = ar_p95_ok
-            dit_ok = all(
-                lat <= self.policy.dit_turn_slo_for(h, steps=st)
-                for lat, h, st in zip(dit_turns, dit_heights, dit_steps_list)
+            slo_eval = self._evaluate_session_slos(
+                eff_policy,
+                ar_ttfts_ms=ar_ttfts,
+                ar_tpots_ms=ar_tpots,
+                ar_turn_tpots_ms=ar_turn_tpots,
+                dit_turns_ms=dit_turns,
+                dit_turn_heights=dit_heights,
+                dit_turn_steps=dit_steps_list,
             )
             return _make_outcome(
                 "ok",
-                ar_ok=ar_ok,
-                ar_p95_ok=ar_p95_ok,
-                ar_mean_ok=ar_mean_ok,
-                ar_strict_ok=ar_strict_ok,
-                dit_ok=dit_ok,
+                ar_ok=bool(slo_eval["ar_slo_met"]),
+                ar_p95_ok=bool(slo_eval["ar_slo_p95_tpot_met"]),
+                ar_mean_ok=bool(slo_eval["ar_slo_mean_tpot_met"]),
+                ar_strict_ok=bool(slo_eval["ar_slo_strict_max_tpot_met"]),
+                dit_ok=bool(slo_eval["dit_slo_met"]),
+                joint_ok=bool(slo_eval["joint_slo_met"]),
             )
         except Exception as exc:
             turn_records.append(
@@ -1494,30 +1495,6 @@ class MorphServeClusterEngine:
             for p_img in owned_tmp_imgs:
                 Path(p_img).unlink(missing_ok=True)
 
-    def _evaluate_outcome_at_k(self, out: SessionOutcome, k: float) -> bool:
-        if out.status != "ok":
-            return False
-        fam = "internvl_u" if self.policy.model_family == "internvl_u" else "bagel"
-        slo = DEFAULT_OPERATOR_PROFILE.slo_thresholds_ms(k=k, model_family=fam)
-        ttft_cap = slo["ar_ttft_slo_ms"]
-        tpot_cap = slo["ar_tpot_slo_ms"]
-        if not all(x <= ttft_cap for x in out.ar_ttfts_ms):
-            return False
-        mode = str(self.policy.ar_tpot_slo_mode)
-        turn_lists = out.ar_turn_tpots_ms if out.ar_turn_tpots_ms else ([out.ar_tpots_ms] if out.ar_tpots_ms else [])
-        if mode in ("token_max", "strict_max"):
-            ar_ok = all(x <= tpot_cap for x in out.ar_tpots_ms)
-        elif mode == "turn_mean":
-            ar_ok = all((sum(t) / float(len(t))) <= tpot_cap for t in turn_lists if t)
-        else:
-            ar_ok = all(_percentile(t, 95.0) <= tpot_cap for t in turn_lists if t)
-        if not ar_ok:
-            return False
-        return all(
-            lat <= self.policy.dit_turn_slo_for(h, steps=st, k=k)
-            for lat, h, st in zip(out.dit_turns_ms, out.dit_turn_heights, out.dit_turn_steps)
-        )
-
     async def _run_suite_async(
         self,
         suite: WorkloadSuite,
@@ -1525,8 +1502,10 @@ class MorphServeClusterEngine:
         burstgpt_deltas: list[float] | None,
         gentd26_deltas: list[float] | None,
         save_outputs_dir: Path | None = None,
+        run_options: RunWindowOptions | None = None,
     ) -> ClusterRunReport:
-        n_gpus = self.policy.num_gpus
+        eff_policy = run_options.apply_to_policy(self.policy) if run_options is not None else self.policy
+        n_gpus = eff_policy.num_gpus
         self._gpu_locks = [asyncio.Lock() for _ in range(n_gpus)]
         self._xfer_locks = [asyncio.Lock() for _ in range(n_gpus)]
         self._dst_staging_sems = [asyncio.Semaphore(1) for _ in range(n_gpus)]
@@ -1539,32 +1518,16 @@ class MorphServeClusterEngine:
             ev.set()
             self._ar_drained_events.append(ev)
 
-        # Reset analytical H2D timeline (`now_rel_ms` restarts at 0.0 per suite) and clean reused workers!
         self.router.pacer.reset_analytical_slots()
         if self.pacer is not None and self.pacer is not self.router.pacer:
             self.pacer.reset_analytical_slots()
-        # Reset per-suite `reset_peak_memory_stats()` + NVML peak watermark BEFORE every `run_suite`
-        # (including `_suites_completed == 0`) to eliminate pre-suite load/warmup double-counting!
+
         should_reset_alpha = self._suites_completed > 0
         reset_acks = await asyncio.gather(
             *(self._rpc(g, {"op": "RESET_SUITE", "reset_alpha": should_reset_alpha}) for g in range(n_gpus))
         )
         if should_reset_alpha:
-            free_est = 22 * GIB if self.policy.use_tripool_vmm else 10 * GIB
-            alphas = {
-                g: float(reset_acks[g].get("resident_alpha", self.policy.initial_alphas.get(g, 1.0)))
-                for g in range(n_gpus)
-            }
-            kv_frees = {
-                g: int(reset_acks[g].get("kv_free_bytes", free_est))
-                for g in range(n_gpus)
-            }
-            self.worker_states = self.router.init_workers(
-                num_gpus=n_gpus,
-                role_of=self.policy.role_of,
-                initial_alphas=alphas,
-                kv_free_bytes=kv_frees,
-            )
+            self._init_router_workers_from_acks({g: reset_acks[g] for g in range(n_gpus)})
         self._suites_completed += 1
 
         if save_outputs_dir is not None:
@@ -1594,26 +1557,45 @@ class MorphServeClusterEngine:
                 for idx_s, s_item in enumerate(sessions):
                     s_item.arrival_offset_s = round(idx_s / eff_qps, 4)
 
-        t0 = time.perf_counter()
-        outcomes = await asyncio.gather(
-            *(self._run_session_coro(s, t0, save_outputs_dir=save_outputs_dir) for s in sessions)
-        )
-        wall_s = max(time.perf_counter() - t0, 1e-6)
+        with self._scoped_ctrl_handle(eff_policy) as ctrl_handle:
+            t0 = time.perf_counter()
+            outcomes = await asyncio.gather(
+                *(
+                    self._run_session_coro(
+                        s,
+                        t0,
+                        eff_policy=eff_policy,
+                        ctrl_handle=ctrl_handle,
+                        save_outputs_dir=save_outputs_dir,
+                    )
+                    for s in sessions
+                )
+            )
+            wall_s = max(time.perf_counter() - t0, 1e-6)
 
-        stat_res = await asyncio.gather(*(self._rpc(g, {"op": "GET_STATS"}) for g in range(n_gpus)))
-        L = get_core_lib()
+        stat_res: list[dict[str, Any]] = []
+        raw_stats = await asyncio.gather(
+            *(self._rpc(g, {"op": "GET_STATS"}) for g in range(n_gpus)),
+            return_exceptions=True,
+        )
+        for item in raw_stats:
+            if isinstance(item, Mapping):
+                stat_res.append(dict(item))
+            else:
+                stat_res.append({"oom_count": 0})
+
         agg = call_json(
-            L,
-            L.ms_ctrl_aggregate_report_json,
-            encode_json(serialize_policy_config(self.policy)),
+            self._lib,
+            self._lib.ms_ctrl_aggregate_report_json,
+            encode_json(eff_policy.to_dict()),
             str(suite.name).encode("utf-8"),
             float(eff_qps),
             float(wall_s),
             float(self.host_shmem_delta_gib),
             encode_json([asdict(o) for o in outcomes]),
-            encode_json(list(stat_res)),
+            encode_json(stat_res),
         )
-        return ClusterRunReport(**agg)
+        return ClusterRunReport.from_dict(agg)
 
     def run_suite(
         self,
@@ -1622,6 +1604,8 @@ class MorphServeClusterEngine:
         burstgpt_deltas: list[float] | None = None,
         gentd26_deltas: list[float] | None = None,
         save_outputs_dir: Path | None = None,
+        *,
+        run_options: RunWindowOptions | None = None,
     ) -> ClusterRunReport:
         if not self._started:
             self.start()
@@ -1632,6 +1616,7 @@ class MorphServeClusterEngine:
                 burstgpt_deltas=burstgpt_deltas,
                 gentd26_deltas=gentd26_deltas,
                 save_outputs_dir=save_outputs_dir,
+                run_options=run_options,
             )
         )
 
@@ -1641,3 +1626,10 @@ class MorphServeClusterEngine:
         self.fleet.shutdown()
         shutil.rmtree(self.tmp_root, ignore_errors=True)
         self._started = False
+
+
+__all__ = [
+    "ClusterRunReport",
+    "MorphServeClusterEngine",
+    "SessionOutcome",
+]

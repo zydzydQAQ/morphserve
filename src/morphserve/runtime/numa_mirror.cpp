@@ -47,20 +47,30 @@ int create_linux_memfd(const std::string& name, size_t raw_len_with_check) {
     return fd;
 }
 
-bool try_bind_numa_node(void* ptr, size_t nbytes, int numa_node) noexcept {
-    void* libnuma = dlopen("libnuma.so.1", RTLD_LAZY | RTLD_LOCAL);
-    if (!libnuma) return false;
+struct LibNumaApi {
     using AvailFn = int (*)();
     using ToNodeFn = void (*)(void*, size_t, int);
-    auto avail = reinterpret_cast<AvailFn>(dlsym(libnuma, "numa_available"));
-    auto tonode = reinterpret_cast<ToNodeFn>(dlsym(libnuma, "numa_tonode_memory"));
-    bool ok = false;
-    if (avail && tonode && avail() >= 0) {
-        tonode(ptr, nbytes, numa_node);
-        ok = true;
+
+    void* handle = nullptr;
+    AvailFn numa_available = nullptr;
+    ToNodeFn numa_tonode_memory = nullptr;
+    bool available = false;
+
+    LibNumaApi() noexcept {
+        handle = dlopen("libnuma.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (!handle) return;
+        numa_available = reinterpret_cast<AvailFn>(dlsym(handle, "numa_available"));
+        numa_tonode_memory = reinterpret_cast<ToNodeFn>(dlsym(handle, "numa_tonode_memory"));
+        available = (numa_available != nullptr && numa_tonode_memory != nullptr && numa_available() >= 0);
     }
-    dlclose(libnuma);
-    return ok;
+};
+
+bool try_bind_numa_node(void* ptr, size_t nbytes, int numa_node) noexcept {
+    if (!ptr || nbytes == 0 || numa_node < 0) return false;
+    static const LibNumaApi api;
+    if (!api.available) return false;
+    api.numa_tonode_memory(ptr, nbytes, numa_node);
+    return true;
 }
 
 }  // namespace
@@ -108,6 +118,10 @@ std::unique_ptr<NumaMemfdMirror> NumaMemfdMirror::create(
     out->numa_node_ = numa_node;
     out->is_owner_ = true;
 
+    // Bind NUMA policy BEFORE first-touch prefaulting/population so Linux mbind(MPOL_BIND, flags=0)
+    // governs physical page placement on `numa_node`.
+    out->numa_bound_ = try_bind_numa_node(addr, nbytes, numa_node);
+
     auto* bytes = static_cast<volatile uint8_t*>(addr);
     for (size_t off = 0; off < nbytes; off += kPrefaultStride) {
         bytes[off] = 0;
@@ -115,7 +129,6 @@ std::unique_ptr<NumaMemfdMirror> NumaMemfdMirror::create(
     if (populate_data && populate_len > 0) {
         std::memcpy(addr, populate_data, populate_len);
     }
-    out->numa_bound_ = try_bind_numa_node(addr, nbytes, numa_node);
     return out;
 }
 

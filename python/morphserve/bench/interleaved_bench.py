@@ -8,7 +8,6 @@ from dataclasses import asdict
 from datetime import datetime
 import io
 import json
-import math
 from pathlib import Path
 import random
 import shutil
@@ -17,12 +16,14 @@ import sys
 from typing import Any
 import urllib.request
 
+from morphserve.bench.harness import resolve_sources_dir
 from morphserve.engine.workload import (
     InterleavedSession,
     InterleavedTurn,
     WorkloadSuite,
     assign_dual_trace_arrivals,
     build_time_window_suite,
+    hamilton_apportion,
     scale_arrivals_to_qps,
 )
 
@@ -274,36 +275,6 @@ def _copy_mse_and_load(sources_dir: Path, out_dir: Path) -> tuple[list[dict[str,
         obj["index"] = idx
         geneval_items.append(obj)
     return templates, geneval_items
-
-
-def _allocate_weighted_counts(weights: dict[str, float], total: int) -> dict[str, int]:
-    """Hamilton largest-remainder apportionment of `total` sessions across quadrants."""
-    n_tot = max(1, int(total))
-    w_sum = sum(max(0.0, float(v)) for v in weights.values())
-    if w_sum <= 0.0:
-        keys = list(weights.keys())
-        base = n_tot // max(1, len(keys))
-        counts = {k: base for k in keys}
-        for k in keys[: n_tot - sum(counts.values())]:
-            counts[k] += 1
-        return counts
-
-    quotas: list[tuple[str, int, float]] = []
-    used = 0
-    for q, w in weights.items():
-        exact = n_tot * (max(0.0, float(w)) / w_sum)
-        c = int(math.floor(exact))
-        quotas.append((q, c, exact - math.floor(exact)))
-        used += c
-    quotas.sort(key=lambda x: (-x[2], x[0]))
-    counts = {q: c for q, c, _ in quotas}
-    rem = n_tot - used
-    idx = 0
-    while rem > 0 and quotas:
-        counts[quotas[idx % len(quotas)][0]] += 1
-        rem -= 1
-        idx += 1
-    return counts
 
 
 def _build_quadrant_pools(
@@ -671,7 +642,7 @@ def build_online_phase_shift_suite(
         start_s = round(p_idx * p_dur, 3)
         end_s = round((p_idx + 1) * p_dur, 3)
         active_weights = {q: w for q, w in weights.items() if pools.get(q)}
-        counts = _allocate_weighted_counts(active_weights, n_per_phase)
+        counts = hamilton_apportion(n_per_phase, active_weights)
 
         phase_sessions: list[InterleavedSession] = []
         for quad, cnt in counts.items():
@@ -731,6 +702,381 @@ def build_online_phase_shift_suite(
         steady_s=steady_s,
         arrival_duration_s=total_duration_s,
         phase_schedule=phase_schedule,
+    )
+
+
+def _load_stratified_geneval_metas(bench_root: Path, limit: int = 64) -> list[dict[str, Any]]:
+    base_acc_path = bench_root / "suites/accuracy_geneval_mmvet.json"
+    metas: list[dict[str, Any]] = []
+    if base_acc_path.is_file():
+        base_acc = WorkloadSuite.load_json(base_acc_path)
+        for s in base_acc.sessions:
+            for t in s.turns:
+                if t.geneval_meta:
+                    meta = dict(t.geneval_meta)
+                    meta.setdefault("prompt", t.prompt)
+                    metas.append(meta)
+    if len(metas) >= limit:
+        return metas[:limit]
+
+    src_dir = resolve_sources_dir(bench_root)
+    gv_jsonl = src_dir / "geneval_evaluation_metadata.jsonl"
+    if gv_jsonl.is_file():
+        by_tag: dict[str, list[dict[str, Any]]] = {}
+        seen_prompts = {str(m.get("prompt", "")) for m in metas}
+        for idx, line in enumerate(gv_jsonl.read_text(encoding="utf-8").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            obj["index"] = idx
+            if str(obj.get("prompt", "")) in seen_prompts:
+                continue
+            by_tag.setdefault(str(obj.get("tag", "other")), []).append(obj)
+        tags = sorted(by_tag.keys())
+        idx_per_tag = 0
+        while len(metas) < limit and tags:
+            added = False
+            for tag in tags:
+                if idx_per_tag < len(by_tag[tag]) and len(metas) < limit:
+                    metas.append(by_tag[tag][idx_per_tag])
+                    added = True
+            if not added:
+                break
+            idx_per_tag += 1
+    return metas[:limit]
+
+
+def build_m3_active_accuracy_suite(
+    bench_root: Path,
+    *,
+    num_co_creation: int = 36,
+    num_edit_4turn: int = 36,
+    num_multiturn_mmvet: int = 36,
+    num_cot_geneval: int = 36,
+) -> WorkloadSuite:
+    """Build the Interleaved-Bench v2 4-quadrant downstream accuracy & parity suite (`144` sessions).
+
+    Covers all four Interleaved-Bench v2 orthogonal quadrants:
+      1. `num_co_creation` (36) Q1 4-turn bidirectional `interleaved_co_creation` sessions
+         (`AR -> DiT -> AR(use_prev_image=True) -> DiT(use_prev_image=True)`);
+      2. `num_edit_4turn` (36) Q2 4-turn `multiturn_edit` sessions (MagicBrush + MSE-Bench, Turn 1..3 `use_prev_image=True`);
+      3. `num_multiturn_mmvet` (36) Q3 multi-turn `multi_image_vqa` sessions (MM-Vet);
+      4. `num_cot_geneval` (36) Q4 `visual_cot_highres` GenEval sessions (`AR <think> -> DiT 512px`, OWLv2 scored).
+    """
+    bench_root = Path(bench_root)
+    base_acc_path = bench_root / "suites/accuracy_geneval_mmvet.json"
+    base_acc = WorkloadSuite.load_json(base_acc_path) if base_acc_path.is_file() else None
+    src_dir = resolve_sources_dir(bench_root)
+
+    fallback_refinements = (
+        "Add soft natural warm lighting while preserving the edited objects.",
+        "Enhance background depth and subtle realistic reflections.",
+        "Adjust the lighting to golden hour while keeping the subject intact.",
+        "Refine surface textures and balance overall scene contrast cleanly.",
+    )
+
+    geneval_metas = _load_stratified_geneval_metas(
+        bench_root, limit=max(64, int(num_cot_geneval) + int(num_co_creation))
+    )
+
+    mse_items: list[dict[str, Any]] = []
+    mse_json = src_dir / "mse_editing_sessions.json"
+    if mse_json.is_file():
+        mse_doc = json.loads(mse_json.read_text(encoding="utf-8"))
+        for idx, tpl in enumerate(mse_doc.get("templates", [])):
+            img_name = Path(tpl["source_image"]["path"]).name
+            img_rel = f"images/mse-bench/{img_name}"
+            if not (bench_root / img_rel).is_file():
+                continue
+            raw_turns = [
+                str(rt["prompt"]).strip() for rt in tpl.get("turns", []) if str(rt.get("prompt", "")).strip()
+            ]
+            if not raw_turns:
+                continue
+            while len(raw_turns) < 4:
+                raw_turns.append(fallback_refinements[(idx + len(raw_turns)) % len(fallback_refinements)])
+            mse_items.append({"idx": idx, "source_image": img_rel, "prompts": raw_turns[:4]})
+
+    mb_items: list[dict[str, Any]] = []
+    mb_json = bench_root / "magicbrush_sessions.json"
+    if mb_json.is_file():
+        for idx, mb in enumerate(json.loads(mb_json.read_text(encoding="utf-8"))):
+            src_rel = str(mb.get("source_image", ""))
+            if not src_rel or not (bench_root / src_rel).is_file():
+                continue
+            insts = [
+                str(x["instruction"]).strip() for x in mb.get("turns", []) if str(x.get("instruction", "")).strip()
+            ]
+            if not insts:
+                continue
+            while len(insts) < 4:
+                insts.append(fallback_refinements[(idx + len(insts)) % len(fallback_refinements)])
+            mb_items.append({"idx": idx, "source_image": src_rel, "prompts": insts[:4]})
+
+    mmvet_pool: list[dict[str, str]] = []
+    mmvet_json = bench_root / "mmvet_questions.json"
+    if mmvet_json.is_file():
+        for item in json.loads(mmvet_json.read_text(encoding="utf-8")):
+            if (bench_root / str(item.get("image_path", ""))).is_file():
+                mmvet_pool.append(item)
+    elif base_acc is not None:
+        for s in base_acc.sessions:
+            if s.source_dataset == "mmvet" and s.turns:
+                t0 = s.turns[0]
+                mmvet_pool.append(
+                    {
+                        "image_path": t0.image_paths[0] if t0.image_paths else "",
+                        "question": t0.prompt,
+                        "answer": t0.expected_answer,
+                    }
+                )
+
+    sessions: list[InterleavedSession] = []
+
+    # 1. Q1: 4-turn bidirectional `interleaved_co_creation` sessions
+    for i in range(int(num_co_creation)):
+        ref_txt = fallback_refinements[i % len(fallback_refinements)]
+        slot = i % 3
+        if slot == 0 and mse_items:
+            it = mse_items[(i // 3) % len(mse_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = (
+                "Analyze the source image composition, lighting, and subjects, "
+                f"and outline a concise visual editing plan for: {t1_prompt}"
+            )
+            t1_meta: dict[str, Any] = {}
+            src_ds = "mse-bench"
+        elif slot == 1 and mb_items:
+            it = mb_items[(i // 3) % len(mb_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = (
+                "Analyze the source image layout and key objects, "
+                f"and plan how to apply this visual edit cleanly: {t1_prompt}"
+            )
+            t1_meta = {}
+            src_ds = "magicbrush"
+        elif geneval_metas:
+            gv = geneval_metas[(int(num_cot_geneval) + i) % len(geneval_metas)]
+            t0_imgs = []
+            t1_plan = "dit_t2i"
+            t1_prompt = str(gv["prompt"])
+            t3_prompt = ref_txt
+            t0_prompt = (
+                "Plan the exact object placement, colors, spatial composition, and lighting "
+                f"before generating the target image: {t1_prompt}"
+            )
+            t1_meta = dict(gv)
+            src_ds = "geneval"
+        elif mse_items:
+            it = mse_items[i % len(mse_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = f"Analyze the source image and plan this edit: {t1_prompt}"
+            t1_meta = {}
+            src_ds = "mse-bench"
+        elif mb_items:
+            it = mb_items[i % len(mb_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = f"Analyze the source image and plan this edit: {t1_prompt}"
+            t1_meta = {}
+            src_ds = "magicbrush"
+        else:
+            break
+
+        sessions.append(
+            InterleavedSession(
+                session_id=f"acc_cocreate_{i:03d}",
+                quadrant="interleaved_co_creation",
+                source_dataset=src_ds,
+                arrival_offset_s=0.0,
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="ar_only",
+                        prompt=t0_prompt,
+                        image_paths=t0_imgs,
+                        max_ar_tokens=48,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=1,
+                        modality_plan=t1_plan,
+                        prompt=t1_prompt,
+                        image_paths=[],
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        geneval_meta=t1_meta,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=2,
+                        modality_plan="ar_only",
+                        prompt=POST_DIT_INSPECT_PROMPT,
+                        image_paths=[],
+                        max_ar_tokens=48,
+                        use_prev_image=True,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3,
+                        modality_plan="dit_edit",
+                        prompt=t3_prompt,
+                        image_paths=[],
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        use_prev_image=True,
+                    ),
+                ],
+            )
+        )
+
+    # 2. Q2: 4-turn chained editing sessions (MagicBrush + MSE-Bench)
+    mb_candidates: list[InterleavedSession] = [
+        InterleavedSession(
+            session_id=f"acc_edit4_mb_{it['idx']:03d}",
+            quadrant="multiturn_edit",
+            source_dataset="magicbrush",
+            arrival_offset_s=0.0,
+            turns=[
+                InterleavedTurn(
+                    turn_idx=ti,
+                    modality_plan="dit_edit",
+                    prompt=inst,
+                    image_paths=[it["source_image"]] if ti == 0 else [],
+                    height=512,
+                    width=512,
+                    dit_steps=20,
+                    use_prev_image=(ti > 0),
+                )
+                for ti, inst in enumerate(it["prompts"][:4])
+            ],
+        )
+        for it in mb_items
+    ]
+    mse_candidates: list[InterleavedSession] = [
+        InterleavedSession(
+            session_id=f"acc_edit4_mse_{it['idx']:03d}",
+            quadrant="multiturn_edit",
+            source_dataset="mse-bench",
+            arrival_offset_s=0.0,
+            turns=[
+                InterleavedTurn(
+                    turn_idx=ti,
+                    modality_plan="dit_edit",
+                    prompt=inst,
+                    image_paths=[it["source_image"]] if ti == 0 else [],
+                    height=512,
+                    width=512,
+                    dit_steps=20,
+                    use_prev_image=(ti > 0),
+                )
+                for ti, inst in enumerate(it["prompts"][:4])
+            ],
+        )
+        for it in mse_items
+    ]
+    combined_edits: list[InterleavedSession] = []
+    max_len = max(len(mb_candidates), len(mse_candidates))
+    for i in range(max_len):
+        if i < len(mb_candidates) and len(combined_edits) < int(num_edit_4turn):
+            combined_edits.append(mb_candidates[i])
+        if i < len(mse_candidates) and len(combined_edits) < int(num_edit_4turn):
+            combined_edits.append(mse_candidates[i])
+    sessions.extend(combined_edits[: int(num_edit_4turn)])
+
+    # 3. Q3: multi-turn MMVet VQA sessions (alternating 2-turn & 3-turn)
+    if mmvet_pool:
+        n_mv = min(int(num_multiturn_mmvet), len(mmvet_pool))
+        for i in range(n_mv):
+            n_turns = 2 if (i % 2 == 0) else 3
+            turns_vqa: list[InterleavedTurn] = []
+            for ti in range(n_turns):
+                item = mmvet_pool[(i * 2 + ti) % len(mmvet_pool)]
+                if ti == 0:
+                    q_txt = str(item["question"])
+                elif ti == 1:
+                    q_txt = f"Now inspect the second image as well: {item['question']}"
+                else:
+                    q_txt = f"Finally, inspect the third image and answer: {item['question']}"
+                turns_vqa.append(
+                    InterleavedTurn(
+                        turn_idx=ti,
+                        modality_plan="ar_only",
+                        prompt=q_txt,
+                        image_paths=[str(item["image_path"])] if item.get("image_path") else [],
+                        max_ar_tokens=192,
+                        expected_answer=str(item.get("answer", "")),
+                        use_prev_image=False,
+                    )
+                )
+            sessions.append(
+                InterleavedSession(
+                    session_id=f"acc_mmvet_mt_{i:03d}",
+                    quadrant="multi_image_vqa",
+                    source_dataset="mmvet",
+                    arrival_offset_s=0.0,
+                    turns=turns_vqa,
+                )
+            )
+
+    # 4. Q4: `visual_cot_highres` GenEval sessions (`AR <think> -> DiT 512px`, OWLv2 scored)
+    for i in range(min(int(num_cot_geneval), len(geneval_metas))):
+        gv = geneval_metas[i]
+        gv_prompt = str(gv["prompt"])
+        plan_prompt = (
+            "Think step by step to plan the exact object counts, colors, spatial positions, "
+            f"and clean background layout before generating the image: {gv_prompt}"
+        )
+        sessions.append(
+            InterleavedSession(
+                session_id=f"acc_cot_geneval_{i:03d}",
+                quadrant="visual_cot_highres",
+                source_dataset="geneval",
+                arrival_offset_s=0.0,
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="ar_only",
+                        prompt=plan_prompt,
+                        max_ar_tokens=48,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=1,
+                        modality_plan="dit_t2i",
+                        prompt=gv_prompt,
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        geneval_meta=dict(gv),
+                        use_prev_image=False,
+                    ),
+                ],
+            )
+        )
+
+    return WorkloadSuite(
+        name="accuracy_v2_4quad_suite",
+        trace_source="deterministic_eval",
+        base_qps=0.8,
+        sessions=sessions,
+        schema="morphserve.interleaved_bench.v2",
+        warmup_s=0.0,
+        steady_s=0.0,
+        arrival_duration_s=0.0,
     )
 
 
@@ -980,6 +1326,7 @@ __all__ = [
     "WorkloadSuite",
     "assign_dual_trace_arrivals",
     "build_interleaved_bench",
+    "build_m3_active_accuracy_suite",
     "build_online_phase_shift_suite",
     "build_time_window_suite",
     "compose_weighted_suite",

@@ -3,27 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
+from morphserve.bench.harness import BenchmarkRunner, resolve_sources_dir
 from morphserve.bench.interleaved_bench import (
     WorkloadSuite,
     load_burstgpt_interarrivals,
     load_gentd26_interarrivals,
 )
-from morphserve.engine import EnginePolicyConfig, MorphServeClusterEngine, VALID_POLICIES
+from morphserve.engine.config import EnginePolicyConfig, VALID_POLICIES
 
 MULTI_GPU_ONLY_POLICIES = ("twostage_shm", "static_nccl_fission")
-
-
-def _resolve_sources_dir(bench_root: Path) -> Path:
-    for cand in (bench_root / "sources", bench_root.parent / "bench_sources"):
-        if cand.is_dir():
-            return cand
-    return bench_root / "sources"
 
 
 def run_smoke_validation(
@@ -33,6 +26,9 @@ def run_smoke_validation(
     qps: float = 0.8,
     num_gpus: int = 8,
     policies: tuple[str, ...] = VALID_POLICIES,
+    *,
+    fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
+    engine_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     num_gpus = int(num_gpus)
     if num_gpus < 1:
@@ -48,38 +44,38 @@ def run_smoke_validation(
     if num_gpus < 2 and policies == VALID_POLICIES:
         policies = tuple(p for p in policies if p not in MULTI_GPU_ONLY_POLICIES)
 
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     burst_csv = sources_dir / "burstgpt_1_sample.csv"
     gentd_csv = sources_dir / "gentd26_lora_request_trace.csv"
     burst_deltas = load_burstgpt_interarrivals(burst_csv) if burst_csv.is_file() else None
     gentd_deltas = load_gentd26_interarrivals(gentd_csv) if gentd_csv.is_file() else None
 
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=output_dir,
+        engine_factory=engine_factory,
+        fleet_factory=fleet_factory,
+    )
+
     results: list[dict[str, Any]] = []
     for preset in policies:
         policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus)
-        engine = MorphServeClusterEngine(
-            policy=policy,
-            model_dir=model_dir,
-            bench_root=bench_root,
-            tmp_root=output_dir / f"_tmp_smoke_{preset}",
-        )
-        t0 = time.perf_counter()
-        try:
-            init_info = engine.start()
-            rep = engine.run_suite(
+        with runner.session(policy, tmp_tag=f"_tmp_smoke_{preset}") as sess:
+            rep = sess.run_suite(
                 suite,
                 target_qps=qps,
                 burstgpt_deltas=burst_deltas,
                 gentd26_deltas=gentd_deltas,
             )
             rep_dict = rep.to_dict()
-            rep_dict["startup_seconds"] = round(time.perf_counter() - t0 - rep.wall_seconds, 2)
+            rep_dict["startup_seconds"] = sess.startup_seconds
             rep_dict["init_summary"] = {
-                "host_shmem_delta_gib": init_info.get("host_shmem_delta_gib"),
+                "host_shmem_delta_gib": sess.init_info.get("host_shmem_delta_gib"),
                 "mirror_inodes": sorted(
                     {
                         w.get("mirror_inode")
-                        for w in (init_info.get("workers") or {}).values()
+                        for w in (sess.init_info.get("workers") or {}).values()
                         if w.get("mirror_inode") is not None
                     }
                 ),
@@ -91,9 +87,6 @@ def run_smoke_validation(
                 f"ship={rep.path_a_ships} morph={rep.path_b_morphs} shmem={rep.host_shmem_delta_gib}GiB",
                 flush=True,
             )
-        finally:
-            engine.shutdown()
-            gc.collect()
 
     by_policy = {r["policy_name"]: r for r in results}
     ms = by_policy.get("morphserve")
@@ -130,14 +123,18 @@ def run_smoke_validation(
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="MorphServe Phase-2 M2.2 8-GPU Engine Smoke Validator")
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--bench-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--qps", type=float, default=0.8)
     parser.add_argument("--num-gpus", type=int, default=8)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
     rep = run_smoke_validation(
         model_dir=args.model_dir,
         bench_root=args.bench_root,

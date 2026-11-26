@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 
 @dataclass
@@ -32,6 +32,16 @@ def _is_same_storage_prefix(a: Any, b: Any, length: int) -> bool:
     )
 
 
+def _preserve_vmm_owner_tag(src: Any, view: Any) -> Any:
+    owner_ref = getattr(src, "_vmm_owner_ref", None)
+    if owner_ref is not None:
+        try:
+            view._vmm_owner_ref = owner_ref
+        except Exception:
+            pass
+    return view
+
+
 def detect_lecp_prefix_len(
     cache_a: Any,
     cache_b: Any,
@@ -53,7 +63,7 @@ def detect_lecp_prefix_len(
         return 0
 
     num_layers = len(cache_a.key_cache)
-    # Fast O(1) CoW storage-identity path (works without importing torch or GPU sync!)
+    # Fast O(1) CoW storage-identity path (works without importing torch or GPU sync).
     if _is_same_storage_prefix(ka0, kb0, l_min) and _is_same_storage_prefix(
         cache_a.value_cache[0], cache_b.value_cache[0], l_min
     ):
@@ -104,28 +114,63 @@ def detect_lecp_prefix_len(
     return lo
 
 
-def cow_fork_context(ctx: dict[str, Any]) -> dict[str, Any]:
-    """Zero-copy Copy-on-Write fork of a BAGEL context dict (replaces `deepcopy(gen_context)`)."""
+def cow_fork_context(
+    ctx: dict[str, Any],
+    *,
+    prefix_len: int | None = None,
+    cache_factory: Callable[[int], Any] | None = None,
+    ropes: list[int] | None = None,
+    kv_lens: list[int] | None = None,
+    clone_slices: bool = False,
+) -> dict[str, Any]:
+    """Zero-copy Copy-on-Write fork (or prefix slice) of a BAGEL context dict."""
     orig_cache = ctx["past_key_values"]
-    cache_cls = type(orig_cache)
-    num_layers = orig_cache.num_layers
-    forked_cache = cache_cls(num_layers)
+    num_layers = int(orig_cache.num_layers)
+    factory = cache_factory if cache_factory is not None else type(orig_cache)
+    forked_cache = factory(num_layers)
+
+    k0 = orig_cache.key_cache[0]
+    full_len = int(k0.shape[0]) if k0 is not None else 0
+    target_len = full_len if prefix_len is None else min(full_len, max(0, int(prefix_len)))
+
     for l in range(num_layers):
-        forked_cache.key_cache[l] = orig_cache.key_cache[l]
-        forked_cache.value_cache[l] = orig_cache.value_cache[l]
-    forked_cache.key_values_lens = list(orig_cache.key_values_lens) if orig_cache.key_values_lens is not None else None
-    seq_len = int(orig_cache.key_cache[0].shape[0]) if orig_cache.key_cache[0] is not None else 0
-    forked_cache._cow_shared_prefix_len = seq_len
-    forked_cache._cow_origin_id = id(orig_cache)
+        k = orig_cache.key_cache[l]
+        v = orig_cache.value_cache[l]
+        if k is None:
+            forked_cache.key_cache[l] = None
+        else:
+            ks = k if (prefix_len is None or target_len == int(k.shape[0])) else _preserve_vmm_owner_tag(k, k[:target_len])
+            forked_cache.key_cache[l] = ks.clone() if clone_slices else ks
+        if v is None:
+            forked_cache.value_cache[l] = None
+        else:
+            vs = v if (prefix_len is None or target_len == int(v.shape[0])) else _preserve_vmm_owner_tag(v, v[:target_len])
+            forked_cache.value_cache[l] = vs.clone() if clone_slices else vs
+
+    orig_kvl = getattr(orig_cache, "key_values_lens", None)
+    forked_cache.key_values_lens = list(orig_kvl) if orig_kvl is not None else None
+    if not clone_slices:
+        forked_cache._cow_shared_prefix_len = target_len
+        forked_cache._cow_origin_id = id(orig_cache)
+    else:
+        forked_cache._cow_shared_prefix_len = 0
+        forked_cache._cow_origin_id = None
+
+    eff_kv_lens = (
+        list(kv_lens)
+        if kv_lens is not None
+        else ([target_len] if prefix_len is not None else list(ctx["kv_lens"]))
+    )
+    eff_ropes = list(ropes) if ropes is not None else list(ctx["ropes"])
     return {
-        "kv_lens": list(ctx["kv_lens"]),
-        "ropes": list(ctx["ropes"]),
+        "kv_lens": eff_kv_lens,
+        "ropes": eff_ropes,
         "past_key_values": forked_cache,
     }
 
 
 def rebind_cow_prefix(parent_cache: Any, child_cache: Any, prefix_len: int | None = None) -> int:
-    """Rebind `child_cache` tensors as zero-copy views into `parent_cache[:L]`, freeing duplicated HBM!
+    """Rebind `child_cache` tensors as zero-copy views into `parent_cache[:L]`, freeing duplicated HBM.
 
     When `parent_cache` appends new tokens via `torch.cat([old_k, new_k])`, `parent_cache` gets a new
     contiguous buffer containing `old_k` as its exact prefix `[:L]`. Rebinding `child_cache` (e.g., `cfg_text`
@@ -141,9 +186,11 @@ def rebind_cow_prefix(parent_cache: Any, child_cache: Any, prefix_len: int | Non
     target_len = len_c if prefix_len is None else int(prefix_len)
     if target_len <= 0 or target_len != len_c or target_len > len_p:
         return 0
-    for l in range(parent_cache.num_layers):
-        child_cache.key_cache[l] = parent_cache.key_cache[l][:target_len]
-        child_cache.value_cache[l] = parent_cache.value_cache[l][:target_len]
+    for l in range(int(parent_cache.num_layers)):
+        kp = parent_cache.key_cache[l]
+        vp = parent_cache.value_cache[l]
+        child_cache.key_cache[l] = _preserve_vmm_owner_tag(kp, kp[:target_len])
+        child_cache.value_cache[l] = _preserve_vmm_owner_tag(vp, vp[:target_len])
     child_cache._cow_shared_prefix_len = target_len
     return target_len
 
@@ -212,6 +259,7 @@ class SharedPrefixCache:
 
     @classmethod
     def clear_memo(cls) -> None:
+        """Clear cached `(cache_id, ptr)` LECP detections (invoked on generation session exit)."""
         cls._lecp_memo.clear()
 
     @classmethod
@@ -223,7 +271,7 @@ class SharedPrefixCache:
     ) -> SharedPrefixCache:
         """Build a zero-copy `SharedPrefixCache` from BAGEL's `cfg_branch_caches`."""
         num_branches = len(caches)
-        num_layers = caches[0].num_layers
+        num_layers = int(caches[0].num_layers)
 
         sig_parts = []
         lens = []

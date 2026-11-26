@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from contextlib import contextmanager
 import time
 from typing import Any
@@ -149,49 +148,31 @@ class _VmmLayerTensorMap(dict):
         for lidx in range(owner.num_layers):
             super().__setitem__(lidx, None)
 
-    def __getitem__(self, layer_idx: int) -> Any:
-        if self._owner._fast_ar_dirty:
-            self._owner.flush_fast_ar()
+    def _prepare_read(self) -> None:
+        self._owner.flush_fast_ar_if_dirty()
         self._owner._touch_access()
         self._owner._ensure_cow_parent_resident_if_any()
-        if self._owner._is_swapped:
+        if self._owner.is_swapped:
             self._owner.ensure_resident()
+
+    def __getitem__(self, layer_idx: int) -> Any:
+        self._prepare_read()
         return super().__getitem__(int(layer_idx))
 
     def get(self, layer_idx: int, default: Any = None) -> Any:
-        if self._owner._fast_ar_dirty:
-            self._owner.flush_fast_ar()
-        self._owner._touch_access()
-        self._owner._ensure_cow_parent_resident_if_any()
-        if self._owner._is_swapped:
-            self._owner.ensure_resident()
+        self._prepare_read()
         return super().get(int(layer_idx), default)
 
     def values(self):  # type: ignore[override]
-        if self._owner._fast_ar_dirty:
-            self._owner.flush_fast_ar()
-        self._owner._touch_access()
-        self._owner._ensure_cow_parent_resident_if_any()
-        if self._owner._is_swapped:
-            self._owner.ensure_resident()
+        self._prepare_read()
         return super().values()
 
     def items(self):  # type: ignore[override]
-        if self._owner._fast_ar_dirty:
-            self._owner.flush_fast_ar()
-        self._owner._touch_access()
-        self._owner._ensure_cow_parent_resident_if_any()
-        if self._owner._is_swapped:
-            self._owner.ensure_resident()
+        self._prepare_read()
         return super().items()
 
     def copy(self) -> dict[int, Any]:
-        if self._owner._fast_ar_dirty:
-            self._owner.flush_fast_ar()
-        self._owner._touch_access()
-        self._owner._ensure_cow_parent_resident_if_any()
-        if self._owner._is_swapped:
-            self._owner.ensure_resident()
+        self._prepare_read()
         return {k: dict.__getitem__(self, k) for k in self}
 
     def __setitem__(self, layer_idx: int, value: Any) -> None:
@@ -209,7 +190,7 @@ class _VmmLayerTensorMap(dict):
                 self._owner._cow_parent_ref = owner_ref
             super().__setitem__(lidx, value)
             return
-        if self._owner._is_swapped:
+        if self._owner.is_swapped:
             self._owner.ensure_resident()
         bound = self._owner._store_layer_tensor(self._kind, lidx, value, super().get(lidx))
         super().__setitem__(lidx, bound)
@@ -298,17 +279,26 @@ class VmmNaiveCache:
         self.key_cache = _VmmLayerTensorMap(self, "k")
         self.value_cache = _VmmLayerTensorMap(self, "v")
 
-        if self.vmm is not None:
-            if hasattr(self.vmm, "kv_session_create"):
-                self._session_id = int(self.vmm.kv_session_create())
-            elif hasattr(self.vmm, "register_kv_cache"):
-                self.vmm.register_kv_cache(self)
+        if self.vmm is not None and hasattr(self.vmm, "kv_session_create"):
+            self._session_id = int(self.vmm.kv_session_create())
 
     def __del__(self) -> None:
         try:
             self.close()
         except Exception:
             pass
+
+    def _sync_vmm_pinned(self, pinned: bool) -> None:
+        """Synchronize Python and C++ `KvSession::pinned_active` state without drift."""
+        self._is_pinned_active = bool(pinned)
+        if (
+            self._session_id > 0
+            and self.vmm is not None
+            and not self._closed
+            and not getattr(self.vmm, "_closed", False)
+            and hasattr(self.vmm, "kv_session_set_pinned")
+        ):
+            self.vmm.kv_session_set_pinned(self._session_id, bool(pinned))
 
     def _touch_access(self) -> None:
         self._last_access_mono = time.monotonic()
@@ -327,7 +317,7 @@ class VmmNaiveCache:
         pref = getattr(self, "_cow_parent_ref", None)
         if pref is not None:
             parent = pref()
-            if parent is not None and parent is not self and not parent._closed and parent._is_swapped:
+            if parent is not None and parent is not self and not parent.is_closed and parent.is_swapped:
                 parent.ensure_resident()
 
     def _resolve_stream_ptr(self, stream_ptr: int | None) -> int:
@@ -344,8 +334,17 @@ class VmmNaiveCache:
             return int(self.vmm._current_stream_ptr())
         return 0
 
+    def _exclude_session_ids(self) -> tuple[int, ...]:
+        return (self._session_id,) if self._session_id > 0 else ()
+
+    # ==================== Public Inspection & Lifecycle Properties ====================
+
     @property
-    def _is_swapped(self) -> bool:
+    def session_id(self) -> int:
+        return self._session_id
+
+    @property
+    def is_swapped(self) -> bool:
         if self._swapped_flag:
             return True
         if self._closed or self.vmm is None or not self._region_ids:
@@ -357,9 +356,21 @@ class VmmNaiveCache:
                     return True
         return False
 
-    @_is_swapped.setter
-    def _is_swapped(self, val: bool) -> None:
-        self._swapped_flag = bool(val)
+    @property
+    def is_swapped_out(self) -> bool:
+        return self.is_swapped
+
+    @property
+    def is_closed(self) -> bool:
+        return self._closed
+
+    @property
+    def uses_vmm_backing(self) -> bool:
+        return self.vmm is not None and not self._closed
+
+    @property
+    def fast_ar_active(self) -> bool:
+        return self._fast_ar_active
 
     @property
     def num_layers(self) -> int:
@@ -382,16 +393,62 @@ class VmmNaiveCache:
         return self._is_pinned_active
 
     @property
-    def is_swapped_out(self) -> bool:
-        return self._is_swapped
-
-    @property
     def swapped_bytes(self) -> int:
         if self._closed or self.vmm is None or not self._region_ids:
             return 0
         if hasattr(self.vmm, "kv_region_swapped_bytes"):
             return sum(int(self.vmm.kv_region_swapped_bytes(rid)) for rid in self._region_ids.values())
         return 0
+
+    def peek_seq_len(self, layer_idx: int = 0) -> int:
+        """Return sequence length at `layer_idx` without triggering swap-in or LRU touch."""
+        lidx = int(layer_idx)
+        if self._fast_ar_dirty and 0 <= lidx < self._num_layers:
+            return int(self._fast_k_lens[lidx])
+        if ("k", lidx) in self._lengths:
+            return int(self._lengths[("k", lidx)])
+        k = dict.get(self.key_cache, lidx)
+        return int(k.shape[0]) if k is not None else 0
+
+    def peek_layer_kv(self, layer_idx: int) -> tuple[Any | None, Any | None]:
+        """Return raw `(key, value)` slots at `layer_idx` without triggering swap-in or LRU touch."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
+        lidx = int(layer_idx)
+        return dict.get(self.key_cache, lidx), dict.get(self.value_cache, lidx)
+
+    def logical_bytes(self) -> int:
+        """Return deduplicated logical KV bytes without triggering swap-in or LRU touch."""
+        if self.is_swapped:
+            return self.swapped_bytes
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
+        seen: dict[int, int] = {}
+        untracked = 0
+        for lidx in range(self._num_layers):
+            for t in (dict.get(self.key_cache, lidx), dict.get(self.value_cache, lidx)):
+                if t is None:
+                    continue
+                nbytes = int(t.numel() * t.element_size()) if hasattr(t, "numel") else int(t.nbytes)
+                if hasattr(t, "data_ptr"):
+                    ptr = int(t.data_ptr())
+                    seen[ptr] = max(seen.get(ptr, 0), nbytes)
+                else:
+                    untracked += nbytes
+        return sum(seen.values()) + untracked
+
+    def set_fast_ar_mode(self, enabled: bool, *, reserve_tokens: int = 128) -> None:
+        """Enable or disable zero-overhead fast-AR capacity-view appends."""
+        if enabled:
+            if not self._fast_ar_active and self.uses_vmm_backing and not self.is_swapped:
+                self.prepare_fast_ar_decode(reserve_tokens=reserve_tokens)
+        else:
+            self.invalidate_fast_ar()
+
+    def flush_fast_ar_if_dirty(self) -> None:
+        """Flush deferred fast-AR lengths back to `key_cache`/`value_cache` if dirty."""
+        if self._fast_ar_dirty:
+            self.flush_fast_ar()
 
     @classmethod
     def create_for_bagel(
@@ -410,8 +467,7 @@ class VmmNaiveCache:
 
     def __deepcopy__(self, memo: dict[int, Any]) -> "VmmNaiveCache":
         """Deep-copy KV contents into a fresh Arena-1 `VmmNaiveCache` without pickling `self.vmm` (`CDLL`)."""
-        if self._fast_ar_dirty:
-            self.flush_fast_ar()
+        self.flush_fast_ar_if_dirty()
         was_pinned = self._is_pinned_active
         was_thinking = self._is_thinking
         self.mark_active()
@@ -420,7 +476,7 @@ class VmmNaiveCache:
         memo[id(self)] = dup
         try:
             self._ensure_cow_parent_resident_if_any()
-            if self._is_swapped:
+            if self.is_swapped:
                 self.ensure_resident()
             dup.key_values_lens = list(self.key_values_lens) if self.key_values_lens is not None else None
             dup._cow_shared_prefix_len = self._cow_shared_prefix_len
@@ -439,22 +495,14 @@ class VmmNaiveCache:
             if was_thinking:
                 self.mark_thinking(trigger_watermark_check=False)
             else:
-                self._is_pinned_active = was_pinned
                 self._is_thinking = False
-            dup._is_pinned_active = False
+                self._sync_vmm_pinned(was_pinned)
+            dup._sync_vmm_pinned(False)
         return dup
 
     @property
     def seq_lens(self) -> int:
-        if self._fast_ar_dirty and self._num_layers > 0:
-            return int(self._fast_k_lens[0])
-        if (
-            self._lengths
-            and ("k", 0) in self._lengths
-        ):
-            return int(self._lengths[("k", 0)])
-        k0 = dict.get(self.key_cache, 0)
-        return int(k0.shape[0]) if k0 is not None else 0
+        return self.peek_seq_len(0)
 
     @property
     def mapped_bytes(self) -> int:
@@ -468,7 +516,7 @@ class VmmNaiveCache:
 
     @staticmethod
     def merge(caches: list[Any]) -> Any:
-        """Delegate static `merge` to `vllm_omni` `NaiveCache.merge` (or `BagelSharedPrefixPatch` hook)."""
+        """Delegate static `merge` to `vllm_omni` `NaiveCache.merge` (or `BagelExecutionInterceptor` hook)."""
         from vllm_omni.diffusion.models.bagel.bagel_transformer import NaiveCache
 
         return NaiveCache.merge(caches)
@@ -501,8 +549,7 @@ class VmmNaiveCache:
 
     def mark_active(self, stream_ptr: int | None = None) -> None:
         """Pin this session's KV on GPU during an active AR/DiT turn and swap in if parked."""
-        if self._fast_ar_dirty:
-            self.flush_fast_ar()
+        self.flush_fast_ar_if_dirty()
         self._is_pinned_active = True
         self._is_thinking = False
         self._touch_access()
@@ -511,7 +558,7 @@ class VmmNaiveCache:
             return
         eff_s = self._resolve_stream_ptr(stream_ptr)
         if self._session_id > 0 and hasattr(self.vmm, "kv_session_mark_active"):
-            was_swapped = self._is_swapped
+            was_swapped = self.is_swapped
             self.vmm.kv_session_mark_active(self._session_id, stream_ptr=eff_s)
             self._c_evictable = False
             if was_swapped:
@@ -521,12 +568,8 @@ class VmmNaiveCache:
                     self._refresh_layer_view_from_capacity(key, rid, mapped_b)
                 self._swapped_flag = False
             return
-        if self._is_swapped:
+        if self.is_swapped:
             self.ensure_resident(stream_ptr=stream_ptr)
-        elif self._c_evictable and hasattr(self.vmm, "kv_region_set_evictable"):
-            for rid in self._region_ids.values():
-                self.vmm.kv_region_set_evictable(rid, False, 0)
-            self._c_evictable = False
 
     def mark_thinking(self, trigger_watermark_check: bool = True, stream_ptr: int | None = None) -> int:
         """Mark session as inactive (inter-turn user think time) and optionally run high-watermark eviction."""
@@ -555,21 +598,13 @@ class VmmNaiveCache:
                     stream_ptr=eff_s,
                 )
             )
-        if self._region_ids and hasattr(self.vmm, "kv_region_set_evictable"):
-            for key, rid in self._region_ids.items():
-                if not self.vmm.kv_region_is_swapped(rid):
-                    valid_b = int(self._lengths.get(key, 0)) * int(self._row_bytes.get(key, 0))
-                    self.vmm.kv_region_set_evictable(rid, True, valid_b, stream_ptr=eff_s)
-            self._c_evictable = True
-        if trigger_watermark_check and hasattr(self.vmm, "maybe_evict_thinking_kv_on_high_watermark"):
-            return int(self.vmm.maybe_evict_thinking_kv_on_high_watermark(sync=False, stream_ptr=stream_ptr))
         return 0
 
     mark_inactive = mark_thinking
 
     @contextmanager
     def active_turn_scope(self, mark_thinking_on_exit: bool = True, stream_ptr: int | None = None):
-        """Context manager pinning KV during an active turn and marking thinking-period on exit."""
+        """Context manager pinning KV during an active turn and marking thinking-period or unpinning on exit."""
         self.mark_active(stream_ptr=stream_ptr)
         try:
             yield self
@@ -577,7 +612,7 @@ class VmmNaiveCache:
             if mark_thinking_on_exit:
                 self.mark_thinking(trigger_watermark_check=True, stream_ptr=stream_ptr)
             else:
-                self._is_pinned_active = False
+                self._sync_vmm_pinned(False)
 
     def swap_out_async(self, stream_ptr: int | None = None) -> int:
         """Asynchronously DMA all mapped K/V regions of this cache to Host Pinned DRAM and free GPU pages."""
@@ -611,88 +646,49 @@ class VmmNaiveCache:
         """Asynchronously restore all swapped K/V regions back into their exact original GPU virtual addresses."""
         if self._fast_ar_active or self._fast_ar_dirty:
             self.invalidate_fast_ar()
-        if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False) or not self._is_swapped:
+        if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False) or not self.is_swapped:
             return 0
         was_pinned = self._is_pinned_active
-        self._is_pinned_active = True
-        self._is_thinking = False
+        eff_stream = self._resolve_stream_ptr(stream_ptr)
         try:
-            eff_stream = self._resolve_stream_ptr(stream_ptr)
-            if hasattr(self.vmm, "kv_region_set_evictable"):
-                for rid in self._region_ids.values():
-                    self.vmm.kv_region_set_evictable(rid, False, 0)
-            self._c_evictable = False
-
-            gran = int(self.vmm.stats_dict().get("min_granularity_bytes", 2 * MIB))
-            needed_restore_b = 0
-            for key, rid in self._region_ids.items():
-                if self.vmm.kv_region_is_swapped(rid):
-                    valid_b = int(self._lengths.get(key, 0)) * int(self._row_bytes.get(key, 0))
-                    pages_est = max(1, (max(1, valid_b) + gran - 1) // gran)
-                    needed_restore_b += pages_est * gran
-
-            if needed_restore_b > 0 and hasattr(self.vmm, "maybe_evict_thinking_kv_on_high_watermark"):
-                self.vmm.maybe_evict_thinking_kv_on_high_watermark(
-                    sync=True,
-                    exclude_caches=(self,),
-                    extra_needed_bytes=needed_restore_b,
-                    stream_ptr=eff_stream,
-                )
-
+            swapped_keys = [key for key, rid in self._region_ids.items() if self.vmm.kv_region_is_swapped(rid)]
             restored_bytes = 0
-            restored_this_call: list[tuple[tuple[str, int], int]] = []
-            try:
+            if self._session_id > 0 and hasattr(self.vmm, "kv_session_mark_active"):
+                self.vmm.kv_session_mark_active(self._session_id, stream_ptr=eff_stream)
+                self._c_evictable = False
                 for key, rid in list(self._region_ids.items()):
-                    was_region_swapped = bool(self.vmm.kv_region_is_swapped(rid))
-                    try:
-                        pages = int(self.vmm.kv_region_swap_in_async(rid, stream_ptr=eff_stream))
-                    except MemoryError:
-                        if hasattr(self.vmm, "reclaim_thinking_kv_bytes"):
-                            reclaimed = self.vmm.reclaim_thinking_kv_bytes(
-                                max(gran, needed_restore_b),
-                                sync=True,
-                                exclude_caches=(self,),
-                                stream_ptr=eff_stream,
-                            )
-                            if reclaimed > 0:
-                                pages = int(self.vmm.kv_region_swap_in_async(rid, stream_ptr=eff_stream))
-                            else:
-                                raise
-                        else:
-                            raise
+                    mapped_b = int(self.vmm.kv_region_mapped_bytes(rid))
+                    self._mapped_bytes[key] = mapped_b
+                    if key in swapped_keys:
+                        restored_bytes += mapped_b
+                        self._refresh_layer_view_from_capacity(key, rid, mapped_b)
+            else:
+                gran = int(self.vmm.stats_dict().get("min_granularity_bytes", 2 * MIB))
+                for key, rid in list(self._region_ids.items()):
+                    was_region_swapped = key in swapped_keys
+                    pages = int(self.vmm.kv_region_swap_in_async(rid, stream_ptr=eff_stream))
                     mapped_b = int(self.vmm.kv_region_mapped_bytes(rid))
                     self._mapped_bytes[key] = mapped_b
                     restored_bytes += pages * gran
                     if was_region_swapped or pages > 0:
-                        restored_this_call.append((key, rid))
                         self._refresh_layer_view_from_capacity(key, rid, mapped_b)
-            except BaseException:
-                # Roll back partially swapped-in regions so a failed swap-in never leaves zombie GPU pages!
-                for r_key, r_rid in restored_this_call:
-                    valid_b = int(self._lengths.get(r_key, 0)) * int(self._row_bytes.get(r_key, 0))
-                    try:
-                        self.vmm.kv_region_swap_out_async(r_rid, valid_b, stream_ptr=eff_stream)
-                    except Exception:
-                        pass
-                    self._mapped_bytes[r_key] = 0
-                if restored_this_call:
-                    self._swapped_flag = True
-                raise
+                self._c_evictable = False
 
             self._swapped_flag = False
+            self._is_thinking = False
             self._touch_access()
             return restored_bytes
         finally:
-            self._is_pinned_active = was_pinned
+            self._sync_vmm_pinned(was_pinned)
 
     def ensure_resident(self, stream_ptr: int | None = None) -> bool:
         """Ensure all K/V regions are mapped on GPU (no-op if already resident)."""
-        if not self._is_swapped:
+        if not self.is_swapped:
             return False
         self.swap_in_async(stream_ptr=stream_ptr)
         return True
 
-    # ==================== In-Place Single-Step / Multi-Step / Batched Append API ====================
+    # ==================== In-Place Single-Step & Polymorphic Append API ====================
 
     def flush_fast_ar(self) -> None:
         """Materialize lazily updated per-layer AR lengths and `_tag_owner` views back into `key_cache`/`value_cache`."""
@@ -716,8 +712,7 @@ class VmmNaiveCache:
 
     def invalidate_fast_ar(self) -> None:
         """Flush any deferred AR decode metadata and clear cached fast-path capacity views."""
-        if self._fast_ar_dirty:
-            self.flush_fast_ar()
+        self.flush_fast_ar_if_dirty()
         if self._fast_ar_active:
             self._fast_ar_active = False
             for lidx in range(self._num_layers):
@@ -726,14 +721,13 @@ class VmmNaiveCache:
 
     def prepare_fast_ar_decode(self, reserve_tokens: int = 128) -> bool:
         """Pre-grow all layer capacity views and materialize CoW prefixes once before an AR decode loop."""
-        if self._fast_ar_dirty:
-            self.flush_fast_ar()
+        self.flush_fast_ar_if_dirty()
         if self._closed or self.vmm is None or getattr(self.vmm, "_closed", False):
             self._fast_ar_active = False
             return False
         self._touch_access()
         self._ensure_cow_parent_resident_if_any()
-        if self._is_swapped:
+        if self.is_swapped:
             self.ensure_resident()
 
         prev_k0 = dict.get(self.key_cache, 0)
@@ -769,7 +763,7 @@ class VmmNaiveCache:
                 owner_ref = getattr(prev, "_vmm_owner_ref", None)
                 if owner_ref is not None:
                     ext_owner = owner_ref()
-                    if ext_owner is not None and ext_owner is not self and not ext_owner._closed and ext_owner._is_swapped:
+                    if ext_owner is not None and ext_owner is not self and not ext_owner.is_closed and ext_owner.is_swapped:
                         ext_owner.ensure_resident()
 
                 old_len = int(prev.shape[0])
@@ -864,12 +858,11 @@ class VmmNaiveCache:
 
     def get_layer_kv(self, layer_idx: int) -> tuple[Any | None, Any | None, int]:
         """Return `(key_tensor, value_tensor, seq_len)` for `layer_idx`, auto-swapping in if needed."""
-        if self._fast_ar_dirty:
-            self.flush_fast_ar()
+        self.flush_fast_ar_if_dirty()
         lidx = int(layer_idx)
         self._touch_access()
         self._ensure_cow_parent_resident_if_any()
-        if self._is_swapped:
+        if self.is_swapped:
             self.ensure_resident()
         k = dict.get(self.key_cache, lidx)
         v = dict.get(self.value_cache, lidx)
@@ -883,7 +876,7 @@ class VmmNaiveCache:
         lidx = int(layer_idx)
         self._touch_access()
         self._ensure_cow_parent_resident_if_any()
-        if self._is_swapped:
+        if self.is_swapped:
             self.ensure_resident()
 
         nk = _normalize_step_tensor(new_k)
@@ -895,7 +888,7 @@ class VmmNaiveCache:
         if delta_len == 0:
             return (nk if prev_k is None else prev_k), (nv if prev_v is None else prev_v)
 
-        if self.vmm is None:
+        if self.vmm is None or self._closed:
             fk = _concat_fallback(prev_k, nk)
             fv = _concat_fallback(prev_v, nv)
             dict.__setitem__(self.key_cache, lidx, fk)
@@ -910,85 +903,34 @@ class VmmNaiveCache:
 
     append_kv_step = append_inplace
 
-    @classmethod
-    def append_layer_kv(cls, cache: Any, layer_idx: int, new_k: Any, new_v: Any) -> tuple[Any, Any]:
-        """Polymorphic in-place KV append supporting both `VmmNaiveCache` and stock `NaiveCache`."""
-        if hasattr(cache, "append_inplace"):
-            return cache.append_inplace(layer_idx, new_k, new_v)
-        lidx = int(layer_idx)
-        nk = _normalize_step_tensor(new_k)
-        nv = _normalize_step_tensor(new_v)
-        old_k = cache.key_cache[lidx]
-        old_v = cache.value_cache[lidx]
-        fk = _concat_fallback(old_k, nk)
-        fv = _concat_fallback(old_v, nv)
-        cache.key_cache[lidx] = fk
-        cache.value_cache[lidx] = fv
-        return fk, fv
-
-    @classmethod
-    def append_batch_inplace(
-        cls,
-        caches: Sequence[Any],
+    def append_kv(
+        self,
         layer_idx: int,
-        packed_k: Any,
-        packed_v: Any,
-        query_lens: Sequence[int] | None = None,
-    ) -> tuple[list[Any], list[Any], list[int]]:
-        """Append packed `[B, H, D]` or varlen `[sum(Q), H, D]` K/V across `B` caches in-place."""
-        b_cnt = len(caches)
-        full_ks: list[Any] = []
-        full_vs: list[Any] = []
-        kv_lens: list[int] = []
-        if b_cnt == 0:
-            return full_ks, full_vs, kv_lens
-
+        k_new: Any,
+        v_new: Any,
+        *,
+        update_past_key_values: bool = True,
+        key_lens_out: list[int] | None = None,
+    ) -> tuple[Any, Any]:
+        """Single polymorphic append entry hiding fast-AR, swap-in, and closed/fallback checks."""
         lidx = int(layer_idx)
-        if tuple(int(d) for d in packed_k.shape) != tuple(int(d) for d in packed_v.shape):
-            raise ValueError(
-                f"append_batch_inplace packed_k.shape {tuple(packed_k.shape)} != packed_v.shape {tuple(packed_v.shape)}"
-            )
-        if query_lens is None:
-            # Uniform decode/chunk batch: packed_k is [B, H, D] or [B, Q, H, D]
-            if int(packed_k.shape[0]) != b_cnt:
-                raise ValueError(
-                    f"append_batch_inplace batch dim ({packed_k.shape[0]}) != len(caches) ({b_cnt})"
-                )
-            is_4d = int(getattr(packed_k, "ndim", len(packed_k.shape))) == 4
-            for b, cache in enumerate(caches):
-                kb = packed_k[b] if is_4d else packed_k[b : b + 1]
-                vb = packed_v[b] if is_4d else packed_v[b : b + 1]
-                fk, fv = cls.append_layer_kv(cache, lidx, kb, vb)
-                full_ks.append(fk)
-                full_vs.append(fv)
-                kv_lens.append(int(fk.shape[0]))
-            return full_ks, full_vs, kv_lens
+        if not update_past_key_values:
+            cache_k, cache_v, _ = self.get_layer_kv(lidx)
+            nk = _normalize_step_tensor(k_new)
+            nv = _normalize_step_tensor(v_new)
+            fk = _concat_fallback(cache_k, nk)
+            fv = _concat_fallback(cache_v, nv)
+            if key_lens_out is not None:
+                key_lens_out.append(int(fk.shape[0]))
+            return fk, fv
 
-        if len(query_lens) != b_cnt:
-            raise ValueError(f"append_batch_inplace len(query_lens) ({len(query_lens)}) != len(caches) ({b_cnt})")
-        q_ints = [int(q) for q in query_lens]
-        if any(q < 0 for q in q_ints):
-            raise ValueError(f"append_batch_inplace negative query_lens not allowed: {q_ints}")
-        expected_rows = sum(q_ints)
-        if int(packed_k.shape[0]) != expected_rows:
-            raise ValueError(
-                f"append_batch_inplace packed_k.shape[0] ({packed_k.shape[0]}) != sum(query_lens) ({expected_rows})"
-            )
-
-        offset = 0
-        for cache, ql in zip(caches, q_ints):
-            if ql > 0:
-                kb = packed_k[offset : offset + ql]
-                vb = packed_v[offset : offset + ql]
-                offset += ql
-                fk, fv = cls.append_layer_kv(cache, lidx, kb, vb)
-            else:
-                fk = cache.key_cache[lidx]
-                fv = cache.value_cache[lidx]
-            full_ks.append(fk)
-            full_vs.append(fv)
-            kv_lens.append(int(fk.shape[0]) if fk is not None else 0)
-        return full_ks, full_vs, kv_lens
+        if self._fast_ar_active and not self._closed and not self._swapped_flag:
+            fk, fv = self.append_ar_token_fast(lidx, k_new, v_new)
+        else:
+            fk, fv = self.append_inplace(lidx, k_new, v_new)
+        if key_lens_out is not None:
+            key_lens_out.append(int(fk.shape[0]))
+        return fk, fv
 
     def truncate(self, new_seq_len: int) -> None:
         """Truncate active KV sequence length across all layers in O(1) without reallocating VA."""
@@ -996,7 +938,7 @@ class VmmNaiveCache:
             self.invalidate_fast_ar()
         target = max(0, int(new_seq_len))
         self._ensure_cow_parent_resident_if_any()
-        if self._is_swapped and target > 0:
+        if self.is_swapped and target > 0:
             self.ensure_resident()
         for lidx in range(self.num_layers):
             if target == 0:
@@ -1024,20 +966,21 @@ class VmmNaiveCache:
         cached_mapped = self._mapped_bytes.get(key, 0)
         rid = self._region_ids.get(key)
         cur_cap = self._region_caps.get(key, 0)
-        if rid is not None and not self._is_swapped and req_b <= cur_cap and cached_mapped >= req_b:
+        if rid is not None and not self.is_swapped and req_b <= cur_cap and cached_mapped >= req_b:
             return rid
 
+        excl = self._exclude_session_ids()
         delta_b = max(0, req_b - cached_mapped)
         if delta_b > 0 and hasattr(self.vmm, "maybe_evict_thinking_kv_on_high_watermark"):
             self.vmm.maybe_evict_thinking_kv_on_high_watermark(
                 sync=False,
-                exclude_caches=(self,),
+                exclude_session_ids=excl,
                 extra_needed_bytes=delta_b,
-                stream_ptr=stream_ptr,
+                stream=stream_ptr,
             )
 
         if rid is not None and req_b > cur_cap:
-            # Transparently grow VA reservation if a marathon multi-turn session exceeds initial max_seq_len!
+            # Transparently grow VA reservation if a marathon multi-turn session exceeds initial max_seq_len.
             target_map = self.key_cache if kind == "k" else self.value_cache
             old_view = dict.get(target_map, layer_idx)
             old_len = int(self._lengths.get(key, 0))
@@ -1051,8 +994,8 @@ class VmmNaiveCache:
                         reclaimed = self.vmm.reclaim_thinking_kv_bytes(
                             max(2 * MIB, req_b),
                             sync=True,
-                            exclude_caches=(self,),
-                            stream_ptr=stream_ptr,
+                            exclude_session_ids=excl,
+                            stream=stream_ptr,
                         )
                         if reclaimed > 0:
                             self.vmm.kv_region_ensure(new_rid, req_b, stream_ptr=stream_ptr)
@@ -1095,8 +1038,8 @@ class VmmNaiveCache:
                 reclaimed = self.vmm.reclaim_thinking_kv_bytes(
                     max(2 * MIB, delta_b),
                     sync=True,
-                    exclude_caches=(self,),
-                    stream_ptr=stream_ptr,
+                    exclude_session_ids=excl,
+                    stream=stream_ptr,
                 )
                 if reclaimed > 0:
                     self.vmm.kv_region_ensure(rid, req_b, stream_ptr=stream_ptr)
@@ -1173,7 +1116,7 @@ class VmmNaiveCache:
         cap_view = self._capacity_views.get(key)
         if (
             cap_view is not None
-            and not self._is_swapped
+            and not self.is_swapped
             and self._mapped_bytes.get(key, 0) >= needed_bytes
             and int(cap_view.shape[0]) >= needed_tokens
             and tuple(int(d) for d in cap_view.shape[1:]) == trailing_shape
@@ -1232,10 +1175,10 @@ class VmmNaiveCache:
             owner_ref = getattr(prev_view, "_vmm_owner_ref", None)
             if owner_ref is not None:
                 owner = owner_ref()
-                if owner is not None and owner is not self and not owner._closed:
+                if owner is not None and owner is not self and not owner.is_closed:
                     ext_owner = owner
-                    ext_was_thinking = owner._is_thinking
-                    ext_was_pinned = owner._is_pinned_active
+                    ext_was_thinking = owner.is_thinking
+                    ext_was_pinned = owner.is_pinned_active
                     owner.mark_active()
 
         old_len = int(prev_view.shape[0]) if prev_view is not None else 0
@@ -1250,8 +1193,6 @@ class VmmNaiveCache:
                 self._lengths[key] = new_len
                 return step_tensor
 
-            # If `_get_or_grow_capacity_view` reallocated our own region (`req_b > cur_cap`),
-            # `self.key_cache[layer_idx]` was already migrated and the old region freed (`munmap`ped)!
             if ext_owner is None and old_len > 0:
                 target_map = self.key_cache if kind == "k" else self.value_cache
                 prev_view = dict.get(target_map, layer_idx)
@@ -1262,7 +1203,7 @@ class VmmNaiveCache:
                     prev_view = ext_cur[:old_len]
 
             # Copy-on-Write check: if `prev_view` does not already alias `cap_view`'s base VA (e.g., external CoW fork),
-            # materialize `[0 : old_len]` into our private VMM region before writing `[old_len : new_len]`!
+            # materialize `[0 : old_len]` into our private VMM region before writing `[old_len : new_len]`.
             if old_len > 0 and prev_view is not None:
                 same_base = (
                     hasattr(prev_view, "data_ptr")
@@ -1278,7 +1219,7 @@ class VmmNaiveCache:
                 if ext_was_thinking:
                     ext_owner.mark_thinking(trigger_watermark_check=False)
                 else:
-                    ext_owner._is_pinned_active = ext_was_pinned
+                    ext_owner._sync_vmm_pinned(ext_was_pinned)
         self._lengths[key] = new_len
         out_view = self._tag_owner(cap_view[:new_len])
         if is_sim and _TORCH is not None and _TORCH.is_tensor(step_tensor) and step_tensor.device.type != "cpu":
@@ -1302,7 +1243,7 @@ class VmmNaiveCache:
         owner_ref = getattr(tensor, "_vmm_owner_ref", None)
         if owner_ref is not None:
             owner = owner_ref()
-            if owner is not None and owner is not self and not owner._closed and owner._is_swapped:
+            if owner is not None and owner is not self and not owner.is_closed and owner.is_swapped:
                 owner.ensure_resident()
 
         trailing = tuple(int(d) for d in tensor.shape[1:])
@@ -1382,23 +1323,17 @@ class VmmNaiveCache:
             dict.__setitem__(self.key_cache, lidx, None)
             dict.__setitem__(self.value_cache, lidx, None)
         self._capacity_views.clear()
-        if self.vmm is not None:
-            if hasattr(self.vmm, "unregister_kv_cache"):
+        if self.vmm is not None and not getattr(self.vmm, "_closed", False):
+            for rid in list(self._region_ids.values()):
                 try:
-                    self.vmm.unregister_kv_cache(self)
+                    self.vmm.kv_region_free(rid, stream_ptr=eff_stream)
                 except Exception:
                     pass
-            if not getattr(self.vmm, "_closed", False):
-                for rid in list(self._region_ids.values()):
-                    try:
-                        self.vmm.kv_region_free(rid, stream_ptr=eff_stream)
-                    except Exception:
-                        pass
-                if self._session_id > 0 and hasattr(self.vmm, "kv_session_destroy"):
-                    try:
-                        self.vmm.kv_session_destroy(self._session_id)
-                    except Exception:
-                        pass
+            if self._session_id > 0 and hasattr(self.vmm, "kv_session_destroy"):
+                try:
+                    self.vmm.kv_session_destroy(self._session_id)
+                except Exception:
+                    pass
         self._session_id = 0
         self._region_ids.clear()
         self._region_caps.clear()

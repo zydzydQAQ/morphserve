@@ -1,5 +1,7 @@
 #include "morphserve/control/router.hpp"
 
+#include "morphserve/control/hash_util.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -11,14 +13,201 @@ namespace morphserve::control {
 
 namespace {
 
-inline double round_1(double x) noexcept { return std::round(x * 10.0) / 10.0; }
-inline double round_2(double x) noexcept { return std::round(x * 100.0) / 100.0; }
-inline double round_3(double x) noexcept { return std::round(x * 1000.0) / 1000.0; }
-
 inline int pos_mod(int x, int m) noexcept {
     if (m <= 1) return 0;
     const int r = x % m;
     return (r < 0) ? (r + m) : r;
+}
+
+int select_static_gen_gpu_unlocked(
+    const ClusterTopologyProfile& topo,
+    const std::string& routing_mode,
+    const std::vector<int>& static_und_ranks,
+    const std::vector<int>& static_gen_ranks,
+    int src_und_gpu,
+    const std::map<int, WorkerState>& w_map,
+    const std::map<int, bool>& gpu_busy,
+    int64_t required_kv_bytes) {
+    if (static_gen_ranks.empty()) {
+        return src_und_gpu;
+    }
+    if (routing_mode == "twostage_shm") {
+        auto it = std::find(static_und_ranks.begin(), static_und_ranks.end(), src_und_gpu);
+        const size_t idx = (it != static_und_ranks.end())
+                               ? static_cast<size_t>(std::distance(static_und_ranks.begin(), it))
+                               : 0;
+        return static_gen_ranks[idx % static_gen_ranks.size()];
+    }
+
+    const int64_t need_b = std::max<int64_t>(64LL * kMiB, required_kv_bytes);
+    const double state_b = static_cast<double>(std::max<int64_t>(1LL * kMiB, required_kv_bytes));
+    auto tier_rank = [&](int g) -> int {
+        const std::string t = topo.fabric_tier(src_und_gpu, g);
+        if (t == "intra_half") return 0;
+        if (t == "inter_socket") return 1;
+        if (t == "inter_node") return 2;
+        return 3;
+    };
+    auto is_busy = [&](int g) -> bool {
+        auto bit = gpu_busy.find(g);
+        return (bit != gpu_busy.end()) ? bit->second : false;
+    };
+
+    std::vector<int> cands = static_gen_ranks;
+    std::sort(cands.begin(), cands.end(), [&](int a, int b) {
+        auto key_of = [&](int g) {
+            const double bw = std::max(0.5, topo.effective_p2p_gbps(src_und_gpu, g));
+            const double t_ship = (state_b / 1e9) / bw * 1000.0 + topo.handoff_ms(src_und_gpu, g);
+            const auto& wg = w_map.at(g);
+            const double tot_wait = round_3(t_ship + wg.queue_wait_ms);
+            return std::make_tuple(
+                wg.kv_free_bytes >= need_b ? 0 : 1,
+                tot_wait,
+                tier_rank(g),
+                is_busy(g),
+                g);
+        };
+        return key_of(a) < key_of(b);
+    });
+    return cands.front();
+}
+
+RouteDecision decide_unlocked(
+    const DualPathMorphRouter& router,
+    const ClusterTopologyProfile& topo,
+    const CPTGRequestSpec& req,
+    const std::map<int, WorkerState>& w_map,
+    double now_ms) {
+    const auto& src_w = w_map.at(req.src_gpu);
+    const auto [t_morph_ms, h2d_bw] = router.evaluate_path_b_morph_ms(req, src_w, now_ms);
+
+    int best_dst = req.src_gpu;
+    double best_ship_ms = std::numeric_limits<double>::infinity();
+    double best_p2p_bw = 0.0;
+
+    for (int cand_id : topo.peer_candidates(req.src_gpu, true)) {
+        auto it = w_map.find(cand_id);
+        if (it == w_map.end()) continue;
+        const auto [t_ship, bw_p2p] = router.evaluate_path_a_ship_ms(req, src_w, it->second, now_ms);
+        if (t_ship < best_ship_ms) {
+            best_ship_ms = t_ship;
+            best_dst = cand_id;
+            best_p2p_bw = bw_p2p;
+        }
+    }
+
+    const double state_mib = round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB));
+    char reason_buf[256];
+    if (best_ship_ms < t_morph_ms) {
+        const std::string tier = topo.fabric_tier(req.src_gpu, best_dst);
+        const std::string hop_label = (tier == "intra_half") ? "same_half" : tier;
+        std::snprintf(
+            reason_buf,
+            sizeof(reason_buf),
+            "%s: %s state_ship(%.2fMiB) %.1fms < morph %.1fms",
+            req.architecture.c_str(),
+            hop_label.c_str(),
+            state_mib,
+            best_ship_ms,
+            t_morph_ms);
+        return RouteDecision{
+            req.req_id,
+            "state_ship",
+            req.src_gpu,
+            best_dst,
+            best_ship_ms,
+            t_morph_ms,
+            best_ship_ms,
+            best_p2p_bw,
+            state_mib,
+            reason_buf,
+            tier};
+    }
+
+    std::snprintf(
+        reason_buf,
+        sizeof(reason_buf),
+        "%s: in_place_morph(alpha=%.2f) %.1fms <= ship %.1fms",
+        req.architecture.c_str(),
+        src_w.expert_alpha,
+        t_morph_ms,
+        best_ship_ms);
+    return RouteDecision{
+        req.req_id,
+        "in_place_morph",
+        req.src_gpu,
+        req.src_gpu,
+        (best_ship_ms < 1e12) ? best_ship_ms : -1.0,
+        t_morph_ms,
+        t_morph_ms,
+        h2d_bw,
+        state_mib,
+        reason_buf,
+        "in_place"};
+}
+
+std::pair<RouteDecision, std::string> plan_transition_unlocked(
+    const DualPathMorphRouter& router,
+    const ClusterTopologyProfile& topo,
+    const std::string& routing_mode,
+    const std::vector<int>& static_und_ranks,
+    const std::vector<int>& static_gen_ranks,
+    const CPTGRequestSpec& req,
+    const std::map<int, WorkerState>& w_map,
+    const std::map<int, bool>& gpu_busy,
+    double now_ms) {
+    if (routing_mode == "dual_path") {
+        RouteDecision dec = decide_unlocked(router, topo, req, w_map, now_ms);
+        const std::string ship_mode =
+            (dec.path == "state_ship" && dec.dst_gpu != req.src_gpu) ? "nccl_dual" : "none";
+        return {std::move(dec), ship_mode};
+    }
+
+    if (routing_mode == "static_nccl_fission" || routing_mode == "twostage_shm") {
+        const int dst_gpu = select_static_gen_gpu_unlocked(
+            topo,
+            routing_mode,
+            static_und_ranks,
+            static_gen_ranks,
+            req.src_gpu,
+            w_map,
+            gpu_busy,
+            req.effective_state_bytes());
+        const std::string ship_mode = (routing_mode == "static_nccl_fission") ? "nccl_static" : "shm_static";
+        const double bw = topo.effective_p2p_gbps(req.src_gpu, dst_gpu);
+        const double t_ship =
+            (static_cast<double>(req.effective_state_bytes()) / 1e9) / std::max(0.5, bw) * 1000.0 +
+            topo.handoff_ms(req.src_gpu, dst_gpu);
+        RouteDecision dec{
+            req.req_id,
+            "state_ship",
+            req.src_gpu,
+            dst_gpu,
+            round_3(t_ship),
+            std::numeric_limits<double>::infinity(),
+            round_3(t_ship),
+            round_3(bw),
+            round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB)),
+            "static " + routing_mode + " " + std::to_string(req.src_gpu) + "->" + std::to_string(dst_gpu),
+            topo.fabric_tier(req.src_gpu, dst_gpu)};
+        return {std::move(dec), ship_mode};
+    }
+
+    const int dst_gpu = req.src_gpu;
+    const double q_ms = round_3(w_map.at(dst_gpu).queue_wait_ms);
+    RouteDecision dec{
+        req.req_id,
+        "in_place_morph",
+        req.src_gpu,
+        dst_gpu,
+        -1.0,
+        q_ms,
+        q_ms,
+        topo.solo_h2d_gbps(dst_gpu),
+        round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB)),
+        "sticky " + routing_mode + " on gpu " + std::to_string(dst_gpu),
+        "in_place"};
+    return {std::move(dec), "none"};
 }
 
 }  // namespace
@@ -196,13 +385,12 @@ void DualPathMorphRouter::update_worker_telemetry(
     std::optional<int64_t> telemetry_seq,
     std::map<int, WorkerState>* ext_workers) {
     std::lock_guard<std::mutex> lock(mu_);
-    const bool use_internal = (ext_workers == nullptr);
-    auto& w_map = use_internal ? worker_states_ : *ext_workers;
+    auto& w_map = ext_workers ? *ext_workers : worker_states_;
     auto it = w_map.find(gpu_id);
     if (it == w_map.end()) {
         return;
     }
-    if (telemetry_seq.has_value() && use_internal) {
+    if (telemetry_seq.has_value()) {
         const int64_t prev_seq = last_telemetry_seq_.count(gpu_id) ? last_telemetry_seq_[gpu_id] : -1;
         if (*telemetry_seq < prev_seq) {
             return;
@@ -214,13 +402,33 @@ void DualPathMorphRouter::update_worker_telemetry(
     }
     if (kv_free_bytes.has_value()) {
         const int64_t raw_b = std::max<int64_t>(0, *kv_free_bytes);
-        if (use_internal) {
-            raw_kv_free_bytes_[gpu_id] = raw_b;
-            const int64_t inf = inflight_kv_reserved_bytes_.count(gpu_id) ? inflight_kv_reserved_bytes_[gpu_id] : 0;
-            it->second.kv_free_bytes = std::max<int64_t>(0, raw_b - inf);
-        } else {
-            it->second.kv_free_bytes = raw_b;
-        }
+        raw_kv_free_bytes_[gpu_id] = raw_b;
+        const int64_t inf = inflight_kv_reserved_bytes_.count(gpu_id) ? inflight_kv_reserved_bytes_[gpu_id] : 0;
+        it->second.kv_free_bytes = std::max<int64_t>(0, raw_b - inf);
+    }
+}
+
+void DualPathMorphRouter::reserve_ar_queue(int gpu_id, double est_ar_ms) {
+    const double delta = std::max(0.0, est_ar_ms);
+    if (delta <= 0.0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = worker_states_.find(gpu_id);
+    if (it != worker_states_.end()) {
+        it->second.queue_wait_ms += delta;
+    }
+}
+
+void DualPathMorphRouter::release_ar_queue(int gpu_id, double est_ar_ms) {
+    const double delta = std::max(0.0, est_ar_ms);
+    if (delta <= 0.0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = worker_states_.find(gpu_id);
+    if (it != worker_states_.end()) {
+        it->second.queue_wait_ms = std::max(0.0, it->second.queue_wait_ms - delta);
     }
 }
 
@@ -352,8 +560,8 @@ int DualPathMorphRouter::select_initial_gpu(
         double aa = 0.0;
         double ab = 0.0;
         if (routing_mode == "dual_path") {
-            // For `bridge_mllm_dit` (e.g. InternVL-U), `PREP_DIT` runs VLM first and ships a tiny
-            // <500 KiB bridge via Path A to hot Decoder GPUs: prefer LOW decoder alpha (VLM resident)!
+            // For `bridge_mllm_dit` (InternVL-U), `PREP_DIT` runs VLM first and ships a compact
+            // bridge via Path A to hot Decoder GPUs: prefer low decoder alpha (VLM resident).
             aa = (architecture == "bridge_mllm_dit") ? wa.expert_alpha : -wa.expert_alpha;
             ab = (architecture == "bridge_mllm_dit") ? wb.expert_alpha : -wb.expert_alpha;
         }
@@ -363,59 +571,6 @@ int DualPathMorphRouter::select_initial_gpu(
     const int chosen = cands.front();
     rr_cursor_ = (chosen + 1) % n;
     return chosen;
-}
-
-static int select_static_gen_gpu_unlocked(
-    const ClusterTopologyProfile& topo,
-    const std::string& routing_mode,
-    const std::vector<int>& static_und_ranks,
-    const std::vector<int>& static_gen_ranks,
-    int src_und_gpu,
-    const std::map<int, WorkerState>& w_map,
-    const std::map<int, bool>& gpu_busy,
-    int64_t required_kv_bytes) {
-    if (static_gen_ranks.empty()) {
-        return src_und_gpu;
-    }
-    if (routing_mode == "twostage_shm") {
-        auto it = std::find(static_und_ranks.begin(), static_und_ranks.end(), src_und_gpu);
-        const size_t idx = (it != static_und_ranks.end())
-                               ? static_cast<size_t>(std::distance(static_und_ranks.begin(), it))
-                               : 0;
-        return static_gen_ranks[idx % static_gen_ranks.size()];
-    }
-
-    const int64_t need_b = std::max<int64_t>(64LL * kMiB, required_kv_bytes);
-    const double state_b = static_cast<double>(std::max<int64_t>(1LL * kMiB, required_kv_bytes));
-    auto tier_rank = [&](int g) -> int {
-        const std::string t = topo.fabric_tier(src_und_gpu, g);
-        if (t == "intra_half") return 0;
-        if (t == "inter_socket") return 1;
-        if (t == "inter_node") return 2;
-        return 3;
-    };
-    auto is_busy = [&](int g) -> bool {
-        auto bit = gpu_busy.find(g);
-        return (bit != gpu_busy.end()) ? bit->second : false;
-    };
-
-    std::vector<int> cands = static_gen_ranks;
-    std::sort(cands.begin(), cands.end(), [&](int a, int b) {
-        auto key_of = [&](int g) {
-            const double bw = std::max(0.5, topo.effective_p2p_gbps(src_und_gpu, g));
-            const double t_ship = (state_b / 1e9) / bw * 1000.0 + topo.handoff_ms(src_und_gpu, g);
-            const auto& wg = w_map.at(g);
-            const double tot_wait = round_3(t_ship + wg.queue_wait_ms);
-            return std::make_tuple(
-                wg.kv_free_bytes >= need_b ? 0 : 1,
-                tot_wait,
-                tier_rank(g),
-                is_busy(g),
-                g);
-        };
-        return key_of(a) < key_of(b);
-    });
-    return cands.front();
 }
 
 int DualPathMorphRouter::select_static_gen_gpu(
@@ -540,80 +695,6 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_a_ship_ms(
     return {round_3(t_ship), round_3(bw_p2p)};
 }
 
-static RouteDecision decide_unlocked(
-    const DualPathMorphRouter& router,
-    const ClusterTopologyProfile& topo,
-    const CPTGRequestSpec& req,
-    const std::map<int, WorkerState>& w_map,
-    double now_ms) {
-    const auto& src_w = w_map.at(req.src_gpu);
-    const auto [t_morph_ms, h2d_bw] = router.evaluate_path_b_morph_ms(req, src_w, now_ms);
-
-    int best_dst = req.src_gpu;
-    double best_ship_ms = std::numeric_limits<double>::infinity();
-    double best_p2p_bw = 0.0;
-
-    for (int cand_id : topo.peer_candidates(req.src_gpu, true)) {
-        auto it = w_map.find(cand_id);
-        if (it == w_map.end()) continue;
-        const auto [t_ship, bw_p2p] = router.evaluate_path_a_ship_ms(req, src_w, it->second, now_ms);
-        if (t_ship < best_ship_ms) {
-            best_ship_ms = t_ship;
-            best_dst = cand_id;
-            best_p2p_bw = bw_p2p;
-        }
-    }
-
-    const double state_mib = round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB));
-    char reason_buf[256];
-    if (best_ship_ms < t_morph_ms) {
-        const std::string tier = topo.fabric_tier(req.src_gpu, best_dst);
-        const std::string hop_label = (tier == "intra_half") ? "same_half" : tier;
-        std::snprintf(
-            reason_buf,
-            sizeof(reason_buf),
-            "%s: %s state_ship(%.2fMiB) %.1fms < morph %.1fms",
-            req.architecture.c_str(),
-            hop_label.c_str(),
-            state_mib,
-            best_ship_ms,
-            t_morph_ms);
-        return RouteDecision{
-            req.req_id,
-            "state_ship",
-            req.src_gpu,
-            best_dst,
-            best_ship_ms,
-            t_morph_ms,
-            best_ship_ms,
-            best_p2p_bw,
-            state_mib,
-            reason_buf,
-            tier};
-    }
-
-    std::snprintf(
-        reason_buf,
-        sizeof(reason_buf),
-        "%s: in_place_morph(alpha=%.2f) %.1fms <= ship %.1fms",
-        req.architecture.c_str(),
-        src_w.expert_alpha,
-        t_morph_ms,
-        best_ship_ms);
-    return RouteDecision{
-        req.req_id,
-        "in_place_morph",
-        req.src_gpu,
-        req.src_gpu,
-        (best_ship_ms < 1e12) ? best_ship_ms : -1.0,
-        t_morph_ms,
-        t_morph_ms,
-        h2d_bw,
-        state_mib,
-        reason_buf,
-        "in_place"};
-}
-
 RouteDecision DualPathMorphRouter::decide(
     const CPTGRequestSpec& req,
     const std::map<int, WorkerState>* ext_workers,
@@ -621,6 +702,22 @@ RouteDecision DualPathMorphRouter::decide(
     std::lock_guard<std::mutex> lock(mu_);
     const auto& w_map = ext_workers ? *ext_workers : worker_states_;
     return decide_unlocked(*this, topology_, req, w_map, now_ms);
+}
+
+std::pair<RouteDecision, std::string> DualPathMorphRouter::plan_transition_readonly(
+    const std::string& routing_mode,
+    const std::vector<int>& static_und_ranks,
+    const std::vector<int>& static_gen_ranks,
+    const CPTGRequestSpec& req,
+    double est_dit_ms,
+    const std::map<int, WorkerState>* ext_workers,
+    const std::map<int, bool>& gpu_busy,
+    double now_ms) const {
+    (void)est_dit_ms;
+    std::lock_guard<std::mutex> lock(mu_);
+    const auto& w_map = ext_workers ? *ext_workers : worker_states_;
+    return plan_transition_unlocked(
+        *this, topology_, routing_mode, static_und_ranks, static_gen_ranks, req, w_map, gpu_busy, now_ms);
 }
 
 std::pair<RouteDecision, std::string> DualPathMorphRouter::plan_and_reserve_transition(
@@ -634,79 +731,28 @@ std::pair<RouteDecision, std::string> DualPathMorphRouter::plan_and_reserve_tran
     bool use_pacer,
     double now_ms) {
     std::lock_guard<std::mutex> lock(mu_);
-    const bool use_internal = (ext_workers == nullptr);
-    auto& w_map = use_internal ? worker_states_ : *ext_workers;
+    auto& w_map = ext_workers ? *ext_workers : worker_states_;
 
-    RouteDecision dec;
-    std::string ship_mode = "none";
-    int dst_gpu = req.src_gpu;
+    auto [dec, ship_mode] = plan_transition_unlocked(
+        *this, topology_, routing_mode, static_und_ranks, static_gen_ranks, req, w_map, gpu_busy, now_ms);
+    const int dst_gpu = dec.dst_gpu;
 
-    if (routing_mode == "dual_path") {
-        dec = decide_unlocked(*this, topology_, req, w_map, now_ms);
-        dst_gpu = dec.dst_gpu;
-        ship_mode = (dec.path == "state_ship" && dst_gpu != req.src_gpu) ? "nccl_dual" : "none";
-        if (dec.path == "in_place_morph" && use_pacer && pacer_) {
-            const double alpha = w_map.at(dst_gpu).expert_alpha;
-            const double missing = (1.0 - alpha) * static_cast<double>(req.gen_expert_bytes);
-            if (missing > 0.0) {
-                const double bw = std::max(1.0, dec.selected_bw_gbps);
-                const double dma_ms = (missing / 1e9) / bw * 1000.0;
-                pacer_->reserve_slot(dst_gpu, dma_ms, now_ms + w_map.at(dst_gpu).queue_wait_ms);
-            }
+    if (routing_mode == "dual_path" && dec.path == "in_place_morph" && use_pacer && pacer_) {
+        const double alpha = w_map.at(dst_gpu).expert_alpha;
+        const double missing = (1.0 - alpha) * static_cast<double>(req.gen_expert_bytes);
+        if (missing > 0.0) {
+            const double bw = std::max(1.0, dec.selected_bw_gbps);
+            const double dma_ms = (missing / 1e9) / bw * 1000.0;
+            pacer_->reserve_slot(dst_gpu, dma_ms, now_ms + w_map.at(dst_gpu).queue_wait_ms);
         }
-    } else if (routing_mode == "static_nccl_fission" || routing_mode == "twostage_shm") {
-        dst_gpu = select_static_gen_gpu_unlocked(
-            topology_,
-            routing_mode,
-            static_und_ranks,
-            static_gen_ranks,
-            req.src_gpu,
-            w_map,
-            gpu_busy,
-            req.effective_state_bytes());
-        ship_mode = (routing_mode == "static_nccl_fission") ? "nccl_static" : "shm_static";
-        const double bw = topology_.effective_p2p_gbps(req.src_gpu, dst_gpu);
-        const double t_ship =
-            (static_cast<double>(req.effective_state_bytes()) / 1e9) / std::max(0.5, bw) * 1000.0 +
-            topology_.handoff_ms(req.src_gpu, dst_gpu);
-        dec = RouteDecision{
-            req.req_id,
-            "state_ship",
-            req.src_gpu,
-            dst_gpu,
-            round_3(t_ship),
-            std::numeric_limits<double>::infinity(),
-            round_3(t_ship),
-            round_3(bw),
-            round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB)),
-            "static " + routing_mode + " " + std::to_string(req.src_gpu) + "->" + std::to_string(dst_gpu),
-            topology_.fabric_tier(req.src_gpu, dst_gpu)};
-    } else {
-        dst_gpu = req.src_gpu;
-        ship_mode = "none";
-        const double q_ms = round_3(w_map.at(dst_gpu).queue_wait_ms);
-        dec = RouteDecision{
-            req.req_id,
-            "in_place_morph",
-            req.src_gpu,
-            dst_gpu,
-            -1.0,
-            q_ms,
-            q_ms,
-            topology_.solo_h2d_gbps(dst_gpu),
-            round_2(static_cast<double>(req.effective_state_bytes()) / static_cast<double>(kMiB)),
-            "sticky " + routing_mode + " on gpu " + std::to_string(dst_gpu),
-            "in_place"};
     }
 
     if (ship_mode != "none" && dst_gpu != req.src_gpu) {
         const int64_t res_kv = std::max<int64_t>(0, req.effective_state_bytes());
-        if (use_internal) {
-            if (!raw_kv_free_bytes_.count(dst_gpu)) {
-                raw_kv_free_bytes_[dst_gpu] = std::max<int64_t>(0, w_map.at(dst_gpu).kv_free_bytes);
-            }
-            inflight_kv_reserved_bytes_[dst_gpu] += res_kv;
+        if (!raw_kv_free_bytes_.count(dst_gpu)) {
+            raw_kv_free_bytes_[dst_gpu] = std::max<int64_t>(0, w_map.at(dst_gpu).kv_free_bytes);
         }
+        inflight_kv_reserved_bytes_[dst_gpu] += res_kv;
         w_map.at(dst_gpu).kv_free_bytes = std::max<int64_t>(0, w_map.at(dst_gpu).kv_free_bytes - res_kv);
     }
     w_map.at(dst_gpu).queue_wait_ms += std::max(0.0, est_dit_ms);
@@ -720,16 +766,13 @@ void DualPathMorphRouter::reserve_kv_bytes(
     const int64_t res_kv = std::max<int64_t>(0, reserved_kv_bytes);
     if (res_kv <= 0) return;
     std::lock_guard<std::mutex> lock(mu_);
-    const bool use_internal = (ext_workers == nullptr);
-    auto& w_map = use_internal ? worker_states_ : *ext_workers;
+    auto& w_map = ext_workers ? *ext_workers : worker_states_;
     auto it = w_map.find(gpu_id);
     if (it == w_map.end()) return;
-    if (use_internal) {
-        if (!raw_kv_free_bytes_.count(gpu_id)) {
-            raw_kv_free_bytes_[gpu_id] = std::max<int64_t>(0, it->second.kv_free_bytes);
-        }
-        inflight_kv_reserved_bytes_[gpu_id] += res_kv;
+    if (!raw_kv_free_bytes_.count(gpu_id)) {
+        raw_kv_free_bytes_[gpu_id] = std::max<int64_t>(0, it->second.kv_free_bytes);
     }
+    inflight_kv_reserved_bytes_[gpu_id] += res_kv;
     it->second.kv_free_bytes = std::max<int64_t>(0, it->second.kv_free_bytes - res_kv);
 }
 
@@ -741,34 +784,28 @@ void DualPathMorphRouter::release_kv_reservation(
     std::map<int, WorkerState>* ext_workers) {
     const int64_t rel = std::max<int64_t>(0, reserved_kv_bytes);
     std::lock_guard<std::mutex> lock(mu_);
-    const bool use_internal = (ext_workers == nullptr);
-    auto& w_map = use_internal ? worker_states_ : *ext_workers;
+    auto& w_map = ext_workers ? *ext_workers : worker_states_;
     auto it = w_map.find(gpu_id);
     if (it == w_map.end()) return;
-    if (use_internal) {
-        const int64_t cur_inf = std::max<int64_t>(0, inflight_kv_reserved_bytes_[gpu_id] - rel);
-        inflight_kv_reserved_bytes_[gpu_id] = cur_inf;
-        bool accept_latest = latest_kv_free_bytes.has_value();
-        if (accept_latest && telemetry_seq.has_value()) {
-            const int64_t prev_seq = last_telemetry_seq_.count(gpu_id) ? last_telemetry_seq_[gpu_id] : -1;
-            if (*telemetry_seq < prev_seq) {
-                accept_latest = false;
-            } else {
-                last_telemetry_seq_[gpu_id] = *telemetry_seq;
-            }
+
+    const int64_t cur_inf = std::max<int64_t>(0, inflight_kv_reserved_bytes_[gpu_id] - rel);
+    inflight_kv_reserved_bytes_[gpu_id] = cur_inf;
+    bool accept_latest = latest_kv_free_bytes.has_value();
+    if (accept_latest && telemetry_seq.has_value()) {
+        const int64_t prev_seq = last_telemetry_seq_.count(gpu_id) ? last_telemetry_seq_[gpu_id] : -1;
+        if (*telemetry_seq < prev_seq) {
+            accept_latest = false;
+        } else {
+            last_telemetry_seq_[gpu_id] = *telemetry_seq;
         }
-        if (accept_latest && latest_kv_free_bytes.has_value()) {
-            raw_kv_free_bytes_[gpu_id] = std::max<int64_t>(0, *latest_kv_free_bytes);
-        }
-        const int64_t raw_b = raw_kv_free_bytes_.count(gpu_id)
-                                  ? raw_kv_free_bytes_[gpu_id]
-                                  : (it->second.kv_free_bytes + rel);
-        it->second.kv_free_bytes = std::max<int64_t>(0, raw_b - cur_inf);
-    } else if (latest_kv_free_bytes.has_value()) {
-        it->second.kv_free_bytes = std::max<int64_t>(0, *latest_kv_free_bytes);
-    } else {
-        it->second.kv_free_bytes = std::max<int64_t>(0, it->second.kv_free_bytes + rel);
     }
+    if (accept_latest && latest_kv_free_bytes.has_value()) {
+        raw_kv_free_bytes_[gpu_id] = std::max<int64_t>(0, *latest_kv_free_bytes);
+    }
+    const int64_t raw_b = raw_kv_free_bytes_.count(gpu_id)
+                              ? raw_kv_free_bytes_[gpu_id]
+                              : (it->second.kv_free_bytes + rel);
+    it->second.kv_free_bytes = std::max<int64_t>(0, raw_b - cur_inf);
 }
 
 void DualPathMorphRouter::release_dit_reservation(
@@ -800,8 +837,8 @@ double DualPathMorphRouter::analytical_crossover_kv_mib(
     req_probe.src_gpu = src_gpu;
     req_probe.architecture = "tight_mot";
     req_probe.kv_bytes = 0;
-    req_probe.gen_expert_bytes = gen_expert_bytes;
-    req_probe.dit_step1_ms = dit_step1_ms;
+    req_probe.gen_expert_bytes = (gen_expert_bytes > 0) ? gen_expert_bytes : operator_profile_.bagel_expert_bytes;
+    req_probe.dit_step1_ms = (dit_step1_ms > 0.0) ? dit_step1_ms : operator_profile_.bagel_dit_512_step_ms;
 
     const double t_morph_ms = evaluate_path_b_morph_ms(req_probe, w_src, 0.0).first;
     const double handoff = state_handoff_ms_.has_value()

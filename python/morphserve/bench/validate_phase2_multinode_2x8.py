@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-import gc
 import json
-import math
 import os
 from pathlib import Path
 import socket
 import struct
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
+from morphserve.bench.harness import (
+    BenchmarkRunner,
+    SuiteRunSpec,
+    parse_csv_strings,
+    resolve_default_main_suite_path,
+    resolve_sources_dir,
+)
 from morphserve.bench.interleaved_bench import (
     InterleavedSession,
     InterleavedTurn,
@@ -24,7 +29,6 @@ from morphserve.bench.interleaved_bench import (
 )
 from morphserve.engine import (
     EnginePolicyConfig,
-    MorphServeClusterEngine,
     MultinodeCoordinatorHub,
     TcpMultinodeWorkerFleet,
     run_multinode_worker_daemon,
@@ -33,15 +37,29 @@ from morphserve.engine.workload import build_time_window_suite
 from morphserve.router import (
     CPTGRequestSpec,
     ClusterTopologyProfile,
-    DirectNcclMesh,
     DualPathMorphRouter,
     PcieHalfGroup,
     WorkerState,
 )
+from morphserve.runtime.peer_transport import DirectNcclMesh
 from morphserve.vmm import TriPoolVMM
 
 MIB = 1024**2
 GIB = 1024**3
+
+
+def _recv_exact(conn: socket.socket, nbytes: int) -> bytes:
+    """Read exactly `nbytes` from a TCP stream, raising `ConnectionError` on premature EOF."""
+    target = int(nbytes)
+    if target < 0:
+        raise ValueError(f"negative byte length: {target}")
+    buf = bytearray()
+    while len(buf) < target:
+        chunk = conn.recv(target - len(buf))
+        if not chunk:
+            raise ConnectionError(f"unexpected EOF: expected {target} bytes, received {len(buf)}")
+        buf.extend(chunk)
+    return bytes(buf)
 
 
 def _exchange_bytes_tcp(is_master: bool, master_addr: str, master_port: int, payload: bytes = b"") -> bytes:
@@ -66,20 +84,8 @@ def _exchange_bytes_tcp(is_master: bool, master_addr: str, master_port: int, pay
         try:
             cli = socket.create_connection((master_addr, master_port), timeout=5.0)
             with cli:
-                hdr = b""
-                while len(hdr) < 4:
-                    chunk = cli.recv(4 - len(hdr))
-                    if not chunk:
-                        raise ConnectionError("short header")
-                    hdr += chunk
-                (nbytes,) = struct.unpack("!I", hdr)
-                buf = bytearray()
-                while len(buf) < nbytes:
-                    chunk = cli.recv(nbytes - len(buf))
-                    if not chunk:
-                        raise ConnectionError("short payload")
-                    buf.extend(chunk)
-                return bytes(buf)
+                (nbytes,) = struct.unpack("!I", _recv_exact(cli, 4))
+                return _recv_exact(cli, nbytes)
         except Exception as exc:
             last_err = exc
             time.sleep(1.0)
@@ -108,12 +114,9 @@ def _recv_json_on_master(port: int) -> dict[str, Any]:
     try:
         conn, _ = srv.accept()
         with conn:
-            hdr = conn.recv(4)
-            (nbytes,) = struct.unpack("!I", hdr)
-            buf = bytearray()
-            while len(buf) < nbytes:
-                buf.extend(conn.recv(nbytes - len(buf)))
-            return json.loads(buf.decode("utf-8"))
+            (nbytes,) = struct.unpack("!I", _recv_exact(conn, 4))
+            payload = _recv_exact(conn, nbytes)
+            return json.loads(payload.decode("utf-8"))
     finally:
         srv.close()
 
@@ -147,7 +150,6 @@ def _local_gpu_worker(
         device_index=local_rank,
     )
     try:
-        # Warmup ring/tree across all 16 GPUs
         next_r = (global_rank + 1) % world_size
         prev_r = (global_rank - 1) % world_size
         w_buf = torch.ones((4096,), dtype=torch.uint8, device=dev)
@@ -160,10 +162,6 @@ def _local_gpu_worker(
         torch.cuda.synchronize(dev)
 
         measurements: list[dict[str, Any]] = []
-        # 3 fabric tiers from global_rank 0:
-        #   Tier 1: 0 -> 1 (intra-half PCIe switch)
-        #   Tier 2: 0 -> 4 (intra-node cross-socket)
-        #   Tier 3: 0 -> 8 (inter-node fabric to Node 1 local_rank 0)
         pairs = (
             ("intra_half_pcie", 0, 1),
             ("intra_node_cross_socket", 0, 4 if world_size > 4 else 1),
@@ -255,7 +253,6 @@ def evaluate_cross_node_routing_check(
     )
     router16 = DualPathMorphRouter(topo16)
 
-    # Scenario: Node 0 GPUs busy except hybrid GPU 0 (alpha=0.50); Node 1 GPU 8 is idle warm Gen (alpha=1.0)
     states = {
         g: WorkerState(
             gpu_id=g,
@@ -395,7 +392,6 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
         off = round((i // 2) * dt * 1.6 + (i % 2) * 0.01, 4)
         mod = i % 4
         if mod == 0:
-            # Q1: 4-turn bidirectional `AR -> DiT -> AR(use_prev_image=True) -> DiT(use_prev_image=True)`
             sessions.append(
                 InterleavedSession(
                     session_id=f"mn_cocreate_{i:03d}",
@@ -439,7 +435,6 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
                 )
             )
         elif mod == 1:
-            # Q2: 4-turn chained editing (`dit_edit` with Turn 1..3 `use_prev_image=True`)
             sessions.append(
                 InterleavedSession(
                     session_id=f"mn_edit_{i:03d}",
@@ -479,7 +474,6 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
                 )
             )
         elif mod == 2:
-            # Q3: Multi-turn interactive VQA (`ar_only` x 2)
             sessions.append(
                 InterleavedSession(
                     session_id=f"mn_vqa_{i:03d}",
@@ -505,7 +499,6 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
                 )
             )
         else:
-            # Q4: Visual-CoT / High-Res (`cot_then_dit` or `dit_t2i` 1024px)
             plan = "cot_then_dit" if ((i // 4) % 2 == 0) else "dit_t2i"
             sessions.append(
                 InterleavedSession(
@@ -540,21 +533,6 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
     )
 
 
-def _resolve_sources_dir(bench_root: Path) -> Path:
-    for cand in (bench_root / "sources", bench_root.parent / "bench_sources"):
-        if cand.is_dir():
-            return cand
-    return bench_root / "sources"
-
-
-def _resolve_default_main_suite_path(bench_root: Path) -> Path:
-    for rel in ("suites/main_mix_v2_80.json", "suites/main_mix_80.json"):
-        cand = bench_root / rel
-        if cand.is_file():
-            return cand
-    return bench_root / "suites/main_mix_v2_80.json"
-
-
 def _prepare_e2e_suite(
     bench_root: Path,
     suite_json: Path | None,
@@ -571,10 +549,10 @@ def _prepare_e2e_suite(
         n_syn = int(num_sessions) if num_sessions is not None else 16
         return _build_synthetic_multinode_suite(num_sessions=n_syn, offered_qps=offered_qps)
 
-    s_path = suite_json if suite_json is not None else _resolve_default_main_suite_path(bench_root)
+    s_path = suite_json if suite_json is not None else resolve_default_main_suite_path(bench_root)
     raw = WorkloadSuite.load_json(s_path)
 
-    sources_dir = _resolve_sources_dir(bench_root)
+    sources_dir = resolve_sources_dir(bench_root)
     b_csv = sources_dir / "burstgpt_1_sample.csv"
     g_csv = sources_dir / "gentd26_lora_request_trace.csv"
     burst_d = load_burstgpt_interarrivals(b_csv) if b_csv.is_file() else [0.4, 0.8, 1.8]
@@ -619,6 +597,7 @@ def run_multinode_e2e_benchmark(
     synthetic_e2e: bool = False,
     coord_port_override: int | None = None,
     spotcheck_summary: dict[str, Any] | None = None,
+    engine_factory: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Run live 2-node (e.g. 2x8 = 16-GPU) distributed `MorphServeClusterEngine` E2E serving evaluation (v2)."""
     node_rank = int(os.environ.get("RANK", "0"))
@@ -675,6 +654,14 @@ def run_multinode_e2e_benchmark(
         advertise_host=master_addr,
         backend=backend,
     )
+    runner = BenchmarkRunner(
+        model_dir=model_dir,
+        bench_root=bench_root,
+        tmp_root_base=output_dir,
+        engine_factory=engine_factory,
+        fleet_factory=lambda cfg: TcpMultinodeWorkerFleet(cfg, model_dir=model_dir, bench_root=bench_root, hub=hub),
+        topology=topo,
+    )
     results: list[dict[str, Any]] = []
     summary_by_policy: dict[str, dict[str, Any]] = {}
     ms_max_inter_ship_bytes = 0
@@ -710,74 +697,61 @@ def run_multinode_e2e_benchmark(
                 )
 
             cfg = EnginePolicyConfig.from_preset(pol_name, num_gpus=world_size, **pol_overrides)
-            fleet = TcpMultinodeWorkerFleet(cfg, model_dir=model_dir, bench_root=bench_root, hub=hub)
-            tmp_dir = output_dir / f"_tmp_m25_{pol_name}"
-            engine = MorphServeClusterEngine(
-                policy=cfg,
-                model_dir=model_dir,
-                bench_root=bench_root,
-                tmp_root=tmp_dir,
-                fleet=fleet,
-                topology=topo,
-            )
-            try:
-                engine.start()
-                rep = engine.run_suite(suite, target_qps=float(offered_qps))
-            finally:
-                engine.shutdown()
-                gc.collect()
 
-            rep_dict = rep.to_dict()
-            sess_rows = rep_dict.pop("sessions", [])
-            err_samples = [str(s.get("error", ""))[:240] for s in sess_rows if s.get("status") == "error"][:5]
-            if err_samples:
-                rep_dict["error_samples"] = err_samples
-            if pol_name == "morphserve":
-                ms_max_inter_ship_bytes = max(
-                    ms_max_inter_ship_bytes,
-                    int(rep_dict.get("max_cross_node_ship_bytes", 0)),
+            def _on_pol(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _pol_name: str = pol_name) -> None:
+                nonlocal ms_max_inter_ship_bytes
+                if _pol_name == "morphserve":
+                    ms_max_inter_ship_bytes = max(
+                        ms_max_inter_ship_bytes,
+                        int(compact.get("max_cross_node_ship_bytes", 0)),
+                    )
+                    for s_row in rep.sessions:
+                        for b in s_row.get("cross_node_ship_bytes_list") or ():
+                            ms_max_inter_ship_bytes = max(ms_max_inter_ship_bytes, int(b))
+
+                summary_by_policy[_pol_name] = {
+                    "steady_state_window_mode": str(rep.steady_state_window_mode),
+                    "steady_window_start_s": float(rep.steady_window_start_s),
+                    "steady_window_end_s": float(rep.steady_window_end_s),
+                    "steady_state_sessions": int(rep.steady_state_sessions),
+                    "steady_oom_sessions": int(rep.steady_oom_sessions),
+                    "joint_slo_goodput_rps": float(rep.joint_slo_goodput_rps),
+                    "full_trace_goodput_rps": float(rep.full_trace_goodput_rps),
+                    "joint_slo_attainment_pct": float(rep.joint_slo_attainment_pct),
+                    "steady_state_survival_pct": float(rep.steady_state_survival_pct),
+                    "active_jct_p50_ms": float(rep.active_jct_p50_ms),
+                    "active_jct_p95_ms": float(rep.active_jct_p95_ms),
+                    "active_jct_p99_ms": float(rep.active_jct_p99_ms),
+                    "all_session_active_jct_p95_ms": rep.all_session_active_jct_p95_ms,
+                    "kv_host_swap_outs": int(rep.kv_host_swap_outs),
+                    "kv_host_swap_ins": int(rep.kv_host_swap_ins),
+                    "vmm_physical_pool_mib": float(rep.vmm_physical_pool_mib),
+                    "per_turn_stats": rep.per_turn_stats,
+                    "cross_node_ships": int(rep.cross_node_ships),
+                    "max_cross_node_ship_bytes": int(rep.max_cross_node_ship_bytes),
+                    "peak_nvml_used_mib": float(rep.peak_nvml_used_mib),
+                }
+                errs = compact.get("error_samples") or ()
+                print(
+                    f"[M2.5-E2E-v2] policy={_pol_name} world_size={world_size} n={len(spec.suite.sessions)} qps={offered_qps} "
+                    f"win={rep.steady_state_window_mode} steady_goodput={rep.joint_slo_goodput_rps:.3f} "
+                    f"steady_slo={rep.joint_slo_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
+                    f"active_jct_p95={rep.active_jct_p95_ms}ms swaps={rep.kv_host_swap_outs} xnode_ships={rep.cross_node_ships} "
+                    f"steady_oom={rep.steady_oom_sessions} oom={rep.oom_sessions} err={rep.error_sessions}"
+                    + (f" sample_err={errs[0]!r}" if errs else ""),
+                    flush=True,
                 )
-                for s_row in sess_rows:
-                    for b in s_row.get("cross_node_ship_bytes_list") or ():
-                        ms_max_inter_ship_bytes = max(ms_max_inter_ship_bytes, int(b))
 
-            eff_tput = float(getattr(rep, "effective_slo_throughput_rps", rep.steady_state_goodput_rps))
-            act_jct_p95 = float(getattr(rep, "active_jct_p95_ms", rep.session_e2e_p95_ms))
-            swaps = int(getattr(rep, "kv_host_swap_outs", 0))
-            st_oom = int(getattr(rep, "steady_oom_sessions", rep.oom_sessions))
-            win_mode_rep = str(getattr(rep, "steady_state_window_mode", window_mode))
-
-            summary_by_policy[pol_name] = {
-                "steady_state_window_mode": win_mode_rep,
-                "steady_window_start_s": getattr(rep, "steady_window_start_s", float(suite.warmup_s)),
-                "steady_window_end_s": getattr(rep, "steady_window_end_s", float(suite.arrival_duration_s)),
-                "steady_state_sessions": int(getattr(rep, "steady_state_sessions", rep.total_sessions)),
-                "steady_oom_sessions": st_oom,
-                "effective_slo_throughput_rps": eff_tput,
-                "steady_state_goodput_rps": float(rep.steady_state_goodput_rps),
-                "steady_state_attainment_pct": float(rep.steady_state_attainment_pct),
-                "steady_state_survival_pct": float(rep.steady_state_survival_pct),
-                "active_jct_p50_ms": float(getattr(rep, "active_jct_p50_ms", rep.session_e2e_p50_ms)),
-                "active_jct_p95_ms": act_jct_p95,
-                "active_jct_p99_ms": float(getattr(rep, "active_jct_p99_ms", rep.session_e2e_p99_ms)),
-                "all_session_active_jct_p95_ms": getattr(rep, "all_session_active_jct_p95_ms", None),
-                "kv_host_swap_outs": swaps,
-                "per_turn_stats": getattr(rep, "per_turn_stats", {}),
-                "cross_node_ships": int(rep.cross_node_ships),
-                "max_cross_node_ship_bytes": int(rep.max_cross_node_ship_bytes),
-                "peak_nvml_used_mib": float(rep.peak_nvml_used_mib),
-            }
-
-            print(
-                f"[M2.5-E2E-v2] policy={pol_name} world_size={world_size} n={len(suite.sessions)} qps={offered_qps} "
-                f"win={win_mode_rep} eff_tput={eff_tput:.3f} steady_goodput={rep.steady_state_goodput_rps:.3f} "
-                f"steady_slo={rep.steady_state_attainment_pct}% steady_surv={rep.steady_state_survival_pct}% "
-                f"active_jct_p95={act_jct_p95}ms swaps={swaps} xnode_ships={rep.cross_node_ships} "
-                f"steady_oom={st_oom} oom={rep.oom_sessions} err={rep.error_sessions}"
-                + (f" sample_err={err_samples[0]!r}" if err_samples else ""),
-                flush=True,
+            results.extend(
+                runner.run_policy_sweep(
+                    cfg,
+                    [SuiteRunSpec(suite=suite, target_qps=float(offered_qps))],
+                    tmp_tag=f"_tmp_m25_{pol_name}",
+                    max_error_samples=5,
+                    attach_init_shmem=False,
+                    on_result=_on_pol,
+                )
             )
-            results.append(rep_dict)
     finally:
         hub.close()
 
@@ -818,7 +792,7 @@ def run_multinode_e2e_benchmark(
     return report
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="MorphServe M2.5 2x8 (16-GPU) Multi-Node Fabric Calibration & Distributed E2E Benchmark (v2)"
     )
@@ -846,7 +820,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inter-bw", type=float, default=1.11)
     parser.add_argument("--coord-port", type=int, default=None)
     parser.add_argument("--synthetic-e2e", action="store_true")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_arg_parser().parse_args(argv)
 
     eff_mode = args.mode
     if args.synthetic_e2e and eff_mode == "spotcheck":
@@ -867,7 +845,7 @@ def main(argv: list[str] | None = None) -> int:
             socket_bw = float(calib.get("intra_node_cross_socket", socket_bw))
             inter_bw = float(calib.get("inter_node_fabric", inter_bw))
 
-    pol_list = tuple(p.strip() for p in str(args.policies).split(",") if p.strip())
+    pol_list = tuple(parse_csv_strings(args.policies))
     e2e_rep = run_multinode_e2e_benchmark(
         args.output_dir,
         model_dir=args.model_dir,

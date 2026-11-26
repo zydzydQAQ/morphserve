@@ -5,8 +5,214 @@
 
 namespace morphserve::control {
 
+namespace {
+
+void configure_static_fission_ranks(
+    PolicyConfig& cfg,
+    const std::string& policy_name,
+    int num_gpus) {
+    if (num_gpus < 2) {
+        throw std::invalid_argument(policy_name + " requires >= 2 GPUs");
+    }
+    cfg.static_und_ranks.clear();
+    cfg.static_gen_ranks.clear();
+
+    if (policy_name == "static_2und_6gen") {
+        if (num_gpus >= 8 && (num_gpus % 8) == 0) {
+            for (int g = 0; g < num_gpus; ++g) {
+                const int r = g % 8;
+                if (r == 0 || r == 4) cfg.static_und_ranks.push_back(g);
+                else cfg.static_gen_ranks.push_back(g);
+            }
+        } else if (num_gpus >= 4 && (num_gpus % 4) == 0) {
+            const int q = num_gpus / 4;
+            for (int g = 0; g < q; ++g) cfg.static_und_ranks.push_back(g);
+            for (int g = q; g < num_gpus; ++g) cfg.static_gen_ranks.push_back(g);
+        } else {
+            cfg.static_und_ranks.push_back(0);
+            for (int g = 1; g < num_gpus; ++g) cfg.static_gen_ranks.push_back(g);
+        }
+    } else if (policy_name == "static_6und_2gen") {
+        if (num_gpus >= 8 && (num_gpus % 8) == 0) {
+            for (int g = 0; g < num_gpus; ++g) {
+                const int r = g % 8;
+                if (r == 0 || r == 1 || r == 2 || r == 4 || r == 5 || r == 6) {
+                    cfg.static_und_ranks.push_back(g);
+                } else {
+                    cfg.static_gen_ranks.push_back(g);
+                }
+            }
+        } else if (num_gpus >= 4 && (num_gpus % 4) == 0) {
+            const int q = num_gpus / 4;
+            for (int g = 0; g < 3 * q; ++g) cfg.static_und_ranks.push_back(g);
+            for (int g = 3 * q; g < num_gpus; ++g) cfg.static_gen_ranks.push_back(g);
+        } else {
+            for (int g = 0; g < num_gpus - 1; ++g) cfg.static_und_ranks.push_back(g);
+            cfg.static_gen_ranks.push_back(num_gpus - 1);
+        }
+    } else {
+        // `static_nccl_fission` and `static_4und_4gen` (balanced 50/50 split)
+        if (num_gpus >= 8 && (num_gpus % 8) == 0) {
+            for (int g = 0; g < num_gpus; ++g) {
+                const int r = g % 8;
+                if (r == 0 || r == 1 || r == 4 || r == 5) cfg.static_und_ranks.push_back(g);
+                else cfg.static_gen_ranks.push_back(g);
+            }
+        } else {
+            const int half = num_gpus / 2;
+            for (int g = 0; g < half; ++g) cfg.static_und_ranks.push_back(g);
+            for (int g = half; g < num_gpus; ++g) cfg.static_gen_ranks.push_back(g);
+        }
+    }
+
+    cfg.routing_mode = "static_nccl_fission";
+    cfg.use_tripool_vmm = false;
+    cfg.use_expert_pager = false;
+    cfg.use_scoped_vae = false;
+    cfg.use_shared_numa_mirror = false;
+    cfg.use_h2d_pacer = false;
+    cfg.use_module3_cow_loopback = false;
+    cfg.use_naive_offload = false;
+    cfg.kv_vmm_only = false;
+    cfg.preemption_mode = "non_preemptive";
+    for (int g = 0; g < num_gpus; ++g) {
+        const bool is_und = std::find(cfg.static_und_ranks.begin(), cfg.static_und_ranks.end(), g) !=
+                            cfg.static_und_ranks.end();
+        cfg.initial_alphas[g] = is_und ? 0.0 : 1.0;
+    }
+}
+
+void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
+    if (!j.is_object()) return;
+    for (auto it = j.begin(); it != j.end(); ++it) {
+        const std::string& k = it.key();
+        const auto& v = it.value();
+        if (k == "cptg_arch_override") {
+            if (v.is_null()) cfg.cptg_arch_override.reset();
+            else cfg.cptg_arch_override = v.get<std::string>();
+            continue;
+        }
+        if (k == "vendor_dir") {
+            if (v.is_null()) cfg.vendor_dir.reset();
+            else cfg.vendor_dir = v.get<std::string>();
+            continue;
+        }
+        if (k == "dit_turn_slo_override_ms") {
+            if (v.is_null()) cfg.dit_turn_slo_override_ms.reset();
+            else cfg.dit_turn_slo_override_ms = v.get<double>();
+            continue;
+        }
+        if (k == "gpu_memory_fraction") {
+            if (v.is_null()) cfg.gpu_memory_fraction.reset();
+            else cfg.gpu_memory_fraction = v.get<double>();
+            continue;
+        }
+        if (k == "gpu_memory_quota_mib") {
+            if (v.is_null()) cfg.gpu_memory_quota_mib.reset();
+            else cfg.gpu_memory_quota_mib = v.get<double>();
+            continue;
+        }
+
+        if (k == "policy_name") {
+            if (!v.is_null()) cfg.policy_name = v.get<std::string>();
+        } else if (k == "num_gpus") {
+            if (!v.is_null()) cfg.num_gpus = v.get<int>();
+        } else if (k == "model_family") {
+            if (!v.is_null()) cfg.model_family = v.get<std::string>();
+        } else if (k == "routing_mode") {
+            if (!v.is_null()) cfg.routing_mode = v.get<std::string>();
+        } else if (k == "use_tripool_vmm") {
+            if (!v.is_null()) cfg.use_tripool_vmm = v.get<bool>();
+        } else if (k == "use_expert_pager") {
+            if (!v.is_null()) cfg.use_expert_pager = v.get<bool>();
+        } else if (k == "use_scoped_vae") {
+            if (!v.is_null()) cfg.use_scoped_vae = v.get<bool>();
+        } else if (k == "use_shared_numa_mirror") {
+            if (!v.is_null()) cfg.use_shared_numa_mirror = v.get<bool>();
+        } else if (k == "use_h2d_pacer") {
+            if (!v.is_null()) cfg.use_h2d_pacer = v.get<bool>();
+        } else if (k == "use_module3_cow_loopback") {
+            if (!v.is_null()) cfg.use_module3_cow_loopback = v.get<bool>();
+        } else if (k == "allow_cascade_cfg_split") {
+            if (!v.is_null()) cfg.allow_cascade_cfg_split = v.get<bool>();
+        } else if (k == "use_naive_offload") {
+            if (!v.is_null()) cfg.use_naive_offload = v.get<bool>();
+        } else if (k == "kv_vmm_only") {
+            if (!v.is_null()) cfg.kv_vmm_only = v.get<bool>();
+        } else if (k == "preemption_mode") {
+            if (!v.is_null()) cfg.preemption_mode = v.get<std::string>();
+        } else if (k == "static_und_ranks") {
+            if (!v.is_null()) cfg.static_und_ranks = v.get<std::vector<int>>();
+        } else if (k == "static_gen_ranks") {
+            if (!v.is_null()) cfg.static_gen_ranks = v.get<std::vector<int>>();
+        } else if (k == "initial_alphas") {
+            if (v.is_object()) {
+                cfg.initial_alphas.clear();
+                for (auto ait = v.begin(); ait != v.end(); ++ait) {
+                    cfg.initial_alphas[std::stoi(ait.key())] = ait.value().get<double>();
+                }
+            }
+        } else if (k == "slo_scale_k") {
+            if (!v.is_null()) cfg.slo_scale_k = v.get<double>();
+        } else if (k == "dit_slo_scale_k") {
+            if (!v.is_null()) cfg.dit_slo_scale_k = v.get<double>();
+        } else if (k == "ar_tpot_slo_ms") {
+            if (!v.is_null()) cfg.ar_tpot_slo_ms = v.get<double>();
+        } else if (k == "ar_ttft_slo_ms") {
+            if (!v.is_null()) cfg.ar_ttft_slo_ms = v.get<double>();
+        } else if (k == "dit_512_slo_ms") {
+            if (!v.is_null()) cfg.dit_512_slo_ms = v.get<double>();
+        } else if (k == "dit_1024_slo_ms") {
+            if (!v.is_null()) cfg.dit_1024_slo_ms = v.get<double>();
+        } else if (k == "max_oom_retries") {
+            if (!v.is_null()) cfg.max_oom_retries = v.get<int>();
+        } else if (k == "inter_turn_think_s_range") {
+            if (v.is_array() && v.size() == 2) {
+                cfg.inter_turn_think_s_range = {v[0].get<double>(), v[1].get<double>()};
+            }
+        } else if (k == "think_time_dist") {
+            if (!v.is_null()) cfg.think_time_dist = v.get<std::string>();
+        } else if (k == "think_time_median_s") {
+            if (!v.is_null()) cfg.think_time_median_s = v.get<double>();
+        } else if (k == "think_time_sigma") {
+            if (!v.is_null()) cfg.think_time_sigma = v.get<double>();
+        } else if (k == "ar_tpot_slo_mode") {
+            if (!v.is_null()) cfg.ar_tpot_slo_mode = v.get<std::string>();
+        } else if (k == "steady_window_mode") {
+            if (!v.is_null()) cfg.steady_window_mode = v.get<std::string>();
+        } else if (k == "warmup_window_s") {
+            if (!v.is_null()) cfg.warmup_window_s = v.get<double>();
+        } else if (k == "steady_window_s") {
+            if (!v.is_null()) cfg.steady_window_s = v.get<double>();
+        } else if (k == "steady_state_trim_frac") {
+            if (!v.is_null()) cfg.steady_state_trim_frac = v.get<double>();
+        } else if (k == "super_pool_mib") {
+            if (!v.is_null()) cfg.super_pool_mib = v.get<int>();
+        } else if (k == "fine_kv_pool_mib") {
+            if (!v.is_null()) cfg.fine_kv_pool_mib = v.get<int>();
+        } else if (k == "super_handle_mib") {
+            if (!v.is_null()) cfg.super_handle_mib = v.get<int>();
+        } else if (k == "transient_va_gib") {
+            if (!v.is_null()) cfg.transient_va_gib = v.get<int>();
+        } else if (k == "kv_va_gib") {
+            if (!v.is_null()) cfg.kv_va_gib = v.get<int>();
+        } else if (k == "allow_vmm_overflow") {
+            if (!v.is_null()) cfg.allow_vmm_overflow = v.get<bool>();
+        } else {
+            throw std::invalid_argument("unknown EnginePolicyConfig field: " + k);
+        }
+    }
+}
+
+}  // namespace
+
 bool is_valid_policy_name(const std::string& policy_name) noexcept {
     for (const char* name : kValidPolicies) {
+        if (policy_name == name) {
+            return true;
+        }
+    }
+    for (const char* name : kStaticSplitPolicies) {
         if (policy_name == name) {
             return true;
         }
@@ -106,76 +312,6 @@ nlohmann::json PolicyConfig::to_json() const {
     };
 }
 
-static void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
-    if (!j.is_object()) return;
-    for (auto it = j.begin(); it != j.end(); ++it) {
-        const std::string& k = it.key();
-        const auto& v = it.value();
-        if (k == "policy_name") cfg.policy_name = v.get<std::string>();
-        else if (k == "num_gpus") cfg.num_gpus = v.get<int>();
-        else if (k == "model_family") cfg.model_family = v.get<std::string>();
-        else if (k == "cptg_arch_override") {
-            if (v.is_null()) cfg.cptg_arch_override.reset();
-            else cfg.cptg_arch_override = v.get<std::string>();
-        } else if (k == "vendor_dir") {
-            if (v.is_null()) cfg.vendor_dir.reset();
-            else cfg.vendor_dir = v.get<std::string>();
-        } else if (k == "routing_mode") cfg.routing_mode = v.get<std::string>();
-        else if (k == "use_tripool_vmm") cfg.use_tripool_vmm = v.get<bool>();
-        else if (k == "use_expert_pager") cfg.use_expert_pager = v.get<bool>();
-        else if (k == "use_scoped_vae") cfg.use_scoped_vae = v.get<bool>();
-        else if (k == "use_shared_numa_mirror") cfg.use_shared_numa_mirror = v.get<bool>();
-        else if (k == "use_h2d_pacer") cfg.use_h2d_pacer = v.get<bool>();
-        else if (k == "use_module3_cow_loopback") cfg.use_module3_cow_loopback = v.get<bool>();
-        else if (k == "allow_cascade_cfg_split") cfg.allow_cascade_cfg_split = v.get<bool>();
-        else if (k == "use_naive_offload") cfg.use_naive_offload = v.get<bool>();
-        else if (k == "kv_vmm_only") cfg.kv_vmm_only = v.get<bool>();
-        else if (k == "preemption_mode") cfg.preemption_mode = v.get<std::string>();
-        else if (k == "static_und_ranks") cfg.static_und_ranks = v.get<std::vector<int>>();
-        else if (k == "static_gen_ranks") cfg.static_gen_ranks = v.get<std::vector<int>>();
-        else if (k == "initial_alphas" && v.is_object()) {
-            cfg.initial_alphas.clear();
-            for (auto ait = v.begin(); ait != v.end(); ++ait) {
-                cfg.initial_alphas[std::stoi(ait.key())] = ait.value().get<double>();
-            }
-        } else if (k == "slo_scale_k") cfg.slo_scale_k = v.get<double>();
-        else if (k == "dit_slo_scale_k") cfg.dit_slo_scale_k = v.get<double>();
-        else if (k == "ar_tpot_slo_ms") cfg.ar_tpot_slo_ms = v.get<double>();
-        else if (k == "ar_ttft_slo_ms") cfg.ar_ttft_slo_ms = v.get<double>();
-        else if (k == "dit_512_slo_ms") cfg.dit_512_slo_ms = v.get<double>();
-        else if (k == "dit_1024_slo_ms") cfg.dit_1024_slo_ms = v.get<double>();
-        else if (k == "dit_turn_slo_override_ms") {
-            if (v.is_null()) cfg.dit_turn_slo_override_ms.reset();
-            else cfg.dit_turn_slo_override_ms = v.get<double>();
-        } else if (k == "max_oom_retries") cfg.max_oom_retries = v.get<int>();
-        else if (k == "inter_turn_think_s_range" && v.is_array() && v.size() == 2) {
-            cfg.inter_turn_think_s_range = {v[0].get<double>(), v[1].get<double>()};
-        } else if (k == "think_time_dist") cfg.think_time_dist = v.get<std::string>();
-        else if (k == "think_time_median_s") cfg.think_time_median_s = v.get<double>();
-        else if (k == "think_time_sigma") cfg.think_time_sigma = v.get<double>();
-        else if (k == "ar_tpot_slo_mode") cfg.ar_tpot_slo_mode = v.get<std::string>();
-        else if (k == "steady_window_mode") cfg.steady_window_mode = v.get<std::string>();
-        else if (k == "warmup_window_s") cfg.warmup_window_s = v.get<double>();
-        else if (k == "steady_window_s") cfg.steady_window_s = v.get<double>();
-        else if (k == "steady_state_trim_frac") cfg.steady_state_trim_frac = v.get<double>();
-        else if (k == "gpu_memory_fraction") {
-            if (v.is_null()) cfg.gpu_memory_fraction.reset();
-            else cfg.gpu_memory_fraction = v.get<double>();
-        } else if (k == "gpu_memory_quota_mib") {
-            if (v.is_null()) cfg.gpu_memory_quota_mib.reset();
-            else cfg.gpu_memory_quota_mib = v.get<double>();
-        } else if (k == "super_pool_mib") cfg.super_pool_mib = v.get<int>();
-        else if (k == "fine_kv_pool_mib") cfg.fine_kv_pool_mib = v.get<int>();
-        else if (k == "super_handle_mib") cfg.super_handle_mib = v.get<int>();
-        else if (k == "transient_va_gib") cfg.transient_va_gib = v.get<int>();
-        else if (k == "kv_va_gib") cfg.kv_va_gib = v.get<int>();
-        else if (k == "allow_vmm_overflow") cfg.allow_vmm_overflow = v.get<bool>();
-        else {
-            throw std::invalid_argument("unknown EnginePolicyConfig field: " + k);
-        }
-    }
-}
-
 PolicyConfig PolicyConfig::from_json(const nlohmann::json& j) {
     PolicyConfig cfg;
     apply_policy_overrides(cfg, j);
@@ -193,14 +329,14 @@ PolicyConfig PolicyConfig::from_preset(
         throw std::invalid_argument("num_gpus must be >= 1");
     }
     const std::string fam =
-        (overrides.contains("model_family") && overrides["model_family"].is_string())
+        (overrides.is_object() && overrides.contains("model_family") && overrides["model_family"].is_string())
             ? overrides["model_family"].get<std::string>()
             : "bagel";
     const bool has_k_override =
-        overrides.contains("slo_scale_k") && overrides["slo_scale_k"].is_number();
+        overrides.is_object() && overrides.contains("slo_scale_k") && overrides["slo_scale_k"].is_number();
     const double k_val = has_k_override ? overrides["slo_scale_k"].get<double>() : 2.0;
     const double k_dit_val =
-        (overrides.contains("dit_slo_scale_k") && overrides["dit_slo_scale_k"].is_number())
+        (overrides.is_object() && overrides.contains("dit_slo_scale_k") && overrides["dit_slo_scale_k"].is_number())
             ? overrides["dit_slo_scale_k"].get<double>()
             : (has_k_override ? k_val : 3.0);
     const std::string eff_fam = (fam == "internvl_u") ? "internvl_u" : "bagel";
@@ -234,9 +370,11 @@ PolicyConfig PolicyConfig::from_preset(
             cfg.initial_alphas[g] = 1.0;
         }
         const bool has_mem_frac =
-            overrides.contains("gpu_memory_fraction") && overrides["gpu_memory_fraction"].is_number();
+            overrides.is_object() && overrides.contains("gpu_memory_fraction") &&
+            overrides["gpu_memory_fraction"].is_number();
         const bool has_quota_mib =
-            overrides.contains("gpu_memory_quota_mib") && overrides["gpu_memory_quota_mib"].is_number();
+            overrides.is_object() && overrides.contains("gpu_memory_quota_mib") &&
+            overrides["gpu_memory_quota_mib"].is_number();
         const bool is_ivlu_capped = (fam == "internvl_u") &&
             ((has_mem_frac && overrides["gpu_memory_fraction"].get<double>() <= 0.5) ||
              (has_quota_mib && overrides["gpu_memory_quota_mib"].get<double>() > 0.0 &&
@@ -291,36 +429,11 @@ PolicyConfig PolicyConfig::from_preset(
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = ((g % 2) == 0) ? 0.0 : 1.0;
         }
-    } else if (policy_name == "static_nccl_fission") {
-        if (num_gpus < 2) {
-            throw std::invalid_argument("static_nccl_fission requires >= 2 GPUs");
-        }
-        if (num_gpus >= 8 && (num_gpus % 8) == 0) {
-            for (int g = 0; g < num_gpus; ++g) {
-                const int r = g % 8;
-                if (r == 0 || r == 1 || r == 4 || r == 5) cfg.static_und_ranks.push_back(g);
-                else cfg.static_gen_ranks.push_back(g);
-            }
-        } else {
-            const int half = num_gpus / 2;
-            for (int g = 0; g < half; ++g) cfg.static_und_ranks.push_back(g);
-            for (int g = half; g < num_gpus; ++g) cfg.static_gen_ranks.push_back(g);
-        }
-        cfg.routing_mode = "static_nccl_fission";
-        cfg.use_tripool_vmm = false;
-        cfg.use_expert_pager = false;
-        cfg.use_scoped_vae = false;
-        cfg.use_shared_numa_mirror = false;
-        cfg.use_h2d_pacer = false;
-        cfg.use_module3_cow_loopback = false;
-        cfg.use_naive_offload = false;
-        cfg.kv_vmm_only = false;
-        cfg.preemption_mode = "non_preemptive";
-        for (int g = 0; g < num_gpus; ++g) {
-            const bool is_und = std::find(cfg.static_und_ranks.begin(), cfg.static_und_ranks.end(), g) !=
-                                cfg.static_und_ranks.end();
-            cfg.initial_alphas[g] = is_und ? 0.0 : 1.0;
-        }
+    } else if (policy_name == "static_nccl_fission" ||
+               policy_name == "static_2und_6gen" ||
+               policy_name == "static_4und_4gen" ||
+               policy_name == "static_6und_2gen") {
+        configure_static_fission_ranks(cfg, policy_name, num_gpus);
     } else if (policy_name == "prism_tetriserve_coloc") {
         cfg.routing_mode = "sticky_least_loaded";
         cfg.use_tripool_vmm = true;
@@ -359,9 +472,11 @@ PolicyConfig PolicyConfig::from_preset(
     return cfg;
 }
 
-std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(int num_gpus) {
+std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(
+    int num_gpus,
+    const nlohmann::json& overrides) {
     // Strict single-variable Leave-One-Out ablations relative to `full_morphserve` (M1+M2+M3+M4).
-    PolicyConfig full = PolicyConfig::from_preset("morphserve", num_gpus);
+    PolicyConfig full = PolicyConfig::from_preset("morphserve", num_gpus, overrides);
 
     PolicyConfig no_m4 = full;
     no_m4.policy_name = "no_m4_layer_chunk";
@@ -394,59 +509,19 @@ std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(int num
     };
 }
 
-std::vector<std::pair<std::string, PolicyConfig>> build_static_split_configs(int num_gpus) {
+std::vector<std::pair<std::string, PolicyConfig>> build_static_split_configs(
+    int num_gpus,
+    const nlohmann::json& overrides) {
     if (num_gpus < 4 || (num_gpus % 4) != 0) {
         throw std::invalid_argument(
             "build_static_split_configs requires num_gpus >= 4 and divisible by 4, got " +
             std::to_string(num_gpus));
     }
-    PolicyConfig base_static = PolicyConfig::from_preset("static_nccl_fission", num_gpus);
-    std::vector<int> und_1_3;
-    std::vector<int> und_3_1;
-    if ((num_gpus % 8) == 0) {
-        for (int g = 0; g < num_gpus; ++g) {
-            const int r = g % 8;
-            if (r == 0 || r == 4) und_1_3.push_back(g);
-            if (r == 0 || r == 1 || r == 2 || r == 4 || r == 5 || r == 6) und_3_1.push_back(g);
-        }
-    } else {
-        const int q = num_gpus / 4;
-        for (int g = 0; g < q; ++g) und_1_3.push_back(g);
-        for (int g = 0; g < 3 * q; ++g) und_3_1.push_back(g);
-    }
-    std::vector<int> gen_1_3;
-    std::vector<int> gen_3_1;
-    for (int g = 0; g < num_gpus; ++g) {
-        if (std::find(und_1_3.begin(), und_1_3.end(), g) == und_1_3.end()) gen_1_3.push_back(g);
-        if (std::find(und_3_1.begin(), und_3_1.end(), g) == und_3_1.end()) gen_3_1.push_back(g);
-    }
-
-    PolicyConfig s_2_6 = base_static;
-    s_2_6.policy_name = "static_2und_6gen";
-    s_2_6.static_und_ranks = und_1_3;
-    s_2_6.static_gen_ranks = gen_1_3;
-    for (int g = 0; g < num_gpus; ++g) {
-        const bool is_u = std::find(und_1_3.begin(), und_1_3.end(), g) != und_1_3.end();
-        s_2_6.initial_alphas[g] = is_u ? 0.0 : 1.0;
-    }
-
-    PolicyConfig s_4_4 = base_static;
-    s_4_4.policy_name = "static_4und_4gen";
-
-    PolicyConfig s_6_2 = base_static;
-    s_6_2.policy_name = "static_6und_2gen";
-    s_6_2.static_und_ranks = und_3_1;
-    s_6_2.static_gen_ranks = gen_3_1;
-    for (int g = 0; g < num_gpus; ++g) {
-        const bool is_u = std::find(und_3_1.begin(), und_3_1.end(), g) != und_3_1.end();
-        s_6_2.initial_alphas[g] = is_u ? 0.0 : 1.0;
-    }
-
     return {
-        {"morphserve_elastic", PolicyConfig::from_preset("morphserve", num_gpus)},
-        {"static_2und_6gen", s_2_6},
-        {"static_4und_4gen", s_4_4},
-        {"static_6und_2gen", s_6_2},
+        {"morphserve_elastic", PolicyConfig::from_preset("morphserve", num_gpus, overrides)},
+        {"static_2und_6gen", PolicyConfig::from_preset("static_2und_6gen", num_gpus, overrides)},
+        {"static_4und_4gen", PolicyConfig::from_preset("static_4und_4gen", num_gpus, overrides)},
+        {"static_6und_2gen", PolicyConfig::from_preset("static_6und_2gen", num_gpus, overrides)},
     };
 }
 

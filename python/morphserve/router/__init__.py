@@ -1,4 +1,6 @@
-"""MorphServe Module 2: Three-tier topology, OperatorLatencyProfile, DualPathMorphRouter & DirectNcclMesh."""
+"""MorphServe Module 2: Three-tier topology, `OperatorLatencyProfile`, and C++-backed `DualPathMorphRouter`."""
+
+from typing import Any
 
 from .cost_router import (
     CPTGRequestSpec,
@@ -7,26 +9,33 @@ from .cost_router import (
     RouteDecision,
     WorkerState,
 )
-from .nccl_state_shipper import DirectNcclMesh, find_free_tcp_port
 from .topology import (
     ClusterTopologyProfile,
-    DEFAULT_OPERATOR_PROFILE,
     OperatorLatencyProfile,
     PcieHalfGroup,
+    default_operator_profile,
+    default_topology_for,
     probe_live_topology,
 )
+
+
+def __getattr__(name: str) -> Any:
+    if name == "DEFAULT_OPERATOR_PROFILE":
+        return default_operator_profile()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "CPTGRequestSpec",
     "ClusterTopologyProfile",
     "DEFAULT_OPERATOR_PROFILE",
-    "DirectNcclMesh",
     "DualPathMorphRouter",
     "HalfNodeH2DPacer",
     "OperatorLatencyProfile",
     "PcieHalfGroup",
     "RouteDecision",
     "WorkerState",
-    "find_free_tcp_port",
+    "default_operator_profile",
+    "default_topology_for",
     "probe_live_topology",
 ]

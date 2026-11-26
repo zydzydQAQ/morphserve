@@ -455,12 +455,21 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             sc.mark_thinking(trigger_watermark_check=False)
         thinking_sessions.append(sc)
 
-    # Exercise strided packed `[B=4, H, D]` `VmmNaiveCache.append_batch_inplace` on CUDA bf16 tensors (`4095 -> 4096`)
+    # Exercise strided packed `[B=4, H, D]` `VmmNaiveCache.append_kv` on CUDA bf16 tensors (`4095 -> 4096`)
     packed_qkv_step = torch.randn((4, 3 * 32, 128), dtype=torch.bfloat16, device=device)
     _, strided_bk, strided_bv = packed_qkv_step.split([32, 32, 32], dim=1)
     batch_targets = thinking_sessions[1:5]
+    ks_b = []
+    vs_b = []
+    lens_b: list[int] = []
     for lidx in range(8):
-        ks_b, vs_b, lens_b = VmmNaiveCache.append_batch_inplace(batch_targets, lidx, strided_bk, strided_bv)
+        ks_b = []
+        vs_b = []
+        lens_b = []
+        for b_idx, cache_b in enumerate(batch_targets):
+            fk_b, fv_b = cache_b.append_kv(lidx, strided_bk[b_idx], strided_bv[b_idx], key_lens_out=lens_b)
+            ks_b.append(fk_b)
+            vs_b.append(fv_b)
     torch.cuda.synchronize()
     batched_append_exact = bool(
         lens_b == [4096, 4096, 4096, 4096]

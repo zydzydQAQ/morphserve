@@ -8,12 +8,20 @@ from .pager import (
     LayerPackPlan,
     NaiveHostOffloader,
     ParamSlice,
+    StaticFissionDropper,
     align_up,
     build_layer_pack_plans,
     drop_partition_weights,
     is_generation_param_name,
 )
-from .tripool import NumaMemfdMirror, SimulatedTriPoolBackend, TriPoolVMM, UnifiedVmmStats, resolve_vmm_so
+from .tripool import (
+    NumaMemfdMirror,
+    SimulatedTriPoolBackend,
+    TriPoolVMM,
+    UnifiedVmmStats,
+    VmmOutOfMemoryError,
+    resolve_vmm_so,
+)
 
 __all__ = [
     "ALIGN_BYTES",
@@ -25,9 +33,11 @@ __all__ = [
     "NumaMemfdMirror",
     "ParamSlice",
     "SimulatedTriPoolBackend",
+    "StaticFissionDropper",
     "TriPoolVMM",
     "UnifiedVmmStats",
     "VmmNaiveCache",
+    "VmmOutOfMemoryError",
     "align_up",
     "build_layer_pack_plans",
     "drop_partition_weights",

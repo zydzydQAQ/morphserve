@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #if __has_include(<cuda.h>)
 #include <cuda.h>
@@ -20,6 +21,7 @@ typedef unsigned long long CUdeviceptr;
 typedef unsigned long long CUmemGenericAllocationHandle;
 
 constexpr CUresult CUDA_SUCCESS = 0;
+constexpr CUresult CUDA_ERROR_OUT_OF_MEMORY = 2;
 
 typedef enum CUdevice_attribute_enum {
     CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16,
@@ -112,6 +114,7 @@ public:
     CUresult (*cuDevicePrimaryCtxRelease)(CUdevice) = nullptr;
     CUresult (*cuCtxSetCurrent)(CUcontext) = nullptr;
     CUresult (*cuCtxGetCurrent)(CUcontext*) = nullptr;
+    CUresult (*cuCtxGetDevice)(CUdevice*) = nullptr;
     CUresult (*cuCtxSynchronize)() = nullptr;
     CUresult (*cuMemGetInfo)(size_t*, size_t*) = nullptr;
 
@@ -163,7 +166,7 @@ class HostCudaPinner {
 public:
     static HostCudaPinner& instance();
 
-    int register_host(void* ptr, size_t nbytes);
+    int register_host(void* ptr, size_t nbytes, int device = -1);
     int unregister_host(void* ptr) noexcept;
     double stream_h2d_chunks_gbps(
         uint64_t dst_dev_ptr,
@@ -178,8 +181,9 @@ private:
     CUdevice retained_dev_ = 0;
     CUcontext retained_ctx_ = nullptr;
     size_t active_pins_ = 0;
+    std::unordered_map<void*, bool> pin_used_retained_ctx_;
 
-    void ensure_ctx_locked(CudaDriver& drv);
+    bool ensure_ctx_locked(CudaDriver& drv, int device);
     void release_ctx_if_idle_locked(CudaDriver& drv) noexcept;
 };
 

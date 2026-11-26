@@ -294,37 +294,43 @@ else
 fi
 chmod -R u+rwX "${PYTEST_WS}/tests"
 
-# (c.1) Native C++17 CTest (`test_vmm_and_runtime` + `test_control_and_sim`) -> ${RUN_DIR}/ctest-a100.txt
-if [ "${MORPHSERVE_SKIP_CTEST:-0}" != "1" ] && [ -f "${PYTEST_WS}/tests/cpp/test_control_and_sim.cpp" ]; then
+# (c.1) Native C++17 CTest (5 seam targets: test_tripool_vmm, test_runtime_transport,
+#       test_control_engine, test_cluster_simulator, test_c_api) -> ${RUN_DIR}/ctest-a100.txt
+CTEST_TARGETS=(
+  test_tripool_vmm
+  test_runtime_transport
+  test_control_engine
+  test_cluster_simulator
+  test_c_api
+)
+if [ "${MORPHSERVE_SKIP_CTEST:-0}" != "1" ] && [ -f "${PYTEST_WS}/tests/cpp/test_control_engine.cpp" ]; then
   CTEST_BUILD="${MORPHSERVE_LOCAL_TMP}/ctest_build"
   rm -rf "${CTEST_BUILD}"
   if command -v cmake >/dev/null 2>&1 && command -v ctest >/dev/null 2>&1 && \
      [ -f "${PYTEST_WS}/CMakeLists.txt" ] && [ -f "${PYTEST_WS}/src/morphserve/c_api.cpp" ]; then
-    echo "== [Stage 1 / Step c.1] Building and running C++17 CTest via cmake/ctest"
+    echo "== [Stage 1 / Step c.1] Building and running 5 C++17 CTest seam targets via cmake/ctest"
     cmake -S "${PYTEST_WS}" -B "${CTEST_BUILD}" -DMORPHSERVE_BUILD_TESTS=ON \
       2>&1 | tee "${RUN_DIR}/ctest-a100.txt"
-    cmake --build "${CTEST_BUILD}" --target test_vmm_and_runtime test_control_and_sim \
+    cmake --build "${CTEST_BUILD}" --target "${CTEST_TARGETS[@]}" \
       -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | tee -a "${RUN_DIR}/ctest-a100.txt"
     ctest --test-dir "${CTEST_BUILD}" --output-on-failure 2>&1 | tee -a "${RUN_DIR}/ctest-a100.txt"
   else
-    echo "== [Stage 1 / Step c.1] cmake/ctest unavailable; compiling C++17 tests directly against libmorphserve_core.so"
+    echo "== [Stage 1 / Step c.1] cmake/ctest unavailable; compiling 5 C++17 seam tests directly against libmorphserve_core.so"
     mkdir -p "${CTEST_BUILD}"
     CXX_BIN="${CXX:-g++}"
-    "${CXX_BIN}" -std=c++17 -O2 -Wall -Wextra -Wpedantic -pthread \
-      -I"${PYTEST_WS}/include" -I"${PYTEST_WS}/deploy/kairos/deps/nlohmann3.11.3" \
-      "${PYTEST_WS}/tests/cpp/test_vmm_and_runtime.cpp" \
-      -L"${BUILD}/lib" -Wl,-rpath,"${BUILD}/lib" -lmorphserve_core -ldl \
-      -o "${CTEST_BUILD}/test_vmm_and_runtime"
-    "${CXX_BIN}" -std=c++17 -O2 -Wall -Wextra -Wpedantic -pthread \
-      -I"${PYTEST_WS}/include" -I"${PYTEST_WS}/deploy/kairos/deps/nlohmann3.11.3" \
-      "${PYTEST_WS}/tests/cpp/test_control_and_sim.cpp" \
-      -L"${BUILD}/lib" -Wl,-rpath,"${BUILD}/lib" -lmorphserve_core -ldl \
-      -o "${CTEST_BUILD}/test_control_and_sim"
+    for tgt in "${CTEST_TARGETS[@]}"; do
+      "${CXX_BIN}" -std=c++17 -O2 -Wall -Wextra -Wpedantic -pthread \
+        -I"${PYTEST_WS}/include" -I"${PYTEST_WS}/deploy/kairos/deps/nlohmann3.11.3" \
+        "${PYTEST_WS}/tests/cpp/${tgt}.cpp" \
+        -L"${BUILD}/lib" -Wl,-rpath,"${BUILD}/lib" -lmorphserve_core -ldl \
+        -o "${CTEST_BUILD}/${tgt}"
+    done
     (
       cd "${PYTEST_WS}"
-      "${CTEST_BUILD}/test_vmm_and_runtime"
-      "${CTEST_BUILD}/test_control_and_sim"
-      echo "100% tests passed, 0 tests failed out of 2"
+      for tgt in "${CTEST_TARGETS[@]}"; do
+        "${CTEST_BUILD}/${tgt}"
+      done
+      echo "100% tests passed, 0 tests failed out of ${#CTEST_TARGETS[@]}"
     ) 2>&1 | tee "${RUN_DIR}/ctest-a100.txt"
   fi
 fi
@@ -510,8 +516,9 @@ def main() -> None:
             f"[STAGE1-1GPU-BAGEL-SMOKE-V2] status={rep.status} completed={rep.completed_sessions}/{rep.total_sessions} "
             f"oom={rep.oom_sessions} preempted={rep.preempted_ar_count} yields={rep.total_yields} "
             f"ar_ttft_p95={rep.ar_ttft_p95_ms}ms ar_tpot_p95={rep.ar_tpot_p95_ms}ms "
-            f"active_jct_p95={getattr(rep, 'active_jct_p95_ms', 0.0)}ms "
-            f"peak_phys_mib={rep.peak_gpu_reserved_mib} peak_pt_mib={rep.peak_pytorch_reserved_mib}",
+            f"active_jct_p95={rep.active_jct_p95_ms}ms "
+            f"peak_phys_mib={rep.peak_gpu_reserved_mib} peak_pt_mib={rep.peak_pytorch_reserved_mib} "
+            f"vmm_pool_mib={rep.vmm_physical_pool_mib}",
             flush=True,
         )
         assert rep.status == "ok", f"expected status=='ok': {d}"
@@ -588,12 +595,20 @@ pytest_passed = bool((run_dir / "pytest-a100.txt").is_file() and (pytest_summary
 
 ctest_log = run_dir / "ctest-a100.txt"
 ctest_tail: list[str] = []
+expected_ctest_banners = (
+    "[PASS] test_tripool_vmm",
+    "[PASS] test_runtime_transport",
+    "[PASS] test_control_engine",
+    "[PASS] test_cluster_simulator",
+    "[PASS] test_c_api",
+)
 if ctest_log.is_file():
     ctest_txt = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", ctest_log.read_text(encoding="utf-8", errors="replace"))
     ctest_lines = [ln.strip() for ln in ctest_txt.splitlines() if ln.strip()]
     ctest_tail = ctest_lines[-5:]
+    all_banners_ok = all(banner in ctest_txt for banner in expected_ctest_banners)
     ctest_ok = bool(
-        ("100% tests passed" in ctest_txt or "[PASS] test_control_and_sim" in ctest_txt)
+        ("100% tests passed" in ctest_txt or all_banners_ok)
         and "CHECK FAILED" not in ctest_txt
         and not re.search(r"\b[1-9][0-9]*\s+tests?\s+failed\b", ctest_txt)
     )

@@ -99,18 +99,30 @@ def _reconstruct_improper_dit_cdf(row: dict[str, Any]) -> tuple[np.ndarray, np.n
 
 
 def _verified_physical_peak_gib(policy_name: str, row: dict[str, Any], sim_peak_mib: float) -> float:
-    """Return physical per-GPU HBM peak in GiB (`<= 39.49 GiB`), correcting legacy pre-suite double-count."""
+    """Return physical per-GPU HBM peak in GiB (`<= 39.49 GiB`), reading canonical NVML/VMM fields first."""
     nvml_mib = float(row.get("peak_nvml_used_mib", 0.0))
-    raw_mib = float(row.get("peak_gpu_reserved_mib", 0.0))
-    if nvml_mib > 0.0 and nvml_mib <= 40443.0:
+    if 0.0 < nvml_mib <= 40443.0:
         return round(nvml_mib / 1024.0, 2)
+    pt_mib = float(row.get("peak_pytorch_reserved_mib", 0.0))
+    vmm_mib = float(row.get("vmm_physical_pool_mib", 0.0))
+    if pt_mib > 0.0 and vmm_mib > 0.0 and (pt_mib + vmm_mib) <= 40443.0:
+        return round((pt_mib + vmm_mib) / 1024.0, 2)
+    raw_mib = float(row.get("peak_gpu_reserved_mib", 0.0))
     if 0.0 < raw_mib <= 40443.0:
         return round(raw_mib / 1024.0, 2)
-    # Before `reset_peak_memory_stats` fix in `e970b83+`, `morphserve` added historical PyTorch load peak + VMM pool;
-    # use verified Stage-1/simulator physical TriPoolVMM + active PyTorch HBM (`<= 40,442.37 MiB`).
+    # Historical pre-`reset_peak_memory_stats` JSON fallback: use simulator physical peak (`<= 40,441 MiB`).
     if policy_name == "morphserve" and sim_peak_mib > 0.0:
         return round(min(40441.0, sim_peak_mib) / 1024.0, 2)
     return round(min(40441.0, raw_mib) / 1024.0, 2)
+
+
+def _canonical_sim_attainment_pct(sr: dict[str, Any]) -> float:
+    """Read canonical steady-state Joint SLO attainment, falling back gracefully on historical v2 JSONs."""
+    for key in ("joint_slo_attainment_pct", "full_trace_joint_slo_attainment_pct", "full_trace_attainment_pct"):
+        val = sr.get(key)
+        if val is not None:
+            return float(val)
+    return 0.0
 
 
 def generate_osdi27_figures(
@@ -170,7 +182,7 @@ def generate_osdi27_figures(
                 xs_all.append(q)
                 ys_all.append(att)
             elif sr is not None:
-                att = float(sr["full_trace_attainment_pct"])
+                att = _canonical_sim_attainment_pct(sr)
                 src_tag = "calibrated_sim"
                 xs_all.append(q)
                 ys_all.append(att)

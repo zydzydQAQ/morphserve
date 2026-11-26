@@ -5,25 +5,20 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 import gc
 import inspect
-import math
 import os
 from pathlib import Path
-import sys
-import threading
 import time
-import types
 from typing import Any, Callable
 
 from morphserve.vmm import (
     ExpertPartitionSpec,
     LayerExpertPager,
-    NaiveHostOffloader,
     NumaMemfdMirror,
     TriPoolVMM,
-    drop_partition_weights,
 )
 
-from .base import CPTGModelAdapter, PackedTransferState, compute_vmm_available_kv_bytes
+from .base import GpuCPTGAdapterMixin, PackedTransferState, compute_vmm_available_kv_bytes
+from .internvl_u_loader import load_internvlu_pipeline
 
 MIB = 1024**2
 GIB = 1024**3
@@ -61,303 +56,58 @@ def compute_internvlu_memory_plan(
     return call_json(L, L.ms_budget_internvlu_plan_json, encode_json(req))
 
 
-def _install_runtime_compat_shims(vendor_dir: Path | None = None) -> None:
-    """Install lightweight compatibility shims for offline container execution (`timm`, `transformers>=5`)."""
-    if vendor_dir is not None and vendor_dir.is_dir():
-        v_str = str(vendor_dir)
-        if v_str not in sys.path:
-            sys.path.insert(0, v_str)
-
-    try:
-        import timm.layers  # noqa: F401
-    except ImportError:
-        import torch.nn as nn
-
-        class DropPath(nn.Module):
-            def __init__(self, drop_prob: float = 0.0, scale_by_keep: bool = True) -> None:
-                super().__init__()
-                self.drop_prob = float(drop_prob)
-                self.scale_by_keep = bool(scale_by_keep)
-
-            def forward(self, x):
-                if self.drop_prob == 0.0 or not self.training:
-                    return x
-                keep = 1.0 - self.drop_prob
-                shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-                rnd = x.new_empty(shape).bernoulli_(keep)
-                if keep > 0.0 and self.scale_by_keep:
-                    rnd.div_(keep)
-                return x * rnd
-
-        timm_mod = types.ModuleType("timm")
-        layers_mod = types.ModuleType("timm.layers")
-        layers_mod.DropPath = DropPath
-        timm_mod.layers = layers_mod
-        sys.modules.setdefault("timm", timm_mod)
-        sys.modules.setdefault("timm.layers", layers_mod)
-
-    import transformers.image_utils as iu
-    from transformers.modeling_utils import PreTrainedModel
-    import transformers.processing_utils as pu
-    import transformers.utils as tu
-
-    if not hasattr(PreTrainedModel, "all_tied_weights_keys"):
-        PreTrainedModel.all_tied_weights_keys = {}
-    if not hasattr(iu, "concatenate_list"):
-        iu.concatenate_list = lambda items: [x for sub in items for x in (sub if isinstance(sub, list) else [sub])]
-    if not hasattr(iu, "make_list_of_images"):
-        iu.make_list_of_images = iu.make_flat_list_of_images
-    if not hasattr(iu, "is_valid_image"):
-        iu.is_valid_image = lambda img: img is not None
-    if not hasattr(iu, "valid_images"):
-        iu.valid_images = lambda imgs: True
-    if not hasattr(iu, "validate_preprocess_arguments"):
-        iu.validate_preprocess_arguments = lambda *a, **kw: None
-    if not hasattr(tu, "is_flash_attn_greater_or_equal_2_10"):
-        tu.is_flash_attn_greater_or_equal_2_10 = lambda: False
-
-    try:
-        import transformers.models.internvl.processing_internvl as pi
-
-        if not hasattr(pi, "InternVLImagesKwargs"):
-            pi.InternVLImagesKwargs = getattr(pu, "ImagesKwargs", dict)
-        if not hasattr(pi, "InternVLProcessorKwargs"):
-            pi.InternVLProcessorKwargs = getattr(pu, "ProcessingKwargs", dict)
-    except ImportError:
-        pi_mod = types.ModuleType("transformers.models.internvl.processing_internvl")
-        pi_mod.InternVLImagesKwargs = getattr(pu, "ImagesKwargs", dict)
-        pi_mod.InternVLProcessorKwargs = getattr(pu, "ProcessingKwargs", dict)
-        sys.modules["transformers.models.internvl.processing_internvl"] = pi_mod
-
-    try:
-        import transformers.models.internvl.video_processing_internvl as vpi
-
-        if not hasattr(vpi, "InternVLVideoProcessor"):
-            vpi.InternVLVideoProcessor = type("InternVLVideoProcessor", (), {})
-    except ImportError:
-        vpi_mod = types.ModuleType("transformers.models.internvl.video_processing_internvl")
-        vpi_mod.InternVLVideoProcessor = type("InternVLVideoProcessor", (), {})
-        sys.modules["transformers.models.internvl.video_processing_internvl"] = vpi_mod
-
-
-def _drop_module_params_to_empty_device(mod: Any, dev: Any) -> None:
+def _clone_diffusers_output(obj: Any) -> Any:
+    """Clone tensors inside `diffusers` `BaseOutput` / `DiagonalGaussianDistribution` objects out of Arena-2."""
     import torch
 
-    for p in mod.parameters():
-        p.data = torch.empty(0, dtype=p.dtype, device=dev)
-    for b in mod.buffers():
-        b.data = b.data.to(dev)
-
-
-def load_internvlu_pipeline(
-    model_dir: Path,
-    vendor_dir: Path | None = None,
-    device_index: int = 0,
-    *,
-    defer_decoder_gpu: bool = False,
-    defer_vlm_gpu: bool = False,
-    drop_vlm_on_load: bool = False,
-    drop_vae_on_load: bool = False,
-) -> Any:
-    """Load `InternVLUPipeline` avoiding redundant GPU weight spikes when paging or fissioning (`c62ec05`)."""
-    import torch
-
-    if vendor_dir is None:
-        repo_vendor = Path(__file__).resolve().parents[3] / "data/internvlu_pkg"
-        if repo_vendor.is_dir():
-            vendor_dir = repo_vendor
-
-    _install_runtime_compat_shims(vendor_dir=vendor_dir)
-    from diffusers.models import AutoencoderKLQwenImage
-    from diffusers.schedulers import DPMSolverMultistepScheduler
-    from internvlu import InternVLUPipeline
-    from internvlu.diffusion import InternVLUGenerationDecoder
-    from internvlu.processing_internvlu import InternVLUProcessor
-    from internvlu.vlm import InternVLUChatModel
-    from internvlu.vlm.modeling_intern_vit import InternVisionModel
-
-    for cls_m in (InternVLUChatModel, InternVisionModel, InternVLUGenerationDecoder):
-        if not getattr(cls_m, "_ms_post_init_patched", False):
-            orig_init = cls_m.__init__
-
-            def _make_patched_init(fn):
-                def _patched_init(self, *a, **kw):
-                    fn(self, *a, **kw)
-                    if not hasattr(self, "all_tied_weights_keys") or "all_tied_weights_keys" not in self.__dict__:
-                        self.all_tied_weights_keys = {}
-
-                return _patched_init
-
-            cls_m.__init__ = _make_patched_init(orig_init)
-            cls_m._ms_post_init_patched = True
-
-    if not getattr(InternVLUProcessor, "_ms_proc_patched", False):
-        from internvlu.vlm.constants import IMG_CONTEXT_TOKEN, IMG_END_TOKEN, IMG_START_TOKEN
-
-        def _patched_proc_init(
-            self,
-            image_processor=None,
-            image_gen_processor=None,
-            tokenizer=None,
-            video_processor=None,
-            image_seq_length: int = 256,
-            chat_template: str | None = None,
-            blank_messages: dict | None = None,
-            **kwargs,
-        ) -> None:
-            if blank_messages is None:
-                blank_messages = {
-                    "text_blank_message": "Generate an image based on reference images.",
-                    "pure_blank_message": "Here is a random image <img_uncond>:",
-                }
-            self.image_seq_length = image_seq_length
-            self.start_image_token = IMG_START_TOKEN
-            self.end_image_token = IMG_END_TOKEN
-            self.image_token = IMG_CONTEXT_TOKEN
-            self.image_token_id = tokenizer.convert_tokens_to_ids(IMG_CONTEXT_TOKEN)
-            self.blank_messages = blank_messages
-            self.image_processor = image_processor
-            self.image_gen_processor = image_gen_processor
-            self.tokenizer = tokenizer
-            self.video_processor = video_processor
-            self.chat_template = chat_template
-            self.template_name = "qwen2_5-chat-v3"
-
-        def _patched_merge_kwargs(self, processing_kwargs_cls=None, tokenizer_init_kwargs=None, **kwargs):
-            if getattr(self, "tokenizer", None) is not None:
-                self.tokenizer.padding_side = kwargs.get("padding_side", "left")
-            text_kw = {
-                k: v
-                for k, v in kwargs.items()
-                if k in ("padding", "truncation", "max_length", "return_tensors", "add_special_tokens")
-            }
-            img_kw: dict[str, Any] = {"crop_to_patches": False}
-            if "return_tensors" in kwargs:
-                img_kw["return_tensors"] = kwargs["return_tensors"]
-            return {"text_kwargs": text_kw, "images_kwargs": img_kw, "videos_kwargs": {}}
-
-        InternVLUProcessor.__init__ = _patched_proc_init
-        InternVLUProcessor._merge_kwargs = _patched_merge_kwargs
-        InternVLUProcessor._ms_proc_patched = True
-
-    torch.cuda.set_device(device_index)
-    dev = torch.device(f"cuda:{device_index}")
-
-    def _load_bf16_pretrained(cls_obj: Any, sub_path: Path) -> Any:
-        try:
-            mod = cls_obj.from_pretrained(
-                str(sub_path),
-                dtype=torch.bfloat16,
-                low_cpu_mem_usage=False,
-                local_files_only=True,
-            )
-        except TypeError:
-            mod = cls_obj.from_pretrained(
-                str(sub_path),
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=False,
-                local_files_only=True,
-            )
-        # Explicitly cast floating-point parameters to BF16 (`transformers>=5` ignores `torch_dtype=`
-        # on custom `PreTrainedModel.__init__` submodules when `low_cpu_mem_usage=False`), while
-        # preserving FP32 rotary frequency buffers (`inv_freq` / `freqs`).
-        for p in mod.parameters():
-            if p.is_floating_point() and p.dtype != torch.bfloat16:
-                p.data = p.data.to(dtype=torch.bfloat16)
-        for bname, b in mod.named_buffers():
-            if b.is_floating_point() and b.dtype != torch.bfloat16 and "freq" not in bname.lower():
-                b.data = b.data.to(dtype=torch.bfloat16)
-        return mod
-
-    vlm = _load_bf16_pretrained(InternVLUChatModel, model_dir / "vlm")
-    generation_decoder = _load_bf16_pretrained(InternVLUGenerationDecoder, model_dir / "generation_decoder")
-    vae = _load_bf16_pretrained(AutoencoderKLQwenImage, model_dir / "vae")
-    scheduler = DPMSolverMultistepScheduler.from_pretrained(
-        str(model_dir / "scheduler"),
-        local_files_only=True,
-    )
-
-    class _MutableConfigDict(dict):
-        def __getattr__(self, name: str) -> Any:
-            try:
-                return self[name]
-            except KeyError as exc:
-                raise AttributeError(name) from exc
-
-        def __setattr__(self, name: str, value: Any) -> None:
-            self[name] = value
-
-    scheduler._internal_dict = _MutableConfigDict(dict(scheduler.config))
-
-    processor = InternVLUProcessor.from_pretrained(
-        str(model_dir / "processor"),
-        local_files_only=True,
-    )
-
-    lm = getattr(vlm, "language_model", None)
-    if lm is not None and hasattr(lm, "forward"):
-        orig_lm_fwd = lm.forward
-        sig_params = inspect.signature(orig_lm_fwd).parameters
-        if "padding_type" not in sig_params:
-            def _safe_lm_fwd(*a, **kw):
-                kw.pop("padding_type", None)
-                return orig_lm_fwd(*a, **kw)
-
-            lm.forward = _safe_lm_fwd
-        if getattr(lm, "generation_config", None) is not None and lm.generation_config.pad_token_id is None:
-            lm.generation_config.pad_token_id = processor.tokenizer.eos_token_id
-
-    pipe = InternVLUPipeline(
-        vlm=vlm,
-        generation_decoder=generation_decoder,
-        vae=vae,
-        scheduler=scheduler,
-        processor=processor,
-    )
-
-    if drop_vlm_on_load:
-        _drop_module_params_to_empty_device(pipe.vlm, dev)
-    elif defer_vlm_gpu:
-        for b in pipe.vlm.buffers():
-            b.data = b.data.to(dev)
-    else:
-        pipe.vlm.to(dev)
-
-    if drop_vae_on_load:
-        _drop_module_params_to_empty_device(pipe.vae, dev)
-    else:
-        pipe.vae.to(dev)
-
-    if defer_decoder_gpu:
-        # Keep 5 GiB decoder parameters on CPU for direct copy into NumaMemfdMirror / CPU offloader
-        # without ever touching GPU `cudaMalloc` during model load!
-        for b in pipe.generation_decoder.buffers():
-            b.data = b.data.to(dev)
-    else:
-        pipe.generation_decoder.to(dev)
-
-    # Materialize non-persistent plain tensor attributes (e.g. UnifiedMSRoPE.all_inv_freqs) (`c62ec05`)
-    for root_mod in (pipe.vlm, pipe.generation_decoder, pipe.vae):
-        for mod in root_mod.modules():
-            if hasattr(mod, "all_inv_freqs") and hasattr(mod, "axes_dim") and hasattr(mod, "theta"):
-                inv_f = getattr(mod, "all_inv_freqs", None)
-                if inv_f is None or getattr(inv_f, "is_meta", False) or inv_f.device != dev:
-                    inv_list = [
-                        1.0
-                        / torch.pow(
-                            mod.theta,
-                            torch.arange(0, dim, 2, device=dev, dtype=torch.float32).div(dim),
-                        )
-                        for dim in mod.axes_dim
-                    ]
-                    mod.all_inv_freqs = torch.cat(inv_list, dim=0).float()
-
-    pipe.vlm.eval()
-    pipe.generation_decoder.eval()
-    pipe.vae.eval()
-    gc.collect()
-    torch.cuda.empty_cache()
-    return pipe
+    if torch.is_tensor(obj):
+        return obj.clone()
+    # Inspect `diffusers.utils.BaseOutput` subclasses (`AutoencoderKLOutput`, `DecoderOutput`, ...)
+    # before plain `dict` because `BaseOutput` inherits from `OrderedDict`.
+    if hasattr(obj, "latent_dist"):
+        ld = obj.latent_dist
+        for attr in ("parameters", "mean", "logvar", "std", "var"):
+            val = getattr(ld, attr, None)
+            if torch.is_tensor(val):
+                setattr(ld, attr, val.clone())
+        if isinstance(obj, dict) and "latent_dist" in obj:
+            obj["latent_dist"] = ld
+        return obj
+    if hasattr(obj, "sample") and torch.is_tensor(obj.sample):
+        cloned = obj.sample.clone()
+        obj.sample = cloned
+        if isinstance(obj, dict) and "sample" in obj:
+            obj["sample"] = cloned
+        return obj
+    if hasattr(obj, "latents") and torch.is_tensor(obj.latents):
+        cloned = obj.latents.clone()
+        obj.latents = cloned
+        if isinstance(obj, dict) and "latents" in obj:
+            obj["latents"] = cloned
+        return obj
+    if any(torch.is_tensor(getattr(obj, attr, None)) for attr in ("parameters", "mean", "logvar", "std", "var")):
+        for attr in ("parameters", "mean", "logvar", "std", "var"):
+            val = getattr(obj, attr, None)
+            if torch.is_tensor(val):
+                setattr(obj, attr, val.clone())
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_clone_diffusers_output(x) for x in obj)
+    if isinstance(obj, list):
+        return [_clone_diffusers_output(x) for x in obj]
+    if isinstance(obj, dict):
+        if type(obj) is dict:
+            return {k: _clone_diffusers_output(v) for k, v in obj.items()}
+        for k, v in list(obj.items()):
+            cloned_v = _clone_diffusers_output(v)
+            obj[k] = cloned_v
+            if hasattr(obj, k):
+                try:
+                    setattr(obj, k, cloned_v)
+                except Exception:
+                    pass
+        return obj
+    return obj
 
 
 _DTYPE_NAME_MAP = {
@@ -469,8 +219,6 @@ def _trim_internvlu_generated_tokens(seq: Any, tokenizer: Any) -> list[int]:
                 if isinstance(tid, int) and tid >= 0 and tid != unk_id:
                     stop_ids.add(int(tid))
 
-    # Truncate right after the first semantic stop token (`eos` / `<|im_end|>` / `<img>`) when `pad_id != stop_id`,
-    # then strip trailing right-padding tokens.
     non_pad_stops = stop_ids - ({pad_id} if pad_id is not None else set())
     trimmed = raw_ids
     for idx, tid in enumerate(raw_ids):
@@ -483,7 +231,7 @@ def _trim_internvlu_generated_tokens(seq: Any, tokenizer: Any) -> list[int]:
     return trimmed
 
 
-class InternVLUCPTGAdapter(CPTGModelAdapter):
+class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
     """Production `InternVL-U` (`bridge_mllm_dit`) adapter running inside `MorphServeClusterEngine`."""
 
     architecture = "bridge_mllm_dit"
@@ -492,19 +240,32 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         self,
         rank: int,
         policy: Any,
-        model_dir: Path,
-        bench_root: Path,
+        model_dir: Path | str | None = None,
+        bench_root: Path | str | None = None,
         numa_node: int = 0,
+        *,
+        pipeline: Any | None = None,
+        device: Any | None = None,
     ) -> None:
-        import torch
-
         self.rank = int(rank)
         self.policy = policy
-        self.model_dir = Path(model_dir)
-        self.bench_root = Path(bench_root)
+        self.model_dir = Path(model_dir) if model_dir is not None else Path(".")
+        self.bench_root = Path(bench_root) if bench_root is not None else Path(".")
         self.numa_node = int(numa_node)
         self.role = policy.role_of(self.rank)
-        self.device = torch.device(f"cuda:{self.rank}")
+        self._init_gpu_lifecycle_state()
+        self.vlm_pager: LayerExpertPager | None = None
+        self._memory_plan: dict[str, Any] = {}
+        self._quota_constrained: bool = False
+
+        if device is not None:
+            self.device = device
+        elif pipeline is not None and getattr(pipeline, "device", None) is not None:
+            self.device = pipeline.device
+        else:
+            import torch
+
+            self.device = torch.device(f"cuda:{self.rank}")
 
         is_static_fission = policy.routing_mode == "static_nccl_fission"
         raw_frac = getattr(policy, "gpu_memory_fraction", None)
@@ -515,62 +276,55 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             and policy.use_expert_pager
             and ((raw_quota is not None and float(raw_quota) > 0.0) or (raw_frac is not None and float(raw_frac) < 0.999))
         )
-        defer_decoder = bool(
-            policy.use_expert_pager or policy.use_naive_offload or (is_static_fission and self.role == "und")
-        )
-        drop_vlm = bool(is_static_fission and self.role == "gen")
-        drop_vae = bool(is_static_fission and self.role == "und")
 
-        # Enforce startup cap immediately during `load_internvlu_pipeline` (even when `use_tripool_vmm=True`),
-        # then tighten PyTorch's fraction in `bind_runtime_resources` before `TriPoolVMM` allocates `cuMemCreate`!
-        if raw_frac is not None:
-            torch.cuda.set_per_process_memory_fraction(float(raw_frac), self.device)
+        if pipeline is not None:
+            self.pipe = pipeline
+        else:
+            import torch
 
-        vendor_p = Path(policy.vendor_dir) if getattr(policy, "vendor_dir", None) else None
-        self.pipe = load_internvlu_pipeline(
-            self.model_dir,
-            vendor_dir=vendor_p,
-            device_index=self.rank,
-            defer_decoder_gpu=defer_decoder,
-            defer_vlm_gpu=copage_vlm,
-            drop_vlm_on_load=drop_vlm,
-            drop_vae_on_load=drop_vae,
-        )
+            defer_decoder = bool(
+                policy.use_expert_pager or policy.use_naive_offload or (is_static_fission and self.role == "und")
+            )
+            drop_vlm = bool(is_static_fission and self.role == "gen")
+            drop_vae = bool(is_static_fission and self.role == "und")
 
-        self.pager: LayerExpertPager | None = None
-        self.vlm_pager: LayerExpertPager | None = None
-        self.naive_offloader: NaiveHostOffloader | None = None
-        self.vmm: TriPoolVMM | None = None
-        self.pacer: Any = None
-        self._ctx_store: dict[str, dict[str, Any]] = {}
-        self._vmm_initial_pool_mib: float = 0.0
-        self._memory_plan: dict[str, Any] = {}
-        self._quota_constrained: bool = False
-        self._max_reserved_mib = 0.0
-        self._max_pytorch_reserved_mib = 0.0
+            if raw_frac is not None and torch.cuda.is_available():
+                torch.cuda.set_per_process_memory_fraction(float(raw_frac), self.device)
 
-        dec_spec = ExpertPartitionSpec.for_internvlu(
-            self.pipe,
-            super_handle_mib=policy.super_handle_mib,
-            wrap_vae=policy.use_scoped_vae,
-        )
-        self.num_expert_layers = dec_spec.num_layers
+            vendor_p = Path(policy.vendor_dir) if getattr(policy, "vendor_dir", None) else None
+            self.pipe = load_internvlu_pipeline(
+                self.model_dir,
+                vendor_dir=vendor_p,
+                device_index=self.rank,
+                defer_decoder_gpu=defer_decoder,
+                defer_vlm_gpu=copage_vlm,
+                drop_vlm_on_load=drop_vlm,
+                drop_vae_on_load=drop_vae,
+            )
 
-        if is_static_fission:
-            if self.role == "und":
-                drop_partition_weights(dec_spec, device=self.device)
-        elif policy.use_naive_offload:
-            self.naive_offloader = NaiveHostOffloader(dec_spec, device=self.device)
-            self.naive_offloader.offload_to_cpu()
-        elif policy.use_expert_pager:
-            self.pager = LayerExpertPager(dec_spec, numa_node=self.numa_node)
-            if copage_vlm:
+        if getattr(self.pipe, "generation_decoder", None) is not None:
+            dec_spec = ExpertPartitionSpec.for_internvlu(
+                self.pipe,
+                super_handle_mib=policy.super_handle_mib,
+                wrap_vae=policy.use_scoped_vae,
+                vae_encode_restore="none",
+                vae_output_cloner=_clone_diffusers_output,
+            )
+            self.num_expert_layers = dec_spec.num_layers
+            self.bind_expert_partition(
+                dec_spec,
+                drop_for_fission=(self.role == "und"),
+                vae_output_cloner=_clone_diffusers_output,
+            )
+            if copage_vlm and self.pager is not None and getattr(self.pipe, "vlm", None) is not None:
                 vlm_spec = ExpertPartitionSpec.for_internvlu_vlm(
                     self.pipe,
                     super_handle_mib=policy.super_handle_mib,
                     install_module_hooks=False,
                 )
                 self.vlm_pager = LayerExpertPager(vlm_spec, numa_node=self.numa_node)
+        else:
+            self.num_expert_layers = 20
 
     @property
     def total_mirror_bytes(self) -> int:
@@ -600,19 +354,6 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             if self.vlm_pager is not None:
                 self.vlm_pager.offload_to_host_mirror()
 
-    def _vmm_physical_pool_mib(self) -> float:
-        if self.vmm is None:
-            return 0.0
-        st = self.vmm.stats_dict()
-        if "pool_total_bytes" in st:
-            return float(st["pool_total_bytes"]) / MIB
-        if "physical_pool_bytes" in st:
-            return float(st["physical_pool_bytes"]) / MIB
-        overflow_b = int(st.get("overflow_creates", 0)) * int(
-            st.get("super_handle_bytes", int(self.policy.super_handle_mib) * MIB)
-        )
-        return self._vmm_initial_pool_mib + float(overflow_b) / MIB
-
     def available_kv_bytes(self, *, for_dit: bool = False) -> int:
         import torch
 
@@ -622,7 +363,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 has_pageable_experts=(self.pager is not None),
                 for_dit=for_dit,
             )
-        if not torch.cuda.is_available():
+        if not torch.cuda.is_available() or getattr(self.device, "type", "cuda") != "cuda":
             return 0
         free_drv, total_drv = torch.cuda.mem_get_info(self.device)
         if getattr(self.policy, "gpu_memory_fraction", None) is not None:
@@ -636,12 +377,17 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
         self.pacer = pacer
         gc.collect()
-        torch.cuda.empty_cache()
-
-        free_b, total_b = torch.cuda.mem_get_info(self.device)
-        total_dev_mib = float(total_b / MIB)
-        free_dev_mib = float(free_b / MIB)
-        base_pt_mib = float(torch.cuda.memory_allocated(self.device) / MIB)
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if is_cuda:
+            torch.cuda.empty_cache()
+            free_b, total_b = torch.cuda.mem_get_info(self.device)
+            total_dev_mib = float(total_b / MIB)
+            free_dev_mib = float(free_b / MIB)
+            base_pt_mib = float(torch.cuda.memory_allocated(self.device) / MIB)
+        else:
+            total_dev_mib = 40_960.0
+            free_dev_mib = 32_768.0
+            base_pt_mib = 0.0
 
         if self.policy.use_tripool_vmm:
             plan = compute_internvlu_memory_plan(
@@ -658,7 +404,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             )
             self._memory_plan = plan
             self._quota_constrained = bool(plan["quota_constrained"])
-            if plan["pytorch_memory_fraction"] is not None:
+            if is_cuda and plan["pytorch_memory_fraction"] is not None:
                 torch.cuda.set_per_process_memory_fraction(float(plan["pytorch_memory_fraction"]), self.device)
 
             self._vmm_initial_pool_mib = float(plan["vmm_physical_pool_mib"])
@@ -687,11 +433,13 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         else:
             self._quota_constrained = getattr(self.policy, "gpu_memory_fraction", None) is not None
 
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
-        self._max_pytorch_reserved_mib = pt_mib
-        self._max_reserved_mib = pt_mib + self._vmm_physical_pool_mib()
+        if is_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self.device)
+            pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
+            self._max_pytorch_reserved_mib = pt_mib
+            self._max_reserved_mib = pt_mib + self._vmm_physical_pool_mib()
+        self._update_hwm()
         return {
             "resident_alpha": self.resident_alpha(),
             "reserved_mib": round(self._max_pytorch_reserved_mib, 2),
@@ -704,45 +452,6 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
     def warmup(self) -> None:
         self.reset_peak_memory_stats()
-
-    def reset_peak_memory_stats(self) -> None:
-        import torch
-
-        gc.collect()
-        if not torch.cuda.is_available():
-            self._max_pytorch_reserved_mib = 0.0
-            self._max_driver_used_mib = self._vmm_physical_pool_mib()
-            self._max_reserved_mib = self._max_driver_used_mib
-            return
-        torch.cuda.synchronize(self.device)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(self.device)
-        pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
-        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
-        drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB) if int(total_drv) > 0 else (pt_mib + self._vmm_physical_pool_mib())
-        self._max_pytorch_reserved_mib = pt_mib
-        self._max_driver_used_mib = drv_used_mib
-        self._max_reserved_mib = drv_used_mib
-
-    def _update_hwm(self) -> None:
-        import torch
-
-        if not torch.cuda.is_available():
-            return
-        cur = float(torch.cuda.memory_reserved(self.device) / MIB)
-        pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
-        pt_peak = max(cur, pk)
-        self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
-        free_drv, total_drv = torch.cuda.mem_get_info(self.device)
-        if int(total_drv) > 0:
-            drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB)
-            tot_mib = float(int(total_drv) / MIB)
-            inst_comb_mib = min(tot_mib, cur + self._vmm_physical_pool_mib())
-            phys_now = max(drv_used_mib, inst_comb_mib)
-            self._max_driver_used_mib = max(getattr(self, "_max_driver_used_mib", 0.0), drv_used_mib)
-            self._max_reserved_mib = max(self._max_reserved_mib, phys_now)
-        else:
-            self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
 
     def _load_pil_path(self, rel_or_abs: str) -> Any:
         from PIL import Image
@@ -763,7 +472,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
     @contextmanager
     def _vlm_execution_scope(self):
-        """Pin & materialize `vlm_pager` during VLM execution, holding H2D pacer ONLY during H2D weight loads."""
+        """Pin & materialize `vlm_pager` during VLM execution, holding H2D pacer only during H2D weight loads."""
         if self.vlm_pager is None or self.vmm is None:
             yield
             return
@@ -803,7 +512,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             self._ctx_store[ctx_id] = {"prompt": prompt, "pil_img": pil_img, "bridge_bytes": 4096}
             return 4096
 
-        if self._quota_constrained:
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
 
         h = int(cmd.get("height", 512))
@@ -837,9 +547,10 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             )
             del inp, v_out
             meta, flat = pack_internvlu_bridge_state(diff_inp, device=self.device)
-        torch.cuda.current_stream(self.device).synchronize()
-        if self._quota_constrained:
-            torch.cuda.empty_cache()
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
+            if self._quota_constrained:
+                torch.cuda.empty_cache()
         b_bytes = int(meta["total_bytes"])
         self._ctx_store[ctx_id] = {
             "prompt": prompt,
@@ -860,7 +571,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         entry = self._ctx_store[ctx_id]
         prompt = entry["prompt"]
         pil_img = entry.get("pil_img")
-        if self._quota_constrained:
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
         t0 = time.perf_counter()
         with self._vlm_execution_scope(), torch.inference_mode():
@@ -871,13 +583,14 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 max_new_tokens=int(max_tokens),
                 do_sample=False,
             )
-        torch.cuda.current_stream(self.device).synchronize()
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t0) * 1000.0
         tok_seq = _trim_internvlu_generated_tokens(out.generate_output[0], self.pipe.tokenizer)
         n_tok = max(1, int(len(tok_seq)))
         txt = self.pipe.tokenizer.decode(tok_seq, skip_special_tokens=True) if tok_seq else ""
         per_tok = dt_ms / float(n_tok)
-        if self._quota_constrained:
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
         self._update_hwm()
         return {
@@ -898,12 +611,10 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             return []
 
         if any(bool(c.get("prepare_for_dit")) for c in batch_cmds):
-            # Visual-CoT (`cot_then_dit`): decode CoT text FIRST, then condition the diffusion bridge state on it!
             results: list[dict[str, Any]] = []
             for cmd in batch_cmds:
                 cid = str(cmd["ctx_id"])
-                recv_s = float(cmd.get("_worker_recv_s", 0.0))
-                enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
+                enq_s = self.normalized_enqueue_time_s(cmd)
                 t_cmd0 = time.perf_counter()
                 if not cmd.get("_skip_prepare", False):
                     self.prepare_turn(cid, dict(cmd, prepare_for_dit=False))
@@ -938,7 +649,8 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             prompts.append(str(self._ctx_store[cid]["prompt"]))
             max_toks.append(max(1, int(cmd.get("max_ar_tokens", 32))))
 
-        if self._quota_constrained:
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
 
         t_gen0 = time.perf_counter()
@@ -950,9 +662,10 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 max_new_tokens=max(max_toks),
                 do_sample=False,
             )
-        torch.cuda.current_stream(self.device).synchronize()
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t_gen0) * 1000.0
-        if self._quota_constrained:
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
         self._update_hwm()
 
@@ -966,8 +679,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         per_step_ms = dt_ms / float(max_steps_executed)
         results = []
         for idx, cmd in enumerate(batch_cmds):
-            recv_s = float(cmd.get("_worker_recv_s", 0.0))
-            enq_s = recv_s if recv_s > 0.0 else float(cmd.get("enqueue_time_s", 0.0))
+            enq_s = self.normalized_enqueue_time_s(cmd)
             q_wait_ms = max(0.0, (t_start - enq_s) * 1000.0) if enq_s > 0.0 else 0.0
             seq = trimmed_seqs[idx]
             n_tok = max(1, int(len(seq)))
@@ -1045,178 +757,65 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         seed = int(cmd.get("seed", 42))
         save_tmp_path = cmd.get("save_tmp_image_path")
 
-        if self._quota_constrained:
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
 
         t0 = time.perf_counter()
         if self.naive_offloader is not None:
             self.naive_offloader.swap_in_sync()
 
-        pacer_cm = None
-        if (
-            self.pacer is not None
-            and self.pager is not None
-            and self.vmm is not None
-            and self.vmm.expert_resident_count(self.pager.expert_id) < self.pager.num_layers
-        ):
-            pacer_cm = self.pacer.acquire_process_slot(self.rank)
-
-        pacer_lock = threading.Lock()
-        pacer_active = {"held": False}
-        h2d_release_thread: threading.Thread | None = None
-
-        def _release_pacer_once() -> None:
-            with pacer_lock:
-                if pacer_cm is None or not pacer_active["held"]:
-                    return
-                pacer_active["held"] = False
-                pacer_cm.__exit__(None, None, None)
-
         gen = torch.Generator(device=self.device).manual_seed(seed)
         try:
-            if pacer_cm is not None:
-                pacer_cm.__enter__()
-                pacer_active["held"] = True
             if self.vlm_pager is not None and self.vmm is not None and self.vlm_pager.expert_id >= 0:
                 self.vmm.set_expert_pinned(self.vlm_pager.expert_id, False)
             with torch.inference_mode():
-                if self.pager is not None:
-                    # Pre-encode `conditional_image` (`dit_edit`) via QwenImage VAE OUTSIDE `generation_mode`
-                    # so `run_in_transient_scope` never contends with concurrent background decoder H2D streaming
-                    # under strict 12 GiB quotas (`allow_overflow=False`), while preserving exact VAE math.
-                    preencoded_cond_latents: Any = None
-                    cond_img = diff_inp.get("conditional_image")
-                    if cond_img is not None:
-                        cat_cond = torch.cat(cond_img) if isinstance(cond_img, list) else cond_img
-                        if torch.is_tensor(cat_cond) and cat_cond.shape[0] > 0:
-                            if self._quota_constrained:
-                                torch.cuda.empty_cache()
-                            if self.vmm is not None and self.pager.expert_id >= 0:
-                                self.vmm.set_expert_pinned(self.pager.expert_id, False)
-                            if (
-                                self._quota_constrained
-                                and cat_cond.shape[0] == 2
-                                and torch.equal(cat_cond[0], cat_cond[1])
-                            ):
-                                lat0 = self.pipe.image_pipeline.pixels_to_latents(cat_cond[:1])
-                                preencoded_cond_latents = torch.cat([lat0, lat0], dim=0)
-                            elif self._quota_constrained and cat_cond.shape[0] > 1:
-                                preencoded_cond_latents = torch.cat(
-                                    [
-                                        self.pipe.image_pipeline.pixels_to_latents(cat_cond[idx : idx + 1])
-                                        for idx in range(int(cat_cond.shape[0]))
-                                    ],
-                                    dim=0,
-                                )
-                            else:
-                                preencoded_cond_latents = self.pipe.image_pipeline.pixels_to_latents(cat_cond)
-                            del cat_cond
-                            if self._quota_constrained:
-                                torch.cuda.empty_cache()
-                            # If post-encode reload already materialized all decoder layers, release H2D pacer now.
-                            if (
-                                pacer_active["held"]
-                                and self.vmm is not None
-                                and self.vmm.expert_resident_count(self.pager.expert_id) >= self.pager.num_layers
-                            ):
-                                _release_pacer_once()
-
-                    orig_pixels_to_latents = None
-                    if preencoded_cond_latents is not None:
-                        orig_pixels_to_latents = self.pipe.image_pipeline.pixels_to_latents
-                        _cached_cond_latents = preencoded_cond_latents
-                        self.pipe.image_pipeline.pixels_to_latents = (
-                            lambda _x, max_bs=32, _lat=_cached_cond_latents: _lat
-                        )
-                    try:
-                        with self.pager.generation_mode(prefetch_all=True):
-                            # Release `HalfNodeH2DPacer` immediately once decoder H2D DMA finishes on `h2d_stream_`
-                            # so Steps 1..15 + QwenImage VAE decode run 100% concurrently across all 4 GPUs/half-node!
-                            if (
-                                pacer_active["held"]
-                                and self.vmm is not None
-                                and callable(getattr(self.vmm, "sync_expert_h2d", None))
-                                and not bool(getattr(self.vmm, "is_simulated", False))
-                            ):
-                                dec_eid = int(self.pager.expert_id)
-                                vmm_ref = self.vmm
-
-                                def _wait_dec_h2d_and_release() -> None:
-                                    try:
-                                        vmm_ref.sync_expert_h2d(dec_eid)
-                                    except Exception:
-                                        pass
-                                    finally:
-                                        _release_pacer_once()
-
-                                h2d_release_thread = threading.Thread(
-                                    target=_wait_dec_h2d_and_release,
-                                    name=f"ms-ivlu-pacer-rel-{self.rank}",
-                                    daemon=True,
-                                )
-                                h2d_release_thread.start()
-                            # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
-                            # `generation_decoder.prepare_forward_input` BEFORE `transformer_blocks[0]`'s pre-hook!
-                            self.pager.wait_layer_if_needed(0, "prepare_forward_input")
-                            latents_out = self.pipe.image_pipeline(
-                                **diff_inp,
-                                all_cfg_scale=4.5,
-                                part_cfg_scale=2.0,
-                                num_inference_steps=steps,
-                                num_images_per_prompt=1,
-                                use_resolution_binning=False,
-                                height=gh,
-                                width=gw,
-                                generator=gen,
-                                output_type="latent",
-                            ).images
-                    finally:
-                        if orig_pixels_to_latents is not None:
-                            self.pipe.image_pipeline.pixels_to_latents = orig_pixels_to_latents
-                        preencoded_cond_latents = None
-                    if h2d_release_thread is not None:
-                        h2d_release_thread.join(timeout=10.0)
-                        h2d_release_thread = None
-                    _release_pacer_once()
-                    # Run QwenImage VAE decode OUTSIDE `generation_mode` so decoder blocks are unpinned
-                    # under 12 GiB quota while staying 100% resident under ample 40/80 GB `super_pool`!
+                if self.pager is not None and self.vmm is not None:
+                    with self.pager.generation_mode(prefetch_all=True, pacer=self.pacer, rank=self.rank):
+                        # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
+                        # `generation_decoder.prepare_forward_input` before `transformer_blocks[0]`'s pre-hook.
+                        self.pager.wait_layer_if_needed(0, "prepare_forward_input")
+                        latents_out = self.pipe.image_pipeline(
+                            **diff_inp,
+                            all_cfg_scale=4.5,
+                            part_cfg_scale=2.0,
+                            num_inference_steps=steps,
+                            num_images_per_prompt=1,
+                            use_resolution_binning=False,
+                            height=gh,
+                            width=gw,
+                            generator=gen,
+                            output_type="latent",
+                        ).images
+                    # Run QwenImage VAE decode outside `generation_mode` so decoder blocks remain unpinned
+                    # under strict 12 GiB quotas while staying 100% resident under ample 40/80 GB `super_pool`.
                     lat_bf16 = latents_out.to(torch.bfloat16)
                     del latents_out
-                    if self._quota_constrained:
+                    if self._quota_constrained and is_cuda:
                         torch.cuda.empty_cache()
                     imgs_t = self.pipe.image_pipeline.latents_to_pixels(lat_bf16)
                     del lat_bf16
                 else:
-                    imgs_t = self.pipe.image_pipeline(
+                    call_kwargs: dict[str, Any] = {
                         **diff_inp,
-                        all_cfg_scale=4.5,
-                        part_cfg_scale=2.0,
-                        num_inference_steps=steps,
-                        num_images_per_prompt=1,
-                        use_resolution_binning=False,
-                        height=gh,
-                        width=gw,
-                        generator=gen,
-                        generator_device=None,
-                    ).images if "generator_device" in inspect.signature(self.pipe.image_pipeline.__call__).parameters else self.pipe.image_pipeline(
-                        **diff_inp,
-                        all_cfg_scale=4.5,
-                        part_cfg_scale=2.0,
-                        num_inference_steps=steps,
-                        num_images_per_prompt=1,
-                        use_resolution_binning=False,
-                        height=gh,
-                        width=gw,
-                        generator=gen,
-                    ).images
+                        "all_cfg_scale": 4.5,
+                        "part_cfg_scale": 2.0,
+                        "num_inference_steps": steps,
+                        "num_images_per_prompt": 1,
+                        "use_resolution_binning": False,
+                        "height": gh,
+                        "width": gw,
+                        "generator": gen,
+                    }
+                    if "generator_device" in inspect.signature(self.pipe.image_pipeline.__call__).parameters:
+                        call_kwargs["generator_device"] = None
+                    imgs_t = self.pipe.image_pipeline(**call_kwargs).images
         finally:
-            if h2d_release_thread is not None:
-                h2d_release_thread.join(timeout=10.0)
-            _release_pacer_once()
             if self.naive_offloader is not None:
                 self.naive_offloader.drop_from_gpu()
 
-        torch.cuda.current_stream(self.device).synchronize()
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
         release_after_dit = bool(cmd.get("release_after_dit", False))
         if (not release_after_dit) or save_tmp_path:
@@ -1232,7 +831,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
                 pil_img.save(save_tmp_path, format="PNG")
         del imgs_t
-        if self._quota_constrained:
+        if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
 
         self._update_hwm()
@@ -1246,11 +845,6 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             "yield_count": 0,
         }
 
-    def set_residency_alpha(self, alpha: float) -> float:
-        if self.pager is not None and self.vmm is not None:
-            self.pager.set_residency_alpha(float(alpha))
-        return self.resident_alpha()
-
     def reset_for_new_suite(self) -> float:
         if self.vmm is not None and self.vlm_pager is not None:
             if self.pager is not None:
@@ -1258,15 +852,7 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             self.vlm_pager.set_residency_alpha(float(getattr(self, "_initial_vlm_alpha", 1.0)))
             self.reset_peak_memory_stats()
             return self.resident_alpha()
-        target = float(getattr(self, "_initial_bound_alpha", self.policy.initial_alphas.get(self.rank, 1.0)))
-        alpha_now = self.set_residency_alpha(target)
-        self.reset_peak_memory_stats()
-        return alpha_now
-
-    def resident_alpha(self) -> float:
-        if self.pager is not None and self.vmm is not None:
-            return round(self.pager.resident_alpha(), 3)
-        return round(float(self.policy.initial_alphas.get(self.rank, 1.0)), 3)
+        return super().reset_for_new_suite()
 
     def release_context(self, ctx_id: str) -> None:
         import torch
@@ -1276,23 +862,9 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
             torch.cuda.empty_cache()
 
     def memory_and_vmm_stats(self) -> dict[str, Any]:
-        self._update_hwm()
-        vmm_st = self.vmm.stats_dict() if self.vmm is not None else {}
-        return {
-            "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
-            "combined_physical_mib": round(self._max_reserved_mib, 2),
-            "nvml_peak_used_mib": round(getattr(self, "_max_driver_used_mib", 0.0) or self._max_reserved_mib, 2),
-            "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
-            "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
-            "vmm_stats": vmm_st,
-            "active_contexts": len(self._ctx_store),
-            "kv_free_bytes": self.available_kv_bytes(),
-            "swapped_kv_contexts": 0,
-            "kv_host_swap_outs": int(vmm_st.get("kv_swap_outs_total", 0)),
-            "kv_host_swap_ins": int(vmm_st.get("kv_swap_ins_total", 0)),
-            "kv_host_pinned_bytes": int(vmm_st.get("kv_swapped_bytes_current", 0)),
-            "memory_plan": dict(self._memory_plan),
-        }
+        stats = super().memory_and_vmm_stats()
+        stats["memory_plan"] = dict(self._memory_plan)
+        return stats
 
     def close(self) -> None:
         import torch
@@ -1307,6 +879,9 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         if self.naive_offloader is not None:
             self.naive_offloader.close()
             self.naive_offloader = None
+        if self.fission_dropper is not None:
+            self.fission_dropper.close()
+            self.fission_dropper = None
         if self.vmm is not None:
             self.vmm.shutdown()
             self.vmm = None

@@ -62,6 +62,7 @@ CudaDriver::CudaDriver() {
     load_sym(lib_, cuDevicePrimaryCtxRelease, "cuDevicePrimaryCtxRelease_v2", "cuDevicePrimaryCtxRelease");
     load_sym(lib_, cuCtxSetCurrent, "cuCtxSetCurrent");
     load_sym(lib_, cuCtxGetCurrent, "cuCtxGetCurrent");
+    load_sym(lib_, cuCtxGetDevice, "cuCtxGetDevice");
     load_sym(lib_, cuCtxSynchronize, "cuCtxSynchronize");
     load_sym(lib_, cuMemGetInfo, "cuMemGetInfo_v2", "cuMemGetInfo");
 
@@ -117,19 +118,36 @@ HostCudaPinner& HostCudaPinner::instance() {
     return pinner;
 }
 
-void HostCudaPinner::ensure_ctx_locked(CudaDriver& drv) {
+bool HostCudaPinner::ensure_ctx_locked(CudaDriver& drv, int device) {
     drv.check(drv.cuInit(0), "cuInit(0)");
     CUcontext cur = nullptr;
     drv.check(drv.cuCtxGetCurrent(&cur), "cuCtxGetCurrent");
-    if (!cur) {
-        if (!retained_ctx_) {
-            CUdevice dev0 = 0;
-            drv.check(drv.cuDeviceGet(&dev0, 0), "cuDeviceGet(0)");
-            drv.check(drv.cuDevicePrimaryCtxRetain(&retained_ctx_, dev0), "cuDevicePrimaryCtxRetain");
-            retained_dev_ = dev0;
+    if (cur) {
+        CUdevice cur_dev = 0;
+        if (drv.cuCtxGetDevice(&cur_dev) == CUDA_SUCCESS) {
+            if (device < 0) {
+                return false;
+            }
+            CUdevice target_dev = 0;
+            drv.check(drv.cuDeviceGet(&target_dev, device), "cuDeviceGet");
+            if (cur_dev == target_dev) {
+                return false;
+            }
         }
-        drv.check(drv.cuCtxSetCurrent(retained_ctx_), "cuCtxSetCurrent");
+        // `CU_MEMHOSTREGISTER_PORTABLE` pins host memory across all CUDA contexts/devices;
+        // reuse the caller's active context whenever it already exists.
+        return false;
     }
+
+    const int target_idx = (device >= 0) ? device : 0;
+    if (!retained_ctx_) {
+        CUdevice dev = 0;
+        drv.check(drv.cuDeviceGet(&dev, target_idx), "cuDeviceGet");
+        drv.check(drv.cuDevicePrimaryCtxRetain(&retained_ctx_, dev), "cuDevicePrimaryCtxRetain");
+        retained_dev_ = dev;
+    }
+    drv.check(drv.cuCtxSetCurrent(retained_ctx_), "cuCtxSetCurrent");
+    return true;
 }
 
 void HostCudaPinner::release_ctx_if_idle_locked(CudaDriver& drv) noexcept {
@@ -143,19 +161,20 @@ void HostCudaPinner::release_ctx_if_idle_locked(CudaDriver& drv) noexcept {
     }
 }
 
-int HostCudaPinner::register_host(void* ptr, size_t nbytes) {
+int HostCudaPinner::register_host(void* ptr, size_t nbytes, int device) {
     if (!ptr || nbytes == 0) return -1;
     std::lock_guard<std::mutex> lock(mu_);
     try {
         auto& drv = CudaDriver::instance();
-        ensure_ctx_locked(drv);
+        const bool used_retained = ensure_ctx_locked(drv, device);
         try {
             drv.check(drv.cuMemHostRegister(ptr, nbytes, CU_MEMHOSTREGISTER_PORTABLE), "cuMemHostRegister");
         } catch (...) {
             release_ctx_if_idle_locked(drv);
             throw;
         }
-        if (retained_ctx_) {
+        pin_used_retained_ctx_[ptr] = used_retained;
+        if (used_retained) {
             ++active_pins_;
         }
         return 0;
@@ -174,10 +193,15 @@ int HostCudaPinner::unregister_host(void* ptr) noexcept {
         if (drv.cuCtxGetCurrent(&cur) == CUDA_SUCCESS && !cur && retained_ctx_) {
             drv.cuCtxSetCurrent(retained_ctx_);
         }
-        CUresult rc = drv.cuMemHostUnregister(ptr);
-        if (active_pins_ > 0) {
-            --active_pins_;
-            release_ctx_if_idle_locked(drv);
+        const CUresult rc = drv.cuMemHostUnregister(ptr);
+        auto it = pin_used_retained_ctx_.find(ptr);
+        if (it != pin_used_retained_ctx_.end()) {
+            const bool used_retained = it->second;
+            pin_used_retained_ctx_.erase(it);
+            if (used_retained && active_pins_ > 0) {
+                --active_pins_;
+                release_ctx_if_idle_locked(drv);
+            }
         }
         return (rc == CUDA_SUCCESS) ? 0 : -1;
     } catch (...) {

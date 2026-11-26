@@ -10,3 +10,9 @@ requires-python = ">=3.10"
 
 [tool.setuptools.packages.find]
 where = ["python"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+markers = [
+    "slow: slow deploy/build/packaging contract tests (skip with -m 'not slow')",
+]

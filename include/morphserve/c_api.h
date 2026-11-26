@@ -8,6 +8,13 @@
 extern "C" {
 #endif
 
+typedef enum MsErrorCode {
+    MS_OK = 0,
+    MS_ERR_RUNTIME = 1,
+    MS_ERR_OOM = 2,
+    MS_ERR_INVALID_ARG = 3
+} MsErrorCode;
+
 // Must match `morphserve::vmm::UnifiedVmmStatsPod` layout byte-for-byte.
 typedef struct UnifiedVmmStatsC {
     uint64_t min_granularity_bytes;
@@ -92,6 +99,7 @@ typedef struct ms_ledger_handle ms_ledger_t;
 
 // Error handling & heap string release
 const char* ms_last_error(void);
+int ms_last_error_code(void);
 void ms_free_cstr(char* p);
 
 // --- Instance-owned TriPoolVMM C API ---
@@ -116,6 +124,7 @@ int ms_vmm_kv_free_page(ms_vmm_t* h, int32_t slot_idx, void* stream);
 uint64_t ms_vmm_kv_session_create(ms_vmm_t* h);
 void ms_vmm_kv_session_destroy(ms_vmm_t* h, uint64_t session_id);
 void ms_vmm_kv_session_touch(ms_vmm_t* h, uint64_t session_id);
+void ms_vmm_kv_session_set_pinned(ms_vmm_t* h, uint64_t session_id, int pinned);
 int ms_vmm_kv_session_mark_active(ms_vmm_t* h, uint64_t session_id, void* stream);
 size_t ms_vmm_kv_session_mark_thinking(
     ms_vmm_t* h,
@@ -131,10 +140,25 @@ size_t ms_vmm_reclaim_thinking_kv_bytes(
     int sync,
     uint64_t exclude_session_id,
     void* stream);
+size_t ms_vmm_reclaim_thinking_kv_bytes_multi(
+    ms_vmm_t* h,
+    size_t target_reclaim_bytes,
+    int sync,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
+    void* stream);
 size_t ms_vmm_maybe_evict_watermark(
     ms_vmm_t* h,
     int sync,
     uint64_t exclude_session_id,
+    size_t extra_needed_bytes,
+    int for_dit,
+    void* stream);
+size_t ms_vmm_maybe_evict_watermark_multi(
+    ms_vmm_t* h,
+    int sync,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
     size_t extra_needed_bytes,
     int for_dit,
     void* stream);
@@ -176,10 +200,21 @@ int ms_vmm_expert_evict_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* s
 int ms_vmm_expert_evict_range(ms_vmm_t* h, int expert_id, int start_layer, int end_layer_exclusive, void* stream);
 int ms_vmm_expert_is_resident(ms_vmm_t* h, int expert_id, int layer_idx);
 int ms_vmm_expert_resident_count(ms_vmm_t* h, int expert_id);
+size_t ms_vmm_ensure_expert_headroom(
+    ms_vmm_t* h,
+    int expert_id,
+    size_t needed_bytes,
+    const uint64_t* exclude_session_ids,
+    size_t num_excludes,
+    void* stream);
 
 // Direct CUDA driver HtoD / DtoH copy helpers for non-PyTorch raw VMM VA verification
 int ms_cuda_memcpy_htod(int device, uint64_t dst_va, const void* src_host, size_t nbytes);
 int ms_cuda_memcpy_dtoh(int device, void* dst_host, uint64_t src_va, size_t nbytes);
+
+// --- PyTorch `CUDAPluggableAllocator` Entrypoints ---
+void* tripool_alloc(ssize_t size, int device, void* stream);
+void tripool_free(void* ptr, ssize_t size, int device, void* stream);
 
 // --- NumaMemfdMirror C API ---
 ms_mirror_t* ms_mirror_create(
@@ -229,7 +264,6 @@ int ms_pacer_acquire_process_flock(ms_pacer_t* p, int gpu_id, int* out_group_id)
 void ms_pacer_release_process_flock(int fd);
 
 // --- PeerByteTransport (`NcclPeerAdapter`, `TcpPeerAdapter`, `InMemoryPeerAdapter`) C API ---
-int ms_find_free_tcp_port(void);
 int ms_nccl_generate_uid(const char* hint_lib_path, uint8_t out_uid_128[128]);
 ms_transport_t* ms_nccl_create(
     int rank,
@@ -237,7 +271,6 @@ ms_transport_t* ms_nccl_create(
     const uint8_t uid_128[128],
     int device_index,
     const char* hint_lib_path);
-uint64_t ms_nccl_transfer_stream(const ms_transport_t* t);
 
 ms_transport_t* ms_tcp_create(int rank, int world_size, const char* bind_host);
 int ms_tcp_bound_port(const ms_transport_t* t);
@@ -303,6 +336,9 @@ int ms_edf_select_microbatch(
 
 // --- Control Plane, Router, BudgetPlanner, Ledger & Simulator JSON/POD C API ---
 char* ms_policy_from_preset_json(const char* policy_name, int num_gpus, const char* overrides_json);
+char* ms_policy_build_ablation_configs_json(int num_gpus, const char* overrides_json);
+char* ms_policy_build_static_split_configs_json(int num_gpus, const char* overrides_json);
+char* ms_topology_default_operator_profile_json(void);
 char* ms_topology_a100_default_json(void);
 char* ms_topology_multinode_json(
     int world_size,
@@ -356,10 +392,13 @@ void ms_router_update_telemetry(
     int64_t kv_free_bytes,
     int has_seq,
     int64_t telemetry_seq);
+void ms_router_reserve_ar_queue(ms_router_t* r, int gpu_id, double est_ar_ms);
+void ms_router_release_ar_queue(ms_router_t* r, int gpu_id, double est_ar_ms);
 int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json);
 int ms_router_select_static_gen_gpu(const ms_router_t* r, const char* req_json);
 int ms_router_select_oom_retry_gpu(const ms_router_t* r, const char* req_json);
 char* ms_router_decide_json(const ms_router_t* r, const char* req_json);
+char* ms_router_plan_transition_readonly_json(const ms_router_t* r, const char* req_json);
 char* ms_router_plan_and_reserve_json(ms_router_t* r, const char* req_json);
 char* ms_router_route_batch_json(ms_router_t* r, const char* req_json);
 void ms_router_reserve_kv_bytes(ms_router_t* r, int gpu_id, int64_t reserved_kv_bytes);
@@ -380,6 +419,11 @@ double ms_router_crossover_kv_mib(
     int src_gpu,
     int dst_gpu);
 
+ms_ctrl_t* ms_ctrl_create(const char* policy_json, const char* topology_json, ms_router_t* opt_router);
+void ms_ctrl_destroy(ms_ctrl_t* c);
+char* ms_ctrl_plan_turn_transition_json(ms_ctrl_t* c, const char* req_json);
+char* ms_ctrl_plan_turn_transition_readonly_json(const ms_ctrl_t* c, const char* req_json);
+char* ms_ctrl_evaluate_session_slos_json(const char* policy_json, const char* req_json);
 double ms_ctrl_deterministic_think_s(const char* session_id, int turn_idx, double lo_s, double hi_s);
 double ms_ctrl_deterministic_think_dist_s(
     const char* session_id,
@@ -417,80 +461,6 @@ char* ms_sim_point_json(const char* req_json);
 char* ms_sim_evaluate_real_json(const char* req_json);
 char* ms_sim_h100_study_json(const char* req_json);
 char* ms_sim_sweep_json(const char* req_json);
-
-// --- Legacy `tripool_*` C ABI (`CUDAPluggableAllocator` & Phase-0/1 binary compatibility) ---
-typedef struct TripoolPhase0StatsC {
-    uint64_t min_granularity_bytes;
-    uint64_t handle_bytes;
-    uint64_t pool_total_handles;
-    uint64_t pool_free_handles;
-    uint64_t mapped_handles_current;
-    uint64_t mapped_handles_peak;
-    uint64_t live_allocs_current;
-    uint64_t overflow_creates;
-    uint64_t alloc_calls;
-    uint64_t free_calls;
-    uint64_t scope_flushes;
-    double total_map_us;
-    double total_unmap_us;
-    double total_sync_us;
-} TripoolPhase0StatsC;
-
-int tripool_init_ex(int device, size_t pool_mib, size_t va_gib, size_t handle_mib);
-void tripool_get_stats(TripoolPhase0StatsC* out);
-int tripool_shutdown(void);
-
-int tripool_vmm_init(
-    int device,
-    size_t super_pool_mib,
-    size_t fine_kv_pool_mib,
-    size_t super_handle_mib,
-    size_t transient_va_gib,
-    size_t kv_va_gib,
-    int allow_overflow);
-int tripool_vmm_shutdown(void);
-void tripool_vmm_get_stats(UnifiedVmmStatsC* out);
-
-int tripool_host_register(void* ptr, size_t bytes);
-int tripool_host_unregister(void* ptr);
-double tripool_host_h2d_bench_gbps(const void* host_ptr, int device, size_t total_bytes, int iters);
-
-void tripool_scope_begin(void);
-int tripool_scope_end(void* stream);
-void* tripool_alloc(ssize_t size, int device, void* stream);
-void tripool_free(void* ptr, ssize_t size, int device, void* stream);
-
-uint64_t tripool_kv_va_base(void);
-uint64_t tripool_kv_free_bytes(int for_dit);
-int32_t tripool_kv_alloc_page(void);
-int tripool_kv_free_page(int32_t slot_idx, void* stream);
-
-int32_t tripool_kv_region_alloc(size_t max_va_bytes);
-uint64_t tripool_kv_region_ensure(int32_t region_id, size_t needed_bytes, void* stream);
-uint64_t tripool_kv_region_va(int32_t region_id);
-size_t tripool_kv_region_mapped_bytes(int32_t region_id);
-int tripool_kv_region_free(int32_t region_id, void* stream);
-
-int tripool_kv_region_set_evictable(int32_t region_id, int evictable, size_t valid_bytes, void* compute_stream);
-int tripool_kv_region_swap_out_async(int32_t region_id, size_t valid_bytes, void* compute_stream);
-int tripool_kv_region_swap_in_async(int32_t region_id, void* target_stream);
-int tripool_kv_region_is_swapped(int32_t region_id);
-size_t tripool_kv_region_swapped_bytes(int32_t region_id);
-int tripool_kv_flush_swaps(void);
-
-int tripool_expert_register(int num_layers, size_t layer_stride_mib, void* host_pinned_base, size_t host_bytes);
-uint64_t tripool_expert_va_base(int expert_id);
-uint64_t tripool_expert_layer_va(int expert_id, int layer_idx);
-size_t tripool_expert_layer_stride_bytes(int expert_id);
-int tripool_expert_set_pinned(int expert_id, int pinned);
-int tripool_expert_set_layer_used_bytes(int expert_id, int layer_idx, size_t used_bytes);
-int tripool_expert_load_layers_sync(int expert_id, int start_layer, int end_layer_exclusive);
-int tripool_expert_prefetch_async(int expert_id, int start_layer, int end_layer_exclusive);
-int tripool_expert_wait_layer(int expert_id, int layer_idx, void* compute_stream);
-int tripool_expert_evict_layer(int expert_id, int layer_idx, void* stream);
-int tripool_expert_evict_range(int expert_id, int start_layer, int end_layer_exclusive, void* stream);
-int tripool_expert_is_resident(int expert_id, int layer_idx);
-int tripool_expert_resident_count(int expert_id);
 
 #ifdef __cplusplus
 }  // extern "C"

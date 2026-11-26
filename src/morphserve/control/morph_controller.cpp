@@ -172,10 +172,6 @@ bool evaluate_outcome_at_k(const PolicyConfig& policy, const nlohmann::json& out
     return true;
 }
 
-bool evaluate_outcome_at_k(const PolicyConfig& policy, const nlohmann::json& out, double k) {
-    return evaluate_outcome_at_k(policy, out, k, k);
-}
-
 struct TurnSloEval {
     bool is_ok = false;
     bool has_ar = false;

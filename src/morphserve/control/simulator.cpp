@@ -2300,7 +2300,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 sess_dit_records[usid].push_back(SimDitRec{turn_lat, p.height, p.dit_steps});
                 SimTurnRec rec;
                 rec.turn_idx = p.ti;
-                rec.modality_plan = p.plan;
+                if (p.ti >= 0 && static_cast<size_t>(p.ti) < built_sessions[usid].turns.size()) {
+                    rec.modality_plan = built_sessions[usid].turns[static_cast<size_t>(p.ti)].modality_plan;
+                }
                 rec.status = "ok";
                 rec.dit_ms = turn_lat;
                 rec.height = p.height;

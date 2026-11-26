@@ -418,6 +418,7 @@ void test_v2_policy_think_slo_and_steady_window() {
 }
 
 void test_d1_d5_multiturn_slo_contract_and_cot_decoupling() {
+    using namespace morphserve::control;
     // D4: Default preset decouples k_AR=2.0 (1500ms / 125.64ms) and k_DiT=3.0 (18360ms / 65160ms BAGEL; 9750ms / 21900ms InternVL-U)
     const PolicyConfig pol_bagel = PolicyConfig::from_preset("morphserve", 8);
     MS_CHECK(std::abs(pol_bagel.slo_scale_k - 2.0) < 1e-9);
@@ -517,7 +518,7 @@ void test_d1_d5_multiturn_slo_contract_and_cot_decoupling() {
     const auto ph = ClusterPhysicsProfile::defaults();
     const auto hw0 = HardwareInterconnectSpec::presets(&ph)[0];
     std::vector<SimSessionSpec> cot_solo = {
-        {0, 0.0, "visual_cot_highres", {{"cot_then_dit", 512, 20, 48, 0, false}}, "solo_cot_0", "main"},
+        {0.0, "visual_cot_highres", {{"cot_then_dit", 512, 20, 48, 0, false}}, "solo_cot_0", "main"},
     };
     const auto sim_rep = ClusterSimulator::simulate_cluster_point(
         "morphserve", 8, hw0, 0.1, 1, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &cot_solo);

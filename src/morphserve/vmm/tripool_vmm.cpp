@@ -1703,7 +1703,7 @@ size_t TriPoolVMM::coalesce_fine_to_super(size_t max_super) {
     if (!initialized_) return 0;
     try {
         backend_->ensure_context();
-        return try_coalesce_fine_to_super_locked(max_super);
+        return try_coalesce_fine_to_super_locked(max_super == 0 ? SIZE_MAX : max_super);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] coalesce_fine_to_super error: %s\n", e.what());
         return 0;

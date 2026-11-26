@@ -196,7 +196,7 @@ void test_tripool_vmm_grow_before_evict_and_fine_to_super_coalescing() {
     MS_CHECK(st.fine_pool_total_pages == 64);
     MS_CHECK(vmm->kv_region_free(rid_re, nullptr) == 0);
 
-    MS_CHECK(vmm->coalesce_fine_to_super(0) == 1);
+    MS_CHECK(vmm->coalesce_fine_to_super() == 1);
     vmm->get_stats(reinterpret_cast<morphserve::vmm::UnifiedVmmStatsPod*>(&st));
     MS_CHECK(st.fine_pool_total_pages == 32);
     MS_CHECK(st.super_pool_total_handles == 4);

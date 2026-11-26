@@ -605,6 +605,16 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
 
     L.ms_ctrl_deterministic_think_s.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_double, ctypes.c_double]
     L.ms_ctrl_deterministic_think_s.restype = ctypes.c_double
+    L.ms_ctrl_deterministic_think_dist_s.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_double,
+        ctypes.c_double,
+        ctypes.c_char_p,
+        ctypes.c_double,
+        ctypes.c_double,
+    ]
+    L.ms_ctrl_deterministic_think_dist_s.restype = ctypes.c_double
     L.ms_ctrl_aggregate_report_json.argtypes = [
         ctypes.c_char_p,
         ctypes.c_char_p,

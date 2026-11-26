@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# OSDI '27 Job R2e (1x8 GPUs): Low-to-Knee QPS Sweep (0.05..0.25 + 0.40, 1.10 RPS),
-# per-suite reset_peak_memory_stats / NVML peak verification, and OOM-aware empirical Latency CDFs.
+# OSDI '27 Interleaved-Bench v2 Job R2e (1x8 GPUs):
+#   Low-to-Knee QPS Sweep, per-suite reset_peak_memory_stats / NVML peak verification,
+#   and OOM-aware empirical Active-JCT & DiT Latency CDFs.
 set -euo pipefail
 
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
@@ -8,8 +9,9 @@ source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
 kairos_check_shared_storage
 
 MODEL_DIR="${MODELS}/BAGEL-7B-MoT"
-BENCH_DIR="${DATA}/benchmarks/interleaved-bench-v1"
-PREV_SUITE_A="${MORPHSERVE_PREV_SUITE_A:-/shared/output/MORPHSERVE/runs/morphserve-osdi27-r2a-suitea-20261124-r5/m23-suite-a-report.json}"
+BENCH_DIR="${MORPHSERVE_BENCH_DIR:-${DATA}/benchmarks/interleaved-bench-v1}"
+# Only merge a v2 Suite-A report when explicitly supplied via MORPHSERVE_PREV_SUITE_A.
+PREV_SUITE_A="${MORPHSERVE_PREV_SUITE_A:-}"
 
 if [ ! -f "${MODEL_DIR}/MODEL_MANIFEST.json" ] || [ ! -f "${BENCH_DIR}/BENCH_MANIFEST.json" ]; then
   echo "error: missing BAGEL-7B-MoT or Interleaved-Bench manifest" >&2
@@ -36,7 +38,7 @@ _cleanup() {
 trap _cleanup EXIT
 
 MERGE_ARGS=()
-if [ -f "${PREV_SUITE_A}" ]; then
+if [ -n "${PREV_SUITE_A}" ] && [ -f "${PREV_SUITE_A}" ]; then
   MERGE_ARGS+=(--merge-suite-a-report "${PREV_SUITE_A}")
 fi
 
@@ -46,10 +48,11 @@ python3 -m morphserve.bench.run_phase2_bagel_main \
   --bench-root "${BENCH_DIR}" \
   --output-dir "${RUN_DIR}" \
   --num-gpus 8 \
-  --low-sessions "${MORPHSERVE_LOW_SESSIONS:-28}" \
-  --knee-sessions "${MORPHSERVE_KNEE_SESSIONS:-48}" \
   "${MERGE_ARGS[@]}" \
+  ${MORPHSERVE_QPS_POINTS:+--qps-points "${MORPHSERVE_QPS_POINTS}"} \
+  ${MORPHSERVE_LOW_SESSIONS:+--low-sessions "${MORPHSERVE_LOW_SESSIONS}"} \
+  ${MORPHSERVE_KNEE_SESSIONS:+--knee-sessions "${MORPHSERVE_KNEE_SESSIONS}"} \
   ${MORPHSERVE_MAX_SESSIONS:+--max-sessions "${MORPHSERVE_MAX_SESSIONS}"}
 
 kairos_check_shared_storage
-echo "== OSDI '27 Job R2e (Low-QPS SLO Curve & OOM-Aware CDF) completed cleanly: ${RUN_DIR}"
+echo "== OSDI '27 Interleaved-Bench v2 Job R2e (Low-QPS SLO Curve & OOM-Aware CDF) completed cleanly: ${RUN_DIR}"

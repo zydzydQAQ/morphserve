@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase-2 Job 2e (1x8 GPUs): Milestone M2.4 InternVL-U (~8.16 GiB) Download + SHA256 Verify + 8xA100 Generality Validation.
+# OSDI '27 Interleaved-Bench v2 Job R2c (1x8 GPUs):
+#   InternVL-U (~8.16 GiB) Verify + Multi-Turn Dual-Regime (40 GiB Burst & 12 GiB Quota) Generality Validation.
 set -euo pipefail
 
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
@@ -14,6 +15,7 @@ kairos_check_shared_storage
 
 IVLU_DIR="${MODELS}/InternVL-U"
 VENDOR_DIR="${DATA}/vendor/internvlu_pkg"
+BENCH_DIR="${MORPHSERVE_BENCH_DIR:-${DATA}/benchmarks/interleaved-bench-v1}"
 if [ ! -d "${VENDOR_DIR}/internvlu" ]; then
   echo "error: vendored internvlu package missing at ${VENDOR_DIR}" >&2
   exit 1
@@ -50,12 +52,20 @@ _cleanup() {
 }
 trap _cleanup EXIT
 
+BENCH_ARGS=()
+if [ -d "${BENCH_DIR}" ]; then
+  BENCH_ARGS+=(--bench-root "${BENCH_DIR}")
+fi
+
 python3 -m morphserve.bench.validate_phase2_internvl_u \
   --model-dir "${IVLU_DIR}" \
   --vendor-dir "${VENDOR_DIR}" \
   --output-dir "${RUN_DIR}" \
-  --num-gpus 8
+  --num-gpus 8 \
+  "${BENCH_ARGS[@]}" \
+  ${MORPHSERVE_IVLU_QPS:+--qps "${MORPHSERVE_IVLU_QPS}"} \
+  ${MORPHSERVE_IVLU_SESSIONS:+--num-sessions "${MORPHSERVE_IVLU_SESSIONS}"}
 
 cp "${IVLU_DIR}/MODEL_MANIFEST.json" "${RUN_DIR}/INTERNVLU_MODEL_MANIFEST.json"
 kairos_check_shared_storage
-echo "== Phase-2 Job 2e (M2.4 InternVL-U) completed cleanly: ${RUN_DIR}"
+echo "== OSDI '27 Interleaved-Bench v2 Job R2c (M2.4 InternVL-U) completed cleanly: ${RUN_DIR}"

@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace morphserve::control {
 
@@ -43,6 +44,22 @@ public:
 
     static double deterministic_think_s(const std::string& session_id, int turn_idx, double lo_s, double hi_s);
     static double deterministic_think_ms_sim(int sid, int turn_idx, double lo_s, double hi_s);
+    static double deterministic_think_dist_s(
+        const std::string& session_id,
+        int turn_idx,
+        double lo_s,
+        double hi_s,
+        const std::string& dist = "lognormal",
+        double median_s = 6.0,
+        double sigma = 0.75);
+    static double deterministic_think_dist_ms_sim(
+        int sid,
+        int turn_idx,
+        double lo_s,
+        double hi_s,
+        const std::string& dist = "lognormal",
+        double median_s = 6.0,
+        double sigma = 0.75);
 
     TurnTransitionPlan plan_turn_transition(
         const std::string& session_id,
@@ -65,7 +82,8 @@ public:
         const std::vector<double>& ar_tpots_ms,
         const std::vector<double>& dit_turns_ms,
         const std::vector<int>& dit_heights,
-        const std::vector<int>& dit_steps);
+        const std::vector<int>& dit_steps,
+        const std::vector<std::vector<double>>& ar_turn_tpots_ms = {});
 
     static nlohmann::json aggregate_cluster_run_report(
         const PolicyConfig& policy,

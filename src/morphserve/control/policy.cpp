@@ -71,6 +71,7 @@ nlohmann::json PolicyConfig::to_json() const {
         {"use_shared_numa_mirror", use_shared_numa_mirror},
         {"use_h2d_pacer", use_h2d_pacer},
         {"use_module3_cow_loopback", use_module3_cow_loopback},
+        {"allow_cascade_cfg_split", allow_cascade_cfg_split},
         {"use_naive_offload", use_naive_offload},
         {"kv_vmm_only", kv_vmm_only},
         {"preemption_mode", preemption_mode},
@@ -85,6 +86,13 @@ nlohmann::json PolicyConfig::to_json() const {
         {"dit_turn_slo_override_ms", dit_turn_slo_override_ms.has_value() ? nlohmann::json(*dit_turn_slo_override_ms) : nlohmann::json(nullptr)},
         {"max_oom_retries", max_oom_retries},
         {"inter_turn_think_s_range", nlohmann::json::array({inter_turn_think_s_range.first, inter_turn_think_s_range.second})},
+        {"think_time_dist", think_time_dist},
+        {"think_time_median_s", think_time_median_s},
+        {"think_time_sigma", think_time_sigma},
+        {"ar_tpot_slo_mode", ar_tpot_slo_mode},
+        {"steady_window_mode", steady_window_mode},
+        {"warmup_window_s", warmup_window_s},
+        {"steady_window_s", steady_window_s},
         {"steady_state_trim_frac", steady_state_trim_frac},
         {"gpu_memory_fraction", gpu_memory_fraction.has_value() ? nlohmann::json(*gpu_memory_fraction) : nlohmann::json(nullptr)},
         {"gpu_memory_quota_mib", gpu_memory_quota_mib.has_value() ? nlohmann::json(*gpu_memory_quota_mib) : nlohmann::json(nullptr)},
@@ -118,6 +126,7 @@ static void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
         else if (k == "use_shared_numa_mirror") cfg.use_shared_numa_mirror = v.get<bool>();
         else if (k == "use_h2d_pacer") cfg.use_h2d_pacer = v.get<bool>();
         else if (k == "use_module3_cow_loopback") cfg.use_module3_cow_loopback = v.get<bool>();
+        else if (k == "allow_cascade_cfg_split") cfg.allow_cascade_cfg_split = v.get<bool>();
         else if (k == "use_naive_offload") cfg.use_naive_offload = v.get<bool>();
         else if (k == "kv_vmm_only") cfg.kv_vmm_only = v.get<bool>();
         else if (k == "preemption_mode") cfg.preemption_mode = v.get<std::string>();
@@ -139,7 +148,14 @@ static void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
         } else if (k == "max_oom_retries") cfg.max_oom_retries = v.get<int>();
         else if (k == "inter_turn_think_s_range" && v.is_array() && v.size() == 2) {
             cfg.inter_turn_think_s_range = {v[0].get<double>(), v[1].get<double>()};
-        } else if (k == "steady_state_trim_frac") cfg.steady_state_trim_frac = v.get<double>();
+        } else if (k == "think_time_dist") cfg.think_time_dist = v.get<std::string>();
+        else if (k == "think_time_median_s") cfg.think_time_median_s = v.get<double>();
+        else if (k == "think_time_sigma") cfg.think_time_sigma = v.get<double>();
+        else if (k == "ar_tpot_slo_mode") cfg.ar_tpot_slo_mode = v.get<std::string>();
+        else if (k == "steady_window_mode") cfg.steady_window_mode = v.get<std::string>();
+        else if (k == "warmup_window_s") cfg.warmup_window_s = v.get<double>();
+        else if (k == "steady_window_s") cfg.steady_window_s = v.get<double>();
+        else if (k == "steady_state_trim_frac") cfg.steady_state_trim_frac = v.get<double>();
         else if (k == "gpu_memory_fraction") {
             if (v.is_null()) cfg.gpu_memory_fraction.reset();
             else cfg.gpu_memory_fraction = v.get<double>();
@@ -185,18 +201,26 @@ PolicyConfig PolicyConfig::from_preset(
     const auto slo_map =
         default_operator_profile().slo_thresholds_ms(k_val, (fam == "internvl_u") ? "internvl_u" : "bagel");
     const std::pair<double, double> think_default =
-        (fam == "synthetic") ? std::make_pair(0.002, 0.005) : std::make_pair(3.0, 8.0);
+        (fam == "synthetic") ? std::make_pair(0.002, 0.005) : std::make_pair(2.0, 25.0);
 
     PolicyConfig cfg;
     cfg.policy_name = policy_name;
     cfg.num_gpus = num_gpus;
     cfg.model_family = fam;
+    cfg.allow_cascade_cfg_split = false;
     cfg.slo_scale_k = k_val;
     cfg.ar_tpot_slo_ms = slo_map.at("ar_tpot_slo_ms");
     cfg.ar_ttft_slo_ms = slo_map.at("ar_ttft_slo_ms");
     cfg.dit_512_slo_ms = slo_map.at("dit_512_slo_ms");
     cfg.dit_1024_slo_ms = slo_map.at("dit_1024_slo_ms");
     cfg.inter_turn_think_s_range = think_default;
+    cfg.think_time_dist = (fam == "synthetic") ? "uniform" : "lognormal";
+    cfg.think_time_median_s = (fam == "synthetic") ? 0.003 : 6.0;
+    cfg.think_time_sigma = 0.75;
+    cfg.ar_tpot_slo_mode = "turn_p95";
+    cfg.steady_window_mode = "time";
+    cfg.warmup_window_s = 60.0;
+    cfg.steady_window_s = 180.0;
 
     if (policy_name == "morphserve") {
         for (int g = 0; g < num_gpus; ++g) {

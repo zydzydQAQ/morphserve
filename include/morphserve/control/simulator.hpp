@@ -20,6 +20,7 @@ struct SimTurnSpec {
     int dit_steps = 20;
     int max_ar_tokens = 48;
     int num_images = 0;
+    bool use_prev_image = false;
 };
 
 struct SimSessionSpec {
@@ -27,6 +28,7 @@ struct SimSessionSpec {
     std::string quadrant = "visual_cot";
     std::vector<SimTurnSpec> turns;
     std::string session_id;
+    std::string phase_label;
 };
 
 // Byte-accurate per-GPU physical HBM ledger from Phase-0/1 driver measurements.
@@ -138,7 +140,8 @@ public:
         const std::string& skew_tag = "",
         const std::string& bench_root = "",
         const std::string& sources_dir = "",
-        const std::vector<SimSessionSpec>* custom_sessions = nullptr);
+        const std::vector<SimSessionSpec>* custom_sessions = nullptr,
+        const nlohmann::json& policy_overrides = nlohmann::json::object());
 
     static nlohmann::json evaluate_against_real_runs(
         const nlohmann::json& real_runs_array,

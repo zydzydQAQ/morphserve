@@ -34,6 +34,7 @@ from morphserve.engine import (  # noqa: E402
     VALID_POLICIES,
     run_multinode_worker_daemon,
 )
+from morphserve.engine.workload import build_time_window_suite  # noqa: E402
 from morphserve.models import SyntheticCPTGAdapter  # noqa: E402
 from morphserve.router import ClusterTopologyProfile, find_free_tcp_port  # noqa: E402
 
@@ -69,9 +70,15 @@ def _build_mini_interleaved_suite() -> WorkloadSuite:
                 arrival_offset_s=0.01,
                 turns=[
                     InterleavedTurn(turn_idx=0, modality_plan="dit_t2i", prompt="cabin by lake", dit_steps=3),
-                    InterleavedTurn(turn_idx=1, modality_plan="dit_edit", prompt="add autumn leaves", dit_steps=3),
-                    InterleavedTurn(turn_idx=2, modality_plan="dit_edit", prompt="make it twilight", dit_steps=3),
-                    InterleavedTurn(turn_idx=3, modality_plan="dit_edit", prompt="add snow peaks", dit_steps=3),
+                    InterleavedTurn(
+                        turn_idx=1, modality_plan="dit_edit", prompt="add autumn leaves", dit_steps=3, use_prev_image=True
+                    ),
+                    InterleavedTurn(
+                        turn_idx=2, modality_plan="dit_edit", prompt="make it twilight", dit_steps=3, use_prev_image=True
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3, modality_plan="dit_edit", prompt="add snow peaks", dit_steps=3, use_prev_image=True
+                    ),
                 ],
             ),
             InterleavedSession(
@@ -91,6 +98,93 @@ def _build_mini_interleaved_suite() -> WorkloadSuite:
                 turns=[
                     InterleavedTurn(
                         turn_idx=0, modality_plan="dit_t2i", prompt="mountain vista", height=1024, width=1024, dit_steps=3
+                    ),
+                ],
+            ),
+        ],
+    )
+
+
+def _build_v2_mini_interleaved_suite() -> WorkloadSuite:
+    return WorkloadSuite(
+        name="inproc_v2_mini_4",
+        trace_source="unit_test_v2",
+        base_qps=4.0,
+        schema="morphserve.interleaved_bench.v2",
+        warmup_s=60.0,
+        steady_s=180.0,
+        arrival_duration_s=240.0,
+        sessions=[
+            InterleavedSession(
+                session_id="s_cocreate",
+                quadrant="interleaved_co_creation",
+                source_dataset="unit_v2",
+                arrival_offset_s=0.00,
+                phase_label="ar50_dit50",
+                turns=[
+                    InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="plan cabin scene", max_ar_tokens=6),
+                    InterleavedTurn(turn_idx=1, modality_plan="dit_t2i", prompt="render cabin by lake", dit_steps=3),
+                    InterleavedTurn(
+                        turn_idx=2,
+                        modality_plan="ar_only",
+                        prompt="inspect generated image and suggest edit",
+                        max_ar_tokens=6,
+                        use_prev_image=True,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3,
+                        modality_plan="dit_edit",
+                        prompt="apply warm twilight glow",
+                        dit_steps=3,
+                        use_prev_image=True,
+                    ),
+                ],
+            ),
+            InterleavedSession(
+                session_id="s_edit_v2",
+                quadrant="multiturn_edit",
+                source_dataset="unit_v2",
+                arrival_offset_s=0.01,
+                phase_label="ar50_dit50",
+                turns=[
+                    InterleavedTurn(turn_idx=0, modality_plan="dit_t2i", prompt="forest path", dit_steps=3),
+                    InterleavedTurn(
+                        turn_idx=1, modality_plan="dit_edit", prompt="add mist", dit_steps=3, use_prev_image=True
+                    ),
+                    InterleavedTurn(
+                        turn_idx=2, modality_plan="dit_edit", prompt="add lantern", dit_steps=3, use_prev_image=True
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3, modality_plan="dit_edit", prompt="add snow", dit_steps=3, use_prev_image=True
+                    ),
+                ],
+            ),
+            InterleavedSession(
+                session_id="s_vqa_v2",
+                quadrant="multi_image_vqa",
+                source_dataset="unit_v2",
+                arrival_offset_s=0.02,
+                phase_label="ar50_dit50",
+                turns=[
+                    InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="describe first frame", max_ar_tokens=6),
+                    InterleavedTurn(turn_idx=1, modality_plan="ar_only", prompt="compare second frame", max_ar_tokens=6),
+                ],
+            ),
+            InterleavedSession(
+                session_id="s_vcot_hr",
+                quadrant="visual_cot_highres",
+                source_dataset="unit_v2",
+                arrival_offset_s=0.03,
+                phase_label="ar50_dit50",
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="cot_then_dit",
+                        prompt="alpine panorama",
+                        height=1024,
+                        width=1024,
+                        max_ar_tokens=6,
+                        dit_steps=3,
                     ),
                 ],
             ),
@@ -164,9 +258,30 @@ class TestPhase2M21M22Offline(unittest.TestCase):
         ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
         self.assertTrue(ms.use_tripool_vmm and ms.use_expert_pager and ms.use_scoped_vae)
         self.assertTrue(ms.use_shared_numa_mirror and ms.use_h2d_pacer and ms.use_module3_cow_loopback)
+        self.assertFalse(ms.allow_cascade_cfg_split)
+        self.assertEqual(ms.inter_turn_think_s_range, (2.0, 25.0))
+        self.assertEqual(ms.think_time_dist, "lognormal")
+        self.assertAlmostEqual(ms.think_time_median_s, 6.0)
+        self.assertAlmostEqual(ms.think_time_sigma, 0.75)
+        self.assertEqual(ms.ar_tpot_slo_mode, "turn_p95")
+        self.assertEqual(ms.steady_window_mode, "time")
+        self.assertAlmostEqual(ms.warmup_window_s, 60.0)
+        self.assertAlmostEqual(ms.steady_window_s, 180.0)
         self.assertEqual(ms.preemption_mode, "layer_chunk")
         self.assertEqual(ms.routing_mode, "dual_path")
         self.assertEqual(ms.initial_alphas, {g: 1.0 for g in range(8)})
+
+        for p_name in VALID_POLICIES:
+            p_cfg = EnginePolicyConfig.from_preset(p_name, num_gpus=8)
+            self.assertFalse(p_cfg.allow_cascade_cfg_split, msg=f"{p_name} must default allow_cascade_cfg_split=False")
+            self.assertEqual(p_cfg.ar_tpot_slo_mode, "turn_p95")
+            self.assertEqual(p_cfg.steady_window_mode, "time")
+
+        syn = EnginePolicyConfig.from_preset("morphserve", num_gpus=4, model_family="synthetic")
+        self.assertFalse(syn.allow_cascade_cfg_split)
+        self.assertEqual(syn.inter_turn_think_s_range, (0.002, 0.005))
+        self.assertEqual(syn.think_time_dist, "uniform")
+        self.assertAlmostEqual(syn.think_time_median_s, 0.003)
 
         prism = EnginePolicyConfig.from_preset("prism_tetriserve_coloc", num_gpus=8)
         self.assertTrue(prism.use_tripool_vmm and prism.kv_vmm_only)
@@ -1083,7 +1198,18 @@ class TestPhase2M21M22Offline(unittest.TestCase):
 
             (models_dir / "BAGEL-7B-MoT/MODEL_MANIFEST.json").write_text("{}\n", encoding="utf-8")
             (models_dir / "InternVL-U/MODEL_MANIFEST.json").write_text("{}\n", encoding="utf-8")
-            (bench_dir / "BENCH_MANIFEST.json").write_text("{}\n", encoding="utf-8")
+            (bench_dir / "suites").mkdir(parents=True, exist_ok=True)
+            (bench_dir / "BENCH_MANIFEST.json").write_text(
+                json.dumps({"schema": "morphserve.interleaved_bench.manifest.v2", "status": "ok"}) + "\n",
+                encoding="utf-8",
+            )
+            _build_v2_mini_interleaved_suite().save_json(bench_dir / "suites/main_mix_80.json")
+            _build_v2_mini_interleaved_suite().save_json(bench_dir / "suites/phase_shift_360s.json")
+            (src_stage / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.16)\n", encoding="utf-8")
+            (src_stage / "src/morphserve").mkdir(parents=True, exist_ok=True)
+            (src_stage / "src/morphserve/c_api.cpp").write_text("// stub\n", encoding="utf-8")
+            (src_stage / "tests/cpp").mkdir(parents=True, exist_ok=True)
+            (src_stage / "tests/cpp/test_control_and_sim.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
             # Pre-stage OWLv2, leave CLIP unstaged so Step (b)'s `snapshot_download` path is exercised!
             (eval_dir / "owlv2-base-patch16-ensemble/config.json").write_text("{}\n", encoding="utf-8")
             (eval_dir / "owlv2-base-patch16-ensemble/model.safetensors").write_bytes(b"weights")
@@ -1221,6 +1347,22 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     encoding="utf-8",
                 )
                 os.chmod(df_script, 0o755)
+                cmake_shim = fake_bin / "cmake"
+                cmake_shim.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "echo '[mock cmake] ok'\n",
+                    encoding="utf-8",
+                )
+                os.chmod(cmake_shim, 0o755)
+                ctest_shim = fake_bin / "ctest"
+                ctest_shim.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "echo '1/2 Test #1: test_vmm_and_runtime .............   Passed    0.01 sec'\n"
+                    "echo '2/2 Test #2: test_control_and_sim .............   Passed    0.01 sec'\n"
+                    "echo '100% tests passed, 0 tests failed out of 2'\n",
+                    encoding="utf-8",
+                )
+                os.chmod(ctest_shim, 0o755)
                 py_shim = fake_bin / "python3"
                 py_shim.write_text(
                     f"#!{sys.executable}\n"
@@ -1247,7 +1389,7 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     "        (a.output_dir / 'module4-report.json').write_text(json.dumps({'status': 'ok'}) + '\\n'); sys.exit(0)\n"
                     "    if mod == 'morphserve.bench.validate_phase2_internvl_u':\n"
                     "        import time\n"
-                    "        ap = argparse.ArgumentParser(); ap.add_argument('--model-dir'); ap.add_argument('--vendor-dir'); ap.add_argument('--output-dir', type=Path); ap.add_argument('--num-gpus', type=int); ap.add_argument('--smoke-1gpu', action='store_true')\n"
+                    "        ap = argparse.ArgumentParser(); ap.add_argument('--model-dir'); ap.add_argument('--vendor-dir'); ap.add_argument('--bench-root', default=None); ap.add_argument('--output-dir', type=Path); ap.add_argument('--num-gpus', type=int); ap.add_argument('--smoke-1gpu', action='store_true')\n"
                     "        a = ap.parse_args(rest); assert (a.num_gpus == 1 and a.smoke_1gpu) or (a.num_gpus == 8 and not a.smoke_1gpu); a.output_dir.mkdir(parents=True, exist_ok=True)\n"
                     "        if a.num_gpus == 8:\n"
                     "            t_dl = time.monotonic() + 5.0\n"
@@ -1263,8 +1405,12 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     "            time.sleep(0.05)\n"
                     "        (od / 'wave3-cli.json').write_text(json.dumps({'argv': rest}) + '\\n'); sys.exit(0)\n"
                     "    if mod == 'morphserve.bench.run_phase2_bagel_main':\n"
+                    "        import time\n"
                     "        out_idx = rest.index('--output-dir') + 1\n"
                     "        od = Path(rest[out_idx]); od.mkdir(parents=True, exist_ok=True)\n"
+                    "        t_dl = time.monotonic() + 5.0\n"
+                    "        while not (od / 'memory-summary.json').is_file() and time.monotonic() < t_dl:\n"
+                    "            time.sleep(0.05)\n"
                     "        (od / 'cli-captured.json').write_text(json.dumps({'argv': rest, 'eval_dir': os.environ.get('MORPHSERVE_EVAL_MODELS_DIR'), 'hf_offline': os.environ.get('HF_HUB_OFFLINE')}) + '\\n')\n"
                     "        sys.exit(0)\n"
                     "    if mod == 'morphserve.bench.validate_phase2_multinode_2x8':\n"
@@ -1287,7 +1433,7 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     "    _orig_init = _ce.MorphServeClusterEngine.__init__\n"
                     "    def _patched_init(self, policy, model_dir=Path('.'), bench_root=Path('.'), tmp_root=Path('/tmp/ms'), *, fleet=None, topology=None):\n"
                     "        if fleet is None:\n"
-                    "            fleet = InProcessWorkerFleet(policy, adapter_factory=lambda r, p: SyntheticCPTGAdapter(r, p, dit_step_sleep_s=0.22))\n"
+                    "            fleet = InProcessWorkerFleet(policy, adapter_factory=lambda r, p: SyntheticCPTGAdapter(r, p, dit_step_sleep_s=0.12))\n"
                     "        _orig_init(self, policy, model_dir=model_dir, bench_root=bench_root, tmp_root=tmp_root, fleet=fleet, topology=topology)\n"
                     "    _ce.MorphServeClusterEngine.__init__ = _patched_init\n"
                     "    sys.argv = argv\n"
@@ -1323,6 +1469,8 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                 run_dir = shared / f"output/MORPHSERVE/runs/{ok_run_id}"
                 summary = json.loads((run_dir / "stage1-gate-summary.json").read_text(encoding="utf-8"))
                 self.assertEqual(summary["status"], "ok")
+                self.assertEqual(summary["schema"], "morphserve.osdi27.stage1_1gpu_gate.v2")
+                self.assertEqual(summary["gates"]["ctest_a100"]["status"], "ok")
                 self.assertEqual(
                     summary["eval_models_staged"],
                     {"owlv2-base-patch16-ensemble": True, "clip-vit-large-patch14": True},
@@ -1335,6 +1483,7 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                 self.assertEqual(bagel_gate["oom_sessions"], 0)
                 self.assertGreaterEqual(bagel_gate["preempted_ar_count"], 2)
                 self.assertGreater(bagel_gate["total_yields"], 0)
+                self.assertIsNotNone(bagel_gate.get("active_jct_p95_ms"))
                 self.assertGreater(bagel_gate["peak_gpu_reserved_mib"], bagel_gate["peak_pytorch_reserved_mib"])
                 # Verify read-only `build_dir/build` was untouched (zero writes to `/shared` build!)
                 self.assertEqual(list((build_dir / "build").iterdir()), [])
@@ -1439,7 +1588,7 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                         msg=f"case={case_name} summary={adv_sum}",
                     )
 
-                # Verify `05`, `10`, `11`, `12`, `13`, and `14` script runtime flags, sampler cleanup, & multi-node logs!
+                # Verify `05`, `10`, `11`, `12`, `13`, `14`, `17`, and `18` script runtime flags, sampler cleanup, & multi-node logs!
                 for s_name in (
                     "05_phase1_module3_validate.sh",
                     "10_phase2_m23_suite_a.sh",
@@ -1447,6 +1596,8 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     "12_phase2_m24_internvl_u_8gpu.sh",
                     "13_phase2_m25_multinode_2x8.sh",
                     "14_phase2_wave3_deep_8gpu.sh",
+                    "17_osdi27_r2e_lowqps_8gpu.sh",
+                    "18_osdi27_v2_thinktime_8gpu.sh",
                 ):
                     raw_sh = (REPO_ROOT / "deploy/kairos/scripts" / s_name).read_text(encoding="utf-8")
                     dst_sh = td / s_name
@@ -1523,10 +1674,11 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                         str(models_dir / "BAGEL-7B-MoT"),
                         "--bench-root",
                         str(bench_dir),
-                        "--num-sessions",
-                        "160",
+                        "--qps",
+                        "1.6",
                     ],
                 )
+                self.assertNotIn("--num-sessions", c13["argv"])
 
                 # InternVL-U (`12`) and Wave-3 Deep (`14`): verify clean sampler SIGTERM/wait and local tmp cleanup
                 for s_id, s_file in ((f"m24-8g-{uid}", "12_phase2_m24_internvl_u_8gpu.sh"), (f"w3-8g-{uid}", "14_phase2_wave3_deep_8gpu.sh")):
@@ -1542,23 +1694,319 @@ class TestPhase2M21M22Offline(unittest.TestCase):
                     s_mem = json.loads((s_run / "memory-summary.json").read_text(encoding="utf-8"))
                     self.assertEqual(s_mem["status"], "completed")
                     self.assertFalse(Path(f"/tmp/morphserve-{s_id}").exists())
+
+                # Low-QPS (`17`) omits stale v1 `--merge-suite-a-report` by default; Think-time (`18`) uses `--mode think_time_sweep`
+                r2e_id = f"r2e-v2-{uid}"
+                p17 = subprocess.run(
+                    ["bash", str(td / "17_osdi27_r2e_lowqps_8gpu.sh")],
+                    env=dict(env, KAIROS_RUN_ID=r2e_id),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(p17.returncode, 0, msg=p17.stderr)
+                c17 = json.loads((shared / f"output/MORPHSERVE/runs/{r2e_id}/cli-captured.json").read_text(encoding="utf-8"))
+                self.assertIn("suite_a_lowqps", c17["argv"])
+                self.assertNotIn("--merge-suite-a-report", c17["argv"])
+
+                r2f_id = f"r2f-v2-{uid}"
+                p18 = subprocess.run(
+                    ["bash", str(td / "18_osdi27_v2_thinktime_8gpu.sh")],
+                    env=dict(env, KAIROS_RUN_ID=r2f_id),
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(p18.returncode, 0, msg=p18.stderr)
+                r2f_run = shared / f"output/MORPHSERVE/runs/{r2f_id}"
+                c18 = json.loads((r2f_run / "cli-captured.json").read_text(encoding="utf-8"))
+                self.assertIn("think_time_sweep", c18["argv"])
+                self.assertEqual(json.loads((r2f_run / "memory-summary.json").read_text(encoding="utf-8"))["status"], "completed")
             finally:
                 for ro_p in (build_dir, build_dir / "data", build_dir / "build"):
                     if ro_p.exists():
                         os.chmod(ro_p, 0o755)
 
+    def test_v2_4quadrant_builder_time_window_and_online_phase_shift_suite(self) -> None:
+        import inspect
+        from morphserve.bench.interleaved_bench import (
+            _build_quadrant_pools,
+            build_online_phase_shift_suite,
+        )
+
+        mmvet_items = [
+            {
+                "question_id": f"mv_{i:03d}",
+                "image_path": f"images/mmvet/{i:04d}.png",
+                "question": f"Describe key object {i} in this photo.",
+                "answer": f"object_{i}",
+                "capability": "rec",
+            }
+            for i in range(60)
+        ]
+        magicbrush_items = [
+            {
+                "img_id": f"mb_{i:03d}",
+                "source_image": f"images/magicbrush/mb_{i:03d}_src.png",
+                "turns": [
+                    {"turn_index": t + 1, "instruction": f"MagicBrush edit step {t + 1} for {i}"}
+                    for t in range(4)
+                ],
+            }
+            for i in range(20)
+        ]
+        mse_templates = [
+            {
+                "source_image": {"path": f"images/mse-bench/{i:03d}.png"},
+                "turns": [{"prompt": f"MSE edit turn {t} for {i}"} for t in range(4)],
+            }
+            for i in range(20)
+        ]
+        geneval_items = [
+            {"index": i, "tag": ("single_object", "counting", "position", "colors")[i % 4], "prompt": f"A scenic prompt {i}"}
+            for i in range(60)
+        ]
+
+        pools = _build_quadrant_pools(mmvet_items, magicbrush_items, mse_templates, geneval_items, seed=2026)
+        self.assertEqual(
+            set(pools.keys()),
+            {"interleaved_co_creation", "multiturn_edit", "multi_image_vqa", "visual_cot_highres"},
+        )
+
+        # Q1: `interleaved_co_creation` must be 4-turn bidirectional `AR -> DiT -> AR(use_prev_image=True) -> DiT(use_prev_image=True)`
+        q1_pool = pools["interleaved_co_creation"]
+        self.assertGreaterEqual(len(q1_pool), 12)
+        for sess in q1_pool:
+            self.assertEqual(sess.quadrant, "interleaved_co_creation")
+            self.assertEqual(len(sess.turns), 4)
+            self.assertEqual(sess.turns[0].modality_plan, "ar_only")
+            self.assertFalse(sess.turns[0].use_prev_image)
+            self.assertIn(sess.turns[1].modality_plan, ("dit_t2i", "dit_edit"))
+            self.assertEqual(sess.turns[2].modality_plan, "ar_only")
+            self.assertTrue(sess.turns[2].use_prev_image)
+            self.assertEqual(sess.turns[3].modality_plan, "dit_edit")
+            self.assertTrue(sess.turns[3].use_prev_image)
+
+        # Q2: `multiturn_edit` (4 DiT turns); Q3: `multi_image_vqa` (2-3 AR turns); Q4: `visual_cot_highres` (`cot_then_dit` + `dit_t2i`)
+        for sess in pools["multiturn_edit"]:
+            self.assertEqual(len(sess.turns), 4)
+            self.assertTrue(all(t.modality_plan in ("dit_t2i", "dit_edit") for t in sess.turns))
+        for sess in pools["multi_image_vqa"]:
+            self.assertIn(len(sess.turns), (2, 3))
+            self.assertTrue(all(t.modality_plan == "ar_only" for t in sess.turns))
+        q4_plans = {t.modality_plan for s in pools["visual_cot_highres"] for t in s.turns}
+        self.assertIn("cot_then_dit", q4_plans)
+        self.assertIn("dit_t2i", q4_plans)
+
+        # `build_time_window_suite`: stationary 30/25/25/20 mix across 240s arrival horizon (60s warmup + 180s steady)
+        base_v2 = compose_weighted_suite(
+            "main_mix_80",
+            pools,
+            {"interleaved_co_creation": 24, "multiturn_edit": 20, "multi_image_vqa": 20, "visual_cot_highres": 16},
+            [0.6, 1.4],
+            [0.8, 1.2],
+            target_qps=0.5,
+            seed=2026,
+        )
+        tw = build_time_window_suite(
+            base_v2,
+            target_qps=0.4,
+            burstgpt_deltas=[0.6, 1.4],
+            gentd26_deltas=[0.8, 1.2],
+            arrival_duration_s=240.0,
+            warmup_s=60.0,
+            steady_s=180.0,
+        )
+        self.assertEqual(tw.schema, "morphserve.interleaved_bench.v2")
+        self.assertEqual(tw.warmup_s, 60.0)
+        self.assertEqual(tw.steady_s, 180.0)
+        self.assertEqual(tw.arrival_duration_s, 240.0)
+        self.assertEqual(len(tw.sessions), 96)
+        self.assertEqual(len({s.session_id for s in tw.sessions}), 96)
+        tw_offsets = [s.arrival_offset_s for s in tw.sessions]
+        self.assertEqual(tw_offsets, sorted(tw_offsets))
+        steady_quads = {s.quadrant for s in tw.sessions if 60.0 <= s.arrival_offset_s <= 240.0}
+        self.assertEqual(
+            steady_quads,
+            {"interleaved_co_creation", "multiturn_edit", "multi_image_vqa", "visual_cot_highres"},
+        )
+        tw_rt = WorkloadSuite.from_dict(tw.to_dict())
+        self.assertEqual(tw_rt.schema, "morphserve.interleaved_bench.v2")
+        self.assertEqual(tw_rt.warmup_s, 60.0)
+        self.assertEqual(tw_rt.steady_s, 180.0)
+        q1_rt = next(s for s in tw_rt.sessions if s.quadrant == "interleaved_co_creation")
+        self.assertTrue(q1_rt.turns[2].use_prev_image)
+        self.assertTrue(q1_rt.turns[3].use_prev_image)
+
+        # `build_online_phase_shift_suite`: continuous 3-phase `ar80_dit20 -> ar20_dit80 -> ar50_dit50` spanning 360 s
+        sig = inspect.signature(build_online_phase_shift_suite)
+        ps_kwargs: dict[str, object] = {}
+        for pname in sig.parameters:
+            if pname == "name":
+                ps_kwargs[pname] = "phase_shift_360s"
+            elif pname == "pools":
+                ps_kwargs[pname] = pools
+            elif pname in ("burstgpt_deltas", "burst_deltas"):
+                ps_kwargs[pname] = [0.7, 1.3]
+            elif pname in ("gentd26_deltas", "gentd_deltas"):
+                ps_kwargs[pname] = [0.8, 1.2]
+            elif pname in ("target_qps", "qps"):
+                ps_kwargs[pname] = 0.5
+            elif pname == "seed":
+                ps_kwargs[pname] = 2026
+        ps = build_online_phase_shift_suite(**ps_kwargs)
+        self.assertEqual(ps.schema, "morphserve.interleaved_bench.v2")
+        self.assertEqual(len(ps.phase_schedule), 3)
+        phase_names = [
+            str(p.get("phase_label") or p.get("phase") or p.get("name") or "") for p in ps.phase_schedule
+        ]
+        self.assertEqual(phase_names, ["ar80_dit20", "ar20_dit80", "ar50_dit50"])
+        last_end = float(
+            ps.phase_schedule[-1].get("t_end_s")
+            or ps.phase_schedule[-1].get("end_s")
+            or ps.arrival_duration_s
+        )
+        self.assertAlmostEqual(last_end, 360.0, places=1)
+        ps_offs = [s.arrival_offset_s for s in ps.sessions]
+        self.assertEqual(ps_offs, sorted(ps_offs))
+        seen_labels = {s.phase_label for s in ps.sessions if s.phase_label}
+        self.assertEqual(seen_labels, {"ar80_dit20", "ar20_dit80", "ar50_dit50"})
+        ps_rt = WorkloadSuite.from_dict(ps.to_dict())
+        self.assertEqual(len(ps_rt.phase_schedule), 3)
+        self.assertEqual(ps_rt.sessions[0].phase_label, ps.sessions[0].phase_label)
+
+    def test_v2_synthetic_e2e_bidirectional_prev_img_think_active_jct_and_telemetry(self) -> None:
+        v2_suite = _build_v2_mini_interleaved_suite()
+        prev_img_calls: list[tuple[str, bool, bool, str | None]] = []
+
+        class _BidirectionalSpyAdapter(SyntheticCPTGAdapter):
+            def prepare_turn(self, ctx_id: str, cmd: dict[str, object]) -> int:
+                lb = super().prepare_turn(ctx_id, cmd)
+                ent = self._contexts.get(ctx_id)
+                if "s_cocreate" in ctx_id:
+                    prev_img_calls.append(
+                        (
+                            ctx_id,
+                            bool(cmd.get("prepare_for_dit", False)),
+                            bool(cmd.get("use_prev_image", False)),
+                            None if ent is None else ent.last_image_tag,
+                        )
+                    )
+                return lb
+
+        with tempfile.TemporaryDirectory(dir=_scratch_dir()) as tmp:
+            td = Path(tmp)
+            pol = EnginePolicyConfig.from_preset(
+                "morphserve",
+                num_gpus=2,
+                model_family="synthetic",
+                inter_turn_think_s_range=(0.02, 0.04),
+                think_time_dist="lognormal",
+                think_time_median_s=0.03,
+                think_time_sigma=0.5,
+            )
+            self.assertFalse(pol.allow_cascade_cfg_split)
+            fleet = InProcessWorkerFleet(pol, adapter_factory=lambda r, p: _BidirectionalSpyAdapter(r, p))
+            eng = MorphServeClusterEngine(pol, td, td, tmp_root=td / "v2_e2e", fleet=fleet)
+            try:
+                eng.start()
+                rep = eng.run_suite(v2_suite)
+            finally:
+                eng.shutdown()
+
+            self.assertEqual(rep.status, "ok")
+            self.assertEqual(rep.completed_sessions, 4)
+            self.assertEqual(rep.oom_sessions, 0)
+            self.assertEqual(rep.error_sessions, 0)
+
+            # Verify bidirectional `use_prev_image=True` on BOTH Turn 2 (AR) and Turn 3 (DiT) of Q1 `s_cocreate`!
+            self.assertEqual(len(prev_img_calls), 4)
+            self.assertEqual(prev_img_calls[0][1:3], (False, False))  # Turn 0: AR plan
+            self.assertEqual(prev_img_calls[1][1:3], (True, False))   # Turn 1: DiT t2i
+            self.assertEqual(prev_img_calls[2][1:3], (False, True))   # Turn 2: AR inspecting generated image
+            self.assertIsNotNone(prev_img_calls[2][3])
+            self.assertEqual(prev_img_calls[3][1:3], (True, True))    # Turn 3: DiT editing generated image
+            self.assertIsNotNone(prev_img_calls[3][3])
+
+            q1_out = next(s for s in rep.sessions if s["session_id"] == "s_cocreate")
+            self.assertEqual(len(q1_out["ar_texts"]), 2)
+            self.assertEqual(len(q1_out["dit_turns_ms"]), 2)
+            self.assertGreaterEqual(float(q1_out["think_time_ms"]), 50.0)
+            self.assertGreater(float(q1_out["active_jct_ms"]), 0.0)
+            self.assertLess(float(q1_out["active_jct_ms"]), float(q1_out["e2e_ms"]))
+            self.assertAlmostEqual(
+                float(q1_out["active_jct_ms"]) + float(q1_out["think_time_ms"]),
+                float(q1_out["e2e_ms"]),
+                delta=5.0,
+            )
+            self.assertEqual(len(q1_out["turn_records"]), 4)
+
+            # Verify v2 ClusterRunReport fields
+            self.assertIn(rep.steady_state_window_mode, ("time", "session_trim"))
+            self.assertEqual(rep.steady_state_sessions, 4)
+            self.assertEqual(rep.steady_oom_sessions, 0)
+            self.assertGreaterEqual(rep.effective_slo_throughput_rps, 0.0)
+            self.assertGreaterEqual(rep.steady_ar_slo_attainment_pct, 0.0)
+            self.assertGreaterEqual(rep.steady_ar_slo_mean_pct, 0.0)
+            self.assertGreaterEqual(rep.steady_ar_slo_strict_max_pct, 0.0)
+            self.assertGreaterEqual(rep.steady_dit_slo_attainment_pct, 0.0)
+            self.assertGreater(rep.active_jct_p50_ms, 0.0)
+            self.assertGreater(rep.active_jct_p95_ms, 0.0)
+            self.assertGreater(rep.active_jct_p99_ms, 0.0)
+            self.assertLess(rep.active_jct_p95_ms, rep.session_e2e_p95_ms)
+            self.assertIsNotNone(rep.all_session_active_jct_p50_ms)
+            self.assertIsNotNone(rep.all_session_active_jct_p90_ms)
+            self.assertIsNotNone(rep.all_session_active_jct_p95_ms)
+            self.assertGreater(len(rep.active_jct_cdf_points), 0)
+            self.assertGreaterEqual(rep.kv_host_swap_outs, 0)
+            self.assertTrue({"turn_0", "turn_1", "turn_2", "turn_3"}.issubset(set(rep.per_turn_stats.keys())))
+            self.assertGreaterEqual(len(rep.time_series_10s), 1)
+
     def test_phase2_scripts_syntax_and_py_compile(self) -> None:
         import os
+        import re
 
         scripts_dir = REPO_ROOT / "deploy/kairos/scripts"
         all_scripts = sorted(scripts_dir.glob("*.sh"))
-        self.assertGreaterEqual(len(all_scripts), 18)
-        stage1_gate = scripts_dir / "16_osdi27_stage1_1gpu_gate.sh"
-        self.assertTrue(stage1_gate.is_file(), "missing 16_osdi27_stage1_1gpu_gate.sh")
-        self.assertTrue(os.access(stage1_gate, os.X_OK), "16_osdi27_stage1_1gpu_gate.sh must be executable")
+        self.assertGreaterEqual(len(all_scripts), 19)
+        for req_script in ("16_osdi27_stage1_1gpu_gate.sh", "18_osdi27_v2_thinktime_8gpu.sh"):
+            sp = scripts_dir / req_script
+            self.assertTrue(sp.is_file(), f"missing {req_script}")
+            self.assertTrue(os.access(sp, os.X_OK), f"{req_script} must be executable")
         for script in all_scripts:
             proc = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, msg=f"bash -n failed on {script.name}: {proc.stderr}")
+
+        # Validate all 7 Interleaved-Bench v2 Kairos job JSON templates (DNS-1035 <= 52 chars, mount_shared, image)
+        jobs_dir = REPO_ROOT / "deploy/kairos/jobs"
+        v2_job_files = (
+            "osdi27_v2_r1_stage1_gate_1gpu.json",
+            "osdi27_v2_r2a_suitea_8gpu.json",
+            "osdi27_v2_r2b_phaseshift_acc_8gpu.json",
+            "osdi27_v2_r2c_internvlu_8gpu.json",
+            "osdi27_v2_r2e_lowqps_8gpu.json",
+            "osdi27_v2_r2f_thinktime_8gpu.json",
+            "osdi27_v2_r3_multinode_2x8.json",
+        )
+        dns_re = re.compile(r"^[a-z][a-z0-9-]{0,50}[a-z0-9]$")
+        for jf in v2_job_files:
+            jp = jobs_dir / jf
+            self.assertTrue(jp.is_file(), f"missing v2 job JSON: {jf}")
+            doc = json.loads(jp.read_text(encoding="utf-8"))
+            name = str(doc["name"])
+            self.assertLessEqual(len(name), 52, msg=f"{jf} job name exceeds 52 chars: {name}")
+            self.assertRegex(name, dns_re, msg=f"{jf} job name not DNS-1035 compliant: {name}")
+            self.assertTrue(doc.get("mount_shared") is True, msg=f"{jf} must set mount_shared=true")
+            self.assertEqual(doc.get("image"), "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2")
+            env_map = {e["name"]: e["value"] for e in doc.get("env", [])}
+            self.assertEqual(env_map.get("KAIROS_PROJECT"), "MORPHSERVE")
+            self.assertEqual(env_map.get("KAIROS_RUN_ID"), name)
+            self.assertTrue(bool(env_map.get("KAIROS_BUILD")))
+            cmd_parts = str(doc.get("command", "")).split()
+            self.assertGreaterEqual(len(cmd_parts), 2)
+            ref_script = scripts_dir / Path(cmd_parts[-1]).name
+            self.assertTrue(ref_script.is_file(), f"{jf} references missing script {ref_script.name}")
+            self.assertTrue(os.access(ref_script, os.X_OK), f"{jf} script not executable: {ref_script.name}")
 
         for py_rel in (
             "python/morphserve/_core.py",
@@ -1566,14 +2014,17 @@ class TestPhase2M21M22Offline(unittest.TestCase):
             "python/morphserve/tools/stage_bench_sources.py",
             "python/morphserve/bench/exactness.py",
             "python/morphserve/bench/interleaved_bench.py",
+            "python/morphserve/bench/run_phase2_bagel_main.py",
             "python/morphserve/bench/validate_phase2_engine_smoke.py",
+            "python/morphserve/bench/validate_phase2_internvl_u.py",
+            "python/morphserve/bench/validate_phase2_multinode_2x8.py",
             "python/morphserve/engine/__init__.py",
             "python/morphserve/engine/config.py",
+            "python/morphserve/engine/workload.py",
             "python/morphserve/engine/worker_runtime.py",
             "python/morphserve/engine/worker_proc.py",
             "python/morphserve/engine/multinode_fleet.py",
             "python/morphserve/engine/cluster_engine.py",
-            "python/morphserve/bench/validate_phase2_multinode_2x8.py",
         ):
             p = REPO_ROOT / py_rel
             res = subprocess.run([sys.executable, "-m", "py_compile", str(p)], capture_output=True, text=True)

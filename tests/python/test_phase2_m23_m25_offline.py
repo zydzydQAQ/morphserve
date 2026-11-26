@@ -123,18 +123,60 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         real_80 = WorkloadSuite.load_json(REPO_ROOT / "data/interleaved-bench-v1/suites/main_mix_80.json")
         real_96 = scale_suite_sessions(real_80, target_sessions=96)
         assert len(real_96.sessions) == 96
-        assert Counter(s.quadrant for s in real_96.sessions) == {
-            "multiturn_edit": 29,
-            "visual_cot": 29,
-            "multi_image_vqa": 24,
-            "highres_t2i": 14,
-        }
+        real_quads = Counter(s.quadrant for s in real_96.sessions)
+        if real_80.schema == "morphserve.interleaved_bench.v2" or "interleaved_co_creation" in real_quads:
+            assert real_quads == {
+                "interleaved_co_creation": 29,
+                "multiturn_edit": 24,
+                "multi_image_vqa": 24,
+                "visual_cot_highres": 19,
+            }
+            expected_quads = ("interleaved_co_creation", "multiturn_edit", "multi_image_vqa", "visual_cot_highres")
+        else:
+            assert real_quads == {
+                "multiturn_edit": 29,
+                "visual_cot": 29,
+                "multi_image_vqa": 24,
+                "highres_t2i": 14,
+            }
+            expected_quads = ("multiturn_edit", "visual_cot", "multi_image_vqa", "highres_t2i")
         appended_dts = [
             real_96.sessions[i].arrival_offset_s - real_96.sessions[i - 1].arrival_offset_s for i in range(80, 96)
         ]
         assert all(0.0 <= dt <= 15.0 for dt in appended_dts)
         core_counts = Counter(s.quadrant for s in real_96.sessions[14:82])
-        assert all(core_counts[q] >= 12 for q in ("multiturn_edit", "visual_cot", "multi_image_vqa", "highres_t2i"))
+        assert all(core_counts[q] >= 12 for q in expected_quads)
+
+        # Unconditionally verify v2 30/25/25/20 80-session suite scaling -> 96 (`29/24/24/19`)
+        v2_quads = (
+            ("interleaved_co_creation",) * 24
+            + ("multiturn_edit",) * 20
+            + ("multi_image_vqa",) * 20
+            + ("visual_cot_highres",) * 16
+        )
+        v2_suite_80 = WorkloadSuite(
+            name="v2_mix_80",
+            trace_source="BurstGPT+GenTD26",
+            base_qps=0.6,
+            schema="morphserve.interleaved_bench.v2",
+            sessions=[
+                InterleavedSession(
+                    session_id=f"v2s_{i:02d}",
+                    quadrant=q,
+                    source_dataset="unit",
+                    arrival_offset_s=float(i) * 1.5,
+                    turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="hello")],
+                )
+                for i, q in enumerate(v2_quads)
+            ],
+        )
+        v2_96 = scale_suite_sessions(v2_suite_80, target_sessions=96)
+        assert Counter(s.quadrant for s in v2_96.sessions) == {
+            "interleaved_co_creation": 29,
+            "multiturn_edit": 24,
+            "multi_image_vqa": 24,
+            "visual_cot_highres": 19,
+        }
 
     def test_build_ablation_configs_ladder(self) -> None:
         ladder = build_ablation_configs(num_gpus=8)
@@ -167,6 +209,7 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert cfgs["no_m1_tripool_vmm"].preemption_mode == "layer_chunk"
         assert cfgs["no_m1_tripool_vmm"].use_module3_cow_loopback
         assert cfgs["no_m1_tripool_vmm"].routing_mode == "dual_path"
+        assert all(not c.allow_cascade_cfg_split for c in cfgs.values())
 
     def test_exactness_evaluator_mmvet_and_parity(self) -> None:
         assert score_mmvet_answer("The painting is by Vincent van Gogh in 1889.", "van gogh<AND>1889") == 1.0
@@ -359,27 +402,46 @@ class TestPhase2M23M25Offline(unittest.TestCase):
     def test_m3_active_accuracy_suite_and_tiered_ssim_exactness(self) -> None:
         bench_root = REPO_ROOT / "data" / "interleaved-bench-v1"
         suite = build_m3_active_accuracy_suite(bench_root)
+        assert suite.schema == "morphserve.interleaved_bench.v2"
         by_q: dict[str, list[InterleavedSession]] = {}
         for s in suite.sessions:
             by_q.setdefault(s.quadrant, []).append(s)
 
-        assert len(by_q["visual_cot"]) == 48
+        assert set(by_q.keys()) == {
+            "interleaved_co_creation",
+            "multiturn_edit",
+            "multi_image_vqa",
+            "visual_cot_highres",
+        }
+        assert len(by_q["interleaved_co_creation"]) == 36
+        assert all(
+            len(s.turns) == 4
+            and s.turns[0].modality_plan == "ar_only"
+            and s.turns[1].modality_plan in ("dit_t2i", "dit_edit")
+            and s.turns[2].modality_plan == "ar_only"
+            and s.turns[2].use_prev_image is True
+            and s.turns[3].modality_plan == "dit_edit"
+            and s.turns[3].use_prev_image is True
+            for s in by_q["interleaved_co_creation"]
+        )
+        assert len(by_q["visual_cot_highres"]) == 36
         # Visual-CoT GenEval MUST be 2-turn (`ar_only` `<think>` >= 32 tokens -> `dit_t2i` with `geneval_meta`)
         # so `BagelCPTGAdapter._prepare_turn_inner` sees `has_hist == True` and forks `L_shared >= 32`!
-        assert all(len(s.turns) == 2 for s in by_q["visual_cot"])
+        assert all(len(s.turns) == 2 for s in by_q["visual_cot_highres"])
         assert all(
             s.turns[0].modality_plan == "ar_only"
-            and len(s.turns[0].prompt.split()) >= 20
+            and len(s.turns[0].prompt.split()) >= 15
             and s.turns[1].modality_plan == "dit_t2i"
             and bool(s.turns[1].geneval_meta)
-            for s in by_q["visual_cot"]
+            for s in by_q["visual_cot_highres"]
         )
-        assert len(by_q["multiturn_edit"]) == 45
+        assert len(by_q["multiturn_edit"]) == 36
         assert all(len(s.turns) == 4 for s in by_q["multiturn_edit"])
-        assert len(by_q["multi_image_vqa"]) == 48
-        assert all(len(s.turns) == 2 for s in by_q["multi_image_vqa"])
+        assert len(by_q["multi_image_vqa"]) == 36
+        assert all(len(s.turns) in (2, 3) for s in by_q["multi_image_vqa"])
 
-        # Verify Tiered SSIM Red Line: Turn-0 requires >=0.99 while chained Turn-1+ requires >=0.96
+        # Verify Tiered SSIM Red Line: Turn-0 requires >=0.99 while chained Turn-1+ requires >=0.96,
+        # and v2 `strict_ssim_1=True` (`strict_lossless` tier) enforces strict SSIM == 1.0!
         with tempfile.TemporaryDirectory(dir=_scratch_dir()) as tmp:
             tdir = Path(tmp)
             rng = np.random.default_rng(7)
@@ -403,16 +465,21 @@ class TestPhase2M23M25Offline(unittest.TestCase):
                     source_dataset="magicbrush",
                     turns=[
                         InterleavedTurn(turn_idx=0, modality_plan="dit_edit", prompt="t0"),
-                        InterleavedTurn(turn_idx=1, modality_plan="dit_edit", prompt="t1"),
+                        InterleavedTurn(turn_idx=1, modality_plan="dit_edit", prompt="t1", use_prev_image=True),
                     ],
                 )
             ]
             r_edit = [{"session_id": "e0", "status": "ok", "ar_texts": [], "image_paths_out": [str(p_ref), str(p_ref)]}]
             c_edit = [{"session_id": "e0", "status": "ok", "ar_texts": [], "image_paths_out": [str(p_ref), str(p_noisy)]}]
-            rep_edit = ev.evaluate_parity_and_quality(s_edit, r_edit, c_edit)
+            rep_edit = ev.evaluate_parity_and_quality(s_edit, r_edit, c_edit, strict_ssim_1=False)
             assert 0.96 <= rep_edit["chained_multiturn_min_ssim"] < 0.99
             assert rep_edit["lossless_pass"] is True
             assert rep_edit["clip_t_delta_pct"] == 0.0
+
+            rep_strict_fail = ev.evaluate_parity_and_quality(s_edit, r_edit, c_edit, strict_ssim_1=True)
+            assert rep_strict_fail["lossless_pass"] is False
+            rep_strict_ok = ev.evaluate_parity_and_quality(s_edit, r_edit, r_edit, strict_ssim_1=True)
+            assert rep_strict_ok["lossless_pass"] is True
 
             # The exact same noisy image on Turn-0 must fail the stricter 0.99 Turn-0 SSIM gate!
             c_bad_t0 = [{"session_id": "e0", "status": "ok", "ar_texts": [], "image_paths_out": [str(p_noisy), str(p_ref)]}]
@@ -628,6 +695,8 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         # Session 0 (`multiturn_edit`, 4 turns) across 2 single-GPU nodes (`gpus_per_node=1`) executes 4 forward ships
         # (`path_a_ships == 4`) plus 3 post-DiT return ships on turns 0..2 (`cross_node_ships == 7`), and marks OOM
         # cleanly without exceeding physical HBM if `und` rank fills during DiT!
+        import morphserve.sim.cluster_simulator as cs_mod
+
         hw_xnode = HardwareInterconnectSpec(
             name="unit_2node_2gpu",
             gpu_hbm_gib=40.0,
@@ -639,8 +708,15 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             inter_node_rdma_gbps=5.0,
             gpus_per_node=1,
         )
-        r_nccl_1 = simulate_cluster_point("static_nccl_fission", 2, hw_xnode, offered_qps=0.5, num_sessions=1, physics=ph)
-        r_shm_1 = simulate_cluster_point("twostage_shm", 2, hw_xnode, offered_qps=0.5, num_sessions=1, physics=ph)
+        with mock.patch.object(
+            cs_mod,
+            "_build_session_stream",
+            return_value=[(0.0, "multiturn_edit", (("dit_edit", 512),) * 4)],
+        ):
+            r_nccl_1 = simulate_cluster_point(
+                "static_nccl_fission", 2, hw_xnode, offered_qps=0.5, num_sessions=1, physics=ph
+            )
+            r_shm_1 = simulate_cluster_point("twostage_shm", 2, hw_xnode, offered_qps=0.5, num_sessions=1, physics=ph)
         assert r_nccl_1["oom_sessions"] == 0
         assert r_nccl_1["path_a_ships"] == 4
         assert r_nccl_1["cross_node_ships"] == 7
@@ -1061,12 +1137,23 @@ class TestPhase2M23M25Offline(unittest.TestCase):
 
         # 2. Improper all-session CDF places OOM sessions at +inf (`None` when survival < 95%, shifted when >= 95%)
         L = get_core_lib()
-        pol_json = encode_json(serialize_policy_config(EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=8)))
+        pol_json = encode_json(
+            serialize_policy_config(
+                EnginePolicyConfig.from_preset(
+                    "monolithic_dp",
+                    num_gpus=8,
+                    steady_window_mode="session_trim",
+                    steady_state_trim_frac=0.0,
+                )
+            )
+        )
         # Case A: 90/100 survive (`survival_rate_pct == 90.0% < 95%`) -> `all_session_e2e_p95_ms` is `None` (`+inf`), P90 is max survivor!
         outcomes_90 = [
             {
                 "status": "ok" if i < 90 else "oom",
                 "e2e_ms": float((i + 1) * 1000.0),
+                "active_jct_ms": float((i + 1) * 800.0),
+                "think_time_ms": float((i + 1) * 200.0),
                 "ar_ttfts_ms": [200.0],
                 "ar_tpots_ms": [50.0],
                 "dit_turns_ms": [float((i + 1) * 500.0)] if i < 90 else [],
@@ -1090,7 +1177,10 @@ class TestPhase2M23M25Offline(unittest.TestCase):
         assert agg_90["survival_rate_pct"] == 90.0
         assert agg_90["all_session_e2e_p95_ms"] is None
         assert agg_90["all_session_dit_p95_ms"] is None
+        assert agg_90["all_session_active_jct_p95_ms"] is None
         assert abs(float(agg_90["all_session_e2e_p90_ms"]) - 90000.0) < 1e-3
+        assert abs(float(agg_90["all_session_active_jct_p90_ms"]) - 72000.0) < 1e-3
+        assert len(agg_90["active_jct_cdf_points"]) > 0
 
         # 3. `@80%` and `@90%` SLO linear crossing interpolation on `SLO Attainment (%) vs. QPS`
         sweep_rows = [
@@ -1191,9 +1281,57 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             sim_vmm.shutdown()
             mirror.close()
 
-        # 3. Verify `BagelCPTGAdapter` enables `allow_cascade_split=True` for E2E FlashPrefix-CFG
+        # 3. Verify `BagelCPTGAdapter` wires `allow_cascade_split=bool(self.policy.allow_cascade_cfg_split)`
+        #    and `EnginePolicyConfig` defaults `allow_cascade_cfg_split=False` for strict-lossless parity!
         bagel_src = (REPO_ROOT / "python/morphserve/models/bagel_adapter.py").read_text(encoding="utf-8")
-        assert "enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=True)" in bagel_src
+        assert "allow_cascade_split=bool(self.policy.allow_cascade_cfg_split)" in bagel_src
+        assert EnginePolicyConfig.from_preset("morphserve", num_gpus=8).allow_cascade_cfg_split is False
+
+    def test_v2_internvlu_multiturn_suite_builder_and_cli_contracts(self) -> None:
+        from morphserve.bench.validate_phase2_internvl_u import build_internvlu_suite
+        import morphserve.bench.run_phase2_bagel_main as bagel_main_mod
+
+        suite = build_internvlu_suite(num_sessions=24, offered_qps=1.2, highres_size=1024)
+        assert len(suite.sessions) == 24
+        assert suite.schema == "morphserve.interleaved_bench.v2"
+        assert all(len(s.turns) >= 2 for s in suite.sessions), "v2 InternVL-U suite must be 100% multi-turn (2-4 turns)"
+        by_q = {}
+        for s in suite.sessions:
+            by_q.setdefault(s.quadrant, []).append(s)
+        assert set(by_q.keys()) == {"interleaved_co_creation", "multiturn_edit", "multi_image_vqa"}
+        assert all(
+            len(s.turns) == 3
+            and s.turns[0].modality_plan == "ar_only"
+            and s.turns[1].modality_plan == "dit_t2i"
+            and s.turns[2].modality_plan == "ar_only"
+            and s.turns[2].use_prev_image is True
+            for s in by_q["interleaved_co_creation"]
+        )
+        assert all(
+            len(s.turns) == 4
+            and s.turns[1].use_prev_image is True
+            and s.turns[2].use_prev_image is True
+            and s.turns[3].use_prev_image is True
+            for s in by_q["multiturn_edit"]
+        )
+        assert all(len(s.turns) == 2 and all(t.modality_plan == "ar_only" for t in s.turns) for s in by_q["multi_image_vqa"])
+        # Verify 12 GiB quota overrides preserve strict-lossless `allow_cascade_cfg_split=False`
+        ov, _ = compute_internvlu_memory_quota_overrides(
+            "morphserve", 8, "/shared/data/MORPHSERVE/models/InternVL-U", constrained_gib=12.0, total_gpu_gib=40.0
+        )
+        pol_ivl = EnginePolicyConfig.from_preset("morphserve", num_gpus=8, **ov)
+        assert pol_ivl.allow_cascade_cfg_split is False
+        assert pol_ivl.ar_tpot_slo_mode == "turn_p95"
+
+        # Verify `run_phase2_bagel_main.py` exposes v2 `think_time_sweep` mode alongside suite_a/suite_a_lowqps/suite_b
+        src_main = Path(bagel_main_mod.__file__).read_text(encoding="utf-8")
+        for mode_tok in ('"suite_a"', '"suite_a_lowqps"', '"think_time_sweep"', '"suite_b"'):
+            assert mode_tok in src_main, f"missing {mode_tok} in run_phase2_bagel_main.py"
+
+        # Verify all 3 AR TPOT SLO modes round-trip via C++ preset engine
+        for slo_mode in ("turn_p95", "turn_mean", "token_max"):
+            p = EnginePolicyConfig.from_preset("morphserve", num_gpus=8, ar_tpot_slo_mode=slo_mode)
+            assert p.ar_tpot_slo_mode == slo_mode
 
 
 if __name__ == "__main__":

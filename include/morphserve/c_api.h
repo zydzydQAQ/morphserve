@@ -381,6 +381,14 @@ double ms_router_crossover_kv_mib(
     int dst_gpu);
 
 double ms_ctrl_deterministic_think_s(const char* session_id, int turn_idx, double lo_s, double hi_s);
+double ms_ctrl_deterministic_think_dist_s(
+    const char* session_id,
+    int turn_idx,
+    double lo_s,
+    double hi_s,
+    const char* dist,
+    double median_s,
+    double sigma);
 char* ms_ctrl_aggregate_report_json(
     const char* policy_json,
     const char* suite_name,

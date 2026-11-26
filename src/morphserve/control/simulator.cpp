@@ -29,6 +29,89 @@ inline double round_2(double x) noexcept { return std::round(x * 100.0) / 100.0;
 inline double round_3(double x) noexcept { return std::round(x * 1000.0) / 1000.0; }
 inline double round_4(double x) noexcept { return std::round(x * 10000.0) / 10000.0; }
 
+double percentile_raw_sim(const std::vector<double>& vals, double p) {
+    if (vals.empty()) {
+        return 0.0;
+    }
+    std::vector<double> s = vals;
+    std::sort(s.begin(), s.end());
+    const double idx = static_cast<double>(s.size() - 1) * (p / 100.0);
+    const size_t lo = static_cast<size_t>(std::floor(idx));
+    const size_t hi = std::min(s.size() - 1, static_cast<size_t>(std::ceil(idx)));
+    if (lo == hi) {
+        return s[lo];
+    }
+    const double frac = idx - static_cast<double>(lo);
+    return s[lo] * (1.0 - frac) + s[hi] * frac;
+}
+
+double mean_raw_sim(const std::vector<double>& vals) {
+    if (vals.empty()) {
+        return 0.0;
+    }
+    double sum = 0.0;
+    for (double v : vals) {
+        sum += v;
+    }
+    return sum / static_cast<double>(vals.size());
+}
+
+struct SimArFlags {
+    bool p95_ok = true;
+    bool mean_ok = true;
+    bool strict_max_ok = true;
+};
+
+SimArFlags eval_sim_ar_slos(
+    const std::vector<double>& ttfts,
+    const std::vector<double>& flat_tpots,
+    const std::vector<std::vector<double>>& turn_tpots,
+    double ttft_cap,
+    double tpot_cap) {
+    for (double x : ttfts) {
+        if (x > ttft_cap) {
+            return SimArFlags{false, false, false};
+        }
+    }
+    SimArFlags flags{true, true, true};
+    bool has_turns = false;
+    for (const auto& tv : turn_tpots) {
+        if (!tv.empty()) {
+            has_turns = true;
+            break;
+        }
+    }
+    if (has_turns) {
+        for (const auto& tv : turn_tpots) {
+            if (tv.empty()) continue;
+            if (percentile_raw_sim(tv, 95.0) > tpot_cap) flags.p95_ok = false;
+            if (mean_raw_sim(tv) > tpot_cap) flags.mean_ok = false;
+            for (double x : tv) {
+                if (x > tpot_cap) {
+                    flags.strict_max_ok = false;
+                    break;
+                }
+            }
+        }
+    } else if (!flat_tpots.empty()) {
+        if (percentile_raw_sim(flat_tpots, 95.0) > tpot_cap) flags.p95_ok = false;
+        if (mean_raw_sim(flat_tpots) > tpot_cap) flags.mean_ok = false;
+        for (double x : flat_tpots) {
+            if (x > tpot_cap) {
+                flags.strict_max_ok = false;
+                break;
+            }
+        }
+    }
+    return flags;
+}
+
+bool select_sim_ar_slo(const SimArFlags& f, const std::string& mode) noexcept {
+    if (mode == "turn_mean") return f.mean_ok;
+    if (mode == "token_max") return f.strict_max_ok;
+    return f.p95_ok;
+}
+
 struct CanonicalEntry {
     double arr_s;
     const char* quad;
@@ -196,6 +279,7 @@ std::vector<double> scale_arrivals_to_qps(const std::vector<double>& norm_deltas
 struct RawSuiteSession {
     std::string session_id;
     std::string quadrant;
+    std::string phase_label;
     double arrival_offset_s = 0.0;
     std::vector<SimTurnSpec> turns;
 };
@@ -222,14 +306,29 @@ CachedSuiteBundle load_cached_suite_bundle(
 
     CachedSuiteBundle out;
     if (!bench_root.empty()) {
-        std::string rel = "suites/main_mix_80.json";
-        if (skew_tag == "ar80_dit20") rel = "suites/skew_ar80_dit20.json";
-        else if (skew_tag == "ar50_dit50") rel = "suites/skew_ar50_dit50.json";
-        else if (skew_tag == "ar20_dit80") rel = "suites/skew_ar20_dit80.json";
+        std::vector<std::string> cand_rels;
+        if (skew_tag == "ar80_dit20") {
+            cand_rels = {"suites/skew_ar80_dit20.json"};
+        } else if (skew_tag == "ar50_dit50") {
+            cand_rels = {"suites/skew_ar50_dit50.json"};
+        } else if (skew_tag == "ar20_dit80") {
+            cand_rels = {"suites/skew_ar20_dit80.json"};
+        } else if (skew_tag.empty() || skew_tag == "main_mix") {
+            cand_rels = {"suites/main_mix_80.json", "suites/main_mix_v2.json", "suites/main_mix.json"};
+        } else {
+            cand_rels = {"suites/" + skew_tag + ".json", "suites/skew_" + skew_tag + ".json"};
+        }
 
-        std::filesystem::path suite_p = std::filesystem::path(bench_root) / rel;
+        std::filesystem::path suite_p;
         std::error_code ec;
-        if (std::filesystem::is_regular_file(suite_p, ec)) {
+        for (const auto& rel : cand_rels) {
+            const auto cand = std::filesystem::path(bench_root) / rel;
+            if (std::filesystem::is_regular_file(cand, ec)) {
+                suite_p = cand;
+                break;
+            }
+        }
+        if (!suite_p.empty() && std::filesystem::is_regular_file(suite_p, ec)) {
             std::ifstream in(suite_p, std::ios::binary);
             if (in) {
                 const auto j = nlohmann::json::parse(in);
@@ -238,6 +337,7 @@ CachedSuiteBundle load_cached_suite_bundle(
                         RawSuiteSession rs;
                         rs.session_id = sj.value("session_id", "");
                         rs.quadrant = sj.value("quadrant", "visual_cot");
+                        rs.phase_label = sj.value("phase_label", "");
                         rs.arrival_offset_s = sj.value("arrival_offset_s", 0.0);
                         if (sj.contains("turns") && sj["turns"].is_array()) {
                             for (const auto& tj : sj["turns"]) {
@@ -250,7 +350,8 @@ CachedSuiteBundle load_cached_suite_bundle(
                                     tj.value("height", 512),
                                     tj.value("dit_steps", 20),
                                     tj.value("max_ar_tokens", 48),
-                                    n_img});
+                                    n_img,
+                                    tj.value("use_prev_image", false)});
                             }
                         }
                         out.sessions.push_back(std::move(rs));
@@ -869,7 +970,14 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
             std::vector<size_t> ar_idx;
             std::vector<size_t> dit_idx;
             for (size_t i = 0; i < cloned.size(); ++i) {
-                if (cloned[i].quadrant == "multi_image_vqa" || cloned[i].quadrant == "visual_cot") {
+                const auto& q = cloned[i].quadrant;
+                const bool is_ar_init =
+                    (q == "multi_image_vqa" || q == "visual_cot" || q == "visual_cot_highres" ||
+                     q == "interleaved_co_creation") ||
+                    (q != "multiturn_edit" && q != "highres_t2i" && !cloned[i].turns.empty() &&
+                     (cloned[i].turns[0].modality_plan == "ar_only" ||
+                      cloned[i].turns[0].modality_plan == "cot_then_dit"));
+                if (is_ar_init) {
                     ar_idx.push_back(i);
                 } else {
                     dit_idx.push_back(i);
@@ -899,8 +1007,16 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
                 if (extra_edit_turns > 0 && sc.quadrant == "multiturn_edit") {
                     const SimTurnSpec last = sc.turns.back();
                     for (int e = 0; e < extra_edit_turns; ++e) sc.turns.push_back(last);
+                } else if (extra_edit_turns > 0 && sc.quadrant == "interleaved_co_creation" &&
+                           sc.turns.size() >= 2) {
+                    const SimTurnSpec prev_a = sc.turns[sc.turns.size() - 2];
+                    const SimTurnSpec prev_b = sc.turns[sc.turns.size() - 1];
+                    for (int e = 0; e < extra_edit_turns; ++e) {
+                        sc.turns.push_back((e % 2 == 0) ? prev_a : prev_b);
+                    }
                 } else if (extra_edit_turns >= 2 &&
-                           (sc.quadrant == "visual_cot" || sc.quadrant == "multi_image_vqa")) {
+                           (sc.quadrant == "visual_cot" || sc.quadrant == "visual_cot_highres" ||
+                            sc.quadrant == "multi_image_vqa")) {
                     const SimTurnSpec last = sc.turns.back();
                     for (int e = 0; e < extra_edit_turns / 2; ++e) sc.turns.push_back(last);
                 }
@@ -909,7 +1025,8 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
                 sc.arrival_offset_s * 1000.0,
                 sc.quadrant,
                 std::move(sc.turns),
-                std::move(sc.session_id)});
+                std::move(sc.session_id),
+                std::move(sc.phase_label)});
         }
         return out;
     }
@@ -922,13 +1039,32 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
     std::vector<SimSessionSpec> out;
     out.reserve(static_cast<size_t>(num_sessions));
     for (int idx = 0; idx < num_sessions; ++idx) {
-        const auto& tmpl = base[static_cast<size_t>(idx) % base.size()];
-        auto turns = tmpl.turns;
-        const std::string q = tmpl.quad;
+        std::vector<SimTurnSpec> turns;
+        std::string q;
+        if (skew_tag == "interleaved_co_creation") {
+            const int h = (idx % 3 == 0) ? 1024 : 512;
+            q = "interleaved_co_creation";
+            turns = {
+                SimTurnSpec{"ar_only", h, 20, 48, 1},
+                SimTurnSpec{"dit_edit", h, 20, 48, 0},
+                SimTurnSpec{"ar_only", h, 20, 48, 0},
+                SimTurnSpec{"dit_edit", h, 20, 48, 0},
+            };
+        } else {
+            const auto& tmpl = base[static_cast<size_t>(idx) % base.size()];
+            turns = tmpl.turns;
+            q = tmpl.quad;
+        }
         if (!turns.empty()) {
             if (extra_edit_turns > 0 && q == "multiturn_edit") {
                 const auto last = turns.back();
                 for (int e = 0; e < extra_edit_turns; ++e) turns.push_back(last);
+            } else if (extra_edit_turns > 0 && q == "interleaved_co_creation" && turns.size() >= 2) {
+                const auto prev_a = turns[turns.size() - 2];
+                const auto prev_b = turns[turns.size() - 1];
+                for (int e = 0; e < extra_edit_turns; ++e) {
+                    turns.push_back((e % 2 == 0) ? prev_a : prev_b);
+                }
             } else if (extra_edit_turns >= 2 && (q == "visual_cot" || q == "multi_image_vqa")) {
                 const auto last = turns.back();
                 for (int e = 0; e < extra_edit_turns / 2; ++e) turns.push_back(last);
@@ -939,7 +1075,7 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
             const double burst_factor = (m5 == 1 || m5 == 2) ? 0.35 : ((m5 == 0) ? 1.85 : 0.90);
             t_cur += mean_inter_ms * burst_factor * dist(rng);
         }
-        out.push_back(SimSessionSpec{t_cur, q, std::move(turns), ""});
+        out.push_back(SimSessionSpec{t_cur, q, std::move(turns), "", ""});
     }
     return out;
 }
@@ -956,19 +1092,30 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     const std::string& skew_tag,
     const std::string& bench_root,
     const std::string& sources_dir,
-    const std::vector<SimSessionSpec>* custom_sessions) {
+    const std::vector<SimSessionSpec>* custom_sessions,
+    const nlohmann::json& policy_overrides) {
     if (!is_valid_policy_name(policy_name)) {
         throw std::invalid_argument("unknown policy: " + policy_name);
     }
 
     nlohmann::json overrides = nlohmann::json::object();
     if (ws.think_s_range_override.has_value()) {
-        overrides["inter_turn_think_s_range"] =
-            nlohmann::json::array({ws.think_s_range_override->first, ws.think_s_range_override->second});
+        const double lo_ov = ws.think_s_range_override->first;
+        const double hi_ov = ws.think_s_range_override->second;
+        overrides["inter_turn_think_s_range"] = nlohmann::json::array({lo_ov, hi_ov});
+        if (lo_ov > 0.0 && hi_ov > lo_ov &&
+            !(policy_overrides.is_object() && policy_overrides.contains("think_time_median_s"))) {
+            overrides["think_time_median_s"] = std::sqrt(lo_ov * hi_ov);
+        }
     }
     if (hw.gpu_hbm_gib >= 75.0 && policy_name == "morphserve") {
         overrides["super_pool_mib"] = ws.super_pool_mib_80g;
         overrides["fine_kv_pool_mib"] = ws.fine_kv_pool_mib_80g;
+    }
+    if (policy_overrides.is_object()) {
+        for (auto it = policy_overrides.begin(); it != policy_overrides.end(); ++it) {
+            overrides[it.key()] = it.value();
+        }
     }
 
     const PolicyConfig policy = PolicyConfig::from_preset(policy_name, num_gpus, overrides);
@@ -1097,14 +1244,35 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                   num_sessions, offered_qps, num_gpus, seed, ws.extra_edit_turns, skew_tag, bench_root, sources_dir);
     const size_t n_sess = built_sessions.size();
 
+    struct SimDitRec {
+        double lat_ms = 0.0;
+        int height = 512;
+        int steps = 20;
+    };
+    struct SimTurnRec {
+        int turn_idx = 0;
+        std::string status = "ok";
+        std::optional<double> ar_ttft_ms;
+        std::vector<double> ar_tpots_ms;
+        std::optional<double> dit_ms;
+        double kv_mib = 0.0;
+    };
+    struct PendingCotAr {
+        bool valid = false;
+        int turn_idx = -1;
+        double ttft_ms = 0.0;
+        std::vector<double> tpots_ms;
+    };
+
     std::vector<int> sess_gpu(n_sess, -1);
     std::vector<double> sess_kv_mib(n_sess, 0.0);
     std::vector<double> sess_main_kv_mib(n_sess, 0.0);
     std::vector<double> sess_dit_actual_end(n_sess, 0.0);
+    std::vector<double> sess_think_ms(n_sess, 0.0);
+    std::vector<double> sess_end_ms(n_sess, 0.0);
     std::vector<bool> sess_ar_ok(n_sess, true);
     std::vector<bool> sess_dit_ok(n_sess, true);
     std::vector<bool> sess_oom(n_sess, false);
-    std::vector<bool> sess_drop_outcomes_on_oom(n_sess, false);
     std::vector<int> sess_retries(n_sess, 0);
     std::vector<int> sess_ships(n_sess, 0);
     std::vector<int> sess_morphs(n_sess, 0);
@@ -1112,7 +1280,25 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     std::vector<int> sess_preemptions(n_sess, 0);
     std::vector<std::vector<double>> sess_ar_ttfts(n_sess);
     std::vector<std::vector<double>> sess_ar_tpots(n_sess);
-    std::vector<std::vector<std::pair<double, int>>> sess_dit_records(n_sess);
+    std::vector<std::vector<std::vector<double>>> sess_ar_turn_tpots(n_sess);
+    std::vector<std::vector<SimDitRec>> sess_dit_records(n_sess);
+    std::vector<std::vector<SimTurnRec>> sess_turn_records(n_sess);
+    std::vector<PendingCotAr> sess_pending_cot_ar(n_sess);
+
+    auto record_oom = [&](size_t usid_idx, int turn_idx, double end_t_ms) {
+        sess_oom[usid_idx] = true;
+        sess_end_ms[usid_idx] = std::max(sess_end_ms[usid_idx], end_t_ms);
+        SimTurnRec rec;
+        rec.turn_idx = turn_idx;
+        rec.status = "oom";
+        rec.kv_mib = sess_main_kv_mib[usid_idx];
+        if (sess_pending_cot_ar[usid_idx].valid && sess_pending_cot_ar[usid_idx].turn_idx == turn_idx) {
+            rec.ar_ttft_ms = sess_pending_cot_ar[usid_idx].ttft_ms;
+            rec.ar_tpots_ms = std::move(sess_pending_cot_ar[usid_idx].tpots_ms);
+            sess_pending_cot_ar[usid_idx].valid = false;
+        }
+        sess_turn_records[usid_idx].push_back(std::move(rec));
+    };
 
     enum EvKind : int {
         EV_RELEASE = 0,
@@ -1277,18 +1463,24 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     auto compute_think_ms = [&](size_t usid_idx, int next_ti) -> double {
         const auto& s_id = built_sessions[usid_idx].session_id;
         if (!s_id.empty()) {
-            return MorphControlEngine::deterministic_think_s(
+            return MorphControlEngine::deterministic_think_dist_s(
                        s_id,
                        next_ti,
                        policy.inter_turn_think_s_range.first,
-                       policy.inter_turn_think_s_range.second) *
+                       policy.inter_turn_think_s_range.second,
+                       policy.think_time_dist,
+                       policy.think_time_median_s,
+                       policy.think_time_sigma) *
                    1000.0;
         }
-        return MorphControlEngine::deterministic_think_ms_sim(
+        return MorphControlEngine::deterministic_think_dist_ms_sim(
             static_cast<int>(usid_idx),
             next_ti,
             policy.inter_turn_think_s_range.first,
-            policy.inter_turn_think_s_range.second);
+            policy.inter_turn_think_s_range.second,
+            policy.think_time_dist,
+            policy.think_time_median_s,
+            policy.think_time_sigma);
     };
 
     auto compute_naive_swap_ms = [&](int gpu_id, double at_ms) -> double {
@@ -1384,7 +1576,10 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                                 double swap_in_ms,
                                 double lock_wait_ms,
                                 const SimTurnSpec& turn,
-                                bool prepare_for_dit) -> double {
+                                bool prepare_for_dit,
+                                bool loopback_prev_dit_img = false,
+                                double* out_ttft_ms = nullptr,
+                                std::vector<double>* out_turn_tpots = nullptr) -> double {
         const size_t ug = static_cast<size_t>(cur_gpu);
         const int max_t = std::max(2, turn.max_ar_tokens);
         // `bagel-1gpu-smoke.json` & MM-Vet VQA (`ar_only`, `max_ar_tokens=64`) average ~21 tokens; `cot_then_dit` (`max_ar_tokens=48`) ~36 tokens.
@@ -1399,6 +1594,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             } else {
                 prefill_ms = static_cast<double>(turn.num_images) * vit_only_img_ms + ar_prefill_ms;
             }
+        } else if (!prepare_for_dit && loopback_prev_dit_img) {
+            const double loop_prep_saving =
+                policy.use_module3_cow_loopback
+                    ? std::max(0.0, ((ph.cpu_pil_prep_only_ms - ph.gpu_inplace_prep_only_ms) * cscale) / sp)
+                    : 0.0;
+            const double eff_vit_ms = std::max(50.0, vit_only_img_ms - loop_prep_saving);
+            prefill_ms = eff_vit_ms + ar_prefill_ms;
         }
 
         int free_pre_slot = -1;
@@ -1464,10 +1666,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             stretch_active_dit(prefill_ms + ar_tok_p50_ms, /*stretch_denoise=*/still_mid_denoise_at_start, start_prefill_ms);
             const double ttft = lock_wait_ms + wait_ms + prefill_ms + ar_tok_p50_ms;
             sess_ar_ttfts[usid_idx].push_back(ttft);
-            if (ttft > ar_ttft_slo) {
-                sess_ar_ok[usid_idx] = false;
-            }
 
+            std::vector<double> turn_tpots;
+            turn_tpots.reserve(static_cast<size_t>(std::max(0, n_tok - 1)));
             double t_cur = start_prefill_ms + prefill_ms + ar_tok_p50_ms;
             for (int tok_i = 1; tok_i < n_tok; ++tok_i) {
                 const double frac = static_cast<double>(tok_i) / static_cast<double>(std::max(1, n_tok - 1));
@@ -1485,12 +1686,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     // `drain_remaining_ar_tasks()` runs unpreempted right before `vae.decode` (`5d81343`)!
                     stretch_active_dit(dit_stretch_c, /*stretch_denoise=*/false, t_cur);
                 }
+                turn_tpots.push_back(tok_tpot);
                 sess_ar_tpots[usid_idx].push_back(tok_tpot);
-                if (tok_tpot > ar_tpot_slo) {
-                    sess_ar_ok[usid_idx] = false;
-                }
                 t_cur += tok_tpot;
             }
+            sess_ar_turn_tpots[usid_idx].push_back(turn_tpots);
+            if (out_ttft_ms != nullptr) *out_ttft_ms = ttft;
+            if (out_turn_tpots != nullptr) *out_turn_tpots = std::move(turn_tpots);
             preempt_slot_end[ug][static_cast<size_t>(free_pre_slot)] = t_cur;
             if (still_mid_denoise_at_start) {
                 ++sess_preemptions[usid_idx];
@@ -1507,10 +1709,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         const double prefill_wait = overlaps_ar ? std::min(ar_prefill_ms, ar_slot_free_at[ug] - start_ar) : 0.0;
         const double ttft = excl_wait + prefill_wait + swap_in_ms + prefill_ms + ar_tok_p50_ms;
         sess_ar_ttfts[usid_idx].push_back(ttft);
-        if (ttft > ar_ttft_slo) {
-            sess_ar_ok[usid_idx] = false;
-        }
 
+        std::vector<double> turn_tpots;
+        turn_tpots.reserve(static_cast<size_t>(std::max(0, n_tok - 1)));
         double t_cur = start_ar + prefill_wait + swap_in_ms + prefill_ms + ar_tok_p50_ms;
         double gpu_added_ms = swap_in_ms + prefill_ms + ar_tok_p50_ms;
         for (int tok_i = 1; tok_i < n_tok; ++tok_i) {
@@ -1519,12 +1720,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             const bool batched_now = (t_cur < ar_slot_free_at[ug]);
             const double tok_tpot = batched_now ? ar_batch2_step_ms : solo_step;
             gpu_added_ms += batched_now ? (0.5 * ar_batch2_step_ms) : solo_step;
+            turn_tpots.push_back(tok_tpot);
             sess_ar_tpots[usid_idx].push_back(tok_tpot);
-            if (tok_tpot > ar_tpot_slo) {
-                sess_ar_ok[usid_idx] = false;
-            }
             t_cur += tok_tpot;
         }
+        sess_ar_turn_tpots[usid_idx].push_back(turn_tpots);
+        if (out_ttft_ms != nullptr) *out_ttft_ms = ttft;
+        if (out_turn_tpots != nullptr) *out_turn_tpots = std::move(turn_tpots);
         ar_slot_free_at[ug] = std::max(start_ar, ar_slot_free_at[ug]) + gpu_added_ms;
         if (crit_rem_ms > 0.0 && policy.preemption_mode != "non_preemptive") {
             gpu_free_at[ug] = std::max(gpu_free_at[ug], ar_slot_free_at[ug]);
@@ -1570,8 +1772,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             const double swap_in_mib = ledgers[ug].ensure_session_resident(sid);
             if (swap_in_mib < 0.0) {
                 ledgers[ug].release_session(sid);
-                sess_oom[usid] = true;
-                sess_drop_outcomes_on_oom[usid] = true;
+                record_oom(usid, p.ti, ev_ms);
                 continue;
             }
             const double swap_in_ms =
@@ -1581,9 +1782,19 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     : 0.0;
 
             const bool has_img_input = (turn.num_images > 0) || (plan == "dit_edit" && p.ti > 0);
+            const bool prev_was_ar_after_dit =
+                (p.ti >= 2 &&
+                 sess_spec.turns[static_cast<size_t>(p.ti - 1)].modality_plan == "ar_only" &&
+                 sess_spec.turns[static_cast<size_t>(p.ti - 2)].modality_plan != "ar_only");
             double base_delta_kv = 28.0;
             if (quad == "multiturn_edit" || has_img_input) {
-                base_delta_kv = ph.turn_edit_512_kv_delta_mib * (is_1024 ? kEdit1024KvRatio : 1.0);
+                const double full_edit_delta = ph.turn_edit_512_kv_delta_mib * (is_1024 ? kEdit1024KvRatio : 1.0);
+                if (quad == "interleaved_co_creation" && prev_was_ar_after_dit && turn.num_images == 0) {
+                    // Turn `p.ti - 1` (`ar_only`) already appended ViT loopback KV (~268 MiB); add remaining VAE+prompt delta.
+                    base_delta_kv = std::max(28.0, full_edit_delta - 268.0);
+                } else {
+                    base_delta_kv = full_edit_delta;
+                }
             }
             const double cand_main_kv = sess_main_kv_mib[usid] + base_delta_kv * ws.kv_per_turn_scale;
             const bool has_hist_for_cfg = has_img_input || (p.ti > 0);
@@ -1613,8 +1824,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(p.cur_gpu, ev_ms);
                     push_ev(ev_ms, EV_TURN, sid, EvTurn{0, p.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
-                    sess_drop_outcomes_on_oom[usid] = true;
+                    record_oom(usid, p.ti, ev_ms);
                 }
                 continue;
             }
@@ -1838,7 +2048,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(s.r.cur_gpu, ev_ms);
                     push_ev(ev_ms, EV_TURN, sid, EvTurn{0, s.r.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
+                    record_oom(usid, s.r.ti, ev_ms);
                 }
                 continue;
             }
@@ -1896,7 +2106,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(p.dst_gpu, start_dit);
                     push_ev(start_dit, EV_TURN, sid, EvTurn{p.ti, p.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
+                    record_oom(usid, p.ti, start_dit);
                 }
                 continue;
             }
@@ -1933,7 +2143,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(p.dst_gpu, abort_end);
                     push_ev(abort_end, EV_TURN, sid, EvTurn{p.ti, p.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
+                    record_oom(usid, p.ti, abort_end);
                 }
                 continue;
             }
@@ -2078,7 +2288,18 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 sess_kv_mib[usid] = p.cand_main_kv;
                 sess_main_kv_mib[usid] = p.cand_main_kv;
                 const double turn_lat = end_dit - p.t_turn0;
-                sess_dit_records[usid].emplace_back(turn_lat, p.height);
+                sess_dit_records[usid].push_back(SimDitRec{turn_lat, p.height, p.dit_steps});
+                SimTurnRec rec;
+                rec.turn_idx = p.ti;
+                rec.status = "ok";
+                rec.dit_ms = turn_lat;
+                rec.kv_mib = p.cand_main_kv;
+                if (sess_pending_cot_ar[usid].valid && sess_pending_cot_ar[usid].turn_idx == p.ti) {
+                    rec.ar_ttft_ms = sess_pending_cot_ar[usid].ttft_ms;
+                    rec.ar_tpots_ms = std::move(sess_pending_cot_ar[usid].tpots_ms);
+                    sess_pending_cot_ar[usid].valid = false;
+                }
+                sess_turn_records[usid].push_back(std::move(rec));
                 const double turn_slo_ms = (policy.dit_turn_slo_for(p.height, p.dit_steps) * cscale) / sp;
                 if (turn_lat > turn_slo_ms) {
                     sess_dit_ok[usid] = false;
@@ -2086,9 +2307,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 if (has_more_turns) {
                     sess_gpu[usid] = ephemeral_gen ? p.cur_gpu : p.dst_gpu;
                     const double think_ms = compute_think_ms(usid, p.ti + 1);
+                    sess_think_ms[usid] += think_ms;
                     push_ev(end_dit + think_ms, EV_TURN, sid, EvTurn{p.ti + 1, 0});
-                } else if (!ephemeral_gen) {
-                    push_ev(end_dit, EV_RELEASE, sid, std::monostate{});
+                } else {
+                    sess_end_ms[usid] = end_dit;
+                    if (!ephemeral_gen) {
+                        push_ev(end_dit, EV_RELEASE, sid, std::monostate{});
+                    }
                 }
             }
             continue;
@@ -2109,7 +2334,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(rs.e.dst_gpu, ev_ms);
                     push_ev(ev_ms, EV_TURN, sid, EvTurn{0, rs.e.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
+                    record_oom(usid, rs.e.ti, ev_ms);
                 }
                 continue;
             }
@@ -2153,7 +2378,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         sess_gpu[usid] = pick_oom_retry_gpu(p.cur_gpu, turn_end_ms);
                         push_ev(turn_end_ms, EV_TURN, sid, EvTurn{0, p.attempt + 1});
                     } else {
-                        sess_oom[usid] = true;
+                        record_oom(usid, p.ti, turn_end_ms);
                     }
                     continue;
                 }
@@ -2165,7 +2390,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     sess_gpu[usid] = pick_oom_retry_gpu(p.cur_gpu, turn_end_ms);
                     push_ev(turn_end_ms, EV_TURN, sid, EvTurn{0, p.attempt + 1});
                 } else {
-                    sess_oom[usid] = true;
+                    record_oom(usid, p.ti, turn_end_ms);
                 }
                 continue;
             }
@@ -2175,13 +2400,25 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             sess_kv_mib[usid] = p.cand_main_kv;
             sess_main_kv_mib[usid] = p.cand_main_kv;
             const double turn_lat = turn_end_ms - p.t_turn0;
-            sess_dit_records[usid].emplace_back(turn_lat, p.height);
+            sess_dit_records[usid].push_back(SimDitRec{turn_lat, p.height, p.dit_steps});
+            SimTurnRec rec;
+            rec.turn_idx = p.ti;
+            rec.status = "ok";
+            rec.dit_ms = turn_lat;
+            rec.kv_mib = p.cand_main_kv;
+            if (sess_pending_cot_ar[usid].valid && sess_pending_cot_ar[usid].turn_idx == p.ti) {
+                rec.ar_ttft_ms = sess_pending_cot_ar[usid].ttft_ms;
+                rec.ar_tpots_ms = std::move(sess_pending_cot_ar[usid].tpots_ms);
+                sess_pending_cot_ar[usid].valid = false;
+            }
+            sess_turn_records[usid].push_back(std::move(rec));
             const double turn_slo_ms = (policy.dit_turn_slo_for(p.height, p.dit_steps) * cscale) / sp;
             if (turn_lat > turn_slo_ms) {
                 sess_dit_ok[usid] = false;
             }
             sess_gpu[usid] = p.cur_gpu;
             const double think_ms = compute_think_ms(usid, p.ti + 1);
+            sess_think_ms[usid] += think_ms;
             push_ev(turn_end_ms + think_ms, EV_TURN, sid, EvTurn{p.ti + 1, 0});
             continue;
         }
@@ -2236,7 +2473,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 const double swap_in_mib = ledgers[ucur].ensure_session_resident(sid);
                 if (swap_in_mib < 0.0) {
                     ledgers[ucur].release_session(sid);
-                    sess_oom[usid] = true;
+                    record_oom(usid, ti, ev_ms);
                     break;
                 }
                 const double swap_in_ms =
@@ -2244,7 +2481,12 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         ? (((swap_in_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(cur_gpu))) *
                            1000.0)
                         : 0.0;
-                const double ar_img_kv = static_cast<double>(turn.num_images) * 268.0;
+                const bool prev_was_dit =
+                    (ti > 0 && sess_spec.turns[static_cast<size_t>(ti - 1)].modality_plan != "ar_only");
+                const bool loopback_prev_dit_img =
+                    (turn.num_images == 0) && (turn.use_prev_image || (prev_was_dit && quad == "interleaved_co_creation"));
+                const int eff_ar_images = loopback_prev_dit_img ? 1 : turn.num_images;
+                const double ar_img_kv = static_cast<double>(eff_ar_images) * 268.0;
                 const double ar_delta = (ar_img_kv + 3.5) * ws.kv_per_turn_scale;
                 const double new_kv = sess_kv_mib[usid] + ar_delta;
                 if (!ledgers[ucur].upsert_session_kv(sid, new_kv)) {
@@ -2257,19 +2499,34 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         turn_ev.waiting_ar_lock = false;
                         continue;
                     }
-                    sess_oom[usid] = true;
+                    record_oom(usid, ti, ev_ms);
                     break;
                 }
                 sess_kv_mib[usid] = new_kv;
                 sess_main_kv_mib[usid] += ar_delta;
 
                 const double lock_w = std::max(0.0, ev_ms - ar_enq);
-                const double end_ms =
-                    run_ar_phase_sim(usid, cur_gpu, ev_ms, swap_in_ms, lock_w, turn, /*prepare_for_dit=*/false);
+                double ar_ttft_val = 0.0;
+                std::vector<double> ar_turn_tp;
+                const double end_ms = run_ar_phase_sim(
+                    usid,
+                    cur_gpu,
+                    ev_ms,
+                    swap_in_ms,
+                    lock_w,
+                    turn,
+                    /*prepare_for_dit=*/false,
+                    loopback_prev_dit_img,
+                    &ar_ttft_val,
+                    &ar_turn_tp);
+                sess_turn_records[usid].push_back(SimTurnRec{
+                    ti, "ok", ar_ttft_val, std::move(ar_turn_tp), std::nullopt, sess_main_kv_mib[usid]});
                 if (ti + 1 < n_turns) {
                     const double think_ms = compute_think_ms(usid, ti + 1);
+                    sess_think_ms[usid] += think_ms;
                     push_ev(end_ms + think_ms, EV_TURN, sid, EvTurn{ti + 1, 0});
                 } else {
+                    sess_end_ms[usid] = end_ms;
                     push_ev(end_ms, EV_RELEASE, sid, std::monostate{});
                 }
                 break;
@@ -2292,7 +2549,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 const double swap_in_mib = ledgers[ucur].ensure_session_resident(sid);
                 if (swap_in_mib < 0.0) {
                     ledgers[ucur].release_session(sid);
-                    sess_oom[usid] = true;
+                    record_oom(usid, ti, ev_ms);
                     break;
                 }
                 double swap_in_ms =
@@ -2333,8 +2590,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         turn_ev.waiting_ar_lock = false;
                         continue;
                     }
-                    sess_oom[usid] = true;
-                    sess_drop_outcomes_on_oom[usid] = true;
+                    record_oom(usid, ti, ev_ms);
                     break;
                 }
                 if (policy.use_naive_offload && can_vae_here) {
@@ -2342,14 +2598,28 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 }
 
                 const double lock_w = std::max(0.0, ev_ms - ar_enq);
-                const double dit_ready_ms =
-                    run_ar_phase_sim(usid, cur_gpu, ev_ms, swap_in_ms, lock_w, turn, /*prepare_for_dit=*/true);
+                double cot_ttft_val = 0.0;
+                std::vector<double> cot_turn_tp;
+                const double dit_ready_ms = run_ar_phase_sim(
+                    usid,
+                    cur_gpu,
+                    ev_ms,
+                    swap_in_ms,
+                    lock_w,
+                    turn,
+                    /*prepare_for_dit=*/true,
+                    /*loopback_prev_dit_img=*/false,
+                    &cot_ttft_val,
+                    &cot_turn_tp);
+                sess_pending_cot_ar[usid] = PendingCotAr{true, ti, cot_ttft_val, std::move(cot_turn_tp)};
                 const double deferred_vae_ms =
                     (turn.num_images > 0 && !can_vae_here) ? (is_1024 ? vae_encode_1024_ms : vae_encode_512_ms) : 0.0;
 
                 const int main_seq_tokens = static_cast<int>(std::round(
                     (cand_main_kv / std::max(0.01, ws.weight_scale)) / std::max(1e-4, ph.kv_mib_per_token)));
-                const bool has_shared_prefix = policy.use_module3_cow_loopback && (ti > 0 || quad == "visual_cot");
+                const bool has_shared_prefix =
+                    policy.use_module3_cow_loopback &&
+                    (ti > 0 || quad == "visual_cot" || quad == "visual_cot_highres");
                 const auto [dit_core_ms, eff_step_ms] =
                     compute_dit_core_ms(cur_gpu, is_1024, (turn.num_images > 0), has_shared_prefix, main_seq_tokens, turn.dit_steps);
                 const double step_base = is_1024 ? dit1024_step_ms : dit512_step_ms;
@@ -2393,51 +2663,138 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         }
     }
 
-    std::vector<double> ttfts;
-    std::vector<double> tpots;
-    std::vector<double> dit_lats;
+    double max_arrival_s = 0.0;
+    for (size_t s = 0; s < n_sess; ++s) {
+        const double arr_s = built_sessions[s].arrival_ms / 1000.0;
+        if (arr_s > max_arrival_s) max_arrival_s = arr_s;
+    }
+
+    std::vector<size_t> core_indices;
+    std::string eff_window_mode = "session_trim";
+    double win_start_s = 0.0;
+    double win_end_s = 0.0;
+    if (n_sess > 0 && policy.steady_window_mode == "time" &&
+        max_arrival_s >= policy.warmup_window_s + 30.0) {
+        const double ws_s = policy.warmup_window_s;
+        const double we_s = policy.warmup_window_s + policy.steady_window_s;
+        for (size_t s = 0; s < n_sess; ++s) {
+            const double arr_s = built_sessions[s].arrival_ms / 1000.0;
+            if (arr_s >= ws_s - 1e-9 && arr_s <= we_s + 1e-9) {
+                core_indices.push_back(s);
+            }
+        }
+        if (!core_indices.empty()) {
+            eff_window_mode = "time";
+            win_start_s = ws_s;
+            win_end_s = we_s;
+        }
+    }
+    if (core_indices.empty() && n_sess > 0) {
+        eff_window_mode = "session_trim";
+        const size_t trim =
+            (n_sess >= 20) ? static_cast<size_t>(static_cast<double>(n_sess) * policy.steady_state_trim_frac) : 0;
+        const size_t core_begin = (trim > 0 && trim * 2 < n_sess) ? trim : 0;
+        const size_t core_end = (trim > 0 && trim * 2 < n_sess) ? (n_sess - trim) : n_sess;
+        core_indices.reserve(core_end - core_begin);
+        for (size_t s = core_begin; s < core_end; ++s) {
+            core_indices.push_back(s);
+        }
+        if (!core_indices.empty()) {
+            win_start_s = built_sessions[core_indices.front()].arrival_ms / 1000.0;
+            win_end_s = built_sessions[core_indices.back()].arrival_ms / 1000.0;
+        }
+    }
+
+    std::vector<uint8_t> in_core(n_sess, 0);
+    for (size_t idx : core_indices) in_core[idx] = 1;
+    const size_t steady_sessions_cnt = core_indices.size();
+    const size_t n_core = std::max<size_t>(1, steady_sessions_cnt);
+
+    std::vector<double> core_ttfts;
+    std::vector<double> core_tpots;
+    std::vector<double> core_dits;
+    std::vector<double> core_e2es;
+    std::vector<double> core_active_jcts;
+
+    struct SimTurnAcc {
+        int total = 0;
+        int ok = 0;
+        int oom = 0;
+        std::vector<double> ttfts;
+        std::vector<double> tpots;
+        std::vector<double> dits;
+        std::vector<double> kv_mibs;
+    };
+    std::map<int, SimTurnAcc> turn_accs;
+
     int ships = 0;
     int morphs = 0;
     int cross_node_ships = 0;
     int preemptions = 0;
-    for (size_t s = 0; s < n_sess; ++s) {
-        if (sess_oom[s]) {
-            if (!sess_drop_outcomes_on_oom[s]) {
-                for (double x : sess_ar_ttfts[s]) ttfts.push_back(x);
-                for (double x : sess_ar_tpots[s]) tpots.push_back(x);
-                for (const auto& [lat, _] : sess_dit_records[s]) dit_lats.push_back(lat);
-            }
-            continue;
-        }
-        for (double x : sess_ar_ttfts[s]) ttfts.push_back(x);
-        for (double x : sess_ar_tpots[s]) tpots.push_back(x);
-        for (const auto& [lat, _] : sess_dit_records[s]) dit_lats.push_back(lat);
-        ships += sess_ships[s];
-        morphs += sess_morphs[s];
-        cross_node_ships += sess_xnode_ships[s];
-        preemptions += sess_preemptions[s];
-    }
-
-    const size_t trim =
-        (n_sess >= 20) ? static_cast<size_t>(static_cast<double>(n_sess) * policy.steady_state_trim_frac) : 0;
-    const size_t core_begin = (trim > 0 && trim * 2 < n_sess) ? trim : 0;
-    const size_t core_end = (trim > 0 && trim * 2 < n_sess) ? (n_sess - trim) : n_sess;
-    const size_t n_core = std::max<size_t>(1, core_end - core_begin);
-
     size_t core_ok = 0;
+    size_t core_surv = 0;
+    size_t core_ooms = 0;
+    size_t core_ar_ok = 0;
+    size_t core_ar_mean_ok = 0;
+    size_t core_ar_strict_max_ok = 0;
+    size_t core_dit_ok = 0;
     size_t ooms = 0;
     size_t joint_ok = 0;
     int total_retries = 0;
+
     for (size_t s = 0; s < n_sess; ++s) {
         total_retries += sess_retries[s];
+        const bool core = (in_core[s] != 0);
         if (sess_oom[s]) {
             ++ooms;
-        } else if (sess_ar_ok[s] && sess_dit_ok[s]) {
-            ++joint_ok;
-            if (s >= core_begin && s < core_end) ++core_ok;
+            if (core) ++core_ooms;
+        } else {
+            const SimArFlags ar_flags = eval_sim_ar_slos(
+                sess_ar_ttfts[s], sess_ar_tpots[s], sess_ar_turn_tpots[s], ar_ttft_slo, ar_tpot_slo);
+            const bool ar_primary = select_sim_ar_slo(ar_flags, policy.ar_tpot_slo_mode);
+            sess_ar_ok[s] = ar_primary;
+            const bool j_ok = ar_primary && sess_dit_ok[s];
+            if (j_ok) ++joint_ok;
+            ships += sess_ships[s];
+            morphs += sess_morphs[s];
+            cross_node_ships += sess_xnode_ships[s];
+            preemptions += sess_preemptions[s];
+
+            if (core) {
+                ++core_surv;
+                if (j_ok) ++core_ok;
+                if (ar_primary) ++core_ar_ok;
+                if (ar_flags.mean_ok) ++core_ar_mean_ok;
+                if (ar_flags.strict_max_ok) ++core_ar_strict_max_ok;
+                if (sess_dit_ok[s]) ++core_dit_ok;
+
+                const double e2e_ms = std::max(0.0, sess_end_ms[s] - built_sessions[s].arrival_ms);
+                const double active_jct_ms = std::max(0.0, e2e_ms - sess_think_ms[s]);
+                core_e2es.push_back(e2e_ms);
+                core_active_jcts.push_back(active_jct_ms);
+                for (double x : sess_ar_ttfts[s]) core_ttfts.push_back(x);
+                for (double x : sess_ar_tpots[s]) core_tpots.push_back(x);
+                for (const auto& rec : sess_dit_records[s]) core_dits.push_back(rec.lat_ms);
+            }
+        }
+        if (core) {
+            for (const auto& tr : sess_turn_records[s]) {
+                auto& ta = turn_accs[tr.turn_idx];
+                ++ta.total;
+                if (tr.status == "ok") {
+                    ++ta.ok;
+                    if (tr.ar_ttft_ms.has_value()) ta.ttfts.push_back(*tr.ar_ttft_ms);
+                    for (double tp : tr.ar_tpots_ms) ta.tpots.push_back(tp);
+                    if (tr.dit_ms.has_value()) ta.dits.push_back(*tr.dit_ms);
+                    ta.kv_mibs.push_back(tr.kv_mib);
+                } else {
+                    ++ta.oom;
+                }
+            }
         }
     }
     const double att_frac = static_cast<double>(core_ok) / static_cast<double>(n_core);
+    const double eff_slo_throughput_rps = round_4(offered_qps * att_frac);
 
     nlohmann::json slo_curve_by_k = nlohmann::json::object();
     for (const auto& [k_lbl, k_val] : std::vector<std::pair<std::string, double>>{
@@ -2446,26 +2803,14 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         const double ttft_k = (slo_k.at("ar_ttft_slo_ms") * cscale) / sp;
         const double tpot_k = (slo_k.at("ar_tpot_slo_ms") * cscale) / sp;
         size_t k_ok_cnt = 0;
-        for (size_t s = core_begin; s < core_end; ++s) {
+        for (size_t s : core_indices) {
             if (sess_oom[s]) continue;
-            bool ok = true;
-            for (double x : sess_ar_ttfts[s]) {
-                if (x > ttft_k) {
-                    ok = false;
-                    break;
-                }
-            }
+            const SimArFlags k_ar_flags = eval_sim_ar_slos(
+                sess_ar_ttfts[s], sess_ar_tpots[s], sess_ar_turn_tpots[s], ttft_k, tpot_k);
+            bool ok = select_sim_ar_slo(k_ar_flags, policy.ar_tpot_slo_mode);
             if (ok) {
-                for (double x : sess_ar_tpots[s]) {
-                    if (x > tpot_k) {
-                        ok = false;
-                        break;
-                    }
-                }
-            }
-            if (ok) {
-                for (const auto& [lat, h] : sess_dit_records[s]) {
-                    if (lat > (policy.dit_turn_slo_for(h, 20, k_val) * cscale) / sp) {
+                for (const auto& rec : sess_dit_records[s]) {
+                    if (rec.lat_ms > (policy.dit_turn_slo_for(rec.height, rec.steps, k_val) * cscale) / sp) {
                         ok = false;
                         break;
                     }
@@ -2474,9 +2819,11 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             if (ok) ++k_ok_cnt;
         }
         const double k_frac = static_cast<double>(k_ok_cnt) / static_cast<double>(n_core);
+        const double k_rps = round_4(offered_qps * k_frac);
         slo_curve_by_k[k_lbl] = {
             {"attainment_pct", round_1(100.0 * k_frac)},
-            {"goodput_rps", round_4(offered_qps * k_frac)},
+            {"effective_slo_throughput_rps", k_rps},
+            {"goodput_rps", k_rps},
         };
     }
 
@@ -2497,19 +2844,16 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         static_cast<double>(joint_ok) / static_cast<double>(std::max<size_t>(1, n_sess));
     const double survival_pct =
         (n_sess == 0) ? 100.0 : round_1(100.0 * static_cast<double>(n_sess - ooms) / static_cast<double>(n_sess));
+    const double steady_survival_pct =
+        (steady_sessions_cnt == 0)
+            ? 100.0
+            : round_1(100.0 * static_cast<double>(core_surv) / static_cast<double>(n_core));
 
-    std::vector<double> survivor_dits;
-    for (size_t s = 0; s < n_sess; ++s) {
-        if (sess_oom[s]) continue;
-        for (const auto& [lat, _] : sess_dit_records[s]) {
-            survivor_dits.push_back(lat);
-        }
-    }
-    const size_t total_dit_units = survivor_dits.size() + ooms;
+    const size_t total_dit_units = core_dits.size() + core_ooms;
     const double dit_survival_pct =
         (total_dit_units == 0)
             ? 100.0
-            : round_1(100.0 * static_cast<double>(survivor_dits.size()) / static_cast<double>(total_dit_units));
+            : round_1(100.0 * static_cast<double>(core_dits.size()) / static_cast<double>(total_dit_units));
     auto sim_failure_aware_quantile = [](const std::vector<double>& surv, size_t tot, double q_pct) -> nlohmann::json {
         if (tot == 0 || surv.empty()) return nullptr;
         const double s_frac = static_cast<double>(surv.size()) / static_cast<double>(tot);
@@ -2517,12 +2861,32 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         if (q_frac > s_frac + 1e-9) return nullptr;
         return percentile_rounded(surv, std::min(100.0, (q_frac / std::max(1e-9, s_frac)) * 100.0));
     };
-    nlohmann::json dit_cdf_pts = nlohmann::json::array();
-    for (double q_pct : {5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 85.0, 90.0, 95.0, 99.0}) {
-        dit_cdf_pts.push_back({
-            {"p", q_pct},
-            {"ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, q_pct)},
-        });
+    auto build_sim_cdf = [&](const std::vector<double>& surv, size_t tot) -> nlohmann::json {
+        nlohmann::json pts = nlohmann::json::array();
+        for (double q_pct : {5.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 85.0, 90.0, 95.0, 99.0}) {
+            pts.push_back({
+                {"p", q_pct},
+                {"ms", sim_failure_aware_quantile(surv, tot, q_pct)},
+            });
+        }
+        return pts;
+    };
+
+    nlohmann::json per_turn_stats = nlohmann::json::object();
+    for (const auto& [tidx, ta] : turn_accs) {
+        const double t_surv =
+            (ta.total == 0) ? 100.0 : round_1(100.0 * static_cast<double>(ta.ok) / static_cast<double>(ta.total));
+        per_turn_stats["turn_" + std::to_string(tidx)] = {
+            {"total", ta.total},
+            {"ok", ta.ok},
+            {"oom", ta.oom},
+            {"survival_pct", t_surv},
+            {"ar_ttft_p95_ms", percentile_rounded(ta.ttfts, 95.0)},
+            {"ar_tpot_p95_ms", percentile_rounded(ta.tpots, 95.0)},
+            {"dit_p95_ms", percentile_rounded(ta.dits, 95.0)},
+            {"kv_mib_mean", round_2(mean_raw_sim(ta.kv_mibs))},
+            {"kv_mib_p95", percentile_rounded(ta.kv_mibs, 95.0)},
+        };
     }
 
     return {
@@ -2533,9 +2897,24 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"interconnect", hw.name},
         {"offered_qps", round_3(offered_qps)},
         {"crossover_kv_mib", crossover_kv_mib(hw, ph, ws)},
-        {"joint_slo_goodput_rps", round_4(offered_qps * att_frac)},
+        {"steady_state_window_mode", eff_window_mode},
+        {"steady_window_start_s", round_2(win_start_s)},
+        {"steady_window_end_s", round_2(win_end_s)},
+        {"steady_state_sessions", steady_sessions_cnt},
+        {"steady_state_survival_pct", steady_survival_pct},
+        {"steady_oom_sessions", core_ooms},
+        {"effective_slo_throughput_rps", eff_slo_throughput_rps},
+        {"steady_state_goodput_rps", eff_slo_throughput_rps},
+        {"joint_slo_goodput_rps", eff_slo_throughput_rps},
         {"full_trace_goodput_rps", round_4(offered_qps * full_att_frac)},
+        {"steady_state_attainment_pct", round_1(100.0 * att_frac)},
         {"joint_slo_attainment_pct", round_1(100.0 * att_frac)},
+        {"steady_ar_slo_attainment_pct", round_1(100.0 * static_cast<double>(core_ar_ok) / static_cast<double>(n_core))},
+        {"steady_ar_slo_mean_pct", round_1(100.0 * static_cast<double>(core_ar_mean_ok) / static_cast<double>(n_core))},
+        {"steady_ar_slo_strict_max_pct",
+         round_1(100.0 * static_cast<double>(core_ar_strict_max_ok) / static_cast<double>(n_core))},
+        {"steady_dit_slo_attainment_pct",
+         round_1(100.0 * static_cast<double>(core_dit_ok) / static_cast<double>(n_core))},
         {"full_trace_attainment_pct", round_1(100.0 * full_att_frac)},
         {"survival_rate_pct", survival_pct},
         {"dit_turn_survival_pct", dit_survival_pct},
@@ -2546,18 +2925,39 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"vmm_expert_evictions", evict_tot},
         {"vmm_kv_host_swap_outs", swap_out_tot},
         {"vmm_kv_host_swap_ins", swap_in_tot},
-        {"ar_ttft_p95_ms", percentile_rounded(ttfts, 95.0)},
-        {"ar_tpot_p95_ms", percentile_rounded(tpots, 95.0)},
-        {"dit_turn_p95_ms", percentile_rounded(dit_lats, 95.0)},
-        {"all_session_dit_p50_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 50.0)},
-        {"all_session_dit_p90_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 90.0)},
-        {"all_session_dit_p95_ms", sim_failure_aware_quantile(survivor_dits, total_dit_units, 95.0)},
-        {"dit_cdf_points", dit_cdf_pts},
+        {"ar_ttft_p50_ms", percentile_rounded(core_ttfts, 50.0)},
+        {"ar_ttft_p95_ms", percentile_rounded(core_ttfts, 95.0)},
+        {"ar_ttft_p99_ms", percentile_rounded(core_ttfts, 99.0)},
+        {"ar_tpot_p50_ms", percentile_rounded(core_tpots, 50.0)},
+        {"ar_tpot_p95_ms", percentile_rounded(core_tpots, 95.0)},
+        {"ar_tpot_p99_ms", percentile_rounded(core_tpots, 99.0)},
+        {"dit_turn_p50_ms", percentile_rounded(core_dits, 50.0)},
+        {"dit_turn_p95_ms", percentile_rounded(core_dits, 95.0)},
+        {"dit_turn_p99_ms", percentile_rounded(core_dits, 99.0)},
+        {"session_e2e_p50_ms", percentile_rounded(core_e2es, 50.0)},
+        {"session_e2e_p95_ms", percentile_rounded(core_e2es, 95.0)},
+        {"session_e2e_p99_ms", percentile_rounded(core_e2es, 99.0)},
+        {"active_jct_p50_ms", percentile_rounded(core_active_jcts, 50.0)},
+        {"active_jct_p95_ms", percentile_rounded(core_active_jcts, 95.0)},
+        {"active_jct_p99_ms", percentile_rounded(core_active_jcts, 99.0)},
+        {"all_session_active_jct_p50_ms", sim_failure_aware_quantile(core_active_jcts, steady_sessions_cnt, 50.0)},
+        {"all_session_active_jct_p90_ms", sim_failure_aware_quantile(core_active_jcts, steady_sessions_cnt, 90.0)},
+        {"all_session_active_jct_p95_ms", sim_failure_aware_quantile(core_active_jcts, steady_sessions_cnt, 95.0)},
+        {"all_session_e2e_p50_ms", sim_failure_aware_quantile(core_e2es, steady_sessions_cnt, 50.0)},
+        {"all_session_e2e_p90_ms", sim_failure_aware_quantile(core_e2es, steady_sessions_cnt, 90.0)},
+        {"all_session_e2e_p95_ms", sim_failure_aware_quantile(core_e2es, steady_sessions_cnt, 95.0)},
+        {"all_session_dit_p50_ms", sim_failure_aware_quantile(core_dits, total_dit_units, 50.0)},
+        {"all_session_dit_p90_ms", sim_failure_aware_quantile(core_dits, total_dit_units, 90.0)},
+        {"all_session_dit_p95_ms", sim_failure_aware_quantile(core_dits, total_dit_units, 95.0)},
+        {"active_jct_cdf_points", build_sim_cdf(core_active_jcts, steady_sessions_cnt)},
+        {"e2e_cdf_points", build_sim_cdf(core_e2es, steady_sessions_cnt)},
+        {"dit_cdf_points", build_sim_cdf(core_dits, total_dit_units)},
         {"path_a_ships", ships},
         {"path_b_morphs", morphs},
         {"preempted_ar_count", preemptions},
         {"cross_node_ships", cross_node_ships},
         {"slo_curve_by_k", slo_curve_by_k},
+        {"per_turn_stats", per_turn_stats},
     };
 }
 
@@ -2609,6 +3009,20 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
                 ph.kairos_2x8_inter_node_gbps,
                 8};
         }
+        nlohmann::json ref_ov = nlohmann::json::object();
+        for (const char* opt_k : {"inter_turn_think_s_range",
+                                  "think_time_dist",
+                                  "think_time_median_s",
+                                  "think_time_sigma",
+                                  "ar_tpot_slo_mode",
+                                  "steady_window_mode",
+                                  "warmup_window_s",
+                                  "steady_window_s",
+                                  "steady_state_trim_frac"}) {
+            if (ref.contains(opt_k) && !ref[opt_k].is_null()) {
+                ref_ov[opt_k] = ref[opt_k];
+            }
+        }
         const auto sim = simulate_cluster_point(
             pol,
             n_gpus,
@@ -2620,14 +3034,19 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
             WorkloadScaleSpec::bagel_7b_standard(),
             sk_tag,
             bench_root,
-            sources_dir);
+            sources_dir,
+            nullptr,
+            ref_ov);
 
-        // Evaluate all three out-of-sample metrics (`joint_slo_goodput_rps`, `ar_tpot_p95_ms`, `dit_turn_p95_ms`)
-        // over the exact same full `n_s`-session population (`morph_controller.cpp:353-369`).
         double real_gp = 0.0;
         double sim_gp = 0.0;
-        if (ref.contains("joint_slo_goodput_rps") && ref["joint_slo_goodput_rps"].is_number() &&
-            ref["joint_slo_goodput_rps"].get<double>() > 0.0) {
+        if (ref.contains("effective_slo_throughput_rps") && ref["effective_slo_throughput_rps"].is_number() &&
+            ref["effective_slo_throughput_rps"].get<double>() > 0.0 &&
+            ref.value("steady_state_window_mode", "") == "time") {
+            real_gp = ref["effective_slo_throughput_rps"].get<double>();
+            sim_gp = sim.at("effective_slo_throughput_rps").get<double>();
+        } else if (ref.contains("joint_slo_goodput_rps") && ref["joint_slo_goodput_rps"].is_number() &&
+                   ref["joint_slo_goodput_rps"].get<double>() > 0.0) {
             real_gp = ref["joint_slo_goodput_rps"].get<double>();
             sim_gp = sim.at("full_trace_goodput_rps").get<double>();
         } else {

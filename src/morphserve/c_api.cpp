@@ -1436,6 +1436,24 @@ double ms_ctrl_deterministic_think_s(const char* session_id, int turn_idx, doubl
         session_id ? session_id : "", turn_idx, lo_s, hi_s);
 }
 
+double ms_ctrl_deterministic_think_dist_s(
+    const char* session_id,
+    int turn_idx,
+    double lo_s,
+    double hi_s,
+    const char* dist,
+    double median_s,
+    double sigma) {
+    return morphserve::control::MorphControlEngine::deterministic_think_dist_s(
+        session_id ? session_id : "",
+        turn_idx,
+        lo_s,
+        hi_s,
+        (dist && dist[0]) ? dist : "lognormal",
+        median_s,
+        sigma);
+}
+
 char* ms_ctrl_aggregate_report_json(
     const char* policy_json,
     const char* suite_name,
@@ -1549,12 +1567,70 @@ char* ms_sim_point_json(const char* req_json) {
         if (has_custom) {
             for (const auto& sj : j["custom_sessions"]) {
                 morphserve::control::SimSessionSpec s;
-                s.arrival_ms = sj.at(0).get<double>();
-                s.quadrant = sj.at(1).get<std::string>();
-                for (const auto& tj : sj.at(2)) {
-                    s.turns.push_back({tj.at(0).get<std::string>(), tj.at(1).get<int>()});
+                if (sj.is_object()) {
+                    s.arrival_ms = sj.contains("arrival_ms")
+                                       ? sj["arrival_ms"].get<double>()
+                                       : (sj.value("arrival_offset_s", 0.0) * 1000.0);
+                    s.quadrant = sj.value("quadrant", std::string("visual_cot"));
+                    s.session_id = sj.value("session_id", std::string(""));
+                    s.phase_label = sj.value("phase_label", std::string(""));
+                    if (sj.contains("turns") && sj["turns"].is_array()) {
+                        for (const auto& tj : sj["turns"]) {
+                            if (tj.is_object()) {
+                                int n_img = tj.value("num_images", 0);
+                                if (n_img == 0 && tj.contains("image_paths") && tj["image_paths"].is_array()) {
+                                    n_img = static_cast<int>(tj["image_paths"].size());
+                                }
+                                s.turns.push_back(morphserve::control::SimTurnSpec{
+                                    tj.value("modality_plan", std::string("ar_only")),
+                                    tj.value("height", 512),
+                                    tj.value("dit_steps", 20),
+                                    tj.value("max_ar_tokens", 48),
+                                    n_img,
+                                    tj.value("use_prev_image", false)});
+                            } else if (tj.is_array() && tj.size() >= 2) {
+                                s.turns.push_back(morphserve::control::SimTurnSpec{
+                                    tj.at(0).get<std::string>(),
+                                    tj.at(1).get<int>(),
+                                    (tj.size() > 2 && tj[2].is_number()) ? tj[2].get<int>() : 20,
+                                    (tj.size() > 3 && tj[3].is_number()) ? tj[3].get<int>() : 48,
+                                    (tj.size() > 4 && tj[4].is_number()) ? tj[4].get<int>() : 0});
+                            }
+                        }
+                    }
+                } else {
+                    s.arrival_ms = sj.at(0).get<double>();
+                    s.quadrant = sj.at(1).get<std::string>();
+                    for (const auto& tj : sj.at(2)) {
+                        s.turns.push_back(morphserve::control::SimTurnSpec{
+                            tj.at(0).get<std::string>(),
+                            tj.at(1).get<int>(),
+                            (tj.size() > 2 && tj[2].is_number()) ? tj[2].get<int>() : 20,
+                            (tj.size() > 3 && tj[3].is_number()) ? tj[3].get<int>() : 48,
+                            (tj.size() > 4 && tj[4].is_number()) ? tj[4].get<int>() : 0});
+                    }
+                    if (sj.size() > 3 && sj[3].is_string()) {
+                        s.session_id = sj[3].get<std::string>();
+                    }
                 }
                 custom.push_back(std::move(s));
+            }
+        }
+        nlohmann::json pol_ov = (j.contains("policy_overrides") && j["policy_overrides"].is_object())
+                                    ? j["policy_overrides"]
+                                    : nlohmann::json::object();
+        for (const char* opt_k : {"allow_cascade_cfg_split",
+                                  "inter_turn_think_s_range",
+                                  "think_time_dist",
+                                  "think_time_median_s",
+                                  "think_time_sigma",
+                                  "ar_tpot_slo_mode",
+                                  "steady_window_mode",
+                                  "warmup_window_s",
+                                  "steady_window_s",
+                                  "steady_state_trim_frac"}) {
+            if (j.contains(opt_k) && !j[opt_k].is_null() && !pol_ov.contains(opt_k)) {
+                pol_ov[opt_k] = j[opt_k];
             }
         }
         const auto res = morphserve::control::ClusterSimulator::simulate_cluster_point(
@@ -1569,7 +1645,8 @@ char* ms_sim_point_json(const char* req_json) {
             j.value("skew_tag", std::string("")),
             j.value("bench_root", std::string("")),
             j.value("sources_dir", std::string("")),
-            has_custom ? &custom : nullptr);
+            has_custom ? &custom : nullptr,
+            pol_ov);
         return dup_json_str(res);
     } catch (const std::exception& e) {
         set_err(e);

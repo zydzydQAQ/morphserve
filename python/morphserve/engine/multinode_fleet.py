@@ -30,18 +30,23 @@ def serialize_policy_config(policy: EnginePolicyConfig) -> dict[str, Any]:
     raw["initial_alphas"] = {str(k): float(v) for k, v in policy.initial_alphas.items()}
     raw["static_und_ranks"] = list(policy.static_und_ranks)
     raw["static_gen_ranks"] = list(policy.static_gen_ranks)
-    raw["inter_turn_think_s_range"] = list(policy.inter_turn_think_s_range)
+    raw["inter_turn_think_s_range"] = [
+        float(policy.inter_turn_think_s_range[0]),
+        float(policy.inter_turn_think_s_range[1]),
+    ]
+    raw["allow_cascade_cfg_split"] = bool(policy.allow_cascade_cfg_split)
+    raw["think_time_dist"] = str(policy.think_time_dist)
+    raw["think_time_median_s"] = float(policy.think_time_median_s)
+    raw["think_time_sigma"] = float(policy.think_time_sigma)
+    raw["ar_tpot_slo_mode"] = str(policy.ar_tpot_slo_mode)
+    raw["steady_window_mode"] = str(policy.steady_window_mode)
+    raw["warmup_window_s"] = float(policy.warmup_window_s)
+    raw["steady_window_s"] = float(policy.steady_window_s)
     return raw
 
 
 def deserialize_policy_config(data: Mapping[str, Any]) -> EnginePolicyConfig:
-    d = dict(data)
-    d["initial_alphas"] = {int(k): float(v) for k, v in (d.get("initial_alphas") or {}).items()}
-    d["static_und_ranks"] = tuple(int(x) for x in (d.get("static_und_ranks") or ()))
-    d["static_gen_ranks"] = tuple(int(x) for x in (d.get("static_gen_ranks") or ()))
-    tr = d.get("inter_turn_think_s_range") or (3.0, 8.0)
-    d["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
-    return EnginePolicyConfig(**d)
+    return EnginePolicyConfig.from_dict(dict(data))
 
 
 def _recv_exact(sock: socket.socket, nbytes: int) -> bytes:

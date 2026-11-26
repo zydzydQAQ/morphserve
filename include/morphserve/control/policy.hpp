@@ -37,6 +37,7 @@ struct PolicyConfig {
     bool use_shared_numa_mirror = true;
     bool use_h2d_pacer = true;
     bool use_module3_cow_loopback = true;
+    bool allow_cascade_cfg_split = false;
     bool use_naive_offload = false;
     bool kv_vmm_only = false;
     std::string preemption_mode = "layer_chunk";
@@ -51,7 +52,14 @@ struct PolicyConfig {
     double dit_1024_slo_ms = 43440.0;
     std::optional<double> dit_turn_slo_override_ms;
     int max_oom_retries = 1;
-    std::pair<double, double> inter_turn_think_s_range = {3.0, 8.0};
+    std::pair<double, double> inter_turn_think_s_range = {2.0, 25.0};
+    std::string think_time_dist = "lognormal";
+    double think_time_median_s = 6.0;
+    double think_time_sigma = 0.75;
+    std::string ar_tpot_slo_mode = "turn_p95";
+    std::string steady_window_mode = "time";
+    double warmup_window_s = 60.0;
+    double steady_window_s = 180.0;
     double steady_state_trim_frac = 0.15;
     std::optional<double> gpu_memory_fraction;
     std::optional<double> gpu_memory_quota_mib;

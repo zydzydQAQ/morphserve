@@ -33,6 +33,7 @@ class EnginePolicyConfig:
     use_shared_numa_mirror: bool = True
     use_h2d_pacer: bool = True
     use_module3_cow_loopback: bool = True
+    allow_cascade_cfg_split: bool = False
     use_naive_offload: bool = False
     kv_vmm_only: bool = False
     preemption_mode: str = "layer_chunk"  # "non_preemptive" | "step_preemptive" | "layer_chunk"
@@ -48,7 +49,14 @@ class EnginePolicyConfig:
     dit_1024_slo_ms: float = 43440.0
     dit_turn_slo_override_ms: float | None = None
     max_oom_retries: int = 1
-    inter_turn_think_s_range: tuple[float, float] = (3.0, 8.0)
+    inter_turn_think_s_range: tuple[float, float] = (2.0, 25.0)
+    think_time_dist: str = "lognormal"
+    think_time_median_s: float = 6.0
+    think_time_sigma: float = 0.75
+    ar_tpot_slo_mode: str = "turn_p95"
+    steady_window_mode: str = "time"
+    warmup_window_s: float = 60.0
+    steady_window_s: float = 180.0
     steady_state_trim_frac: float = 0.15
     gpu_memory_fraction: float | None = None
     gpu_memory_quota_mib: float | None = None
@@ -96,8 +104,28 @@ class EnginePolicyConfig:
         d["initial_alphas"] = {int(k): float(v) for k, v in (d.get("initial_alphas") or {}).items()}
         d["static_und_ranks"] = tuple(int(x) for x in (d.get("static_und_ranks") or ()))
         d["static_gen_ranks"] = tuple(int(x) for x in (d.get("static_gen_ranks") or ()))
-        tr = d.get("inter_turn_think_s_range") or (3.0, 8.0)
-        d["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
+        tr = d.get("inter_turn_think_s_range")
+        if tr is None:
+            d["inter_turn_think_s_range"] = (2.0, 25.0)
+        else:
+            d["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
+        if "allow_cascade_cfg_split" in d:
+            if d["allow_cascade_cfg_split"] is None:
+                d.pop("allow_cascade_cfg_split")
+            else:
+                d["allow_cascade_cfg_split"] = bool(d["allow_cascade_cfg_split"])
+        for str_key in ("think_time_dist", "ar_tpot_slo_mode", "steady_window_mode"):
+            if str_key in d:
+                if d[str_key] is None:
+                    d.pop(str_key)
+                else:
+                    d[str_key] = str(d[str_key])
+        for flt_key in ("think_time_median_s", "think_time_sigma", "warmup_window_s", "steady_window_s"):
+            if flt_key in d:
+                if d[flt_key] is None:
+                    d.pop(flt_key)
+                else:
+                    d[flt_key] = float(d[flt_key])
         return cls(**d)
 
     @classmethod

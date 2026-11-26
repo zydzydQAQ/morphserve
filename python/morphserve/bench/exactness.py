@@ -627,71 +627,85 @@ def _resolve_bench_sources_dir(bench_root: Path) -> Path | None:
     return None
 
 
+def _load_stratified_geneval_metas(bench_root: Path, limit: int = 64) -> list[dict[str, Any]]:
+    base_acc_path = bench_root / "suites/accuracy_geneval_mmvet.json"
+    metas: list[dict[str, Any]] = []
+    if base_acc_path.is_file():
+        base_acc = WorkloadSuite.load_json(base_acc_path)
+        for s in base_acc.sessions:
+            for t in s.turns:
+                if t.geneval_meta:
+                    meta = dict(t.geneval_meta)
+                    meta.setdefault("prompt", t.prompt)
+                    metas.append(meta)
+    if len(metas) >= limit:
+        return metas[:limit]
+
+    src_dir = _resolve_bench_sources_dir(bench_root)
+    gv_jsonl = (src_dir / "geneval_evaluation_metadata.jsonl") if src_dir is not None else None
+    if gv_jsonl is not None and gv_jsonl.is_file():
+        by_tag: dict[str, list[dict[str, Any]]] = {}
+        seen_prompts = {str(m.get("prompt", "")) for m in metas}
+        for idx, line in enumerate(gv_jsonl.read_text(encoding="utf-8").splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            obj["index"] = idx
+            if str(obj.get("prompt", "")) in seen_prompts:
+                continue
+            by_tag.setdefault(str(obj.get("tag", "other")), []).append(obj)
+        tags = sorted(by_tag.keys())
+        idx_per_tag = 0
+        while len(metas) < limit and tags:
+            added = False
+            for tag in tags:
+                if idx_per_tag < len(by_tag[tag]) and len(metas) < limit:
+                    metas.append(by_tag[tag][idx_per_tag])
+                    added = True
+            if not added:
+                break
+            idx_per_tag += 1
+    return metas[:limit]
+
+
 def build_m3_active_accuracy_suite(
     bench_root: Path,
     *,
-    num_cot_geneval: int = 48,
-    num_edit_4turn: int = 45,
-    num_multiturn_mmvet: int = 48,
+    num_co_creation: int = 36,
+    num_edit_4turn: int = 36,
+    num_multiturn_mmvet: int = 36,
+    num_cot_geneval: int = 36,
 ) -> WorkloadSuite:
-    """Build the M3-active multi-turn downstream accuracy suite (`L_shared > 0` + 4-turn GPU loopback).
+    """Build the Interleaved-Bench v2 4-quadrant downstream accuracy & parity suite (`144` sessions).
 
-    Covers all three Module-3 active regimes (`D6`):
-      1. `num_cot_geneval` Visual-CoT GenEval sessions (`cot_then_dit`, `<think>` shared causal prefix -> `L_shared > 0`);
-      2. `num_edit_4turn` 4-turn MagicBrush / MSE-Bench editing sessions (`LECP CoW` + `Cascade-CFG` + `GpuInPlaceLoopback`);
-      3. `num_multiturn_mmvet` multi-turn MMVet VQA sessions (`ar_only` across paired images & questions).
+    Covers all four Interleaved-Bench v2 orthogonal quadrants:
+      1. `num_co_creation` (36) Q1 4-turn bidirectional `interleaved_co_creation` sessions
+         (`AR -> DiT -> AR(use_prev_image=True) -> DiT(use_prev_image=True)`);
+      2. `num_edit_4turn` (36) Q2 4-turn `multiturn_edit` sessions (MagicBrush + MSE-Bench, Turn 1..3 `use_prev_image=True`);
+      3. `num_multiturn_mmvet` (36) Q3 multi-turn `multi_image_vqa` sessions (MM-Vet);
+      4. `num_cot_geneval` (36) Q4 `visual_cot_highres` GenEval sessions (`AR <think> -> DiT 512px`, OWLv2 scored).
     """
     bench_root = Path(bench_root)
     base_acc_path = bench_root / "suites/accuracy_geneval_mmvet.json"
     base_acc = WorkloadSuite.load_json(base_acc_path) if base_acc_path.is_file() else None
-
-    sessions: list[InterleavedSession] = []
-
-    # 1. 2-Turn Visual-CoT GenEval:
-    #    - Turn 0 (`ar_only`) decodes the `<think>` layout plan into `main_ctx` (`>= 48` causal tokens);
-    #    - Turn 1 (`dit_t2i`) forks `cfg_text_ctx = main_ctx[:L_shared]` via CoW (`has_hist == True`, `L_shared >= 32`)
-    #      and synthesizes the target GenEval scene!
-    geneval_turns: list[InterleavedTurn] = []
-    if base_acc is not None:
-        for s in base_acc.sessions:
-            for t in s.turns:
-                if t.geneval_meta:
-                    geneval_turns.append(t)
-    for i in range(min(int(num_cot_geneval), len(geneval_turns))):
-        gt = geneval_turns[i]
-        plan_prompt = (
-            "Think step by step to plan the exact object counts, colors, spatial positions, "
-            f"and clean background layout before generating the image: {gt.prompt}"
-        )
-        sessions.append(
-            InterleavedSession(
-                session_id=f"acc_cot_geneval_{i:03d}",
-                quadrant="visual_cot",
-                source_dataset="geneval",
-                arrival_offset_s=0.0,
-                turns=[
-                    InterleavedTurn(
-                        turn_idx=0,
-                        modality_plan="ar_only",
-                        prompt=plan_prompt,
-                        max_ar_tokens=48,
-                    ),
-                    InterleavedTurn(
-                        turn_idx=1,
-                        modality_plan="dit_t2i",
-                        prompt=gt.prompt,
-                        height=512,
-                        width=512,
-                        dit_steps=20,
-                        geneval_meta=dict(gt.geneval_meta),
-                    ),
-                ],
-            )
-        )
-
-    # 2. 4-Turn Chained Editing (`MSE-Bench` 4-turn templates + `MagicBrush` extended to 4 turns)
-    edit_candidates: list[InterleavedSession] = []
     src_dir = _resolve_bench_sources_dir(bench_root)
+
+    fallback_refinements = (
+        "Add soft natural warm lighting while preserving the edited objects.",
+        "Enhance background depth and subtle realistic reflections.",
+        "Adjust the lighting to golden hour while keeping the subject intact.",
+        "Refine surface textures and balance overall scene contrast cleanly.",
+    )
+    inspect_prompt = (
+        "Inspect the generated image carefully: verify object placement, lighting, "
+        "and suggest one concrete refinement."
+    )
+
+    # Load source pools cleanly once
+    geneval_metas = _load_stratified_geneval_metas(bench_root, limit=max(64, int(num_cot_geneval) + int(num_co_creation)))
+
+    mse_items: list[dict[str, Any]] = []
     mse_json = (src_dir / "mse_editing_sessions.json") if src_dir is not None else None
     if mse_json is not None and mse_json.is_file():
         mse_doc = json.loads(mse_json.read_text(encoding="utf-8"))
@@ -700,40 +714,17 @@ def build_m3_active_accuracy_suite(
             img_rel = f"images/mse-bench/{img_name}"
             if not (bench_root / img_rel).is_file():
                 continue
-            raw_turns = tpl.get("turns", [])
-            if len(raw_turns) < 4:
+            raw_turns = [str(rt["prompt"]).strip() for rt in tpl.get("turns", []) if str(rt.get("prompt", "")).strip()]
+            if not raw_turns:
                 continue
-            edit_candidates.append(
-                InterleavedSession(
-                    session_id=f"acc_edit4_mse_{idx:03d}",
-                    quadrant="multiturn_edit",
-                    source_dataset="mse-bench",
-                    arrival_offset_s=0.0,
-                    turns=[
-                        InterleavedTurn(
-                            turn_idx=ti,
-                            modality_plan="dit_edit",
-                            prompt=str(rt["prompt"]),
-                            image_paths=[img_rel] if ti == 0 else [],
-                            height=512,
-                            width=512,
-                            dit_steps=20,
-                        )
-                        for ti, rt in enumerate(raw_turns[:4])
-                    ],
-                )
-            )
+            while len(raw_turns) < 4:
+                raw_turns.append(fallback_refinements[(idx + len(raw_turns)) % len(fallback_refinements)])
+            mse_items.append({"idx": idx, "source_image": img_rel, "prompts": raw_turns[:4]})
 
+    mb_items: list[dict[str, Any]] = []
     mb_json = bench_root / "magicbrush_sessions.json"
-    fallback_refinements = (
-        "Add soft natural warm lighting while preserving the edited objects.",
-        "Enhance background depth and subtle realistic reflections.",
-        "Adjust the lighting to golden hour while keeping the subject intact.",
-    )
-    mb_candidates: list[InterleavedSession] = []
     if mb_json.is_file():
-        mb_items = json.loads(mb_json.read_text(encoding="utf-8"))
-        for idx, mb in enumerate(mb_items):
+        for idx, mb in enumerate(json.loads(mb_json.read_text(encoding="utf-8"))):
             src_rel = str(mb.get("source_image", ""))
             if not src_rel or not (bench_root / src_rel).is_file():
                 continue
@@ -742,38 +733,8 @@ def build_m3_active_accuracy_suite(
                 continue
             while len(insts) < 4:
                 insts.append(fallback_refinements[(idx + len(insts)) % len(fallback_refinements)])
-            mb_candidates.append(
-                InterleavedSession(
-                    session_id=f"acc_edit4_mb_{idx:03d}",
-                    quadrant="multiturn_edit",
-                    source_dataset="magicbrush",
-                    arrival_offset_s=0.0,
-                    turns=[
-                        InterleavedTurn(
-                            turn_idx=ti,
-                            modality_plan="dit_edit",
-                            prompt=inst,
-                            image_paths=[src_rel] if ti == 0 else [],
-                            height=512,
-                            width=512,
-                            dit_steps=20,
-                        )
-                        for ti, inst in enumerate(insts[:4])
-                    ],
-                )
-            )
+            mb_items.append({"idx": idx, "source_image": src_rel, "prompts": insts[:4]})
 
-    # Interleave MagicBrush and MSE-Bench 4-turn sessions evenly up to `num_edit_4turn`
-    combined_edits: list[InterleavedSession] = []
-    max_len = max(len(mb_candidates), len(edit_candidates))
-    for i in range(max_len):
-        if i < len(mb_candidates) and len(combined_edits) < int(num_edit_4turn):
-            combined_edits.append(mb_candidates[i])
-        if i < len(edit_candidates) and len(combined_edits) < int(num_edit_4turn):
-            combined_edits.append(edit_candidates[i])
-    sessions.extend(combined_edits[: int(num_edit_4turn)])
-
-    # 3. Multi-Turn MMVet VQA (`2` chained VQA turns per session)
     mmvet_pool: list[dict[str, str]] = []
     mmvet_json = bench_root / "mmvet_questions.json"
     if mmvet_json.is_file():
@@ -792,43 +753,253 @@ def build_m3_active_accuracy_suite(
                     }
                 )
 
+    sessions: list[InterleavedSession] = []
+
+    # 1. Q1: `num_co_creation` (36) 4-turn bidirectional `interleaved_co_creation` sessions
+    #    (`AR -> DiT -> AR(use_prev_image=True) -> DiT(use_prev_image=True)`),
+    #    testing BOTH post-DiT AR inspection exactness AND chained edit loopback!
+    for i in range(int(num_co_creation)):
+        ref_txt = fallback_refinements[i % len(fallback_refinements)]
+        slot = i % 3
+        if slot == 0 and mse_items:
+            it = mse_items[(i // 3) % len(mse_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = (
+                "Analyze the source image composition, lighting, and subjects, "
+                f"and outline a concise visual editing plan for: {t1_prompt}"
+            )
+            t1_meta: dict[str, Any] = {}
+            src_ds = "mse-bench"
+        elif slot == 1 and mb_items:
+            it = mb_items[(i // 3) % len(mb_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = (
+                "Analyze the source image layout and key objects, "
+                f"and plan how to apply this visual edit cleanly: {t1_prompt}"
+            )
+            t1_meta = {}
+            src_ds = "magicbrush"
+        elif geneval_metas:
+            gv = geneval_metas[(int(num_cot_geneval) + i) % len(geneval_metas)]
+            t0_imgs = []
+            t1_plan = "dit_t2i"
+            t1_prompt = str(gv["prompt"])
+            t3_prompt = ref_txt
+            t0_prompt = (
+                "Plan the exact object placement, colors, spatial composition, and lighting "
+                f"before generating the target image: {t1_prompt}"
+            )
+            t1_meta = dict(gv)
+            src_ds = "geneval"
+        elif mse_items:
+            it = mse_items[i % len(mse_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = f"Analyze the source image and plan this edit: {t1_prompt}"
+            t1_meta = {}
+            src_ds = "mse-bench"
+        elif mb_items:
+            it = mb_items[i % len(mb_items)]
+            t0_imgs = [it["source_image"]]
+            t1_plan = "dit_edit"
+            t1_prompt = it["prompts"][0]
+            t3_prompt = it["prompts"][1]
+            t0_prompt = f"Analyze the source image and plan this edit: {t1_prompt}"
+            t1_meta = {}
+            src_ds = "magicbrush"
+        else:
+            break
+
+        sessions.append(
+            InterleavedSession(
+                session_id=f"acc_cocreate_{i:03d}",
+                quadrant="interleaved_co_creation",
+                source_dataset=src_ds,
+                arrival_offset_s=0.0,
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="ar_only",
+                        prompt=t0_prompt,
+                        image_paths=t0_imgs,
+                        max_ar_tokens=48,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=1,
+                        modality_plan=t1_plan,
+                        prompt=t1_prompt,
+                        image_paths=[],
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        geneval_meta=t1_meta,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=2,
+                        modality_plan="ar_only",
+                        prompt=inspect_prompt,
+                        image_paths=[],
+                        max_ar_tokens=48,
+                        use_prev_image=True,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=3,
+                        modality_plan="dit_edit",
+                        prompt=t3_prompt,
+                        image_paths=[],
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        use_prev_image=True,
+                    ),
+                ],
+            )
+        )
+
+    # 2. Q2: `num_edit_4turn` (36) 4-turn chained editing sessions (MagicBrush + MSE-Bench)
+    mb_candidates: list[InterleavedSession] = [
+        InterleavedSession(
+            session_id=f"acc_edit4_mb_{it['idx']:03d}",
+            quadrant="multiturn_edit",
+            source_dataset="magicbrush",
+            arrival_offset_s=0.0,
+            turns=[
+                InterleavedTurn(
+                    turn_idx=ti,
+                    modality_plan="dit_edit",
+                    prompt=inst,
+                    image_paths=[it["source_image"]] if ti == 0 else [],
+                    height=512,
+                    width=512,
+                    dit_steps=20,
+                    use_prev_image=(ti > 0),
+                )
+                for ti, inst in enumerate(it["prompts"][:4])
+            ],
+        )
+        for it in mb_items
+    ]
+    mse_candidates: list[InterleavedSession] = [
+        InterleavedSession(
+            session_id=f"acc_edit4_mse_{it['idx']:03d}",
+            quadrant="multiturn_edit",
+            source_dataset="mse-bench",
+            arrival_offset_s=0.0,
+            turns=[
+                InterleavedTurn(
+                    turn_idx=ti,
+                    modality_plan="dit_edit",
+                    prompt=inst,
+                    image_paths=[it["source_image"]] if ti == 0 else [],
+                    height=512,
+                    width=512,
+                    dit_steps=20,
+                    use_prev_image=(ti > 0),
+                )
+                for ti, inst in enumerate(it["prompts"][:4])
+            ],
+        )
+        for it in mse_items
+    ]
+    combined_edits: list[InterleavedSession] = []
+    max_len = max(len(mb_candidates), len(mse_candidates))
+    for i in range(max_len):
+        if i < len(mb_candidates) and len(combined_edits) < int(num_edit_4turn):
+            combined_edits.append(mb_candidates[i])
+        if i < len(mse_candidates) and len(combined_edits) < int(num_edit_4turn):
+            combined_edits.append(mse_candidates[i])
+    sessions.extend(combined_edits[: int(num_edit_4turn)])
+
+    # 3. Q3: `num_multiturn_mmvet` (36) multi-turn MMVet VQA sessions (alternating 2-turn & 3-turn)
     if mmvet_pool:
         n_mv = min(int(num_multiturn_mmvet), len(mmvet_pool))
         for i in range(n_mv):
-            a = mmvet_pool[i]
-            b = mmvet_pool[(i + 1) % len(mmvet_pool)]
+            n_turns = 2 if (i % 2 == 0) else 3
+            turns_vqa: list[InterleavedTurn] = []
+            for ti in range(n_turns):
+                item = mmvet_pool[(i * 2 + ti) % len(mmvet_pool)]
+                if ti == 0:
+                    q_txt = str(item["question"])
+                elif ti == 1:
+                    q_txt = f"Now inspect the second image as well: {item['question']}"
+                else:
+                    q_txt = f"Finally, inspect the third image and answer: {item['question']}"
+                turns_vqa.append(
+                    InterleavedTurn(
+                        turn_idx=ti,
+                        modality_plan="ar_only",
+                        prompt=q_txt,
+                        image_paths=[str(item["image_path"])] if item.get("image_path") else [],
+                        max_ar_tokens=192,
+                        expected_answer=str(item.get("answer", "")),
+                        use_prev_image=False,
+                    )
+                )
             sessions.append(
                 InterleavedSession(
                     session_id=f"acc_mmvet_mt_{i:03d}",
                     quadrant="multi_image_vqa",
                     source_dataset="mmvet",
                     arrival_offset_s=0.0,
-                    turns=[
-                        InterleavedTurn(
-                            turn_idx=0,
-                            modality_plan="ar_only",
-                            prompt=str(a["question"]),
-                            image_paths=[str(a["image_path"])] if a.get("image_path") else [],
-                            max_ar_tokens=192,
-                            expected_answer=str(a.get("answer", "")),
-                        ),
-                        InterleavedTurn(
-                            turn_idx=1,
-                            modality_plan="ar_only",
-                            prompt=f"Now inspect the second image as well: {b['question']}",
-                            image_paths=[str(b["image_path"])] if b.get("image_path") else [],
-                            max_ar_tokens=192,
-                            expected_answer=str(b.get("answer", "")),
-                        ),
-                    ],
+                    turns=turns_vqa,
                 )
             )
 
+    # 4. Q4: `num_cot_geneval` (36) `visual_cot_highres` GenEval sessions (`AR <think> -> DiT 512px`, OWLv2 scored)
+    for i in range(min(int(num_cot_geneval), len(geneval_metas))):
+        gv = geneval_metas[i]
+        gv_prompt = str(gv["prompt"])
+        plan_prompt = (
+            "Think step by step to plan the exact object counts, colors, spatial positions, "
+            f"and clean background layout before generating the image: {gv_prompt}"
+        )
+        sessions.append(
+            InterleavedSession(
+                session_id=f"acc_cot_geneval_{i:03d}",
+                quadrant="visual_cot_highres",
+                source_dataset="geneval",
+                arrival_offset_s=0.0,
+                turns=[
+                    InterleavedTurn(
+                        turn_idx=0,
+                        modality_plan="ar_only",
+                        prompt=plan_prompt,
+                        max_ar_tokens=48,
+                        use_prev_image=False,
+                    ),
+                    InterleavedTurn(
+                        turn_idx=1,
+                        modality_plan="dit_t2i",
+                        prompt=gv_prompt,
+                        height=512,
+                        width=512,
+                        dit_steps=20,
+                        geneval_meta=dict(gv),
+                        use_prev_image=False,
+                    ),
+                ],
+            )
+        )
+
     return WorkloadSuite(
-        name="accuracy_m3_multiturn_suite",
+        name="accuracy_v2_4quad_suite",
         trace_source="deterministic_eval",
         base_qps=0.8,
         sessions=sessions,
+        schema="morphserve.interleaved_bench.v2",
+        warmup_s=0.0,
+        steady_s=0.0,
+        arrival_duration_s=0.0,
     )
 
 
@@ -889,8 +1060,9 @@ class ExactnessEvaluator:
         cand_outcomes: Sequence[dict[str, Any]],
         *,
         bench_root: Path | None = None,
+        strict_ssim_1: bool = False,
     ) -> dict[str, Any]:
-        """Compare `monolithic_dp` (`ref`) vs `morphserve` (`cand`) across AR parity, SSIM, MMVet, OWLv2 & CLIP."""
+        """Compare `monolithic_dp` (`ref`) vs `morphserve` (`cand`) across AR/post-DiT AR parity, SSIM, MMVet, OWLv2 & CLIP."""
         from PIL import Image
 
         eff_bench_root = Path(bench_root) if bench_root is not None else self.bench_root
@@ -900,14 +1072,18 @@ class ExactnessEvaluator:
         ref_by_id = {r["session_id"]: r for r in ref_outcomes}
         cand_by_id = {c["session_id"]: c for c in cand_outcomes}
 
+        matched_sessions = 0
         ar_total = 0
         ar_exact = 0
+        post_dit_ar_total = 0
+        post_dit_ar_exact = 0
         mmvet_ref_scores: list[float] = []
         mmvet_cand_scores: list[float] = []
 
         img_metrics: list[dict[str, Any]] = []
         turn0_ssims: list[float] = []
         chained_ssims: list[float] = []
+        co_creation_ssims: list[float] = []
         edit_turn_ssims: dict[int, list[float]] = {}
 
         geneval_ref_scores: list[float] = []
@@ -926,16 +1102,36 @@ class ExactnessEvaluator:
             co = cand_by_id.get(sid)
             if not ro or not co or ro.get("status") != "ok" or co.get("status") != "ok":
                 continue
+            matched_sessions += 1
 
-            r_txts = ro.get("ar_texts") or []
-            c_txts = co.get("ar_texts") or []
+            dit_turn_indices = [int(t.turn_idx) for t in sess.turns if t.modality_plan != "ar_only"]
+            first_dit_turn_idx = min(dit_turn_indices) if dit_turn_indices else None
+
+            r_txts = list(ro.get("ar_texts") or [])
+            c_txts = list(co.get("ar_texts") or [])
             ar_turns = [t for t in sess.turns if t.modality_plan in ("ar_only", "cot_then_dit")]
-            for idx, (rt, ct) in enumerate(zip(r_txts, c_txts)):
+            n_ar_cmp = max(len(r_txts), len(c_txts))
+            for idx in range(n_ar_cmp):
+                rt = r_txts[idx] if idx < len(r_txts) else None
+                ct = c_txts[idx] if idx < len(c_txts) else None
+                ar_t = ar_turns[idx] if idx < len(ar_turns) else None
+                is_post_dit_ar = bool(
+                    ar_t is not None
+                    and (
+                        bool(getattr(ar_t, "use_prev_image", False))
+                        or (first_dit_turn_idx is not None and int(ar_t.turn_idx) > first_dit_turn_idx)
+                    )
+                )
                 ar_total += 1
-                if rt == ct:
+                matched_txt = (rt is not None) and (ct is not None) and (rt == ct)
+                if matched_txt:
                     ar_exact += 1
-                if idx < len(ar_turns) and ar_turns[idx].expected_answer:
-                    exp = ar_turns[idx].expected_answer
+                if is_post_dit_ar:
+                    post_dit_ar_total += 1
+                    if matched_txt:
+                        post_dit_ar_exact += 1
+                if ar_t is not None and ar_t.expected_answer and rt is not None and ct is not None:
+                    exp = ar_t.expected_answer
                     mmvet_ref_scores.append(score_mmvet_answer(rt, exp))
                     mmvet_cand_scores.append(score_mmvet_answer(ct, exp))
 
@@ -948,8 +1144,9 @@ class ExactnessEvaluator:
                         src_pil = raw_src.convert("RGB")
                         src_pil.load()
 
-            r_imgs = ro.get("image_paths_out") or []
-            c_imgs = co.get("image_paths_out") or []
+            r_imgs = list(ro.get("image_paths_out") or [])
+            c_imgs = list(co.get("image_paths_out") or [])
+            prev_ref_pil = None
             for img_idx, (rp_str, cp_str) in enumerate(zip(r_imgs, c_imgs)):
                 rp, cp = Path(rp_str), Path(cp_str)
                 if not (rp.is_file() and cp.is_file()):
@@ -957,7 +1154,14 @@ class ExactnessEvaluator:
                 d_turn = dit_turns[img_idx] if img_idx < len(dit_turns) else None
                 has_shared_or_loopback = bool(
                     img_idx > 0
-                    or (d_turn is not None and (d_turn.modality_plan == "cot_then_dit" or int(d_turn.turn_idx) > 0))
+                    or (
+                        d_turn is not None
+                        and (
+                            d_turn.modality_plan == "cot_then_dit"
+                            or int(d_turn.turn_idx) > 0
+                            or bool(getattr(d_turn, "use_prev_image", False))
+                        )
+                    )
                 )
                 pair_m = self.verify_tier2_image_pair(rp, cp, chained_turn=has_shared_or_loopback)
                 img_metrics.append(pair_m)
@@ -966,45 +1170,64 @@ class ExactnessEvaluator:
                 else:
                     turn0_ssims.append(float(pair_m["ssim"]))
 
+                if str(getattr(sess, "quadrant", "")) == "interleaved_co_creation":
+                    co_creation_ssims.append(float(pair_m["ssim"]))
+
                 if d_turn is not None and d_turn.modality_plan == "dit_edit":
                     edit_turn_ssims.setdefault(int(d_turn.turn_idx), []).append(float(pair_m["ssim"]))
 
-                if (d_turn is not None and d_turn.geneval_meta and owlv2.available) or (
-                    d_turn is not None and d_turn.modality_plan == "dit_edit" and clip.available
-                ):
+                need_open_imgs = (
+                    (d_turn is not None and d_turn.geneval_meta and owlv2.available)
+                    or (d_turn is not None and d_turn.modality_plan == "dit_edit" and clip.available)
+                    or (clip.available and img_idx + 1 < len(dit_turns))
+                )
+                if need_open_imgs:
                     with Image.open(rp) as rim, Image.open(cp) as cim:
                         r_rgb = rim.convert("RGB")
+                        r_rgb.load()
                         c_rgb = cim.convert("RGB")
-                        if d_turn.geneval_meta and owlv2.available:
-                            gr = owlv2.score_image(r_rgb, d_turn.geneval_meta)
-                            gc = owlv2.score_image(c_rgb, d_turn.geneval_meta)
-                            if gr["score"] is not None and gc["score"] is not None:
-                                geneval_ref_scores.append(float(gr["score"]))
-                                geneval_cand_scores.append(float(gc["score"]))
-                                tg = str(gr["tag"])
-                                slot = geneval_by_tag.setdefault(tg, {"ref": [], "cand": []})
-                                slot["ref"].append(float(gr["score"]))
-                                slot["cand"].append(float(gc["score"]))
-                        if d_turn.modality_plan == "dit_edit" and clip.available:
-                            cr = clip.score_edit_turn(r_rgb, d_turn.prompt, source_img=src_pil)
-                            cc = clip.score_edit_turn(c_rgb, d_turn.prompt, source_img=src_pil)
-                            if cr["clip_t_pct"] is not None and cc["clip_t_pct"] is not None:
-                                clip_t_ref_list.append(float(cr["clip_t_pct"]))
-                                clip_t_cand_list.append(float(cc["clip_t_pct"]))
-                            if cr["clip_i_pct"] is not None and cc["clip_i_pct"] is not None:
-                                clip_i_ref_list.append(float(cr["clip_i_pct"]))
-                                clip_i_cand_list.append(float(cc["clip_i_pct"]))
-                            ps = clip.pair_similarity_pct(r_rgb, c_rgb)
-                            if ps is not None:
-                                clip_pair_sims.append(ps)
+                        c_rgb.load()
+                    if d_turn is not None and d_turn.geneval_meta and owlv2.available:
+                        gr = owlv2.score_image(r_rgb, d_turn.geneval_meta)
+                        gc_res = owlv2.score_image(c_rgb, d_turn.geneval_meta)
+                        if gr["score"] is not None and gc_res["score"] is not None:
+                            geneval_ref_scores.append(float(gr["score"]))
+                            geneval_cand_scores.append(float(gc_res["score"]))
+                            tg = str(gr["tag"])
+                            slot = geneval_by_tag.setdefault(tg, {"ref": [], "cand": []})
+                            slot["ref"].append(float(gr["score"]))
+                            slot["cand"].append(float(gc_res["score"]))
+                    if d_turn is not None and d_turn.modality_plan == "dit_edit" and clip.available:
+                        eff_src = src_pil if src_pil is not None else prev_ref_pil
+                        cr = clip.score_edit_turn(r_rgb, d_turn.prompt, source_img=eff_src)
+                        cc = clip.score_edit_turn(c_rgb, d_turn.prompt, source_img=eff_src)
+                        if cr["clip_t_pct"] is not None and cc["clip_t_pct"] is not None:
+                            clip_t_ref_list.append(float(cr["clip_t_pct"]))
+                            clip_t_cand_list.append(float(cc["clip_t_pct"]))
+                        if cr["clip_i_pct"] is not None and cc["clip_i_pct"] is not None:
+                            clip_i_ref_list.append(float(cr["clip_i_pct"]))
+                            clip_i_cand_list.append(float(cc["clip_i_pct"]))
+                        ps = clip.pair_similarity_pct(r_rgb, c_rgb)
+                        if ps is not None:
+                            clip_pair_sims.append(ps)
+                    prev_ref_pil = r_rgb
 
         exact_pct = round(100.0 * ar_exact / max(1, ar_total), 2) if ar_total > 0 else 100.0
+        post_dit_ar_exact_pct = (
+            round(100.0 * post_dit_ar_exact / max(1, post_dit_ar_total), 2) if post_dit_ar_total > 0 else 100.0
+        )
         mean_ssim = round(sum(m["ssim"] for m in img_metrics) / max(1, len(img_metrics)), 6) if img_metrics else 1.0
         min_ssim = round(min((m["ssim"] for m in img_metrics), default=1.0), 6)
+        sha256_exact_count = sum(1 for m in img_metrics if m.get("sha256_equal"))
+        sha256_exact_pct = (
+            round(100.0 * sha256_exact_count / max(1, len(img_metrics)), 2) if img_metrics else 100.0
+        )
         min_t0_ssim = round(min(turn0_ssims, default=1.0), 6)
         mean_t0_ssim = round(sum(turn0_ssims) / len(turn0_ssims), 6) if turn0_ssims else 1.0
         min_chained_ssim_obs = round(min(chained_ssims, default=1.0), 6)
         mean_chained_ssim_obs = round(sum(chained_ssims) / len(chained_ssims), 6) if chained_ssims else 1.0
+        mean_cocreate_ssim = round(sum(co_creation_ssims) / len(co_creation_ssims), 6) if co_creation_ssims else 1.0
+        min_cocreate_ssim = round(min(co_creation_ssims, default=1.0), 6)
 
         ref_mmvet = round(100.0 * sum(mmvet_ref_scores) / max(1, len(mmvet_ref_scores)), 2) if mmvet_ref_scores else 0.0
         cand_mmvet = (
@@ -1036,25 +1259,38 @@ class ExactnessEvaluator:
         clip_i_delta = round(clip_i_cand - clip_i_ref, 3) if (clip_i_ref is not None and clip_i_cand is not None) else None
         clip_pair_mean = round(sum(clip_pair_sims) / len(clip_pair_sims), 3) if clip_pair_sims else None
 
-        ssim_ok = (
-            (mean_t0_ssim >= self.min_tier2_ssim)
-            and (min_t0_ssim >= min(self.min_tier2_ssim, 0.985))
-            and (mean_chained_ssim_obs >= self.min_chained_ssim)
-            and (min_chained_ssim_obs >= min(self.min_chained_ssim, 0.90))
-        )
+        if strict_ssim_1:
+            ssim_ok = (min_ssim >= 1.0 - 1e-6) and (mean_ssim >= 1.0 - 1e-6)
+        else:
+            ssim_ok = (
+                (mean_t0_ssim >= self.min_tier2_ssim)
+                and (min_t0_ssim >= min(self.min_tier2_ssim, 0.985))
+                and (mean_chained_ssim_obs >= self.min_chained_ssim)
+                and (min_chained_ssim_obs >= min(self.min_chained_ssim, 0.90))
+            )
         gv_ok = True if delta_gv is None else (cand_gv >= ref_gv - 2.5)
         clip_ok = True if clip_t_delta is None else (abs(clip_t_delta) <= 0.5)
+        has_matched = (matched_sessions > 0) or (len(sessions) == 0)
 
         return {
+            "matched_sessions": matched_sessions,
+            "strict_ssim_1_gate": bool(strict_ssim_1),
             "ar_turns_compared": ar_total,
             "ar_greedy_exact_match_pct": exact_pct,
+            "post_dit_ar_turns_compared": post_dit_ar_total,
+            "post_dit_ar_exact_match_pct": post_dit_ar_exact_pct,
             "images_compared": len(img_metrics),
+            "image_sha256_exact_count": sha256_exact_count,
+            "image_sha256_exact_pct": sha256_exact_pct,
             "image_mean_ssim": mean_ssim,
             "image_min_ssim": min_ssim,
             "turn0_mean_ssim": mean_t0_ssim,
             "turn0_min_ssim": min_t0_ssim,
             "chained_multiturn_mean_ssim": mean_chained_ssim_obs,
             "chained_multiturn_min_ssim": min_chained_ssim_obs,
+            "co_creation_images_compared": len(co_creation_ssims),
+            "co_creation_mean_ssim": mean_cocreate_ssim,
+            "co_creation_min_ssim": min_cocreate_ssim,
             "edit_per_turn_mean_ssim": {
                 f"turn_{ti}": round(sum(vals) / len(vals), 6) for ti, vals in sorted(edit_turn_ssims.items())
             },
@@ -1076,7 +1312,15 @@ class ExactnessEvaluator:
             "clip_i_morphserve_pct": clip_i_cand,
             "clip_i_delta_pct": clip_i_delta,
             "clip_pair_mean_sim_pct": clip_pair_mean,
-            "lossless_pass": bool(exact_pct == 100.0 and ssim_ok and abs(delta_mmvet) <= 0.2 and gv_ok and clip_ok),
+            "lossless_pass": bool(
+                has_matched
+                and exact_pct == 100.0
+                and post_dit_ar_exact_pct == 100.0
+                and ssim_ok
+                and abs(delta_mmvet) <= 0.2
+                and gv_ok
+                and clip_ok
+            ),
         }
 
 

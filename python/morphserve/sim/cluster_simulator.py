@@ -405,20 +405,33 @@ CANONICAL_28_TRACE: tuple[tuple[float, str, tuple[tuple[str, int], ...]], ...] =
 _SUITE_CACHE: dict[str, Any] = {}
 
 
-def _load_real_bench_templates(skew_tag: str | None = None) -> tuple[list[Any] | None, list[float] | None, list[float] | None]:
-    cache_key = skew_tag or "main_mix"
+def _load_real_bench_templates(
+    skew_tag: str | None = None,
+    bench_root: Path | None = None,
+    sources_dir: Path | None = None,
+) -> tuple[list[Any] | None, list[float] | None, list[float] | None]:
+    b_root = DEFAULT_BENCH_ROOT if bench_root is None else Path(bench_root)
+    s_dir = DEFAULT_SOURCES_DIR if sources_dir is None else Path(sources_dir)
+    tag = skew_tag or "main_mix"
+    cache_key = f"{tag}|{b_root}|{s_dir}"
     if cache_key in _SUITE_CACHE:
         return _SUITE_CACHE[cache_key]
-    rel_map = {
-        "main_mix": "suites/main_mix_80.json",
-        "ar80_dit20": "suites/skew_ar80_dit20.json",
-        "ar50_dit50": "suites/skew_ar50_dit50.json",
-        "ar20_dit80": "suites/skew_ar20_dit80.json",
-    }
-    suite_p = DEFAULT_BENCH_ROOT / rel_map.get(cache_key, "suites/main_mix_80.json")
-    burst_p = DEFAULT_SOURCES_DIR / "burstgpt_1_sample.csv"
-    gentd_p = DEFAULT_SOURCES_DIR / "gentd26_lora_request_trace.csv"
-    if not suite_p.is_file():
+    cand_rels: tuple[str, ...]
+    if tag == "main_mix":
+        cand_rels = ("suites/main_mix_80.json", "suites/main_mix_v2.json", "suites/main_mix.json")
+    elif tag in ("ar80_dit20", "ar50_dit50", "ar20_dit80"):
+        cand_rels = (f"suites/skew_{tag}.json",)
+    else:
+        cand_rels = (f"suites/{tag}.json", f"suites/skew_{tag}.json")
+    suite_p: Path | None = None
+    for rel in cand_rels:
+        p = b_root / rel
+        if p.is_file():
+            suite_p = p
+            break
+    burst_p = s_dir / "burstgpt_1_sample.csv"
+    gentd_p = s_dir / "gentd26_lora_request_trace.csv"
+    if suite_p is None:
         _SUITE_CACHE[cache_key] = (None, None, None)
         return (None, None, None)
     suite = WorkloadSuite.load_json(suite_p)
@@ -460,7 +473,12 @@ def _default_build_session_stream(
             q = str(s_copy.quadrant)
             if extra_edit_turns > 0 and q == "multiturn_edit" and turns:
                 turns = turns + tuple(turns[-1] for _ in range(extra_edit_turns))
-            elif extra_edit_turns >= 2 and q in ("visual_cot", "multi_image_vqa") and turns:
+            elif extra_edit_turns > 0 and q == "interleaved_co_creation" and len(turns) >= 2:
+                extra: list[tuple[str, int]] = []
+                for e in range(extra_edit_turns):
+                    extra.append(turns[-2] if (e % 2 == 0) else turns[-1])
+                turns = turns + tuple(extra)
+            elif extra_edit_turns >= 2 and q in ("visual_cot", "visual_cot_highres", "multi_image_vqa") and turns:
                 turns = turns + tuple(turns[-1] for _ in range(extra_edit_turns // 2))
             out_real.append((float(s_copy.arrival_offset_s) * 1000.0, q, turns))
         return out_real
@@ -471,9 +489,17 @@ def _default_build_session_stream(
     mean_inter_ms = 1000.0 / max(0.05, float(offered_qps))
     t_cur = 0.0
     for idx in range(num_sessions):
-        _, q, turns = CANONICAL_28_TRACE[idx % n_base]
+        if skew_tag == "interleaved_co_creation":
+            h = 1024 if (idx % 3 == 0) else 512
+            q = "interleaved_co_creation"
+            turns = (("ar_only", h), ("dit_edit", h), ("ar_only", h), ("dit_edit", h))
+        else:
+            _, q, turns = CANONICAL_28_TRACE[idx % n_base]
         if extra_edit_turns > 0 and q == "multiturn_edit" and turns:
             turns = turns + tuple(turns[-1] for _ in range(extra_edit_turns))
+        elif extra_edit_turns > 0 and q == "interleaved_co_creation" and len(turns) >= 2:
+            extra = [turns[-2] if (e % 2 == 0) else turns[-1] for e in range(extra_edit_turns)]
+            turns = turns + tuple(extra)
         elif extra_edit_turns >= 2 and q in ("visual_cot", "multi_image_vqa") and turns:
             turns = turns + tuple(turns[-1] for _ in range(extra_edit_turns // 2))
         if idx > 0:
@@ -514,6 +540,10 @@ def simulate_cluster_point(
     physics: MeasuredPhysicsProfile | None = None,
     workload_scale: WorkloadScaleSpec | None = None,
     skew_tag: str | None = None,
+    *,
+    policy_overrides: dict[str, Any] | None = None,
+    bench_root: Path | str | None = None,
+    sources_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Execute zero-bias discrete-event simulation natively in C++17 `ClusterSimulator`."""
     if policy_name not in VALID_POLICIES:
@@ -521,6 +551,8 @@ def simulate_cluster_point(
 
     ph = MeasuredPhysicsProfile.from_phase01_results() if physics is None else physics
     ws = WorkloadScaleSpec.bagel_7b_standard() if workload_scale is None else workload_scale
+    b_root = DEFAULT_BENCH_ROOT if bench_root is None else Path(bench_root)
+    s_dir = DEFAULT_SOURCES_DIR if sources_dir is None else Path(sources_dir)
 
     req: dict[str, Any] = {
         "policy_name": policy_name,
@@ -532,9 +564,19 @@ def simulate_cluster_point(
         "physics": asdict(ph),
         "workload_scale": ws.to_dict(),
         "skew_tag": "" if skew_tag is None else str(skew_tag),
-        "bench_root": str(DEFAULT_BENCH_ROOT),
-        "sources_dir": str(DEFAULT_SOURCES_DIR),
+        "bench_root": str(b_root),
+        "sources_dir": str(s_dir),
     }
+    if policy_overrides:
+        ser_ov: dict[str, Any] = {}
+        for k, v in policy_overrides.items():
+            if k == "initial_alphas" and isinstance(v, dict):
+                ser_ov[k] = {str(rk): float(rv) for rk, rv in v.items()}
+            elif isinstance(v, tuple):
+                ser_ov[k] = list(v)
+            else:
+                ser_ov[k] = v
+        req["policy_overrides"] = ser_ov
     if _build_session_stream is not _default_build_session_stream:
         custom = _build_session_stream(
             int(num_sessions),
@@ -556,15 +598,20 @@ def simulate_cluster_point(
 def evaluate_against_real_runs(
     real_runs: list[dict[str, Any]],
     physics: MeasuredPhysicsProfile | None = None,
+    *,
+    bench_root: Path | str | None = None,
+    sources_dir: Path | str | None = None,
 ) -> SimValidationReport:
     """Out-of-sample validation with ZERO parameter grid search via C++17 `ClusterSimulator`."""
     ph = MeasuredPhysicsProfile.from_phase01_results() if physics is None else physics
+    b_root = DEFAULT_BENCH_ROOT if bench_root is None else Path(bench_root)
+    s_dir = DEFAULT_SOURCES_DIR if sources_dir is None else Path(sources_dir)
     L = get_core_lib()
     req = {
         "real_runs": list(real_runs),
         "physics": asdict(ph),
-        "bench_root": str(DEFAULT_BENCH_ROOT),
-        "sources_dir": str(DEFAULT_SOURCES_DIR),
+        "bench_root": str(b_root),
+        "sources_dir": str(s_dir),
     }
     out = call_json(L, L.ms_sim_evaluate_real_json, encode_json(req))
     return SimValidationReport(**out)
@@ -572,14 +619,19 @@ def evaluate_against_real_runs(
 
 def run_h100_80gb_generality_study(
     physics: MeasuredPhysicsProfile | None = None,
+    *,
+    bench_root: Path | str | None = None,
+    sources_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Evaluate H100-80GB NVLink generality natively in C++17 `ClusterSimulator`."""
     ph = MeasuredPhysicsProfile.from_phase01_results() if physics is None else physics
+    b_root = DEFAULT_BENCH_ROOT if bench_root is None else Path(bench_root)
+    s_dir = DEFAULT_SOURCES_DIR if sources_dir is None else Path(sources_dir)
     L = get_core_lib()
     req = {
         "physics": asdict(ph),
-        "bench_root": str(DEFAULT_BENCH_ROOT),
-        "sources_dir": str(DEFAULT_SOURCES_DIR),
+        "bench_root": str(b_root),
+        "sources_dir": str(s_dir),
     }
     return call_json(L, L.ms_sim_h100_study_json, encode_json(req))
 
@@ -588,18 +640,23 @@ def run_scale_and_interconnect_sweep(
     output_dir: Path,
     real_report_path: Path | None = None,
     results_dir: Path | None = None,
+    *,
+    bench_root: Path | str | None = None,
+    sources_dir: Path | str | None = None,
 ) -> dict[str, Any]:
     """Run full 8->16->64 GPU & H100-80GB generality sweep natively in C++17 `ClusterSimulator`."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     res_dir = DEFAULT_RESULTS_DIR if results_dir is None else Path(results_dir)
+    b_root = DEFAULT_BENCH_ROOT if bench_root is None else Path(bench_root)
+    s_dir = DEFAULT_SOURCES_DIR if sources_dir is None else Path(sources_dir)
     L = get_core_lib()
     req = {
         "output_dir": str(out_dir),
         "real_report_path": "" if real_report_path is None else str(real_report_path),
         "results_dir": str(res_dir),
-        "bench_root": str(DEFAULT_BENCH_ROOT),
-        "sources_dir": str(DEFAULT_SOURCES_DIR),
+        "bench_root": str(b_root),
+        "sources_dir": str(s_dir),
     }
     return call_json(L, L.ms_sim_sweep_json, encode_json(req))
 
@@ -609,11 +666,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--real-report", type=Path, default=None)
     parser.add_argument("--results-dir", type=Path, default=None)
+    parser.add_argument("--bench-root", type=Path, default=None)
+    parser.add_argument("--sources-dir", type=Path, default=None)
     args = parser.parse_args(argv)
     rep = run_scale_and_interconnect_sweep(
         args.output_dir,
         real_report_path=args.real_report,
         results_dir=args.results_dir,
+        bench_root=args.bench_root,
+        sources_dir=args.sources_dir,
     )
     return 0 if rep.get("status") == "ok" else 2
 

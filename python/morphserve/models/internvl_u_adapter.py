@@ -744,20 +744,22 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         else:
             self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
 
-    def _load_pil_if_any(self, cmd: dict[str, Any]) -> Any:
+    def _load_pil_path(self, rel_or_abs: str) -> Any:
         from PIL import Image
 
-        paths = cmd.get("image_paths") or []
-        if not paths:
-            return None
-        rel = str(paths[0])
-        p = self.bench_root / rel if not os.path.isabs(rel) else Path(rel)
+        p = self.bench_root / rel_or_abs if not os.path.isabs(rel_or_abs) else Path(rel_or_abs)
         if not p.is_file():
             return None
         with Image.open(p) as raw:
             im = raw.convert("RGB")
             im.load()
             return im
+
+    def _load_pil_if_any(self, cmd: dict[str, Any]) -> Any:
+        paths = cmd.get("image_paths") or []
+        if not paths:
+            return None
+        return self._load_pil_path(str(paths[0]))
 
     @contextmanager
     def _vlm_execution_scope(self):
@@ -785,8 +787,17 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
         prompt = str(cmd["prompt"])
         prep_dit = bool(cmd.get("prepare_for_dit", False))
         prev_ent = self._ctx_store.get(ctx_id)
-        pil_img = self._load_pil_if_any(cmd)
-        if pil_img is None and prev_ent is not None and not (cmd.get("image_paths")):
+        use_prev = cmd.get("use_prev_image")
+        pil_img = None
+        if use_prev:
+            prev_path = cmd.get("prev_image_path")
+            if prev_path:
+                pil_img = self._load_pil_path(str(prev_path))
+            if pil_img is None and prev_ent is not None:
+                pil_img = prev_ent.get("pil_img")
+        if pil_img is None:
+            pil_img = self._load_pil_if_any(cmd)
+        if pil_img is None and use_prev is None and prev_ent is not None and not (cmd.get("image_paths")):
             pil_img = prev_ent.get("pil_img")
         if not prep_dit:
             self._ctx_store[ctx_id] = {"prompt": prompt, "pil_img": pil_img, "bridge_bytes": 4096}
@@ -909,7 +920,12 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 results.append(ar_out)
             return results
 
-        if len(batch_cmds) <= 1 or any(bool(c.get("image_paths")) for c in batch_cmds):
+        if len(batch_cmds) <= 1 or any(
+            bool(c.get("image_paths"))
+            or bool(c.get("use_prev_image"))
+            or (self._ctx_store.get(str(c["ctx_id"]), {}).get("pil_img") is not None)
+            for c in batch_cmds
+        ):
             return super().decode_ar_batch(batch_cmds)
 
         t_start = time.perf_counter()
@@ -1150,11 +1166,19 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
 
         torch.cuda.current_stream(self.device).synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        if save_tmp_path:
-            out_c = ((127.5 * imgs_t[0] + 128.0) / 255.0).clamp(0, 1)
-            pil = Image.fromarray((out_c.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-            Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
-            pil.save(save_tmp_path, format="PNG")
+        release_after_dit = bool(cmd.get("release_after_dit", False))
+        if (not release_after_dit) or save_tmp_path:
+            img0 = imgs_t[0]
+            if isinstance(img0, Image.Image):
+                pil_img = img0.convert("RGB")
+            else:
+                out_c = ((127.5 * img0 + 128.0) / 255.0).clamp(0, 1)
+                pil_img = Image.fromarray((out_c.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
+            if not release_after_dit:
+                entry["pil_img"] = pil_img
+            if save_tmp_path:
+                Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+                pil_img.save(save_tmp_path, format="PNG")
         del imgs_t
         if self._quota_constrained:
             torch.cuda.empty_cache()

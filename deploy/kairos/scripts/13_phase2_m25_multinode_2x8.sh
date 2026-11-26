@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase-2 Job 2f (2x8 = 16 GPUs): Milestone M2.5 Cross-Node Fabric Calibration & 16-GPU E2E Serving Benchmark.
+# OSDI '27 Interleaved-Bench v2 Job R3 (2x8 = 16 GPUs):
+#   Cross-Node Fabric Calibration & 16-GPU Distributed E2E Serving Benchmark.
 # Preserves platform-injected $RANK, $WORLD_SIZE, $MASTER_ADDR, $MASTER_PORT per AGENTS.md!
 set -euo pipefail
 
@@ -16,7 +17,7 @@ if [ "${RANK:-0}" != "0" ] && [ "${KAIROS_DISABLE_NODE_TEE:-0}" != "1" ]; then
 fi
 
 MODEL_DIR="${MODELS}/BAGEL-7B-MoT"
-BENCH_DIR="${DATA}/benchmarks/interleaved-bench-v1"
+BENCH_DIR="${MORPHSERVE_BENCH_DIR:-${DATA}/benchmarks/interleaved-bench-v1}"
 MODE_2X8="${MORPHSERVE_2X8_MODE:-both}"
 
 if [ "${MODE_2X8}" != "spotcheck" ]; then
@@ -59,13 +60,14 @@ python3 -m morphserve.bench.validate_phase2_multinode_2x8 \
   --mode "${MODE_2X8}" \
   --model-dir "${MODEL_DIR}" \
   --bench-root "${BENCH_DIR}" \
-  --num-sessions "${MORPHSERVE_2X8_SESSIONS:-160}" \
   --qps "${MORPHSERVE_2X8_QPS:-1.6}" \
   --output-dir "${RUN_DIR}" \
-  --gpus-per-node 8
+  --gpus-per-node 8 \
+  ${MORPHSERVE_2X8_SESSIONS:+--num-sessions "${MORPHSERVE_2X8_SESSIONS}"} \
+  ${MORPHSERVE_2X8_POLICIES:+--policies "${MORPHSERVE_2X8_POLICIES}"}
 
 _stop_node0_sampler
 if [ "${RANK:-0}" = "0" ]; then
   kairos_check_shared_storage
-  echo "== Phase-2 Job 2f (M2.5 2x8 Multi-Node) completed cleanly: ${RUN_DIR}"
+  echo "== OSDI '27 Interleaved-Bench v2 Job R3 (M2.5 2x8 Multi-Node) completed cleanly: ${RUN_DIR}"
 fi

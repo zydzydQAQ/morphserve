@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ class InterleavedTurn:
     max_ar_tokens: int = 48
     expected_answer: str = ""
     geneval_meta: dict[str, Any] = field(default_factory=dict)
+    use_prev_image: bool = False
 
 
 @dataclass
@@ -29,10 +32,11 @@ class InterleavedSession:
     """One multi-turn or single-turn multimodal request session."""
 
     session_id: str
-    quadrant: str  # "visual_cot" | "multiturn_edit" | "multi_image_vqa" | "highres_t2i"
+    quadrant: str  # "visual_cot" | "visual_cot_highres" | "interleaved_co_creation" | "multiturn_edit" | "multi_image_vqa" | "highres_t2i"
     source_dataset: str
     arrival_offset_s: float = 0.0
     turns: list[InterleavedTurn] = field(default_factory=list)
+    phase_label: str = ""
 
 
 @dataclass
@@ -43,7 +47,11 @@ class WorkloadSuite:
     trace_source: str
     base_qps: float
     sessions: list[InterleavedSession]
-    schema: str = "morphserve.interleaved_bench.v1"
+    schema: str = "morphserve.interleaved_bench.v2"
+    warmup_s: float = 60.0
+    steady_s: float = 180.0
+    arrival_duration_s: float = 240.0
+    phase_schedule: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +60,10 @@ class WorkloadSuite:
             "trace_source": self.trace_source,
             "base_qps": self.base_qps,
             "num_sessions": len(self.sessions),
+            "warmup_s": float(self.warmup_s),
+            "steady_s": float(self.steady_s),
+            "arrival_duration_s": float(self.arrival_duration_s),
+            "phase_schedule": [dict(p) for p in self.phase_schedule],
             "sessions": [asdict(s) for s in self.sessions],
         }
 
@@ -67,6 +79,7 @@ class WorkloadSuite:
                     source_dataset=row["source_dataset"],
                     arrival_offset_s=float(row.get("arrival_offset_s", 0.0)),
                     turns=turns,
+                    phase_label=str(row.get("phase_label", "")),
                 )
             )
         return cls(
@@ -74,7 +87,11 @@ class WorkloadSuite:
             trace_source=data.get("trace_source", "burstgpt+gentd26"),
             base_qps=float(data.get("base_qps", 1.0)),
             sessions=sessions,
-            schema=data.get("schema", "morphserve.interleaved_bench.v1"),
+            schema=data.get("schema", "morphserve.interleaved_bench.v2"),
+            warmup_s=float(data.get("warmup_s", 60.0)),
+            steady_s=float(data.get("steady_s", 180.0)),
+            arrival_duration_s=float(data.get("arrival_duration_s", 240.0)),
+            phase_schedule=[dict(p) for p in (data.get("phase_schedule") or [])],
         )
 
     def save_json(self, path: Path) -> None:
@@ -91,11 +108,30 @@ def scale_arrivals_to_qps(norm_deltas: list[float], target_qps: float, count: in
     if count <= 0:
         return []
     qps = max(float(target_qps), 1e-6)
+    deltas = norm_deltas if norm_deltas else [1.0]
     offsets = [0.0]
     for i in range(1, count):
-        d = norm_deltas[(i - 1) % len(norm_deltas)]
+        d = float(deltas[(i - 1) % len(deltas)])
         offsets.append(round(offsets[-1] + d / qps, 4))
     return offsets
+
+
+def _is_ar_initiating_session(session: InterleavedSession) -> bool:
+    """Return True for AR-initiating sessions (BurstGPT trace), False for DiT-initiating sessions (GenTD26)."""
+    if session.quadrant in (
+        "multi_image_vqa",
+        "visual_cot",
+        "visual_cot_highres",
+        "interleaved_co_creation",
+    ):
+        return True
+    if session.quadrant in ("multiturn_edit", "highres_t2i"):
+        return False
+    if session.turns and session.turns[0].modality_plan in ("ar_only", "cot_then_dit"):
+        return True
+    if session.turns and session.turns[0].modality_plan in ("dit_edit", "dit_t2i"):
+        return False
+    return False
 
 
 def assign_dual_trace_arrivals(
@@ -104,9 +140,9 @@ def assign_dual_trace_arrivals(
     gentd26_deltas: list[float],
     target_qps: float,
 ) -> list[InterleavedSession]:
-    """Assign BurstGPT offsets to AR/CoT sessions and GenTD26 offsets to DiT sessions."""
-    ar_indices = [i for i, s in enumerate(sessions) if s.quadrant in ("multi_image_vqa", "visual_cot")]
-    dit_indices = [i for i, s in enumerate(sessions) if s.quadrant not in ("multi_image_vqa", "visual_cot")]
+    """Assign BurstGPT offsets to AR-initiating sessions and GenTD26 offsets to DiT-initiating sessions."""
+    ar_indices = [i for i, s in enumerate(sessions) if _is_ar_initiating_session(s)]
+    dit_indices = [i for i, s in enumerate(sessions) if not _is_ar_initiating_session(s)]
     total = max(1, len(sessions))
     ar_qps = max(1e-4, target_qps * (len(ar_indices) / float(total)))
     dit_qps = max(1e-4, target_qps * (len(dit_indices) / float(total)))
@@ -122,10 +158,106 @@ def assign_dual_trace_arrivals(
     return sessions
 
 
+def build_time_window_suite(
+    base_suite: WorkloadSuite,
+    target_qps: float,
+    burstgpt_deltas: list[float] | None,
+    gentd26_deltas: list[float] | None,
+    *,
+    arrival_duration_s: float = 240.0,
+    min_sessions: int = 40,
+    max_sessions: int | None = None,
+    warmup_s: float = 60.0,
+    steady_s: float = 180.0,
+) -> WorkloadSuite:
+    """Build a fixed-duration time-window suite preserving quadrant proportions and assigning arrivals."""
+    eff_qps = max(float(target_qps), 1e-4)
+    eff_dur = max(0.0, float(arrival_duration_s))
+    target_n = max(int(min_sessions), int(round(eff_qps * eff_dur)))
+    if max_sessions is not None:
+        target_n = min(target_n, max(1, int(max_sessions)))
+
+    if not base_suite.sessions or target_n <= 0:
+        return WorkloadSuite(
+            name=base_suite.name,
+            trace_source=base_suite.trace_source,
+            base_qps=eff_qps,
+            sessions=[],
+            schema="morphserve.interleaved_bench.v2",
+            warmup_s=float(warmup_s),
+            steady_s=float(steady_s),
+            arrival_duration_s=float(arrival_duration_s),
+            phase_schedule=[dict(p) for p in base_suite.phase_schedule],
+        )
+
+    by_quad: dict[str, list[InterleavedSession]] = {}
+    for s in base_suite.sessions:
+        by_quad.setdefault(s.quadrant, []).append(s)
+
+    quads = list(by_quad.keys())
+    n_base = float(len(base_suite.sessions))
+    quotas = {q: (target_n * len(by_quad[q]) / n_base) for q in quads}
+    counts = {q: int(math.floor(quotas[q])) for q in quads}
+    rem = target_n - sum(counts.values())
+    if rem > 0:
+        order = sorted(range(len(quads)), key=lambda idx: (-(quotas[quads[idx]] - counts[quads[idx]]), idx))
+        for idx in order[:rem]:
+            counts[quads[idx]] += 1
+
+    # Smooth proportional interleaving across quadrants keeps quadrant mix stationary across time windows.
+    active_quads = [q for q in quads if counts[q] > 0]
+    emitted = {q: 0 for q in active_quads}
+    used_ids: set[str] = set()
+    expanded: list[InterleavedSession] = []
+
+    for _ in range(target_n):
+        best_q = min(
+            (q for q in active_quads if emitted[q] < counts[q]),
+            key=lambda q: ((emitted[q] + 0.5) / float(counts[q]), active_quads.index(q)),
+        )
+        pos = emitted[best_q]
+        emitted[best_q] = pos + 1
+        pool = by_quad[best_q]
+        tmpl = pool[pos % len(pool)]
+        rep = pos // len(pool)
+
+        cand_id = tmpl.session_id if (rep == 0 and tmpl.session_id not in used_ids) else f"{tmpl.session_id}__w{rep}"
+        if cand_id in used_ids:
+            suffix = 1
+            while f"{cand_id}_{suffix}" in used_ids:
+                suffix += 1
+            cand_id = f"{cand_id}_{suffix}"
+        used_ids.add(cand_id)
+
+        cloned = deepcopy(tmpl)
+        cloned.session_id = cand_id
+        cloned.arrival_offset_s = 0.0
+        expanded.append(cloned)
+
+    if burstgpt_deltas and gentd26_deltas:
+        assign_dual_trace_arrivals(expanded, burstgpt_deltas, gentd26_deltas, target_qps=eff_qps)
+    else:
+        for idx_s, s_item in enumerate(expanded):
+            s_item.arrival_offset_s = round(idx_s / eff_qps, 4)
+
+    return WorkloadSuite(
+        name=base_suite.name,
+        trace_source=base_suite.trace_source,
+        base_qps=eff_qps,
+        sessions=expanded,
+        schema="morphserve.interleaved_bench.v2",
+        warmup_s=float(warmup_s),
+        steady_s=float(steady_s),
+        arrival_duration_s=float(arrival_duration_s),
+        phase_schedule=[dict(p) for p in base_suite.phase_schedule],
+    )
+
+
 __all__ = [
     "InterleavedSession",
     "InterleavedTurn",
     "WorkloadSuite",
     "assign_dual_trace_arrivals",
+    "build_time_window_suite",
     "scale_arrivals_to_qps",
 ]

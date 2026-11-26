@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Phase-2 Job 2d (1x8 GPUs): Milestone M2.3 Suite B (Modality Skew 80:20/50:50/20:80 + GenEval/MMVet Lossless Parity).
+# OSDI '27 Interleaved-Bench v2 Suite B (1x8 GPUs):
+#   Continuous 360s Online Phase-Shift (ar80_dit20 -> ar20_dit80 -> ar50_dit50)
+#   + Two-Tier (strict_lossless & cascade_cfg_fast) GenEval/CLIP/MMVet Accuracy Evaluation.
 set -euo pipefail
 
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
@@ -7,7 +9,7 @@ source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
 kairos_check_shared_storage
 
 MODEL_DIR="${MODELS}/BAGEL-7B-MoT"
-BENCH_DIR="${DATA}/benchmarks/interleaved-bench-v1"
+BENCH_DIR="${MORPHSERVE_BENCH_DIR:-${DATA}/benchmarks/interleaved-bench-v1}"
 if [ ! -f "${MODEL_DIR}/MODEL_MANIFEST.json" ] || [ ! -f "${BENCH_DIR}/BENCH_MANIFEST.json" ]; then
   echo "error: missing BAGEL-7B-MoT or Interleaved-Bench manifest" >&2
   exit 1
@@ -42,7 +44,7 @@ _cleanup() {
     wait "$SAMPLER_PID" 2>/dev/null || true
   fi
   SAMPLER_PID=""
-  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_m23_* /tmp/ms_m23b_* /tmp/morphserve_h2d_locks /dev/shm/ms_shm_* 2>/dev/null || true
+  rm -rf "$MORPHSERVE_LOCAL_TMP" /tmp/ms_m23_* /tmp/ms_m23b_* /tmp/ms_m23_acc_* /tmp/ms_m23_parity_outputs* /tmp/morphserve_h2d_locks /dev/shm/ms_shm_* 2>/dev/null || true
   _kairos_cleanup
 }
 trap _cleanup EXIT
@@ -54,7 +56,8 @@ python3 -m morphserve.bench.run_phase2_bagel_main \
   --output-dir "${RUN_DIR}" \
   --num-gpus 8 \
   --allow-eval-download \
+  ${MORPHSERVE_QPS_POINTS:+--qps-points "${MORPHSERVE_QPS_POINTS}"} \
   ${MORPHSERVE_MAX_SESSIONS:+--max-sessions "${MORPHSERVE_MAX_SESSIONS}"}
 
 kairos_check_shared_storage
-echo "== Phase-2 Job 2d (M2.3 Suite B) completed cleanly: ${RUN_DIR}"
+echo "== OSDI '27 Interleaved-Bench v2 Suite B (Phase-Shift + Two-Tier Accuracy) completed cleanly: ${RUN_DIR}"

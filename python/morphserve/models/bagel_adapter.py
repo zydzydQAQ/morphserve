@@ -950,9 +950,8 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 and torch.cuda.is_available()
             ):
                 # Reserve physical driver HBM headroom for upcoming `DirectNcclMesh` (~768 MiB) plus
-                # `1024^2` 3-branch DiT/ViT PyTorch activations (6,144 MiB), leaving ~1.8–2.6 GiB of
-                # safe VMM growth headroom above the 15 GiB initial pool so mid/low-QPS VAE spikes and
-                # KV growth never prematurely evict resident Gen Expert layers, while strictly preventing OOM!
+                # `1024^2` 3-branch DiT/ViT PyTorch activations (8,192 MiB), preventing late-run OOMs
+                # while still preserving safe VMM growth headroom above the initial pool!
                 free_drv, total_drv = torch.cuda.mem_get_info(self.device)
                 if int(total_drv) > 0:
                     nccl_reserve_mib = (
@@ -963,7 +962,7 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 6144) * MIB
+                    headroom_b = (nccl_reserve_mib + 8192) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -981,7 +980,10 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
 
         if self.policy.use_module3_cow_loopback:
-            self.interceptor.enable_shared_prefix_cfg(min_shared_tokens=32, allow_cascade_split=True)
+            self.interceptor.enable_shared_prefix_cfg(
+                min_shared_tokens=32,
+                allow_cascade_split=bool(self.policy.allow_cascade_cfg_split),
+            )
 
         if self.policy.preemption_mode != "non_preemptive":
             self.sched = UnifiedPreemptiveScheduler(
@@ -1217,6 +1219,10 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                 self._update_image_ctx(main_ctx, prev_pil, update_vae=can_run_vae, update_vit=True)
                 if prep_dit and not can_run_vae:
                     entry["pending_vae_pil"] = True
+            elif entry.get("last_img_u8") is not None:
+                self._update_image_ctx(main_ctx, entry["last_img_u8"], update_vae=can_run_vae, update_vit=True)
+                if prep_dit and not can_run_vae:
+                    entry["pending_vae_u8"] = True
 
         for rel_img in cmd.get("image_paths", []):
             self._update_image_ctx(main_ctx, self._load_pil(rel_img), update_vae=can_run_vae, update_vit=True)
@@ -1651,7 +1657,14 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                     ar_cid = str(ar_msg["ctx_id"])
                     self._active_ctx_pins[ar_cid] = self._active_ctx_pins.get(ar_cid, 0) + 1
                     try:
-                        self.prepare_turn(ar_cid, ar_msg)
+                        prev_in_yield = bool(self.sched.in_ar_yield) if self.sched is not None else False
+                        if self.sched is not None:
+                            self.sched.in_ar_yield = True
+                        try:
+                            self.prepare_turn(ar_cid, ar_msg)
+                        finally:
+                            if self.sched is not None:
+                                self.sched.in_ar_yield = prev_in_yield
                         ar_entry = self._ctx_store[ar_cid]
                         ar_ctx = ar_entry["main_ctx"]
                         st = self.pipeline.bagel.prepare_start_tokens(
@@ -1813,11 +1826,14 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         # so `vae.decode` never stalls an active AR stream's inter-token TPOT!
                         if self.sched is not None and emit_preempt_ack is not None:
                             _flush_completed_ar()
-                            if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
-                                self.sched._admit_due_arrivals(time.perf_counter())
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                self.sched.drain_remaining_ar_tasks()
-                            _flush_completed_ar()
+                            while deferred_img_ar_msgs or self.sched.active_ar_tasks:
+                                if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
+                                    self.sched._admit_due_arrivals(time.perf_counter())
+                                    if not self.sched.active_ar_tasks:
+                                        break
+                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                    self.sched.drain_remaining_ar_tasks()
+                                _flush_completed_ar()
                             self.sched.external_arrival_poll = None
 
                         # Drop dead per-turn CFG branch caches immediately after denoising completes so
@@ -1859,11 +1875,14 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                         if self.sched is not None and emit_preempt_ack is not None:
                             try:
                                 _flush_completed_ar()
-                                if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
-                                    self.sched._admit_due_arrivals(time.perf_counter())
-                                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                                    self.sched.drain_remaining_ar_tasks()
-                                _flush_completed_ar()
+                                while deferred_img_ar_msgs or self.sched.active_ar_tasks:
+                                    if deferred_img_ar_msgs and not self.sched.active_ar_tasks:
+                                        self.sched._admit_due_arrivals(time.perf_counter())
+                                        if not self.sched.active_ar_tasks:
+                                            break
+                                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                                        self.sched.drain_remaining_ar_tasks()
+                                    _flush_completed_ar()
                             except Exception as ar_exc:
                                 if is_oom_exception(ar_exc):
                                     torch.cuda.empty_cache()
@@ -1891,6 +1910,16 @@ class BagelCPTGAdapter(CPTGModelAdapter):
                                         {"cmd_id": c_id, "rank": self.rank, "status": "oom", "error": "aborted mid-dit"}
                                     )
                                 inflight_ar_meta.clear()
+                                for d_msg in deferred_img_ar_msgs:
+                                    emit_preempt_ack(
+                                        {
+                                            "cmd_id": str(d_msg["cmd_id"]),
+                                            "rank": self.rank,
+                                            "status": "oom",
+                                            "error": "aborted deferred mid-dit",
+                                        }
+                                    )
+                                deferred_img_ar_msgs.clear()
             finally:
                 if self.sched is not None:
                     self.sched.external_arrival_poll = None

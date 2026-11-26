@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase-2 Job 2c (1x8 GPUs): Milestone M2.3 Suite A (Main 4-Quadrant QPS Sweep + M1-M4 Ablation Ladder).
+# OSDI '27 Interleaved-Bench v2 Suite A (1x8 GPUs): 4-Quadrant Time-Window QPS Sweep + M1-M4 LOO Ablation Ladder.
 set -euo pipefail
 
 source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
@@ -7,7 +7,7 @@ source /shared/data/MORPHSERVE/scripts/morphserve_common.sh
 kairos_check_shared_storage
 
 MODEL_DIR="${MODELS}/BAGEL-7B-MoT"
-BENCH_DIR="${DATA}/benchmarks/interleaved-bench-v1"
+BENCH_DIR="${MORPHSERVE_BENCH_DIR:-${DATA}/benchmarks/interleaved-bench-v1}"
 if [ ! -f "${MODEL_DIR}/MODEL_MANIFEST.json" ] || [ ! -f "${BENCH_DIR}/BENCH_MANIFEST.json" ]; then
   echo "error: missing BAGEL-7B-MoT or Interleaved-Bench manifest" >&2
   exit 1
@@ -38,7 +38,8 @@ python3 -m morphserve.bench.run_phase2_bagel_main \
   --bench-root "${BENCH_DIR}" \
   --output-dir "${RUN_DIR}" \
   --num-gpus 8 \
+  ${MORPHSERVE_QPS_POINTS:+--qps-points "${MORPHSERVE_QPS_POINTS}"} \
   ${MORPHSERVE_MAX_SESSIONS:+--max-sessions "${MORPHSERVE_MAX_SESSIONS}"}
 
 kairos_check_shared_storage
-echo "== Phase-2 Job 2c (M2.3 Suite A) completed cleanly: ${RUN_DIR}"
+echo "== OSDI '27 Interleaved-Bench v2 Suite A completed cleanly: ${RUN_DIR}"

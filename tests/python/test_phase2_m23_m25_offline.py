@@ -1333,6 +1333,77 @@ class TestPhase2M23M25Offline(unittest.TestCase):
             p = EnginePolicyConfig.from_preset("morphserve", num_gpus=8, ar_tpot_slo_mode=slo_mode)
             assert p.ar_tpot_slo_mode == slo_mode
 
+    def test_vmm_clone_outputs_preserves_baseoutput_ordereddict_and_exactness_rejects_cand_error(self) -> None:
+        from collections import OrderedDict
+        import morphserve.vmm.tripool as tripool_mod
+
+        class _FakeTensor:
+            def __init__(self, tag: str) -> None:
+                self.tag = tag
+                self.cloned = False
+
+            def clone(self) -> "_FakeTensor":
+                c = _FakeTensor(self.tag)
+                c.cloned = True
+                return c
+
+        class _FakeDiagGauss:
+            def __init__(self) -> None:
+                self.parameters = _FakeTensor("params")
+                self.mean = _FakeTensor("mean")
+                self.logvar = _FakeTensor("logvar")
+
+        class _FakeAutoencoderKLOutput(OrderedDict):
+            def __init__(self, latent_dist: Any) -> None:
+                super().__init__(latent_dist=latent_dist)
+                self.latent_dist = latent_dist
+
+        class _FakeTorch:
+            @staticmethod
+            def is_tensor(x: Any) -> bool:
+                return isinstance(x, _FakeTensor)
+
+        orig_torch = tripool_mod._TORCH
+        tripool_mod._TORCH = _FakeTorch  # type: ignore[assignment]
+        try:
+            out = _FakeAutoencoderKLOutput(_FakeDiagGauss())
+            cloned = tripool_mod._clone_outputs(out)
+            assert isinstance(cloned, _FakeAutoencoderKLOutput)
+            assert hasattr(cloned, "latent_dist")
+            assert cloned.latent_dist.mean.cloned is True
+            assert cloned.latent_dist.logvar.cloned is True
+            assert cloned.latent_dist.parameters.cloned is True
+        finally:
+            tripool_mod._TORCH = orig_torch
+
+        # ExactnessEvaluator must fail `lossless_pass` if candidate errors on any session where reference succeeded!
+        sessions = [
+            InterleavedSession(
+                session_id="s0",
+                quadrant="multi_image_vqa",
+                source_dataset="mmvet",
+                turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="q0")],
+            ),
+            InterleavedSession(
+                session_id="s1",
+                quadrant="multiturn_edit",
+                source_dataset="magicbrush",
+                turns=[InterleavedTurn(turn_idx=0, modality_plan="dit_edit", prompt="e0")],
+            ),
+        ]
+        ref_out = [
+            {"session_id": "s0", "status": "ok", "ar_texts": ["ok"], "image_paths_out": []},
+            {"session_id": "s1", "status": "ok", "ar_texts": [], "image_paths_out": []},
+        ]
+        cand_partial = [
+            {"session_id": "s0", "status": "ok", "ar_texts": ["ok"], "image_paths_out": []},
+            {"session_id": "s1", "status": "error", "ar_texts": [], "image_paths_out": [], "error": "boom"},
+        ]
+        rep = ExactnessEvaluator().evaluate_parity_and_quality(sessions, ref_out, cand_partial)
+        assert rep["matched_sessions"] == 1
+        assert rep["cand_missing_or_failed_sessions"] == 1
+        assert rep["lossless_pass"] is False
+
 
 if __name__ == "__main__":
     unittest.main()

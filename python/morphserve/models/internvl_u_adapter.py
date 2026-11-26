@@ -1081,47 +1081,99 @@ class InternVLUCPTGAdapter(CPTGModelAdapter):
                 self.vmm.set_expert_pinned(self.vlm_pager.expert_id, False)
             with torch.inference_mode():
                 if self.pager is not None:
-                    with self.pager.generation_mode(prefetch_all=True):
-                        # Release `HalfNodeH2DPacer` immediately once decoder H2D DMA finishes on `h2d_stream_`
-                        # so Steps 1..15 + QwenImage VAE decode run 100% concurrently across all 4 GPUs/half-node!
-                        if (
-                            pacer_cm is not None
-                            and self.vmm is not None
-                            and callable(getattr(self.vmm, "sync_expert_h2d", None))
-                            and not bool(getattr(self.vmm, "is_simulated", False))
-                        ):
-                            dec_eid = int(self.pager.expert_id)
-                            vmm_ref = self.vmm
+                    # Pre-encode `conditional_image` (`dit_edit`) via QwenImage VAE OUTSIDE `generation_mode`
+                    # so `run_in_transient_scope` never contends with concurrent background decoder H2D streaming
+                    # under strict 12 GiB quotas (`allow_overflow=False`), while preserving exact VAE math.
+                    preencoded_cond_latents: Any = None
+                    cond_img = diff_inp.get("conditional_image")
+                    if cond_img is not None:
+                        cat_cond = torch.cat(cond_img) if isinstance(cond_img, list) else cond_img
+                        if torch.is_tensor(cat_cond) and cat_cond.shape[0] > 0:
+                            if self._quota_constrained:
+                                torch.cuda.empty_cache()
+                            if self.vmm is not None and self.pager.expert_id >= 0:
+                                self.vmm.set_expert_pinned(self.pager.expert_id, False)
+                            if (
+                                self._quota_constrained
+                                and cat_cond.shape[0] == 2
+                                and torch.equal(cat_cond[0], cat_cond[1])
+                            ):
+                                lat0 = self.pipe.image_pipeline.pixels_to_latents(cat_cond[:1])
+                                preencoded_cond_latents = torch.cat([lat0, lat0], dim=0)
+                            elif self._quota_constrained and cat_cond.shape[0] > 1:
+                                preencoded_cond_latents = torch.cat(
+                                    [
+                                        self.pipe.image_pipeline.pixels_to_latents(cat_cond[idx : idx + 1])
+                                        for idx in range(int(cat_cond.shape[0]))
+                                    ],
+                                    dim=0,
+                                )
+                            else:
+                                preencoded_cond_latents = self.pipe.image_pipeline.pixels_to_latents(cat_cond)
+                            del cat_cond
+                            if self._quota_constrained:
+                                torch.cuda.empty_cache()
+                            # If post-encode reload already materialized all decoder layers, release H2D pacer now.
+                            if (
+                                pacer_active["held"]
+                                and self.vmm is not None
+                                and self.vmm.expert_resident_count(self.pager.expert_id) >= self.pager.num_layers
+                            ):
+                                _release_pacer_once()
 
-                            def _wait_dec_h2d_and_release() -> None:
-                                try:
-                                    vmm_ref.sync_expert_h2d(dec_eid)
-                                except Exception:
-                                    pass
-                                finally:
-                                    _release_pacer_once()
+                    orig_pixels_to_latents = None
+                    if preencoded_cond_latents is not None:
+                        orig_pixels_to_latents = self.pipe.image_pipeline.pixels_to_latents
+                        _cached_cond_latents = preencoded_cond_latents
+                        self.pipe.image_pipeline.pixels_to_latents = (
+                            lambda _x, max_bs=32, _lat=_cached_cond_latents: _lat
+                        )
+                    try:
+                        with self.pager.generation_mode(prefetch_all=True):
+                            # Release `HalfNodeH2DPacer` immediately once decoder H2D DMA finishes on `h2d_stream_`
+                            # so Steps 1..15 + QwenImage VAE decode run 100% concurrently across all 4 GPUs/half-node!
+                            if (
+                                pacer_active["held"]
+                                and self.vmm is not None
+                                and callable(getattr(self.vmm, "sync_expert_h2d", None))
+                                and not bool(getattr(self.vmm, "is_simulated", False))
+                            ):
+                                dec_eid = int(self.pager.expert_id)
+                                vmm_ref = self.vmm
 
-                            h2d_release_thread = threading.Thread(
-                                target=_wait_dec_h2d_and_release,
-                                name=f"ms-ivlu-pacer-rel-{self.rank}",
-                                daemon=True,
-                            )
-                            h2d_release_thread.start()
-                        # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
-                        # `generation_decoder.prepare_forward_input` BEFORE `transformer_blocks[0]`'s pre-hook!
-                        self.pager.wait_layer_if_needed(0, "prepare_forward_input")
-                        latents_out = self.pipe.image_pipeline(
-                            **diff_inp,
-                            all_cfg_scale=4.5,
-                            part_cfg_scale=2.0,
-                            num_inference_steps=steps,
-                            num_images_per_prompt=1,
-                            use_resolution_binning=False,
-                            height=gh,
-                            width=gw,
-                            generator=gen,
-                            output_type="latent",
-                        ).images
+                                def _wait_dec_h2d_and_release() -> None:
+                                    try:
+                                        vmm_ref.sync_expert_h2d(dec_eid)
+                                    except Exception:
+                                        pass
+                                    finally:
+                                        _release_pacer_once()
+
+                                h2d_release_thread = threading.Thread(
+                                    target=_wait_dec_h2d_and_release,
+                                    name=f"ms-ivlu-pacer-rel-{self.rank}",
+                                    daemon=True,
+                                )
+                                h2d_release_thread.start()
+                            # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
+                            # `generation_decoder.prepare_forward_input` BEFORE `transformer_blocks[0]`'s pre-hook!
+                            self.pager.wait_layer_if_needed(0, "prepare_forward_input")
+                            latents_out = self.pipe.image_pipeline(
+                                **diff_inp,
+                                all_cfg_scale=4.5,
+                                part_cfg_scale=2.0,
+                                num_inference_steps=steps,
+                                num_images_per_prompt=1,
+                                use_resolution_binning=False,
+                                height=gh,
+                                width=gw,
+                                generator=gen,
+                                output_type="latent",
+                            ).images
+                    finally:
+                        if orig_pixels_to_latents is not None:
+                            self.pipe.image_pipeline.pixels_to_latents = orig_pixels_to_latents
+                        preencoded_cond_latents = None
                     if h2d_release_thread is not None:
                         h2d_release_thread.join(timeout=10.0)
                         h2d_release_thread = None

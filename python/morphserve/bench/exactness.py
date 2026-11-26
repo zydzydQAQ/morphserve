@@ -1073,6 +1073,9 @@ class ExactnessEvaluator:
         cand_by_id = {c["session_id"]: c for c in cand_outcomes}
 
         matched_sessions = 0
+        ref_ok_sessions = 0
+        cand_ok_sessions = 0
+        cand_missing_or_failed_sessions = 0
         ar_total = 0
         ar_exact = 0
         post_dit_ar_total = 0
@@ -1100,7 +1103,15 @@ class ExactnessEvaluator:
             sid = sess.session_id
             ro = ref_by_id.get(sid)
             co = cand_by_id.get(sid)
-            if not ro or not co or ro.get("status") != "ok" or co.get("status") != "ok":
+            ref_ok = bool(ro and ro.get("status") == "ok")
+            cand_ok = bool(co and co.get("status") == "ok")
+            if ref_ok:
+                ref_ok_sessions += 1
+            if cand_ok:
+                cand_ok_sessions += 1
+            if ref_ok and not cand_ok:
+                cand_missing_or_failed_sessions += 1
+            if not (ref_ok and cand_ok):
                 continue
             matched_sessions += 1
 
@@ -1274,6 +1285,9 @@ class ExactnessEvaluator:
 
         return {
             "matched_sessions": matched_sessions,
+            "ref_ok_sessions": ref_ok_sessions,
+            "cand_ok_sessions": cand_ok_sessions,
+            "cand_missing_or_failed_sessions": cand_missing_or_failed_sessions,
             "strict_ssim_1_gate": bool(strict_ssim_1),
             "ar_turns_compared": ar_total,
             "ar_greedy_exact_match_pct": exact_pct,
@@ -1314,6 +1328,7 @@ class ExactnessEvaluator:
             "clip_pair_mean_sim_pct": clip_pair_mean,
             "lossless_pass": bool(
                 has_matched
+                and cand_missing_or_failed_sessions == 0
                 and exact_pct == 100.0
                 and post_dit_ar_exact_pct == 100.0
                 and ssim_ok

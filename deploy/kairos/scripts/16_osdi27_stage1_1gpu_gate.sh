@@ -629,6 +629,22 @@ if isinstance(m3_t4, dict):
         and m3_t4.get("clip_backend") not in (None, "unavailable_offline")
     )
 
+ivlu_reg_a = ivlu.get("regime_a_40gb_burst") or []
+ivlu_reg_b = ivlu.get("regime_b_memory_capped") or []
+ivlu_ms_a = next((r for r in ivlu_reg_a if r.get("policy_name") == "morphserve"), {})
+ivlu_ms_b = next((r for r in ivlu_reg_b if r.get("policy_name") == "morphserve"), {})
+ivlu_parity = ivlu.get("lossless_parity") or {}
+ivlu_gate_ok = bool(
+    ivlu.get("status") == "ok"
+    and ivlu.get("morphserve_12gib_quota_verified") is True
+    and int(ivlu_ms_a.get("error_sessions", -1)) == 0
+    and int(ivlu_ms_a.get("oom_sessions", -1)) == 0
+    and int(ivlu_ms_b.get("error_sessions", -1)) == 0
+    and int(ivlu_ms_b.get("oom_sessions", -1)) == 0
+    and int(ivlu_parity.get("matched_sessions", 0)) >= 4
+    and int(ivlu_parity.get("edit_turns_evaluated", 0)) >= 1
+)
+
 gates = {
     "ctest_a100": {
         "status": ctest_status,
@@ -655,8 +671,12 @@ gates = {
         "report_path": str(run_dir / "module4/module4-report.json"),
     },
     "internvlu_1gpu_smoke": {
-        "status": ivlu.get("status", "check_failed"),
+        "status": "ok" if ivlu_gate_ok else "check_failed",
         "morphserve_12gib_quota_verified": ivlu.get("morphserve_12gib_quota_verified"),
+        "regime_a_error_sessions": ivlu_ms_a.get("error_sessions"),
+        "regime_b_error_sessions": ivlu_ms_b.get("error_sessions"),
+        "parity_matched_sessions": ivlu_parity.get("matched_sessions"),
+        "edit_turns_evaluated": ivlu_parity.get("edit_turns_evaluated"),
         "report_path": str(run_dir / "internvlu_1gpu/m24-internvlu-report.json"),
     },
     "bagel_1gpu_cluster_smoke": {

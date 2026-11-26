@@ -384,6 +384,23 @@ def _think_time_overrides(smoke_1gpu: bool) -> dict[str, Any]:
     }
 
 
+def _strip_sessions_keep_failures(report_dict: dict[str, Any]) -> dict[str, Any]:
+    raw_sessions = report_dict.pop("sessions", None) or []
+    failed = [
+        {
+            "session_id": str(s.get("session_id", "")),
+            "quadrant": str(s.get("quadrant", "")),
+            "status": str(s.get("status", "")),
+            "error": str(s.get("error", ""))[:400],
+        }
+        for s in raw_sessions
+        if s.get("status") != "ok"
+    ]
+    if failed:
+        report_dict["failed_sessions"] = failed[:8]
+    return report_dict
+
+
 def run_internvlu_generality_validation(
     model_dir: Path,
     vendor_dir: Path,
@@ -455,15 +472,13 @@ def run_internvlu_generality_validation(
             if smoke_1gpu:
                 p_dir = tmp_base / f"ivlu_parity_{pol_name}"
                 p_rep = eng.run_suite(parity_slice, target_qps=0.5, save_outputs_dir=p_dir)
-                d = p_rep.to_dict()
-                d.pop("sessions", None)
+                d = _strip_sessions_keep_failures(p_rep.to_dict())
                 d["regime"] = "smoke_1gpu_parity"
                 regime_a_results.append(d)
                 parity_outcomes[pol_name] = p_rep.sessions
             else:
                 rep = eng.run_suite(suite_a, target_qps=offered_qps)
-                d = rep.to_dict()
-                d.pop("sessions", None)
+                d = _strip_sessions_keep_failures(rep.to_dict())
                 d["regime"] = "regime_a_40gb_burst"
                 regime_a_results.append(d)
 
@@ -533,8 +548,7 @@ def run_internvlu_generality_validation(
                 return list(await asyncio.gather(*(eng._rpc(g, {"op": "GET_STATS"}) for g in range(num_gpus))))
 
             w_stats = asyncio.run(_fetch_w_stats())
-            d = rep.to_dict()
-            d.pop("sessions", None)
+            d = _strip_sessions_keep_failures(rep.to_dict())
             if w_stats and any("pytorch_reserved_mib" in st for st in w_stats):
                 d["pytorch_peak_reserved_mib"] = round(
                     max(float(st.get("pytorch_reserved_mib", 0.0)) for st in w_stats), 2
@@ -547,11 +561,24 @@ def run_internvlu_generality_validation(
             audit = verify_internvlu_memory_quota(d, cfg, constrained_gib=constrained_gib)
             d["memory_quota_audit"] = audit
             if pol_name == "morphserve":
-                morphserve_quota_ok = bool(audit["within_quota"] and int(d.get("oom_sessions", 0)) == 0)
+                morphserve_quota_ok = bool(
+                    audit["within_quota"]
+                    and int(d.get("oom_sessions", 0)) == 0
+                    and int(d.get("error_sessions", 0)) == 0
+                    and int(d.get("completed_sessions", 0)) == int(d.get("total_sessions", 0))
+                )
             regime_b_results.append(d)
         finally:
             eng.shutdown()
             gc.collect()
+
+    regime_a_ms = next((r for r in regime_a_results if r.get("policy_name") == "morphserve"), None)
+    regime_a_morphserve_ok = bool(
+        regime_a_ms is not None
+        and int(regime_a_ms.get("oom_sessions", 0)) == 0
+        and int(regime_a_ms.get("error_sessions", 0)) == 0
+        and int(regime_a_ms.get("completed_sessions", 0)) == int(regime_a_ms.get("total_sessions", 0))
+    )
 
     evaluator = ExactnessEvaluator(bench_root=eff_bench_root)
     parity = evaluator.evaluate_parity_and_quality(
@@ -580,10 +607,15 @@ def run_internvlu_generality_validation(
         "think_time_config": think_ov,
         "bench_root_used": str(bench_root) if bench_root is not None else None,
         "morphserve_12gib_quota_verified": morphserve_quota_ok,
+        "regime_a_morphserve_ok": regime_a_morphserve_ok,
         "regime_a_40gb_burst": regime_a_results,
         "regime_b_memory_capped": regime_b_results,
         "lossless_parity": parity,
-        "status": "ok" if (parity["lossless_pass"] and morphserve_quota_ok) else "check_failed",
+        "status": (
+            "ok"
+            if (parity["lossless_pass"] and regime_a_morphserve_ok and morphserve_quota_ok)
+            else "check_failed"
+        ),
     }
     out_path = output_dir / "m24-internvlu-report.json"
     out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

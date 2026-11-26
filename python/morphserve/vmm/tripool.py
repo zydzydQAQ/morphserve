@@ -65,21 +65,50 @@ def _clone_outputs(obj: Any) -> Any:
         return obj
     if _TORCH.is_tensor(obj):
         return obj.clone()
-    if isinstance(obj, tuple):
-        return tuple(_clone_outputs(x) for x in obj)
-    if isinstance(obj, list):
-        return [_clone_outputs(x) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _clone_outputs(v) for k, v in obj.items()}
-    if hasattr(obj, "sample") and _TORCH.is_tensor(obj.sample):
-        obj.sample = obj.sample.clone()
-        return obj
+    # Check `diffusers.utils.BaseOutput` subclasses (`AutoencoderKLOutput`, `DecoderOutput`, ...)
+    # BEFORE `isinstance(obj, dict)`, since `BaseOutput` subclasses `OrderedDict` (`dict`).
     if hasattr(obj, "latent_dist"):
         ld = obj.latent_dist
         for attr in ("parameters", "mean", "logvar", "std", "var"):
             val = getattr(ld, attr, None)
             if _TORCH.is_tensor(val):
                 setattr(ld, attr, val.clone())
+        if isinstance(obj, dict) and "latent_dist" in obj:
+            obj["latent_dist"] = ld
+        return obj
+    if hasattr(obj, "sample") and _TORCH.is_tensor(obj.sample):
+        cloned = obj.sample.clone()
+        obj.sample = cloned
+        if isinstance(obj, dict) and "sample" in obj:
+            obj["sample"] = cloned
+        return obj
+    if hasattr(obj, "latents") and _TORCH.is_tensor(obj.latents):
+        cloned = obj.latents.clone()
+        obj.latents = cloned
+        if isinstance(obj, dict) and "latents" in obj:
+            obj["latents"] = cloned
+        return obj
+    if any(_TORCH.is_tensor(getattr(obj, attr, None)) for attr in ("parameters", "mean", "logvar", "std", "var")):
+        for attr in ("parameters", "mean", "logvar", "std", "var"):
+            val = getattr(obj, attr, None)
+            if _TORCH.is_tensor(val):
+                setattr(obj, attr, val.clone())
+        return obj
+    if isinstance(obj, tuple):
+        return tuple(_clone_outputs(x) for x in obj)
+    if isinstance(obj, list):
+        return [_clone_outputs(x) for x in obj]
+    if isinstance(obj, dict):
+        if type(obj) is dict:
+            return {k: _clone_outputs(v) for k, v in obj.items()}
+        for k, v in list(obj.items()):
+            cloned_v = _clone_outputs(v)
+            obj[k] = cloned_v
+            if hasattr(obj, k):
+                try:
+                    setattr(obj, k, cloned_v)
+                except Exception:
+                    pass
         return obj
     return obj
 

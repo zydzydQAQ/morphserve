@@ -1,0 +1,30 @@
+{
+  "name": "morphserve-osdi27-r2a-suitea-20261125-r6",
+  "image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
+  "workers": 1,
+  "gpus_per_worker": 8,
+  "mount_shared": true,
+  "command": "bash /shared/data/MORPHSERVE/scripts/10_phase2_m23_suite_a.sh",
+  "env": [
+    {
+      "name": "KAIROS_PROJECT",
+      "value": "MORPHSERVE"
+    },
+    {
+      "name": "KAIROS_RUN_ID",
+      "value": "morphserve-osdi27-r2a-suitea-20261125-r6"
+    },
+    {
+      "name": "KAIROS_BUILD",
+      "value": "f1b4b83"
+    },
+    {
+      "name": "KAIROS_REQUIRE_BUILD",
+      "value": "1"
+    },
+    {
+      "name": "KAIROS_EXECUTION_IMAGE",
+      "value": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2"
+    }
+  ]
+}

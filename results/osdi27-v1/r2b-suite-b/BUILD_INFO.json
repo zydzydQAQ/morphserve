@@ -1,12 +1,12 @@
 {
   "schema": "kairos.cluster-build.v1",
   "project": "MORPHSERVE",
-  "commit": "403e7aa520b53650e082e6cc07eb73198f030099",
-  "short_commit": "403e7aa",
-  "subject": "fix(kernels): implement bit-exact 0-diff UpSampleKernel int16 GPU bicubic resize and 0-ULP VAE norm",
-  "built_utc": "2026-11-24T13:43:22+00:00",
+  "commit": "f1b4b83f9711c1f1e03bd4ef49e243eaddc15340",
+  "short_commit": "f1b4b83",
+  "subject": "fix(bench): use schedule_ar_arrival and run_session for solo VMM AR probe",
+  "built_utc": "2026-11-25T15:22:53+00:00",
   "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "build_cmd": "bash \"$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"",
-  "files": 343,
-  "bytes": 9069155
+  "files": 369,
+  "bytes": 10542353
 }

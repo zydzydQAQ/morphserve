@@ -142,14 +142,14 @@
     }
   },
   "nvidia_smi": [
-    "0, GPU-488f5047-729a-fdfa-601b-7ba98b88a814, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "1, GPU-4a80f271-d669-dad2-0301-0d7dd15a4095, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "2, GPU-dd208b13-f954-864c-d65a-05fe43dc8613, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "3, GPU-d84c993d-42a5-a56b-86cc-2ad8254c2351, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "4, GPU-50f853c6-0c1d-425b-af23-c022a616c030, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "5, GPU-d48241f7-4e77-e195-59a0-63552f67e285, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "6, GPU-4f488320-12e4-9e69-aee0-d3e9e5dbb452, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
-    "7, GPU-8940ccee-259b-0b4f-f459-b9811246fae9, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0"
+    "0, GPU-afb5ebb2-a584-abce-e912-6cd50477f4bb, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "1, GPU-c2195fc4-0579-e149-dcd5-8f912dfb44c2, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "2, GPU-a331a424-15be-fa45-6b08-d951d2dce277, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "3, GPU-6c6892f8-1aa0-4c8f-d1ec-bc514adcbd42, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "4, GPU-9bd9082d-b7d4-f4de-cd0a-5788492a5247, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "5, GPU-bb1751f0-c0e1-a4e8-ae83-008e4246cced, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "6, GPU-979da027-ad90-4f70-6203-0e86fce22d4c, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0",
+    "7, GPU-e6a7b9a6-b668-5e8d-5989-b9934c468d94, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0"
   ],
   "packages": {
     "accelerate": "1.12.0",
@@ -163,7 +163,7 @@
   "platform": "Linux-6.8.0-57-generic-x86_64-with-glibc2.39",
   "project": "MORPHSERVE",
   "python": "3.12.3",
-  "run_id": "morphserve-osdi27-r2a-suitea-20261124-r5",
+  "run_id": "morphserve-osdi27-r2a-suitea-20261125-r6",
   "schema": "kairos.runtime-audit.v1",
   "topology": "\t\u001b[4mGPU0\tGPU1\tGPU2\tGPU3\tGPU4\tGPU5\tGPU6\tGPU7\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU1\tPHB\t X \tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU2\tPHB\tPHB\t X \tPHB\tPHB\tPHB\tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU3\tPHB\tPHB\tPHB\t X \tPHB\tPHB\tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU4\tPHB\tPHB\tPHB\tPHB\t X \tPHB\tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU5\tPHB\tPHB\tPHB\tPHB\tPHB\t X \tPHB\tPHB\t0-79\t0-1\t\tN/A\nGPU6\tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\t X \tPHB\t0-79\t0-1\t\tN/A\nGPU7\tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\tPHB\t X \t0-79\t0-1\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n"
 }

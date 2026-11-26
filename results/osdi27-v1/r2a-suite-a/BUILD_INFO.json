@@ -1,12 +1,12 @@
 {
   "schema": "kairos.cluster-build.v1",
   "project": "MORPHSERVE",
-  "commit": "5d813436f8390f5390f42c1e888778df1a60508d",
-  "short_commit": "5d81343",
-  "subject": "fix(bagel): match TorchvisionBackend ViT loopback outside autocast, protect mid-DiT AR TPOT, and classify wait_layer OOM",
-  "built_utc": "2026-11-24T07:38:02+00:00",
+  "commit": "f1b4b83f9711c1f1e03bd4ef49e243eaddc15340",
+  "short_commit": "f1b4b83",
+  "subject": "fix(bench): use schedule_ar_arrival and run_session for solo VMM AR probe",
+  "built_utc": "2026-11-25T15:22:53+00:00",
   "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "build_cmd": "bash \"$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"",
-  "files": 341,
-  "bytes": 9062318
+  "files": 369,
+  "bytes": 10542353
 }

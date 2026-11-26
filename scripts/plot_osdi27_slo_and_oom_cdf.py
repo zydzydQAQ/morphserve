@@ -129,11 +129,12 @@ def generate_osdi27_figures(
     )
 
     live_by_pol_q: dict[tuple[str, float], dict[str, Any]] = {}
-    for row in r2a.get("qps_sweep", []):
-        live_by_pol_q[(str(row["policy_name"]), round(float(row["offered_qps"]), 2))] = row
     if r2e is not None:
         for row in r2e.get("qps_sweep", []):
             live_by_pol_q[(str(row["policy_name"]), round(float(row["offered_qps"]), 2))] = row
+    # Prefer full n=96 R2a-r6 rows for 0.40 / 0.80 / 1.10 / 1.40 over n=48 R2e knee checks
+    for row in r2a.get("qps_sweep", []):
+        live_by_pol_q[(str(row["policy_name"]), round(float(row["offered_qps"]), 2))] = row
 
     sim_slo = sim.get("slo_attainment_vs_qps_8gpu", {})
     sim_by_pol_q: dict[tuple[str, float], dict[str, Any]] = {}
@@ -202,11 +203,14 @@ def generate_osdi27_figures(
     ax_cdf.axhline(100.0, color="#BDBDBD", linestyle=":", linewidth=0.65, zorder=1)
     ax_cdf.axhline(95.0, color="#CFCFCF", linestyle="--", linewidth=0.65, zorder=1)
 
+    baseline_survs_11: list[float] = []
     for pol_key, label, color, marker, lw in POLICY_META:
         lr_11 = live_by_pol_q.get((pol_key, 1.10))
         if lr_11 is None:
             continue
         xs_s, ys_pct, surv_pct = _reconstruct_improper_dit_cdf(lr_11)
+        if pol_key != "morphserve":
+            baseline_survs_11.append(surv_pct)
         xs_ext = np.concatenate([[0.0], xs_s, [x_max_s]])
         ys_ext = np.concatenate([[0.0], ys_pct, [surv_pct]])
         z_ord = 5 if pol_key == "morphserve" else 3
@@ -226,8 +230,10 @@ def generate_osdi27_figures(
                 }
             )
 
+    b_lo = min(baseline_survs_11) if baseline_survs_11 else 89.6
+    b_hi = max(baseline_survs_11) if baseline_survs_11 else 97.9
     ax_cdf.text(233.0, 42.0, "MorphServe:\n100% survival (0 OOM)", fontsize=5.4, color="#0F4D92", ha="right", va="center")
-    ax_cdf.text(233.0, 18.0, "Baselines:\n88.5-96.9% cap (OOM)", fontsize=5.4, color="#B64342", ha="right", va="center")
+    ax_cdf.text(233.0, 18.0, f"Baselines:\n{b_lo:.1f}-{b_hi:.1f}% cap (OOM)", fontsize=5.4, color="#B64342", ha="right", va="center")
     ax_cdf.set_xlim(0.0, x_max_s)
     ax_cdf.set_ylim(0.0, 105.0)
     ax_cdf.set_yticks([0, 25, 50, 75, 100])

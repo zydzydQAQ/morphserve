@@ -16,7 +16,7 @@
     },
     {
       "name": "KAIROS_BUILD",
-      "value": "HEAD_SHA_TBD"
+      "value": "aab6b1e"
     },
     {
       "name": "KAIROS_REQUIRE_BUILD",

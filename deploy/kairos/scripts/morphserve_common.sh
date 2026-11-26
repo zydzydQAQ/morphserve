@@ -5,6 +5,7 @@ set -euo pipefail
 export KAIROS_PROJECT="${KAIROS_PROJECT:-MORPHSERVE}"
 export KAIROS_REQUIRE_BUILD="${KAIROS_REQUIRE_BUILD:-1}"
 export KAIROS_EXECUTION_IMAGE="${KAIROS_EXECUTION_IMAGE:-192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2}"
+export KAIROS_BUILD_CMD="${KAIROS_BUILD_CMD:-bash \"\$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"}"
 
 # Source shared kairos-toolkit runtime library (handles lazy build lock, /data gate, RUN_DIR, tee log).
 source /shared/data/MORPHSERVE/scripts/kairos_common.sh

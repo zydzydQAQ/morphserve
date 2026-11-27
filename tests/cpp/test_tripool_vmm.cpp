@@ -820,7 +820,8 @@ void test_lru_multibank_eviction_and_release_free_overflow() {
         const uint64_t sid_think = vmm->kv_session_create();
         const int32_t rid_think = vmm->kv_region_alloc(4 * kMiB, sid_think);
         MS_EXPECT(vmm->kv_region_ensure(rid_think, 4 * kMiB, nullptr) != 0);  // Consumes base fine pages
-        MS_EXPECT(vmm->kv_session_mark_thinking(sid_think, nullptr) == 0);
+        const size_t valid_4m = 4 * kMiB;
+        MS_EXPECT(vmm->kv_session_mark_thinking(sid_think, &rid_think, &valid_4m, 1, false, nullptr) == 0);
 
         // Active KV session needs 6 MiB (3 fine pages) -> must grow within max_pool_bytes (20->26 MiB)
         // WITHOUT evicting the unpinned expert layers or swapping the thinking KV region!
@@ -832,7 +833,7 @@ void test_lru_multibank_eviction_and_release_free_overflow() {
         vmm->get_stats(&st_grow);
         MS_EXPECT(st_grow.overflow_creates == 3);
         MS_EXPECT(st_grow.expert_auto_evictions_for_kv == 0);
-        MS_EXPECT(st_grow.kv_host_swap_outs == 0);
+        MS_EXPECT(st_grow.kv_swap_outs_total == 0);
         MS_EXPECT(st_grow.pool_total_bytes == 26 * kMiB);
 
         // Exceeding max_pool_bytes (need +4 MiB -> 30 > 28 MiB): grows 2 MiB to cap, then evicts expert.

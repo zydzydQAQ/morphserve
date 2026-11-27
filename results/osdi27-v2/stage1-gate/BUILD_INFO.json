@@ -1,12 +1,12 @@
 {
   "schema": "kairos.cluster-build.v1",
   "project": "MORPHSERVE",
-  "commit": "8b16ef23b02e6b4234704e449767d5956b49f295",
-  "short_commit": "8b16ef2",
-  "subject": "fix(vmm): treat max_super==0 as unlimited in TriPoolVMM::coalesce_fine_to_super",
-  "built_utc": "2026-11-26T12:43:25+00:00",
+  "commit": "4cc5e046e37bf9344da5e194a1346b3f8df2d300",
+  "short_commit": "4cc5e04",
+  "subject": "fix(bench): use stock-consistent red hydrant prompt in M3 test4 and honest staggered-B2 gate in M4",
+  "built_utc": "2026-11-27T02:15:48+00:00",
   "runtime_image": "192.168.1.114:30500/jjjkairos/mllmserve:vllm-omni0.30.0-r2",
   "build_cmd": "bash \"$SRC_DIR/deploy/kairos/scripts/build_stage.sh\"",
-  "files": 390,
-  "bytes": 12933094
+  "files": 265,
+  "bytes": 10811744
 }

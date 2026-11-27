@@ -1,14 +1,14 @@
 {
   "cadence_ms": 100,
   "gpus": {
-    "GPU-601e4969-39bd-d7bc-af70-7e99a34cd529": {
-      "first_timestamp": "2026/11/26 12:43:37.438",
-      "last_timestamp": "2026/11/26 13:00:04.015",
+    "GPU-7bb0920b-6181-9486-380c-042e9fe68433": {
+      "first_timestamp": "2026/11/27 02:15:59.747",
+      "last_timestamp": "2026/11/27 02:30:07.605",
       "memory_free_min_mib": 1426.0,
       "memory_total_mib": 40960.0,
       "memory_used_max_mib": 39017.0,
-      "samples": 9799,
-      "utilization_mean_pct": 40.236554750484714
+      "samples": 8423,
+      "utilization_mean_pct": 46.00332423127157
     }
   },
   "invalid_samples": 0,

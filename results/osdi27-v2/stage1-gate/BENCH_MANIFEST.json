@@ -1,6 +1,6 @@
 {
   "schema": "morphserve.interleaved_bench.manifest.v2",
-  "total_bytes": 155022939,
+  "total_bytes": 155024119,
   "total_mib": 147.84,
   "quadrants": [
     "interleaved_co_creation",

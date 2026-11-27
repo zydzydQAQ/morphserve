@@ -1,8 +1,8 @@
 {
   "schema": "morphserve.osdi27.stage1_1gpu_gate.v2",
-  "timestamp_utc": "2026-11-26T13:00:04Z",
-  "kairos_run_id": "morphserve-osdi27-v2-r1-8b16ef2-gate1g",
-  "kairos_build": "8b16ef2",
+  "timestamp_utc": "2026-11-27T02:30:07Z",
+  "kairos_run_id": "morphserve-osdi27-v2-r1-4cc5e04-gate1g",
+  "kairos_build": "4cc5e04",
   "eval_models_dir": "/shared/data/MORPHSERVE/eval_models",
   "eval_models_staged": {
     "owlv2-base-patch16-ensemble": true,
@@ -11,39 +11,40 @@
   "gates": {
     "ctest_a100": {
       "status": "ok",
-      "log_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/ctest-a100.txt",
+      "log_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/ctest-a100.txt",
       "tail": [
-        "[tripool_vmm] kv_region_ensure error: TriPool physical pool reached max_pool_bytes cap for KV page",
-        "[tripool_vmm] transient_alloc(67108864) error: TriPool super-handle pool reached max_pool_bytes cap",
-        "[PASS] test_vmm_and_runtime",
-        "[PASS] test_control_and_sim",
-        "100% tests passed, 0 tests failed out of 2"
+        "[PASS] test_runtime_transport",
+        "[PASS] test_control_engine",
+        "[PASS] test_cluster_simulator",
+        "[PASS] test_c_api",
+        "100% tests passed, 0 tests failed out of 5"
       ]
     },
     "pytest_a100": {
       "status": "ok",
-      "log_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/pytest-a100.txt",
+      "log_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/pytest-a100.txt",
       "tail": [
-        "tests/python/test_phase2_m23_m25_offline.py::TestPhase2M23M25Offline::test_vmm_clone_outputs_preserves_baseoutput_ordereddict_and_exactness_rejects_cand_error",
-        "/usr/local/lib/python3.12/dist-packages/transformers/models/clip/tokenization_clip.py:79: DeprecationWarning: Deprecated in 0.9.0: BPE.__init__ will not create from files anymore, try `BPE.from_file` instead",
-        "BPE(",
+        "tests/python/test_models_adapters.py::test_bagel_adapter_cascade_cfg_runtime_wiring_and_atomic_oom_rollback",
+        "/usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/availability.py:135: DeprecationWarning: Arch from arch.py is deprecated. Use Arch from enums.py instead.",
+        "from cutlass.base_dsl.arch import Arch",
         "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html",
-        "============ 81 passed, 1 skipped, 17 warnings in 196.45s (0:03:16) ============"
+        "======================= 65 passed, 15 warnings in 46.54s ======================="
       ]
     },
     "module1_vmm_bagel": {
       "status": "ok",
-      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/module1/module1-report.json"
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/module1/module1-report.json"
     },
     "module3_cfg_loopback": {
       "status": "ok",
       "owlv2_backend": "transformers_owlv2",
       "clip_backend": "transformers_clip",
-      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/module3/module3-report.json"
+      "mmvet_vqa_parity_valid": true,
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/module3/module3-report.json"
     },
     "module4_preemption": {
       "status": "ok",
-      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/module4/module4-report.json"
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/module4/module4-report.json"
     },
     "internvlu_1gpu_smoke": {
       "status": "ok",
@@ -52,7 +53,7 @@
       "regime_b_error_sessions": 0,
       "parity_matched_sessions": 4,
       "edit_turns_evaluated": 1,
-      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/internvlu_1gpu/m24-internvlu-report.json"
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/internvlu_1gpu/m24-internvlu-report.json"
     },
     "bagel_1gpu_cluster_smoke": {
       "status": "ok",
@@ -60,10 +61,10 @@
       "oom_sessions": 0,
       "preempted_ar_count": 3,
       "total_yields": 32,
-      "active_jct_p95_ms": 17120.37,
-      "peak_gpu_reserved_mib": 32494.81,
+      "active_jct_p95_ms": 17027.05,
+      "peak_gpu_reserved_mib": 32788.44,
       "peak_pytorch_reserved_mib": 18440.0,
-      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-8b16ef2-gate1g/bagel_1gpu/bagel-1gpu-smoke.json"
+      "report_path": "/shared/output/MORPHSERVE/runs/morphserve-osdi27-v2-r1-4cc5e04-gate1g/bagel_1gpu/bagel-1gpu-smoke.json"
     }
   },
   "status": "ok"

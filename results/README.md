@@ -22,7 +22,7 @@ Current-protocol evaluation artifacts under the OSDI '27 v2 specification (turn-
 
 | Directory | Provenance Keys | Build Commit | Source Kairos Run | Primary Reports | Summary |
 | --- | --- | --- | --- | --- | --- |
-| `osdi27-v2/stage1-gate/` | `module1_vmm`, `module3_cow_loopback`, `module4_scheduler` | `8b16ef2` | `morphserve-osdi27-v2-r1-8b16ef2-gate1g` | `stage1-gate-summary.json`, `module1/module1-report.json`, `module3/module3-report.json`, `module4/module4-report.json`, `internvlu_1gpu/m24-internvlu-report.json`, `bagel_1gpu/bagel-1gpu-smoke.json`, `ctest-a100.txt`, `pytest-a100.txt` | Passed Stage-1 1×A100 gate (`status: "ok"`): CTest `2/2`, pytest `81 passed, 1 skipped`, M1/M3/M4 bit-exact/SLO verified, InternVL-U 12 GiB quota & BAGEL 1-GPU cluster smoke verified |
+| `osdi27-v2/stage1-gate/` | `module1_vmm`, `module3_cow_loopback`, `module4_scheduler` | `4cc5e04` | `morphserve-osdi27-v2-r1-4cc5e04-gate1g` | `stage1-gate-summary.json`, `module1/module1-report.json`, `module3/module3-report.json`, `module4/module4-report.json`, `internvlu_1gpu/m24-internvlu-report.json`, `bagel_1gpu/bagel-1gpu-smoke.json`, `ctest-a100.txt`, `pytest-a100.txt` | Passed Stage-1 1×A100 gate (`status: "ok"`): CTest `5/5`, pytest `65 passed`, M1 (`fine_to_super_bundles=93, overflow=0`), M3 (`mmvet_vqa=1.0/1.0`), M4, InternVL-U 12 GiB quota & streaming TTFT/TPOT, and BAGEL 1-GPU smoke (`vmm_overflow=3`, `nvml_sm_util=78.98%`) |
 
 Future multi-GPU v2 campaign results (`r2a-suite-a`, `r2b-phaseshift-acc`, `r2c-internvlu`, `r2e-lowqps-8gpu`, `r2f-thinktime-8gpu`, `r3-multinode-2x8`, `sim`) will be synced into `results/osdi27-v2/<suite>/` upon completion.
 

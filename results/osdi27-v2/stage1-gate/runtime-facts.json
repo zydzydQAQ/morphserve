@@ -192,7 +192,7 @@
     }
   },
   "nvidia_smi": [
-    "0, GPU-601e4969-39bd-d7bc-af70-7e99a34cd529, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0"
+    "0, GPU-7bb0920b-6181-9486-380c-042e9fe68433, NVIDIA A100-PCIE-40GB, 40960 MiB, 570.133.20, 8.0"
   ],
   "packages": {
     "accelerate": "1.12.0",
@@ -206,7 +206,7 @@
   "platform": "Linux-6.8.0-57-generic-x86_64-with-glibc2.39",
   "project": "MORPHSERVE",
   "python": "3.12.3",
-  "run_id": "morphserve-osdi27-v2-r1-8b16ef2-gate1g",
+  "run_id": "morphserve-osdi27-v2-r1-4cc5e04-gate1g",
   "schema": "kairos.runtime-audit.v1",
   "topology": "\t\u001b[4mGPU0\tCPU Affinity\tNUMA Affinity\tGPU NUMA ID\u001b[0m\nGPU0\t X \t0-79\t0-1\t\tN/A\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe as well as the SMP interconnect between NUMA nodes (e.g., QPI/UPI)\n  NODE = Connection traversing PCIe as well as the interconnect between PCIe Host Bridges within a NUMA node\n  PHB  = Connection traversing PCIe as well as a PCIe Host Bridge (typically the CPU)\n  PXB  = Connection traversing multiple PCIe bridges (without traversing the PCIe Host Bridge)\n  PIX  = Connection traversing at most a single PCIe bridge\n  NV#  = Connection traversing a bonded set of # NVLinks\n"
 }

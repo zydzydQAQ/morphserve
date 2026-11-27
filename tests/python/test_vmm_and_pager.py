@@ -429,7 +429,7 @@ def test_vmm_out_of_memory_error_uniform_on_exhaustion() -> None:
     )
     try:
         assert vmm_cap.max_pool_bytes == 12 * MIB
-        assert vmm_cap.stats().total_physical_pool_bytes >= 12 * MIB
+        assert int(vmm_cap.stats_dict()["pool_total_bytes"]) >= 12 * MIB
     finally:
         vmm_cap.shutdown()
 

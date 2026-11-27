@@ -171,10 +171,11 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
     }
     assert ablations["full_morphserve"].use_tripool_vmm is True
     assert ablations["no_m1_tripool_vmm"].use_tripool_vmm is False
-    assert ablations["no_m1_tripool_vmm"].use_scoped_vae is False
+    assert ablations["no_m1_tripool_vmm"].use_expert_pager is False
+    assert ablations["no_m1_tripool_vmm"].use_scoped_vae is True
     assert ablations["no_m1_scoped_vae"].use_tripool_vmm is True
     assert ablations["no_m1_scoped_vae"].use_scoped_vae is False
-    assert ablations["no_m2_dual_path"].routing_mode == "in_place_only"
+    assert ablations["no_m2_dual_path"].routing_mode == "sticky_least_loaded"
     assert ablations["no_m2_dual_path"].use_h2d_pacer is True
     assert ablations["no_m2_pacer_numa"].routing_mode == "dual_path"
     assert ablations["no_m2_pacer_numa"].use_h2d_pacer is False

@@ -106,7 +106,8 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
     atlas_acc = run_atlas_prediction_accuracy_table()
 
     # 2. Ablation A: Cost Model Routing (legacy_analytical vs pipeline_analytical vs atlas_3d)
-    # 8xA100 mixed workload with cold/partial-alpha heterogeneous GPUs & heavy multi-turn 1024^2 edits.
+    # 8xA100-40GB with constrained 14 GiB expert super-pool (matching Stage-1 `tab:eval_microbench` VAE eviction cap)
+    # so partial residency (`alpha_g < 1.0`) and `post_evict` states persist throughout steady state.
     ablation_a: list[dict[str, Any]] = []
     init_het_alphas = {str(g): (0.0 if (g % 2 == 0) else 0.5) for g in range(8)}
     for mode in ("legacy_analytical", "pipeline_analytical", "atlas_3d"):
@@ -114,7 +115,7 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
             policy_name="morphserve",
             num_gpus=8,
             hw=hw_8a100,
-            offered_qps=1.0,
+            offered_qps=0.65,
             num_sessions=160,
             seed=2026,
             physics=ph,
@@ -126,49 +127,41 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
                 "gpu_queue_mode": "fcfs",
                 "kv_eviction_mode": "swap",
                 "initial_alphas": init_het_alphas,
+                "super_pool_mib": 14080,
                 "steady_window_mode": "session_trim",
                 "steady_state_trim_frac": 0.10,
             },
         )
         ablation_a.append(_summarize(f"cost_{mode}", rep))
 
-    # 3. Ablation B: Per-GPU Queue Reordering (fcfs vs memory_slack) at high contention (1.2 QPS, 8xA100)
+    # 3. Ablation B: Per-GPU Queue Reordering (fcfs vs memory_slack) at operating knee (0.65 QPS) & overload (1.0 QPS)
     ablation_b: list[dict[str, Any]] = []
-    for q_mode in ("fcfs", "memory_slack"):
-        rep = simulate_cluster_point(
-            policy_name="morphserve",
-            num_gpus=8,
-            hw=hw_8a100,
-            offered_qps=1.2,
-            num_sessions=192,
-            seed=2026,
-            physics=ph,
-            workload_scale=ws_std,
-            skew_tag="main_mix",
-            bench_root=bench_root,
-            policy_overrides={
-                "cost_model_mode": "atlas_3d",
-                "gpu_queue_mode": q_mode,
-                "kv_eviction_mode": "swap",
-                "steady_window_mode": "session_trim",
-                "steady_state_trim_frac": 0.10,
-            },
-        )
-        ablation_b.append(_summarize(f"queue_{q_mode}", rep))
+    for qps_b, q_label in ((0.65, "knee065"), (1.00, "load100")):
+        for q_mode in ("fcfs", "memory_slack"):
+            rep = simulate_cluster_point(
+                policy_name="morphserve",
+                num_gpus=8,
+                hw=hw_8a100,
+                offered_qps=qps_b,
+                num_sessions=192,
+                seed=2026,
+                physics=ph,
+                workload_scale=ws_std,
+                skew_tag="main_mix",
+                bench_root=bench_root,
+                policy_overrides={
+                    "cost_model_mode": "atlas_3d",
+                    "gpu_queue_mode": q_mode,
+                    "kv_eviction_mode": "swap",
+                    "steady_window_mode": "session_trim",
+                    "steady_state_trim_frac": 0.10,
+                },
+            )
+            ablation_b.append(_summarize(f"{q_label}_{q_mode}", rep))
 
-    # 4. Ablation C: Think-Time KV Eviction (swap vs recompute) under tight-memory multi-turn pressure
-    # 8x36 GiB constrained HBM with extended multi-turn editing & CoT sessions where think-time KV eviction triggers.
-    hw_tight8 = HardwareInterconnectSpec(
-        name="A100_36GB_Pressure_8GPU",
-        gpu_hbm_gib=36.0,
-        compute_speedup_x=1.0,
-        solo_h2d_gbps=hw_8a100.solo_h2d_gbps,
-        agg_h2d_gbps=hw_8a100.agg_h2d_gbps,
-        intra_half_p2p_gbps=hw_8a100.intra_half_p2p_gbps,
-        inter_socket_p2p_gbps=hw_8a100.inter_socket_p2p_gbps,
-        inter_node_rdma_gbps=hw_8a100.inter_node_rdma_gbps,
-        gpus_per_node=8,
-    )
+    # 4. Ablation C: Think-Time KV Eviction (swap vs recompute) on real 8xA100-40GB under multi-turn KV pressure
+    # Extended multi-turn editing + CoT sessions with realistic 5-20s user think times trigger heavy LRU think-time
+    # KV eviction while preserving 0 OOMs on 40 GB A100 HBM.
     ws_long_mt = WorkloadScaleSpec(
         name="bagel_7b_multiturn_pressure",
         weight_scale=1.0,
@@ -176,14 +169,15 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
         vae_spike_scale=1.0,
         compute_scale=1.0,
         extra_edit_turns=2,
+        think_s_range_override=(5.0, 20.0),
     )
     ablation_c: list[dict[str, Any]] = []
     for kv_mode in ("swap", "recompute"):
         rep = simulate_cluster_point(
             policy_name="morphserve",
             num_gpus=8,
-            hw=hw_tight8,
-            offered_qps=1.0,
+            hw=hw_8a100,
+            offered_qps=0.70,
             num_sessions=160,
             seed=2026,
             physics=ph,
@@ -223,26 +217,29 @@ def main() -> None:
 
     print("=== 1. Stage-1 A100 H2D Stall Prediction MAE (ms) ===")
     print(json.dumps(res["atlas_stall_prediction_accuracy"]["mae_ms"], indent=2))
-    print("\n=== 2. Ablation A: Cost Model (8xA100, 1.0 QPS, heterogeneous alpha) ===")
+    print("\n=== 2. Ablation A: Cost Model (8xA100-40GB, 0.65 QPS, 14 GiB super-pool cap) ===")
     for r in res["ablation_a_cost_model_8gpu"]:
         print(
             f"{r['tag']:26s} | OOM={r['oom_sessions']} | TurnSLO={r['steady_turn_slo_attainment_pct']:5.1f}% "
+            f"| JointSLO={r['joint_slo_attainment_pct']:5.1f}% "
             f"| DiT mean/p95={r['dit_turn_mean_ms']:7.1f}/{r['dit_turn_p95_ms']:7.1f} ms "
             f"| PathA={r['path_a_ships']:4d} PathB={r['path_b_morphs']:4d} "
             f"| EffHBM={r['effective_hbm_util_mean_pct']}%"
         )
-    print("\n=== 3. Ablation B: Per-GPU Queue Reordering (8xA100, 1.2 QPS) ===")
+    print("\n=== 3. Ablation B: Per-GPU Queue Reordering (8xA100-40GB, 0.65 & 1.00 QPS) ===")
     for r in res["ablation_b_queue_reordering_8gpu"]:
         print(
             f"{r['tag']:26s} | OOM={r['oom_sessions']} | TurnSLO={r['steady_turn_slo_attainment_pct']:5.1f}% "
+            f"| JointSLO={r['joint_slo_attainment_pct']:5.1f}% "
             f"| DiT mean/p95/p99={r['dit_turn_mean_ms']:7.1f}/{r['dit_turn_p95_ms']:7.1f}/{r['dit_turn_p99_ms']:7.1f} ms "
             f"| Reord={r['queue_reorders_total']:4d} MemByp={r['queue_memory_bypasses_total']:3d} "
             f"Starv={r['queue_starvation_promotions_total']:3d} | EffHBM={r['effective_hbm_util_mean_pct']}%"
         )
-    print("\n=== 4. Ablation C: Think-Time KV Swap vs. Recompute (8x36GB pressure, 1.0 QPS) ===")
+    print("\n=== 4. Ablation C: Think-Time KV Swap vs. Recompute (8xA100-40GB multi-turn pressure, 0.70 QPS) ===")
     for r in res["ablation_c_kv_swap_vs_recompute_8gpu"]:
         print(
             f"{r['tag']:26s} | OOM={r['oom_sessions']} | TurnSLO={r['steady_turn_slo_attainment_pct']:5.1f}% "
+            f"| JointSLO={r['joint_slo_attainment_pct']:5.1f}% "
             f"| TTFT mean/p95={r['ar_ttft_mean_ms']:6.1f}/{r['ar_ttft_p95_ms']:6.1f} ms "
             f"| DiT mean/p95={r['dit_turn_mean_ms']:7.1f}/{r['dit_turn_p95_ms']:7.1f} ms "
             f"| SwapIn={r['kv_host_swap_ins']:3d} (p95={r['kv_swap_in_p95_ms']:5.1f}ms, hit={r['kv_swap_hit_rate_pct']:5.1f}%) "

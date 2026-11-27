@@ -539,7 +539,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 if (pe > now_ms) ++p_cnt;
             }
             pre_map[g] = p_cnt;
-            wg.colocated_ar_b = p_cnt + ((rem_ar > 0.0) ? 1 : 0);
+            wg.colocated_ar_b = p_cnt;
         }
     };
 
@@ -1172,7 +1172,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             w.est_mem_bytes = static_cast<int64_t>(est_kv_mib * static_cast<double>(kMiB));
             w.est_exec_ms = p.est_prep_q;
             w.slo_deadline_ms = p.t_turn0 + policy.dit_turn_slo_for(turn.height, turn.dit_steps) * slo_time_scale;
-            w.op_priority = 0;
+            w.op_priority = 1;
             PendingGpuWork work;
             work.sid = sid;
             work.is_prep = true;

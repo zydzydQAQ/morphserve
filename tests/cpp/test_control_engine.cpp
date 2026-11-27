@@ -1008,6 +1008,23 @@ void test_performance_atlas_3d_and_fallbacks() {
     MS_CHECK(d_atlas.path == "in_place_morph" && d_atlas.t_morph_ms < 300.0);
     MS_CHECK(d_legacy.path == "state_ship" && d_legacy.t_morph_ms > 5.0 * d_atlas.t_morph_ms);
 
+    // Bounded single-turn colocated AR stretch: a 60s queue with 1 active AR turn stretches ONLY
+    // the currently executing turn (~5.6s * 0.48 = ~2.7s), NOT the entire 60s queue (+28.8s)!
+    WorkerState w_long;
+    w_long.gpu_id = 0;
+    w_long.expert_alpha = 1.0;
+    w_long.queue_wait_ms = 60000.0;
+    w_long.colocated_ar_b = 1;
+    CPTGRequestSpec req512;
+    req512.req_id = "bounded_coloc_stretch";
+    req512.src_gpu = 0;
+    req512.model_family = "bagel";
+    req512.resolution = 512;
+    req512.dit_step1_ms = 280.0;
+    req512.dit_total_steps = 20;
+    const double q_stretched_ms = r_atlas.evaluate_path_b_morph_ms(req512, w_long, 0.0).first;
+    MS_CHECK(q_stretched_ms > 62000.0 && q_stretched_ms < 64000.0);
+
     // JSON round-trip preserves exact entries.
     const PerformanceAtlas rt = PerformanceAtlas::from_json(atlas.to_json());
     const auto rt_pt = rt.estimate_morph_stall("bagel", 1024, 0.0, false, bagel_exp, 12.34, 939.804, 11.71);

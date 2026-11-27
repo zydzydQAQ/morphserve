@@ -710,7 +710,11 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
         (cost_model_mode_ == "atlas_3d" && src_worker.colocated_ar_b > 0)
             ? atlas_.dit_step_stretch_factor(eff_fam, req.resolution, src_worker.colocated_ar_b)
             : 1.0;
-    const double eff_q_wait_ms = src_worker.queue_wait_ms * coloc_stretch;
+    // Active colocated AR microbatches only stretch the currently executing DiT turn on `src_worker`,
+    // not future turns queued tens of seconds later after the short AR turn has finished.
+    const double one_dit_turn_ms = std::max(0.0, req.dit_step1_ms * static_cast<double>(std::max(1, req.dit_total_steps)));
+    const double active_src_dit_ms = std::min(src_worker.queue_wait_ms, one_dit_turn_ms);
+    const double eff_q_wait_ms = src_worker.queue_wait_ms + active_src_dit_ms * std::max(0.0, coloc_stretch - 1.0);
 
     const double alpha = std::max(0.0, std::min(1.0, src_worker.expert_alpha));
     const double missing_bytes = (1.0 - alpha) * static_cast<double>(req.gen_expert_bytes);
@@ -802,6 +806,9 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_a_ship_ms(
         (cost_model_mode_ == "atlas_3d" && dst_worker.colocated_ar_b > 0)
             ? atlas_.dit_step_stretch_factor(eff_fam, req.resolution, dst_worker.colocated_ar_b)
             : 1.0;
+    const double one_dit_turn_ms = std::max(0.0, req.dit_step1_ms * static_cast<double>(std::max(1, req.dit_total_steps)));
+    const double active_dst_dit_ms = std::min(dst_worker.queue_wait_ms, one_dit_turn_ms);
+    const double eff_dst_q_ms = dst_worker.queue_wait_ms + active_dst_dit_ms * std::max(0.0, dst_stretch - 1.0);
 
     double dst_morph_ms = 0.0;
     if (dst_worker.expert_alpha < 1.0) {
@@ -809,7 +816,7 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_a_ship_ms(
         probe.queue_wait_ms = 0.0;
         dst_morph_ms = evaluate_path_b_morph_ms(req, probe, now_ms).first;
     }
-    const double t_ship = ship_xfer_ms + (dst_worker.queue_wait_ms * dst_stretch) + dst_morph_ms;
+    const double t_ship = ship_xfer_ms + eff_dst_q_ms + dst_morph_ms;
     return {round_3(t_ship), round_3(bw_p2p)};
 }
 

@@ -525,6 +525,14 @@ int DualPathMorphRouter::select_initial_gpu(
         // share tier 1 so idle ar_only arrivals spread uniformly via round-robin.
         return (alpha <= 0.50) ? 0 : 1;
     };
+    auto dit_alpha_tier = [&](int g) -> int {
+        const double alpha = w_map.at(g).expert_alpha;
+        // Symmetric to `ar_alpha_tier`: on tight_mot (BAGEL), minor post-VAE alpha dips
+        // (e.g. 0.75-0.96 vs 1.0) incur near-zero exposed stall (<2 ms via layer-pipelined H2D);
+        // bucket alpha > 0.50 into tier 0 so idle dit_t2i / cot_then_dit arrivals spread uniformly
+        // via round-robin instead of piling onto 1-2 untouched alpha=1.0 GPUs.
+        return (alpha > 0.50) ? 0 : 1;
+    };
 
     if ((routing_mode == "twostage_shm" || routing_mode == "static_nccl_fission") && !static_und_ranks.empty()) {
         std::vector<int> cands = static_und_ranks;
@@ -587,8 +595,8 @@ int DualPathMorphRouter::select_initial_gpu(
         if (!idle.empty()) {
             const bool prefer_high_alpha = (routing_mode == "dual_path" && architecture != "bridge_mllm_dit");
             std::sort(idle.begin(), idle.end(), [&](int a, int b) {
-                const double aa = prefer_high_alpha ? -w_map.at(a).expert_alpha : w_map.at(a).expert_alpha;
-                const double ab = prefer_high_alpha ? -w_map.at(b).expert_alpha : w_map.at(b).expert_alpha;
+                const double aa = prefer_high_alpha ? static_cast<double>(dit_alpha_tier(a)) : w_map.at(a).expert_alpha;
+                const double ab = prefer_high_alpha ? static_cast<double>(dit_alpha_tier(b)) : w_map.at(b).expert_alpha;
                 return std::make_tuple(aa, pos_mod(a - cur, n)) <
                        std::make_tuple(ab, pos_mod(b - cur, n));
             });
@@ -635,8 +643,8 @@ int DualPathMorphRouter::select_initial_gpu(
                 if (wa.expert_alpha > 0.01) eff_qa += 1200.0;
                 if (wb.expert_alpha > 0.01) eff_qb += 1200.0;
             } else {
-                aa = -wa.expert_alpha;
-                ab = -wb.expert_alpha;
+                aa = static_cast<double>(dit_alpha_tier(a));
+                ab = static_cast<double>(dit_alpha_tier(b));
             }
         }
         return std::make_tuple(wa.kv_free_bytes >= min_kv_b ? 0 : 1, eff_qa, is_busy(a), aa, pos_mod(a - cur, n)) <
@@ -763,7 +771,8 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
             overlap_efficiency_,
             num_layers);
     }
-    const double t_morph = eff_q_wait_ms + h2d_wait_ms + stall_est.map_ms + stall_est.exposed_stall_ms;
+    const double eff_local_q_ms = std::max(0.0, eff_q_wait_ms - std::max(0.0, req.src_hold_credit_ms));
+    const double t_morph = eff_local_q_ms + h2d_wait_ms + stall_est.map_ms + stall_est.exposed_stall_ms;
     return {round_3(t_morph), round_3(bw_h2d_gbps)};
 }
 

@@ -461,3 +461,59 @@ def test_numa_memfd_mirror_cross_fd_shared_mapping() -> None:
         if attached is not None:
             attached.close()
         owner.close()
+
+
+def test_expert_pager_restore_free_super_layers_async_bounded_by_free_handles() -> None:
+    from types import SimpleNamespace
+    from morphserve.vmm.pager import ExpertPager, ExpertPartitionSpec
+
+    prefetch_calls: list[tuple[int, int, int]] = []
+
+    class _FakeVmm:
+        def __init__(self, resident: int, free_super: int, handle_bytes: int = 64 * MIB) -> None:
+            self.resident = resident
+            self.free_super = free_super
+            self.handle_bytes = handle_bytes
+
+        def expert_resident_count(self, _eid: int) -> int:
+            return self.resident
+
+        def stats_dict(self) -> dict[str, int]:
+            return {"super_pool_free_handles": self.free_super, "super_handle_bytes": self.handle_bytes}
+
+        def prefetch_expert_async(self, eid: int, start: int, end: int) -> int:
+            prefetch_calls.append((eid, start, end))
+            return max(0, end - start)
+
+    spec = ExpertPartitionSpec(
+        model_family="bagel",
+        role="generation",
+        num_layers=28,
+        layer_stride_bytes=512 * MIB,
+        layer_params=[[] for _ in range(28)],
+        hook_modules=[],
+        vae_module=None,
+    )
+    pager = ExpertPager(spec)
+    pager.expert_id = 0
+
+    # 1. Partial eviction (20/28 resident) with 18 free super handles (18*64MiB = 1152MiB -> 2 layers @ 512MiB).
+    pager.vmm = _FakeVmm(resident=20, free_super=18)
+    assert pager._has_pending_async_prefetch is False
+    q1 = pager.restore_free_super_layers_async()
+    assert q1 == 2
+    assert prefetch_calls == [(0, 20, 22)]
+    assert pager._has_pending_async_prefetch is True
+
+    # 2. Not enough free super handles for even 1 layer (< 8 handles) -> returns 0 without prefetching.
+    prefetch_calls.clear()
+    pager._has_pending_async_prefetch = False
+    pager.vmm = _FakeVmm(resident=20, free_super=7)
+    assert pager.restore_free_super_layers_async() == 0
+    assert prefetch_calls == []
+    assert pager._has_pending_async_prefetch is False
+
+    # 3. Already 28/28 resident -> returns 0.
+    pager.vmm = _FakeVmm(resident=28, free_super=64)
+    assert pager.restore_free_super_layers_async() == 0
+    assert prefetch_calls == []

@@ -1207,7 +1207,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 4608) * MIB
+                    headroom_b = (nccl_reserve_mib + 5376) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -1925,8 +1925,9 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             has_pending = session.has_pending_deferral
             if self.policy.use_scoped_vae:
                 # With Scoped VAE active, FLUX VAE decode activations run inside TriPoolVMM Arena-2
-                # rather than PyTorch driver memory, so keep driver headroom aligned with `max_pool_b`.
-                est_dit_vae_bytes = int(4608 * MIB) if (height >= 1024 or width >= 1024) else int(2560 * MIB)
+                # rather than PyTorch driver memory; reserve 5.0/3.0 GiB so 1024px DiT + concurrent
+                # preempted AR never fragment CUDACachingAllocator on 40 GiB A100.
+                est_dit_vae_bytes = int(5120 * MIB) if (height >= 1024 or width >= 1024) else int(3072 * MIB)
             else:
                 est_dit_vae_bytes = int(6144 * MIB) if (height >= 1024 or width >= 1024) else int(3584 * MIB)
             if self.pager is not None and self.vmm is not None:
@@ -2133,12 +2134,16 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 return bool(ar_sess is not None and ar_sess.is_swapped)
 
             def _reclaim_for_preempt(_tasks: list[ArDecodeTask]) -> int:
-                freed_b = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
+                # Reclaim ~2 GiB first so a single transient activation spike doesn't dump every warm session.
+                target_b = self.available_kv_bytes(for_dit=False) + 2048 * MIB
+                freed_b = self.evict_idle_kv_to_host(target_b, exclude_ctx_ids=(ctx_id,))
+                if freed_b == 0:
+                    freed_b = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
                 if self.vmm is not None:
                     flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
                     if callable(flush_fn):
                         flush_fn()
-                    freed_b += self._release_vmm_overflow_to_driver()
+                    freed_b += self._release_vmm_overflow_to_driver(2048 * MIB)
                 return freed_b
 
             hw_key = (height, width)
@@ -2247,13 +2252,22 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             if dit_attempt < max_dit_oom_retries and is_oom_exception(exc):
                                 self._update_hwm()
                                 free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
-                                freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                target_reclaim = (
+                                    (self.available_kv_bytes(for_dit=False) + 2048 * MIB)
+                                    if dit_attempt == 0
+                                    else (1 << 50)
+                                )
+                                freed = self.evict_idle_kv_to_host(target_reclaim, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                if freed == 0 and dit_attempt == 0:
+                                    freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
                                 vmm_trimmed = 0
                                 if self.vmm is not None:
                                     flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
                                     if callable(flush_fn):
                                         flush_fn()
-                                    vmm_trimmed = self._release_vmm_overflow_to_driver()
+                                    vmm_trimmed = self._release_vmm_overflow_to_driver(
+                                        2048 * MIB if dit_attempt == 0 else 0
+                                    )
                                 if is_cuda:
                                     gc.collect()
                                     torch.cuda.empty_cache()
@@ -2348,6 +2362,15 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 # Always record peak HBM BEFORE dropping offloaded expert weights / emptying cache!
                 self._update_hwm()
                 self._release_naive_hold(ctx_id)
+
+            # After Scoped VAE `scope_end()` returns Arena-2 super handles to `free_super_handles_`,
+            # stream back any evicted tail expert layers that fit directly in those free handles
+            # (async on `h2d_stream_`, zero KV eviction, zero compute-stream stall) so `resident_alpha`
+            # recovers during think-time/AR instead of causing H2D pacer stalls on the next DiT turn.
+            if self.pager is not None and self.vmm is not None and self.policy.use_scoped_vae:
+                restore_fn = getattr(self.pager, "restore_free_super_layers_async", None)
+                if callable(restore_fn):
+                    restore_fn()
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if vae_decode_ev_pair is not None:

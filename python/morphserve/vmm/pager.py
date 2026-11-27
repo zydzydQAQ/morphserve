@@ -652,6 +652,27 @@ class LayerExpertPager:
             self._waited_layers.clear()
             self._all_resident_synced = bool(self.vmm.expert_resident_count(self.expert_id) == self.num_layers)
 
+    def restore_free_super_layers_async(self) -> int:
+        """Asynchronously stream back evicted tail layers that fit directly in free super handles.
+
+        Never evicts KV pages or blocks the compute stream; marks `_has_pending_async_prefetch`
+        so the next `generation_mode()` synchronizes per-layer ready events cleanly.
+        """
+        if self.vmm is None or self.expert_id < 0 or self.layer_stride_bytes <= 0:
+            return 0
+        cur_res = int(self.vmm.expert_resident_count(self.expert_id))
+        if cur_res >= self.num_layers:
+            return 0
+        st = self.vmm.stats_dict()
+        free_super_b = int(st.get("super_pool_free_handles", 0)) * int(st.get("super_handle_bytes", 0))
+        can_restore = min(self.num_layers - cur_res, free_super_b // self.layer_stride_bytes)
+        if can_restore <= 0:
+            return 0
+        queued = int(self.vmm.prefetch_expert_async(self.expert_id, cur_res, cur_res + can_restore))
+        if queued > 0:
+            self._has_pending_async_prefetch = True
+        return queued
+
     def set_residency_alpha(self, alpha: float) -> int:
         assert self.vmm is not None
         if not 0.0 <= float(alpha) <= 1.0:

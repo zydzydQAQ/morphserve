@@ -393,7 +393,8 @@ void test_router_seams() {
             2, "dual_path", "layer_chunk", {}, "ar_only", nullptr, {{0, true}, {1, true}}, {{0, 1}, {1, 0}}, {{0, 0}, {1, 0}}, 6, "tight_mot") ==
         1);
 
-    // Low-load tight_mot ar_only MUST spread uniformly across idle GPUs despite minor post-VAE alpha dip (0.75 vs 1.0).
+    // Low-load tight_mot ar_only, dit_t2i, and cot_then_dit MUST spread uniformly across idle GPUs
+    // despite minor post-VAE alpha dips (0.75 vs 1.0) so new sessions never pile onto 1-2 GPUs.
     DualPathMorphRouter router_spread(topo);
     router_spread.init_workers(
         4,
@@ -407,6 +408,18 @@ void test_router_seams() {
             router_spread.select_initial_gpu(4, "dual_path", "layer_chunk", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "tight_mot"));
     }
     MS_CHECK(picked_idle.size() == 4);
+    std::set<int> picked_dit;
+    for (int i = 0; i < 4; ++i) {
+        picked_dit.insert(
+            router_spread.select_initial_gpu(4, "dual_path", "layer_chunk", {}, "dit_t2i", nullptr, all_idle, {}, {}, 6, "tight_mot"));
+    }
+    MS_CHECK(picked_dit.size() == 4);
+    std::set<int> picked_cot;
+    for (int i = 0; i < 4; ++i) {
+        picked_cot.insert(
+            router_spread.select_initial_gpu(4, "dual_path", "layer_chunk", {}, "cot_then_dit", nullptr, all_idle, {}, {}, 6, "tight_mot"));
+    }
+    MS_CHECK(picked_cot.size() == 4);
 
     // Genuinely KV-heavy GPU (alpha <= 0.50) IS still preferred for ar_only, and bridge_mllm_dit prefers VLM-hot (<= 0.01).
     DualPathMorphRouter router_ivlu(topo);
@@ -465,6 +478,16 @@ void test_router_seams() {
     router_hold.set_worker_state_fields(1, 1.0, 0.0, 0, 16 * kGiB, 1);
     const RouteDecision dec_idle = router_hold.decide(req_hold);
     MS_CHECK(dec_idle.path == "state_ship" && dec_idle.dst_gpu == 1);
+    // src_hold_credit_ms MUST also apply when src has partial post-VAE alpha < 1.0 so holding
+    // src's lock never causes spurious Path-A hops onto busy peers.
+    router_hold.set_worker_state_fields(0, 0.75, 10000.0, 0, 16 * kGiB, 1);
+    router_hold.set_worker_state_fields(1, 1.0, 8000.0, 0, 16 * kGiB, 1);
+    CPTGRequestSpec req_hold_partial = req_hold;
+    req_hold_partial.architecture = "tight_mot";
+    req_hold_partial.kv_bytes = 512 * kMiB;
+    req_hold_partial.src_hold_credit_ms = 5000.0;
+    const RouteDecision dec_busy_partial = router_hold.decide(req_hold_partial);
+    MS_CHECK(dec_busy_partial.path == "in_place_morph" && dec_busy_partial.dst_gpu == 0);
 
     // Co-paged bridge_mllm_dit Regime B: VLM-hot src (alpha=0.0, post_evict=false) MUST NOT
     // appear cheaper to morph than a post-VAE Decoder-hot peer (alpha=0.40, post_evict=true).

@@ -961,9 +961,19 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
     torch = pytest.importorskip("torch")
     from PIL import Image
 
+    class _FakeScheduler:
+        def __init__(self) -> None:
+            self.steps_called = 0
+
+        def step(self, noise_pred: Any, t: Any, latents: Any, return_dict: bool = False) -> tuple[Any]:
+            self.steps_called += 1
+            return (latents,)
+
     class _StepPipe:
         def __init__(self) -> None:
-            self.cb_seen: list[bool] = []
+            self.scheduler = _FakeScheduler()
+            self.orig_step = self.scheduler.step
+            self.step_wrapped_seen: list[bool] = []
 
         def __call__(
             self,
@@ -972,12 +982,12 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
             callback_on_step_end: Any = None,
             **kwargs: Any,
         ) -> Any:
-            self.cb_seen.append(callback_on_step_end is not None)
+            # Must NOT use upstream's buggy `callback_on_step_end` hook.
+            assert callback_on_step_end is None
+            self.step_wrapped_seen.append(self.scheduler.step is not self.orig_step)
             latents = torch.zeros((1, 4, 8, 8))
-            if callback_on_step_end is not None:
-                for step_i in range(num_inference_steps):
-                    out_cb = callback_on_step_end(self, step_i, step_i, {"latents": latents})
-                    assert isinstance(out_cb, dict)
+            for step_i in range(num_inference_steps):
+                latents = self.scheduler.step(latents, step_i, latents, return_dict=False)[0]
             return SimpleNamespace(images=[Image.new("RGB", (32, 32), color=(40, 80, 120))])
 
     def _make_stub_pipe():
@@ -1055,7 +1065,9 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
             emit_preempt_ack=acks.append,
         )
         assert res_a["status"] == "ok"
-        assert step_pipe_a.cb_seen == [True]
+        assert step_pipe_a.step_wrapped_seen == [True]
+        assert step_pipe_a.scheduler.step == step_pipe_a.orig_step
+        assert step_pipe_a.scheduler.steps_called == 4
         assert res_a["yield_count"] == 1
         by_id = {a["cmd_id"]: a for a in acks}
         assert by_id["c_ok"]["status"] == "ok" and by_id["c_ok"]["preempted_mid_dit"] is True
@@ -1063,7 +1075,7 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
     finally:
         ad_a.close()
 
-    # 2. Regime B (quota-constrained): callback_on_step_end MUST NOT be passed (prevents VLM<->Decoder thrash).
+    # 2. Regime B (quota-constrained): scheduler.step MUST NOT be wrapped (prevents VLM<->Decoder thrash).
     pipe_b, step_pipe_b = _make_stub_pipe()
     pol_b = EnginePolicyConfig.from_preset(
         "morphserve",
@@ -1091,7 +1103,8 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
             emit_preempt_ack=acks_b.append,
         )
         assert res_b["status"] == "ok"
-        assert step_pipe_b.cb_seen == [False]
+        assert step_pipe_b.step_wrapped_seen == [False]
+        assert step_pipe_b.scheduler.step == step_pipe_b.orig_step
         assert res_b["yield_count"] == 0
         assert acks_b == []
     finally:

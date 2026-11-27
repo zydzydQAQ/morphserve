@@ -1109,29 +1109,33 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         )
 
         # In unconstrained Regime A (VLM & Decoder both 100% resident in HBM), service arriving AR
-        # commands at DiT denoising step boundaries via `callback_on_step_end` (bit-exact lossless:
-        # greedy VLM decoding never touches diffusion latents or the local `torch.Generator`).
+        # commands at DiT denoising step boundaries by temporarily wrapping `image_pipeline.scheduler.step`
+        # (bit-exact lossless: greedy VLM decoding never touches diffusion latents or the local
+        # `torch.Generator`, and avoids upstream `InternVLUGenerationDecoderPipeline`'s buggy
+        # `callback_on_step_end` reference to undefined `prompt_embeds`/`negative_prompt_embeds`).
         img_pipe_params = inspect.signature(self.pipe.image_pipeline.__call__).parameters
-        step_preempt_cb = None
-        if (
+        sched_obj = getattr(self.pipe.image_pipeline, "scheduler", None)
+        orig_sched_step = getattr(sched_obj, "step", None)
+        enable_step_preempt = (
             (not self._quota_constrained)
             and str(getattr(self.policy, "preemption_mode", "non_preemptive")) != "non_preemptive"
             and poll_preempt_cmds is not None
             and emit_preempt_ack is not None
-            and "callback_on_step_end" in img_pipe_params
-        ):
-            def _on_step_end(_pipe: Any, _step_idx: int, _timestep: Any, _cb_kwargs: dict[str, Any]) -> dict[str, Any]:
+            and callable(orig_sched_step)
+        )
+        if enable_step_preempt:
+            def _step_with_preempt(*s_args: Any, **s_kwargs: Any) -> Any:
                 nonlocal yield_count, preempt_yield_ms
+                step_out = orig_sched_step(*s_args, **s_kwargs)
                 polled = poll_preempt_cmds()
-                if not polled:
-                    return {}
-                t_ar0 = time.perf_counter()
-                self._serve_preempted_ar_cmds(polled, emit_preempt_ack)
-                preempt_yield_ms += (time.perf_counter() - t_ar0) * 1000.0
-                yield_count += 1
-                return {}
+                if polled:
+                    t_ar0 = time.perf_counter()
+                    self._serve_preempted_ar_cmds(polled, emit_preempt_ack)
+                    preempt_yield_ms += (time.perf_counter() - t_ar0) * 1000.0
+                    yield_count += 1
+                return step_out
 
-            step_preempt_cb = _on_step_end
+            sched_obj.step = _step_with_preempt
 
         gen = torch.Generator(device=self.device).manual_seed(seed)
         try:
@@ -1155,8 +1159,6 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                             "generator": gen,
                             "output_type": "latent",
                         }
-                        if step_preempt_cb is not None:
-                            paged_kwargs["callback_on_step_end"] = step_preempt_cb
                         latents_out = self.pipe.image_pipeline(**paged_kwargs).images
                     # Run QwenImage VAE decode outside `generation_mode` so decoder blocks remain unpinned
                     # under strict 12 GiB quotas while staying 100% resident under ample 40/80 GB `super_pool`.
@@ -1183,10 +1185,10 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                     }
                     if "generator_device" in img_pipe_params:
                         call_kwargs["generator_device"] = None
-                    if step_preempt_cb is not None:
-                        call_kwargs["callback_on_step_end"] = step_preempt_cb
                     imgs_t = self.pipe.image_pipeline(**call_kwargs).images
         finally:
+            if enable_step_preempt and sched_obj is not None:
+                sched_obj.step = orig_sched_step
             if is_cuda:
                 try:
                     torch.cuda.current_stream(self.device).synchronize()

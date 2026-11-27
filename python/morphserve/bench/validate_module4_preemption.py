@@ -308,18 +308,44 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
 
         g1 = list(t_ar1.generated_token_ids)
         g2 = list(t_ar2.generated_token_ids)
-        ar1_exact_b1 = g1 == ar_ref_tokens["ar1"][: len(g1)]
-        ar2_exact_b1 = g2 == ar_ref_tokens["ar2"][: len(g2)]
-        ar1_exact_b2 = bool(b2_ref_tokens.get("ar1") and g1 == b2_ref_tokens["ar1"][: len(g1)])
-        ar2_exact_b2 = bool(b2_ref_tokens.get("ar2") and g2 == b2_ref_tokens["ar2"][: len(g2)])
+        ref1_b1 = ar_ref_tokens["ar1"][: len(g1)]
+        ref2_b1 = ar_ref_tokens["ar2"][: len(g2)]
+        ref1_b2 = (b2_ref_tokens.get("ar1") or [])[: len(g1)]
+        ref2_b2 = (b2_ref_tokens.get("ar2") or [])[: len(g2)]
+
+        ar1_exact_b1 = len(g1) > 0 and g1 == ref1_b1
+        ar2_exact_b1 = len(g2) > 0 and g2 == ref2_b1
+        ar1_exact_b2 = bool(ref1_b2 and len(g1) == len(ref1_b2) and g1 == ref1_b2)
+        ar2_exact_b2 = bool(ref2_b2 and len(g2) == len(ref2_b2) and g2 == ref2_b2)
         used_b2 = sched.max_microbatch_size >= 2
-        # Under staggered arrivals (`ar1` starts at B=1, then transitions to B=2 when `ar2` arrives),
-        # cuBLAS selects different bf16 kernels for [1, D] vs [2, D]; verify every pre-B=2 token of `ar1`
-        # is 100% bit-exact with `ar_ref_tokens["ar1"]` and full 20-token completion holds.
+
+        ar1_match_b1 = sum(1 for a, b in zip(g1, ref1_b1) if a == b)
+        ar2_match_b1 = sum(1 for a, b in zip(g2, ref2_b1) if a == b)
+        ar1_match_b2 = sum(1 for a, b in zip(g1, ref1_b2) if a == b) if ref1_b2 else 0
+        ar2_match_b2 = sum(1 for a, b in zip(g2, ref2_b2) if a == b) if ref2_b2 else 0
+        ar1_best_match = max(ar1_match_b1, ar1_match_b2) if used_b2 else ar1_match_b1
+        ar2_best_match = max(ar2_match_b1, ar2_match_b2) if used_b2 else ar2_match_b1
+        ar1_greedy_match_pct = round(100.0 * ar1_best_match / max(len(g1), 1), 2)
+        ar2_greedy_match_pct = round(100.0 * ar2_best_match / max(len(g2), 1), 2)
+        combined_greedy_match_pct = round(
+            100.0 * (ar1_best_match + ar2_best_match) / max(len(g1) + len(g2), 1), 2
+        )
+
+        # Track whether `ar1` and `ar2` overlapped in staggered B=2 execution without fabricating bit-exactness.
         ar2_first_s = t_ar2.token_timestamps_s[0] if t_ar2.token_timestamps_s else float("inf")
+        ar1_last_s = t_ar1.token_timestamps_s[-1] if t_ar1.token_timestamps_s else -1.0
         n_ar1_pre_b2 = sum(1 for ts in t_ar1.token_timestamps_s if ts < ar2_first_s - 1e-6)
+        n_ar2_in_b2 = sum(1 for ts in t_ar2.token_timestamps_s if ts <= ar1_last_s + 1e-6)
         staggered_b2 = used_b2 and (0 < n_ar1_pre_b2 < len(g1))
         ar1_pre_b2_exact = g1[:n_ar1_pre_b2] == ar_ref_tokens["ar1"][:n_ar1_pre_b2]
+        ar2_b2_prefix_exact = bool(
+            n_ar2_in_b2 == 0
+            or (g2[:n_ar2_in_b2] == ar_ref_tokens["ar2"][:n_ar2_in_b2])
+            or (bool(b2_ref_tokens.get("ar2")) and g2[:n_ar2_in_b2] == b2_ref_tokens["ar2"][:n_ar2_in_b2])
+        )
+        # Honest bit-exact checks: require actual full greedy token equality against B=1 or B=2 reference.
+        ar1_bit_exact = bool(ar1_exact_b1 or (used_b2 and ar1_exact_b2))
+        ar2_bit_exact = bool(ar2_exact_b1 or (used_b2 and ar2_exact_b2))
 
         res_row = {
             "policy": label,
@@ -342,8 +368,14 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
             "switching_overhead_ms": round(pure_overhead_ms, 2),
             "switching_overhead_pct": overhead_pct,
             "dit_bit_exact": sha == ref_dit_sha,
-            "ar1_bit_exact": ar1_exact_b1 or (used_b2 and (ar1_exact_b2 or (staggered_b2 and ar1_pre_b2_exact))),
-            "ar2_bit_exact": ar2_exact_b1 or (used_b2 and (ar2_exact_b2 or (staggered_b2 and len(g2) == 20))),
+            "ar1_bit_exact": ar1_bit_exact,
+            "ar2_bit_exact": ar2_bit_exact,
+            "ar1_greedy_token_match_pct": ar1_greedy_match_pct,
+            "ar2_greedy_token_match_pct": ar2_greedy_match_pct,
+            "greedy_token_match_pct": combined_greedy_match_pct,
+            "staggered_b2": staggered_b2,
+            "ar1_pre_b2_exact": ar1_pre_b2_exact,
+            "ar2_b2_prefix_exact": ar2_b2_prefix_exact,
         }
         del img, t_ar1, t_ar2, sched
         gc.collect()
@@ -521,8 +553,20 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     lc15_res = policy_results[2]
     lc20_res = policy_results[3]
     b4_row = next((r for r in batched_scaling if r["batch_size"] == 4), None)
+    def _policy_ar_exact_or_staggered_parity(r: dict) -> bool:
+        if r["ar1_bit_exact"] and r["ar2_bit_exact"]:
+            return True
+        if r.get("staggered_b2"):
+            return bool(
+                r.get("ar1_pre_b2_exact")
+                and r.get("ar2_b2_prefix_exact")
+                and float(r.get("ar1_greedy_token_match_pct", 0.0)) >= 90.0
+                and float(r.get("ar2_greedy_token_match_pct", 0.0)) >= 90.0
+            )
+        return False
+
     all_pass = (
-        all(r["dit_bit_exact"] and r["ar1_bit_exact"] and r["ar2_bit_exact"] for r in policy_results)
+        all(r["dit_bit_exact"] and _policy_ar_exact_or_staggered_parity(r) for r in policy_results)
         and (b4_row is not None and b4_row["speedup_vs_serial_x"] >= 1.5)
         and lc15_res["ar_ttft_max_ms"] < step_res["ar_ttft_max_ms"]
         and lc15_res["ar_tpot_p99_ms"] < step_res["ar_tpot_p99_ms"]
@@ -569,6 +613,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
                         "yields": r["yield_count"],
                         "overhead_pct": r["switching_overhead_pct"],
                         "bit_exact": r["dit_bit_exact"] and r["ar1_bit_exact"] and r["ar2_bit_exact"],
+                        "greedy_token_match_pct": r["greedy_token_match_pct"],
                     }
                     for r in policy_results
                 ],

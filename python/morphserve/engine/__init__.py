@@ -10,6 +10,7 @@ from morphserve.runtime.peer_transport import (
 from .cluster_engine import ClusterRunReport, MorphServeClusterEngine, SessionOutcome
 from .config import (
     EnginePolicyConfig,
+    MAIN_QPS_POLICIES,
     RunWindowOptions,
     STATIC_SPLIT_POLICIES,
     VALID_POLICIES,
@@ -45,6 +46,7 @@ __all__ = [
     "InterleavedSession",
     "InterleavedTurn",
     "LocalNodeWorkerHost",
+    "MAIN_QPS_POLICIES",
     "MorphServeClusterEngine",
     "MpSpawnGpuWorkerFleet",
     "MultinodeCoordinatorHub",

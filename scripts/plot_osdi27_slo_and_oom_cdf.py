@@ -39,13 +39,14 @@ if AUDIT_SCRIPTS_DIR.is_dir() and str(AUDIT_SCRIPTS_DIR) not in sys.path:
 
 from audit_panel_alignment import require_matplotlib_panel_alignment  # noqa: E402
 
-POLICY_META: list[tuple[str, str, str, str, float]] = [
-    ("morphserve", "MorphServe (Ours)", "#0F4D92", "o", 1.8),
-    ("monolithic_dp", "Monolithic DP", "#4D4D4D", "s", 1.15),
-    ("prism_tetriserve_coloc", "Prism+TetriServe", "#42949E", "^", 1.15),
-    ("static_nccl_fission", "Static NCCL (4U:4G)", "#9A4D8E", "D", 1.10),
-    ("naive_host_offload", "Naive Host Offload", "#E28E2C", "v", 1.05),
-    ("twostage_shm", "TwoStage SHM", "#B64342", "P", 1.05),
+POLICY_META: list[tuple[str, str, str, str, float, str]] = [
+    ("morphserve", "MorphServe (Ours)", "#0F4D92", "o", 1.8, "Morph\nServe"),
+    ("monolithic_dp", "Monolithic DP", "#4D4D4D", "s", 1.15, "Mono\nDP"),
+    ("monolithic_kv_swap", "Monolithic + KV Swap", "#3D8B5B", "X", 1.25, "Mono+\nKVSwap"),
+    ("prism_tetriserve_coloc", "Prism+TetriServe", "#42949E", "^", 1.15, "Prism\n+Tetri"),
+    ("static_nccl_fission", "Static NCCL (4U:4G)", "#9A4D8E", "D", 1.10, "Static\nNCCL"),
+    ("naive_host_offload", "Naive Host Offload", "#E28E2C", "v", 1.05, "Naive\nOffload"),
+    ("twostage_shm", "TwoStage SHM", "#B64342", "P", 1.05, "TwoStg\nSHM"),
 ]
 
 
@@ -162,20 +163,31 @@ def generate_osdi27_figures(
     fig.subplots_adjust(left=0.070, right=0.988, bottom=0.23, top=0.84, wspace=0.35)
     ax_slo, ax_cdf, ax_mem = axes
 
+    present_policies = {pol_k for (pol_k, _) in live_by_pol_q} | {pol_k for (pol_k, _) in sim_by_pol_q}
+    active_policy_meta = [m for m in POLICY_META if m[0] in present_policies] or list(POLICY_META)
+
     # ---- Panel a: Primary Metric — Joint SLO Attainment (%) vs. Offered QPS ----
     ax_slo.axhline(90.0, color="#9E9E9E", linestyle=":", linewidth=0.7, zorder=1)
     ax_slo.axhline(80.0, color="#BDBDBD", linestyle="--", linewidth=0.7, zorder=1)
     ax_slo.text(1.38, 91.2, "90% SLO", fontsize=5.5, color="#616161", ha="right", va="bottom")
     ax_slo.text(1.38, 81.2, "80% SLO", fontsize=5.5, color="#616161", ha="right", va="bottom")
 
-    for pol_key, label, color, marker, lw in POLICY_META:
+    for pol_key, label, color, marker, lw, _short_lbl in active_policy_meta:
         xs_live, ys_live = [], []
         xs_all, ys_all = [], []
         for q in q_grid:
             lr = live_by_pol_q.get((pol_key, round(q, 2)))
             sr = sim_by_pol_q.get((pol_key, round(q, 2)))
+            actual_qps: float | None = None
+            turn_goodput: float | None = None
+            turn_att: float | None = None
             if lr is not None:
                 att = float(lr["joint_slo_attainment_pct"])
+                actual_qps = float(lr["actual_steady_arrival_qps"]) if lr.get("actual_steady_arrival_qps") is not None else float(q)
+                if lr.get("steady_turn_slo_goodput_rps") is not None:
+                    turn_goodput = round(float(lr["steady_turn_slo_goodput_rps"]), 4)
+                if lr.get("steady_turn_slo_attainment_pct") is not None:
+                    turn_att = round(float(lr["steady_turn_slo_attainment_pct"]), 2)
                 src_tag = "live_a100"
                 xs_live.append(q)
                 ys_live.append(att)
@@ -183,6 +195,11 @@ def generate_osdi27_figures(
                 ys_all.append(att)
             elif sr is not None:
                 att = _canonical_sim_attainment_pct(sr)
+                actual_qps = float(sr["actual_steady_arrival_qps"]) if sr.get("actual_steady_arrival_qps") is not None else float(q)
+                if sr.get("steady_turn_slo_goodput_rps") is not None:
+                    turn_goodput = round(float(sr["steady_turn_slo_goodput_rps"]), 4)
+                if sr.get("steady_turn_slo_attainment_pct") is not None:
+                    turn_att = round(float(sr["steady_turn_slo_attainment_pct"]), 2)
                 src_tag = "calibrated_sim"
                 xs_all.append(q)
                 ys_all.append(att)
@@ -193,16 +210,24 @@ def generate_osdi27_figures(
                     "panel": "a_slo_vs_qps",
                     "policy": pol_key,
                     "offered_qps": q,
+                    "actual_steady_arrival_qps": round(actual_qps, 4) if actual_qps is not None else "",
                     "joint_slo_attainment_pct": round(att, 2),
+                    "steady_turn_slo_attainment_pct": turn_att if turn_att is not None else "",
+                    "steady_turn_slo_goodput_rps": turn_goodput if turn_goodput is not None else "",
                     "source": src_tag,
                 }
             )
+        if not xs_all:
+            continue
         z_ord = 5 if pol_key == "morphserve" else 3
         if len(xs_live) == len(xs_all):
             ax_slo.plot(xs_all, ys_all, color=color, linewidth=lw, marker=marker, markersize=3.4, label=label, zorder=z_ord)
         else:
             ax_slo.plot(xs_all, ys_all, color=color, linewidth=lw * 0.85, linestyle="--", alpha=0.82, zorder=z_ord - 1)
-            ax_slo.plot(xs_live, ys_live, color=color, linewidth=lw, marker=marker, markersize=3.5, label=label, zorder=z_ord)
+            if xs_live:
+                ax_slo.plot(xs_live, ys_live, color=color, linewidth=lw, marker=marker, markersize=3.5, label=label, zorder=z_ord)
+            else:
+                ax_slo.plot(xs_all, ys_all, color=color, linewidth=lw * 0.85, linestyle="--", marker=marker, markersize=3.0, label=label, zorder=z_ord)
 
     ax_slo.set_xlim(0.0, 1.46)
     ax_slo.set_ylim(0.0, 104.0)
@@ -216,7 +241,7 @@ def generate_osdi27_figures(
     ax_cdf.axhline(95.0, color="#CFCFCF", linestyle="--", linewidth=0.65, zorder=1)
 
     baseline_survs_11: list[float] = []
-    for pol_key, label, color, marker, lw in POLICY_META:
+    for pol_key, label, color, marker, lw, _short_lbl in active_policy_meta:
         lr_11 = live_by_pol_q.get((pol_key, 1.10))
         if lr_11 is None:
             continue
@@ -254,13 +279,13 @@ def generate_osdi27_figures(
     ax_cdf.set_title("OOM-aware latency CDF (1.1 rps)", pad=5.0)
 
     # ---- Panel c: Physical NVML Peak HBM (<= 40 GiB) & Session Survival Rate (q = 1.1 RPS) ----
-    short_names = ["Morph\nServe", "Mono\nDP", "Prism\n+Tetri", "Static\nNCCL", "Naive\nOffload", "TwoStg\nSHM"]
-    x_pos = np.arange(len(POLICY_META), dtype=np.float64)
+    short_names = [m[5] for m in active_policy_meta]
+    x_pos = np.arange(len(active_policy_meta), dtype=np.float64)
     mem_gibs: list[float] = []
     surv_rates: list[float] = []
     bar_colors: list[str] = []
 
-    for pol_key, _, color, _, _ in POLICY_META:
+    for pol_key, _, color, _, _, _ in active_policy_meta:
         lr_11 = live_by_pol_q.get((pol_key, 1.10), {})
         sr_11 = sim_by_pol_q.get((pol_key, 1.10), {})
         sim_pk = float(sr_11.get("peak_hbm_mib", 34200.0))
@@ -281,7 +306,7 @@ def generate_osdi27_figures(
         )
 
     ax_mem.axhline(39.49, color="#B64342", linestyle="--", linewidth=0.75, zorder=2)
-    ax_mem.text(5.35, 41.2, "A100 usable HBM (39.5 GiB)", fontsize=5.3, color="#B64342", ha="right", va="bottom")
+    ax_mem.text(max(0.0, len(active_policy_meta) - 0.65), 41.2, "A100 usable HBM (39.5 GiB)", fontsize=5.3, color="#B64342", ha="right", va="bottom")
     bars = ax_mem.bar(x_pos, mem_gibs, width=0.68, color=bar_colors, edgecolor="#272727", linewidth=0.55, zorder=3)
     # Annotate survival rate (%) cleanly centered inside each bar (>= 5.2 pt, narrower than bar width)
     for idx_b, (bar_rect, sv_val) in enumerate(zip(bars, surv_rates)):
@@ -306,9 +331,10 @@ def generate_osdi27_figures(
     for ax_i, lbl in zip(axes, ("a", "b", "c")):
         ax_i.text(-0.15, 1.11, lbl, transform=ax_i.transAxes, fontsize=8.0, fontweight="bold", va="top", ha="left")
 
-    # Shared single-row legend centered along bottom margin
+    # Shared legend centered along bottom margin (single row for <= 6 policies, balanced 2-row for 7)
     handles, labels = ax_slo.get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.52, 0.005), ncol=6, columnspacing=0.9, handlelength=1.5)
+    leg_ncol = max(1, min(len(handles), 6 if len(handles) <= 6 else 4))
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.52, 0.005), ncol=leg_ncol, columnspacing=0.9, handlelength=1.5)
 
     base_out = out_dir / "osdi27_slo_and_oom_cdf"
     fig.canvas.draw()
@@ -330,7 +356,10 @@ def generate_osdi27_figures(
         "panel",
         "policy",
         "offered_qps",
+        "actual_steady_arrival_qps",
         "joint_slo_attainment_pct",
+        "steady_turn_slo_attainment_pct",
+        "steady_turn_slo_goodput_rps",
         "source",
         "dit_latency_s",
         "all_request_cdf_pct",

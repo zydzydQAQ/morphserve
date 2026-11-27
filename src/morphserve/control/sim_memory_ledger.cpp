@@ -60,7 +60,7 @@ double SimGpuMemoryLedger::base_weights_mib() const noexcept {
     if (policy_.use_expert_pager || policy_.use_naive_offload) {
         return offloaded_base_mib();
     }
-    if (policy_.routing_mode == "static_nccl_fission" && role_ == "und") {
+    if ((policy_.routing_mode == "static_nccl_fission" || policy_.routing_mode == "twostage_shm") && role_ == "und") {
         return offloaded_base_mib();
     }
     return monolithic_weights_mib();
@@ -103,7 +103,7 @@ int64_t SimGpuMemoryLedger::free_kv_bytes() const noexcept {
 double SimGpuMemoryLedger::evict_idle_kv_to_host(
     double needed_free_mib,
     std::optional<int> exclude_sid) {
-    if (!(policy_.use_tripool_vmm && policy_.use_expert_pager)) {
+    if (!policy_.use_idle_kv_swap) {
         return 0.0;
     }
     std::vector<int> sids;
@@ -119,11 +119,13 @@ double SimGpuMemoryLedger::evict_idle_kv_to_host(
         if (freed_mib >= needed_free_mib) {
             break;
         }
+        const double kv_before = active_kv_mib();
         const double val = session_kv_mib_.at(cand_sid);
         session_kv_mib_.erase(cand_sid);
         swapped_session_kv_mib_[cand_sid] = val;
         ++kv_host_swap_outs_;
-        freed_mib += std::max(2.0, 2.0 * std::ceil(std::max(0.01, val) / 2.0));
+        const double kv_after = active_kv_mib();
+        freed_mib += std::max(0.0, kv_before - kv_after);
     }
     reclaim_empty_slabs_to_super();
     return freed_mib;
@@ -211,11 +213,19 @@ bool SimGpuMemoryLedger::upsert_session_kv(int sid, double logical_kv_mib) {
         }
     } else {
         // `prism_tetriserve_coloc` (`kv_vmm_only`) pre-reserves `fine_kv_pool_mib + super_pool_mib` physical VMM handles.
-        const double phys_kv =
-            policy_.kv_vmm_only
-                ? std::max(kv_tot, static_cast<double>(policy_.fine_kv_pool_mib + policy_.super_pool_mib))
-                : kv_tot;
-        used = base_weights_mib() + phys_kv;
+        auto compute_used = [&]() {
+            const double kt = active_kv_mib();
+            const double phys_kv =
+                policy_.kv_vmm_only
+                    ? std::max(kt, static_cast<double>(policy_.fine_kv_pool_mib + policy_.super_pool_mib))
+                    : kt;
+            return base_weights_mib() + phys_kv;
+        };
+        used = compute_used();
+        if (used > total_hbm_mib_ && policy_.use_idle_kv_swap) {
+            evict_idle_kv_to_host(used - total_hbm_mib_, sid);
+            used = compute_used();
+        }
     }
 
     if (used > total_hbm_mib_) {
@@ -258,12 +268,20 @@ bool SimGpuMemoryLedger::check_transient_spike(
     const double eff_spike = (policy_.use_naive_offload && !contiguous_alloc && retain_unscoped_frag_mib > 0.0)
                                  ? std::max(0.0, spike_mib - retain_unscoped_frag_mib)
                                  : spike_mib;
-    const double phys_kv =
-        policy_.kv_vmm_only
-            ? std::max(kv_tot, static_cast<double>(policy_.fine_kv_pool_mib + policy_.super_pool_mib))
-            : kv_tot;
     const double eff_transient = contiguous_alloc ? (eff_spike + held_frag) : std::max(eff_spike, held_frag);
-    const double peak = base_weights_mib() + gen_w + phys_kv + eff_transient;
+    auto compute_peak = [&]() {
+        const double kt = active_kv_mib();
+        const double phys_kv =
+            policy_.kv_vmm_only
+                ? std::max(kt, static_cast<double>(policy_.fine_kv_pool_mib + policy_.super_pool_mib))
+                : kt;
+        return base_weights_mib() + gen_w + phys_kv + eff_transient;
+    };
+    double peak = compute_peak();
+    if (peak > total_hbm_mib_ && policy_.use_idle_kv_swap && active_sid.has_value()) {
+        evict_idle_kv_to_host(peak - total_hbm_mib_, active_sid);
+        peak = compute_peak();
+    }
     if (peak > total_hbm_mib_) {
         retained_unscoped_vae_mib_ = 0.0;
         peak_used_mib_ = std::max(peak_used_mib_, total_hbm_mib_);
@@ -367,14 +385,19 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
         peak_used_mib_ = std::max(peak_used_mib_, unpack_peak);
     }
 
-    // 1b. Deferred `pending_vae` (`static_nccl_fission` `gen` rank) runs `vae.encode` before denoising.
+    // 1b. Deferred `pending_vae` (`static_nccl_fission` / `twostage_shm` `gen` rank) runs `vae.encode` before denoising.
     if (run_pre_denoise_vae) {
-        const double enc_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + std::max(vae_mib, held_frag_mib);
+        double enc_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + std::max(vae_mib, held_frag_mib);
+        if (enc_peak > total_hbm_mib_ && policy_.use_idle_kv_swap && active_sid.has_value()) {
+            swapped_out_mib += evict_idle_kv_to_host(enc_peak - total_hbm_mib_, active_sid);
+            kv_tot = active_kv_mib();
+            enc_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + std::max(vae_mib, held_frag_mib);
+        }
         if (enc_peak > total_hbm_mib_) {
             retained_unscoped_vae_mib_ = 0.0;
             last_fail_dit_frac_ = 0.04;
             peak_used_mib_ = std::max(peak_used_mib_, total_hbm_mib_);
-            return {false, 0.0};
+            return {false, swapped_out_mib};
         }
         if (!policy_.use_scoped_vae && !policy_.use_naive_offload) {
             retained_unscoped_vae_mib_ = std::max(retained_unscoped_vae_mib_, vae_frag_slack_mib);
@@ -384,31 +407,41 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
     }
 
     // 2. Denoising (`generate_image`): `dit_phys_kv` (`main_ctx + cfg_text_ctx`) + `dit_act_mib` + non-reusable Conv2d slack.
-    const double step_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + dit_act_mib + held_frag_mib;
+    double step_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + dit_act_mib + held_frag_mib;
+    if (step_peak > total_hbm_mib_ && policy_.use_idle_kv_swap && active_sid.has_value()) {
+        swapped_out_mib += evict_idle_kv_to_host(step_peak - total_hbm_mib_, active_sid);
+        kv_tot = active_kv_mib();
+        step_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + dit_act_mib + held_frag_mib;
+    }
     if (step_peak > total_hbm_mib_) {
         retained_unscoped_vae_mib_ = 0.0;
         last_fail_dit_frac_ = 0.12;
         peak_used_mib_ = std::max(peak_used_mib_, total_hbm_mib_);
-        return {false, 0.0};
+        return {false, swapped_out_mib};
     }
 
-    // 3. Release `cfg_text_ctx` before `vae.decode`.
+    // 3. Release `cfg_text_ctx` before `vae.decode` (symmetric VAE accounting with zero asymmetric DiT penalty).
     if (active_sid.has_value() && post_denoise_sid_kv_mib.has_value()) {
         session_kv_mib_[*active_sid] = *post_denoise_sid_kv_mib;
         kv_tot = active_kv_mib();
     }
-    const double vae_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + vae_mib + 0.35 * dit_act_mib;
+    double vae_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + vae_mib;
+    if (vae_peak > total_hbm_mib_ && policy_.use_idle_kv_swap && active_sid.has_value()) {
+        swapped_out_mib += evict_idle_kv_to_host(vae_peak - total_hbm_mib_, active_sid);
+        kv_tot = active_kv_mib();
+        vae_peak = base_weights_mib() + gen_weights_mib + eff_kv_mib(kv_tot) + vae_mib;
+    }
     if (vae_peak > total_hbm_mib_) {
         retained_unscoped_vae_mib_ = 0.0;
         last_fail_dit_frac_ = 1.00;
         peak_used_mib_ = std::max(peak_used_mib_, total_hbm_mib_);
-        return {false, 0.0};
+        return {false, swapped_out_mib};
     }
     if (!policy_.use_scoped_vae && !policy_.use_naive_offload) {
         retained_unscoped_vae_mib_ = std::max(retained_unscoped_vae_mib_, vae_frag_slack_mib);
     }
     peak_used_mib_ = std::max({peak_used_mib_, step_peak, vae_peak});
-    return {true, 0.0};
+    return {true, swapped_out_mib};
 }
 
 void SimGpuMemoryLedger::release_session(int sid) {

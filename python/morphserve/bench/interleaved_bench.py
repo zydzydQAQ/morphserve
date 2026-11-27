@@ -82,6 +82,40 @@ def load_burstgpt_interarrivals(csv_path: Path, max_events: int = 2000) -> list[
     return _normalize_interarrivals(deltas)
 
 
+def load_burstgpt_response_lengths(csv_path: Path, max_events: int = 200000) -> list[int]:
+    """Parse positive `Response tokens` counts from BurstGPT CSV for bounded AR decode-length sampling."""
+    lengths: list[int] = []
+    with csv_path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            raw_tok = row.get("Response tokens")
+            if raw_tok is None:
+                continue
+            try:
+                tok = int(float(raw_tok))
+            except ValueError:
+                continue
+            if tok > 0:
+                lengths.append(tok)
+                if len(lengths) >= max_events:
+                    break
+    return lengths
+
+
+def _sample_bounded_ar_length(
+    rng: random.Random,
+    pool: list[int],
+    lo: int,
+    hi: int,
+    fallback_mode: int,
+) -> int:
+    """Deterministically sample a bounded AR token length in `[lo, hi]` from empirical BurstGPT lengths."""
+    if pool:
+        val = int(pool[rng.randrange(len(pool))])
+        return max(lo, min(hi, val))
+    return max(lo, min(hi, int(round(rng.triangular(lo, hi, fallback_mode)))))
+
+
 def load_gentd26_interarrivals(csv_path: Path, max_events: int = 2000) -> list[float]:
     """Parse normalized inter-arrival deltas (mean=1.0) from GenTD26 successful request trace."""
     timestamps: list[float] = []
@@ -283,17 +317,27 @@ def _build_quadrant_pools(
     mse_templates: list[dict[str, Any]],
     geneval_items: list[dict[str, Any]],
     seed: int = 2026,
+    burstgpt_response_lengths: list[int] | None = None,
 ) -> dict[str, list[InterleavedSession]]:
     """Build Interleaved-Bench v2 pools across 4 clean orthogonal multi-turn quadrants."""
     rng = random.Random(seed)
+    len_rng = random.Random(seed + 101)
     gv_shuffled = list(geneval_items)
     rng.shuffle(gv_shuffled)
 
+    raw_resp = [int(v) for v in (burstgpt_response_lengths or ()) if int(v) > 0]
+    ar_len_pool = [v for v in raw_resp if 64 <= v <= 192]
+    if not ar_len_pool and raw_resp:
+        ar_len_pool = [max(64, min(192, v)) for v in raw_resp]
+    cot_len_pool = [v for v in raw_resp if 96 <= v <= 160]
+    if not cot_len_pool and raw_resp:
+        cot_len_pool = [max(96, min(160, v)) for v in raw_resp]
+
     # Q1: `interleaved_co_creation` (30% of main mix)
     # 4-turn true bidirectional cross-paradigm sessions:
-    #   Turn 0: `ar_only` (analyze source image / plan visual scene, max_ar_tokens=48)
+    #   Turn 0: `ar_only` (analyze source image / plan visual scene, BurstGPT bounded 64-192 tok)
     #   Turn 1: `dit_edit` (if Turn 0 had image, `use_prev_image=False` since already in ctx) OR `dit_t2i` (if text-only)
-    #   Turn 2: `ar_only` (`use_prev_image=True`, inspect generated/edited image, max_ar_tokens=48)
+    #   Turn 2: `ar_only` (`use_prev_image=True`, inspect generated/edited image, BurstGPT bounded 64-192 tok)
     #   Turn 3: `dit_edit` (`use_prev_image=True`, concrete visual refinement, same resolution, dit_steps=20)
     co_creation_pool: list[InterleavedSession] = []
     for i in range(60):
@@ -356,6 +400,8 @@ def _build_quadrant_pools(
             t1_meta = dict(gv) if "include" in gv else {}
             src = "geneval"
 
+        t0_ar_tokens = _sample_bounded_ar_length(len_rng, ar_len_pool, 64, 192, 110)
+        t2_ar_tokens = _sample_bounded_ar_length(len_rng, ar_len_pool, 64, 192, 110)
         co_creation_pool.append(
             InterleavedSession(
                 session_id=f"cocreate_{i:03d}",
@@ -367,7 +413,7 @@ def _build_quadrant_pools(
                         modality_plan="ar_only",
                         prompt=t0_prompt,
                         image_paths=t0_imgs,
-                        max_ar_tokens=48,
+                        max_ar_tokens=t0_ar_tokens,
                         use_prev_image=False,
                     ),
                     InterleavedTurn(
@@ -386,7 +432,7 @@ def _build_quadrant_pools(
                         modality_plan="ar_only",
                         prompt=POST_DIT_INSPECT_PROMPT,
                         image_paths=[],
-                        max_ar_tokens=48,
+                        max_ar_tokens=t2_ar_tokens,
                         use_prev_image=True,
                     ),
                     InterleavedTurn(
@@ -489,7 +535,7 @@ def _build_quadrant_pools(
                     modality_plan="ar_only",
                     prompt=q_prompt,
                     image_paths=[str(item["image_path"])] if item.get("image_path") else [],
-                    max_ar_tokens=64,
+                    max_ar_tokens=_sample_bounded_ar_length(len_rng, ar_len_pool, 64, 192, 110),
                     expected_answer=str(item.get("answer", "")),
                     use_prev_image=False,
                 )
@@ -505,11 +551,12 @@ def _build_quadrant_pools(
         vqa_idx += 1
 
     # Q4: `visual_cot_highres` (20% of main mix)
-    # 50% `cot_then_dit` (`AR <think> 48 tok -> DiT`) + 50% `dit_t2i` from GenEval, 50% 1024 / 50% 512, dit_steps=20
+    # 50% `cot_then_dit` (`AR <think>` BurstGPT bounded 96-160 tok -> DiT) + 50% `dit_t2i` from GenEval, 50% 1024 / 50% 512, dit_steps=20
     vcot_hires_pool: list[InterleavedSession] = []
     for i, gv in enumerate(gv_shuffled[:60]):
         plan = "cot_then_dit" if (i % 2 == 0) else "dit_t2i"
         hw = 1024 if ((i // 2) % 2 == 1) else 512
+        cot_tokens = _sample_bounded_ar_length(len_rng, cot_len_pool, 96, 160, 120) if plan == "cot_then_dit" else 0
         vcot_hires_pool.append(
             InterleavedSession(
                 session_id=f"vcot_hires_{i:03d}",
@@ -524,7 +571,7 @@ def _build_quadrant_pools(
                         height=hw,
                         width=hw,
                         dit_steps=20,
-                        max_ar_tokens=48,
+                        max_ar_tokens=cot_tokens,
                         geneval_meta=dict(gv),
                         use_prev_image=False,
                     )
@@ -667,12 +714,17 @@ def build_online_phase_shift_suite(
         g_rot = (p_idx * 89) % len(g_base)
         b_phase = b_base[b_rot:] + b_base[:b_rot]
         g_phase = g_base[g_rot:] + g_base[:g_rot]
-        assign_dual_trace_arrivals(phase_sessions, b_phase, g_phase, target_qps=qps)
-
-        max_raw = max((float(s.arrival_offset_s) for s in phase_sessions), default=0.0)
-        scale = (target_span / max_raw) if (max_raw > 0.0 and target_span > 0.0) else 1.0
+        # Normalize AR (BurstGPT) and DiT (GenTD26) sub-streams independently to `[0, target_span]`
+        # inside each phase so neither modality is compressed by the other's raw trace span.
+        assign_dual_trace_arrivals(
+            phase_sessions,
+            b_phase,
+            g_phase,
+            target_qps=qps,
+            target_span_s=target_span,
+        )
         for s in phase_sessions:
-            s.arrival_offset_s = round(start_s + float(s.arrival_offset_s) * scale, 4)
+            s.arrival_offset_s = round(start_s + float(s.arrival_offset_s), 4)
 
         phase_sessions.sort(key=lambda s: (s.arrival_offset_s, s.session_id))
         all_sessions.extend(phase_sessions)
@@ -700,6 +752,7 @@ def build_online_phase_shift_suite(
         schema="morphserve.interleaved_bench.v2",
         warmup_s=warmup_s,
         steady_s=steady_s,
+        cooldown_s=0.0,
         arrival_duration_s=total_duration_s,
         phase_schedule=phase_schedule,
     )
@@ -1076,6 +1129,7 @@ def build_m3_active_accuracy_suite(
         schema="morphserve.interleaved_bench.v2",
         warmup_s=0.0,
         steady_s=0.0,
+        cooldown_s=0.0,
         arrival_duration_s=0.0,
     )
 
@@ -1103,10 +1157,19 @@ def build_interleaved_bench(sources_dir: Path, output_dir: Path, tmp_dir: Path) 
 
     mse_templates, geneval_items = _copy_mse_and_load(sources_dir, output_dir)
 
-    burstgpt_deltas = load_burstgpt_interarrivals(sources_dir / "burstgpt_1_sample.csv", max_events=2000)
+    burstgpt_csv = sources_dir / "burstgpt_1_sample.csv"
+    burstgpt_deltas = load_burstgpt_interarrivals(burstgpt_csv, max_events=2000)
+    burstgpt_resp_lens = load_burstgpt_response_lengths(burstgpt_csv)
     gentd26_deltas = load_gentd26_interarrivals(sources_dir / "gentd26_lora_request_trace.csv", max_events=2000)
 
-    pools = _build_quadrant_pools(mmvet_items, mb_items, mse_templates, geneval_items, seed=2026)
+    pools = _build_quadrant_pools(
+        mmvet_items,
+        mb_items,
+        mse_templates,
+        geneval_items,
+        seed=2026,
+        burstgpt_response_lengths=burstgpt_resp_lens,
+    )
 
     suites_dir = output_dir / "suites"
     suites_dir.mkdir(parents=True, exist_ok=True)
@@ -1273,6 +1336,7 @@ def build_interleaved_bench(sources_dir: Path, output_dir: Path, tmp_dir: Path) 
         schema="morphserve.interleaved_bench.v2",
         warmup_s=0.0,
         steady_s=0.0,
+        cooldown_s=0.0,
         arrival_duration_s=0.0,
     ).save_json(suites_dir / "accuracy_geneval_mmvet.json")
 
@@ -1331,6 +1395,7 @@ __all__ = [
     "build_time_window_suite",
     "compose_weighted_suite",
     "load_burstgpt_interarrivals",
+    "load_burstgpt_response_lengths",
     "load_gentd26_interarrivals",
     "scale_arrivals_to_qps",
 ]

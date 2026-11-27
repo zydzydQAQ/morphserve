@@ -74,6 +74,7 @@ void configure_static_fission_ranks(
     cfg.use_module3_cow_loopback = false;
     cfg.use_naive_offload = false;
     cfg.kv_vmm_only = false;
+    cfg.use_idle_kv_swap = false;
     cfg.preemption_mode = "non_preemptive";
     for (int g = 0; g < num_gpus; ++g) {
         const bool is_und = std::find(cfg.static_und_ranks.begin(), cfg.static_und_ranks.end(), g) !=
@@ -139,6 +140,8 @@ void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
             if (!v.is_null()) cfg.use_naive_offload = v.get<bool>();
         } else if (k == "kv_vmm_only") {
             if (!v.is_null()) cfg.kv_vmm_only = v.get<bool>();
+        } else if (k == "use_idle_kv_swap") {
+            if (!v.is_null()) cfg.use_idle_kv_swap = v.get<bool>();
         } else if (k == "preemption_mode") {
             if (!v.is_null()) cfg.preemption_mode = v.get<std::string>();
         } else if (k == "static_und_ranks") {
@@ -184,6 +187,8 @@ void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
             if (!v.is_null()) cfg.warmup_window_s = v.get<double>();
         } else if (k == "steady_window_s") {
             if (!v.is_null()) cfg.steady_window_s = v.get<double>();
+        } else if (k == "cooldown_s") {
+            if (!v.is_null()) cfg.cooldown_s = v.get<double>();
         } else if (k == "steady_state_trim_frac") {
             if (!v.is_null()) cfg.steady_state_trim_frac = v.get<double>();
         } else if (k == "super_pool_mib") {
@@ -259,6 +264,16 @@ double PolicyConfig::dit_turn_slo_for(
     return default_operator_profile().dit_turn_slo_ms(height, eff_k, fam, steps);
 }
 
+double PolicyConfig::ar_ttft_slo_for(
+    bool has_image,
+    int num_images,
+    int image_res,
+    std::optional<double> k_opt) const {
+    const double eff_k = k_opt.has_value() ? *k_opt : slo_scale_k;
+    const std::string fam = (model_family == "internvl_u") ? "internvl_u" : "bagel";
+    return default_operator_profile().ar_ttft_slo_for(has_image, num_images, image_res, eff_k, fam);
+}
+
 nlohmann::json PolicyConfig::to_json() const {
     nlohmann::json alphas = nlohmann::json::object();
     for (const auto& [k, v] : initial_alphas) {
@@ -280,6 +295,7 @@ nlohmann::json PolicyConfig::to_json() const {
         {"allow_cascade_cfg_split", allow_cascade_cfg_split},
         {"use_naive_offload", use_naive_offload},
         {"kv_vmm_only", kv_vmm_only},
+        {"use_idle_kv_swap", use_idle_kv_swap},
         {"preemption_mode", preemption_mode},
         {"static_und_ranks", static_und_ranks},
         {"static_gen_ranks", static_gen_ranks},
@@ -300,6 +316,7 @@ nlohmann::json PolicyConfig::to_json() const {
         {"steady_window_mode", steady_window_mode},
         {"warmup_window_s", warmup_window_s},
         {"steady_window_s", steady_window_s},
+        {"cooldown_s", cooldown_s},
         {"steady_state_trim_frac", steady_state_trim_frac},
         {"gpu_memory_fraction", gpu_memory_fraction.has_value() ? nlohmann::json(*gpu_memory_fraction) : nlohmann::json(nullptr)},
         {"gpu_memory_quota_mib", gpu_memory_quota_mib.has_value() ? nlohmann::json(*gpu_memory_quota_mib) : nlohmann::json(nullptr)},
@@ -363,7 +380,8 @@ PolicyConfig PolicyConfig::from_preset(
     cfg.ar_tpot_slo_mode = "turn_p95";
     cfg.steady_window_mode = "time";
     cfg.warmup_window_s = 60.0;
-    cfg.steady_window_s = 180.0;
+    cfg.steady_window_s = 150.0;
+    cfg.cooldown_s = 30.0;
 
     if (policy_name == "morphserve") {
         for (int g = 0; g < num_gpus; ++g) {
@@ -390,13 +408,14 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_module3_cow_loopback = (fam != "internvl_u");
         cfg.use_naive_offload = false;
         cfg.kv_vmm_only = false;
+        cfg.use_idle_kv_swap = true;
         cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "layer_chunk";
         cfg.super_pool_mib = (fam == "internvl_u") ? ivlu_super_mib : 14336;
         cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 256;
         cfg.transient_va_gib = 16;
         cfg.kv_va_gib = (fam == "internvl_u") ? 8 : 16;
         cfg.allow_vmm_overflow = !is_ivlu_capped;
-    } else if (policy_name == "monolithic_dp") {
+    } else if (policy_name == "monolithic_dp" || policy_name == "monolithic_kv_swap") {
         cfg.routing_mode = "sticky_least_loaded";
         cfg.use_tripool_vmm = false;
         cfg.use_expert_pager = false;
@@ -406,6 +425,7 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_module3_cow_loopback = false;
         cfg.use_naive_offload = false;
         cfg.kv_vmm_only = false;
+        cfg.use_idle_kv_swap = (policy_name == "monolithic_kv_swap");
         cfg.preemption_mode = "non_preemptive";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 1.0;
@@ -425,6 +445,7 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_module3_cow_loopback = false;
         cfg.use_naive_offload = false;
         cfg.kv_vmm_only = false;
+        cfg.use_idle_kv_swap = false;
         cfg.preemption_mode = "non_preemptive";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = ((g % 2) == 0) ? 0.0 : 1.0;
@@ -444,6 +465,7 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_module3_cow_loopback = false;
         cfg.use_naive_offload = false;
         cfg.kv_vmm_only = true;
+        cfg.use_idle_kv_swap = true;
         cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "step_preemptive";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 1.0;
@@ -462,6 +484,7 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_module3_cow_loopback = false;
         cfg.use_naive_offload = true;
         cfg.kv_vmm_only = false;
+        cfg.use_idle_kv_swap = false;
         cfg.preemption_mode = "non_preemptive";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 0.0;
@@ -475,37 +498,43 @@ PolicyConfig PolicyConfig::from_preset(
 std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(
     int num_gpus,
     const nlohmann::json& overrides) {
-    // Strict single-variable Leave-One-Out ablations relative to `full_morphserve` (M1+M2+M3+M4).
+    // Decoupled single-mechanism Leave-One-Out ablations relative to `full_morphserve` (M1-M4).
     PolicyConfig full = PolicyConfig::from_preset("morphserve", num_gpus, overrides);
 
-    PolicyConfig no_m4 = full;
-    no_m4.policy_name = "no_m4_layer_chunk";
-    no_m4.preemption_mode = "non_preemptive";
+    PolicyConfig no_m1_vmm = full;
+    no_m1_vmm.policy_name = "no_m1_tripool_vmm";
+    no_m1_vmm.use_tripool_vmm = false;
+    no_m1_vmm.use_expert_pager = false;
+
+    PolicyConfig no_m1_vae = full;
+    no_m1_vae.policy_name = "no_m1_scoped_vae";
+    no_m1_vae.use_scoped_vae = false;
+
+    PolicyConfig no_m2_dual = full;
+    no_m2_dual.policy_name = "no_m2_dual_path";
+    no_m2_dual.routing_mode = "sticky_least_loaded";
+
+    PolicyConfig no_m2_pacer = full;
+    no_m2_pacer.policy_name = "no_m2_pacer_numa";
+    no_m2_pacer.use_h2d_pacer = false;
+    no_m2_pacer.use_shared_numa_mirror = false;
 
     PolicyConfig no_m3 = full;
     no_m3.policy_name = "no_m3_cow_loopback";
     no_m3.use_module3_cow_loopback = false;
 
-    PolicyConfig no_m2 = full;
-    no_m2.policy_name = "no_m2_dual_path";
-    no_m2.routing_mode = "sticky_least_loaded";
-    no_m2.use_shared_numa_mirror = false;
-    no_m2.use_h2d_pacer = false;
-
-    PolicyConfig no_m1 = full;
-    no_m1.policy_name = "no_m1_tripool_vmm";
-    no_m1.use_tripool_vmm = false;
-    no_m1.use_expert_pager = false;
-    no_m1.use_scoped_vae = false;
-    no_m1.use_shared_numa_mirror = false;
-    no_m1.use_h2d_pacer = false;
+    PolicyConfig no_m4 = full;
+    no_m4.policy_name = "no_m4_layer_chunk";
+    no_m4.preemption_mode = "non_preemptive";
 
     return {
         {"full_morphserve", full},
-        {"no_m4_layer_chunk", no_m4},
+        {"no_m1_tripool_vmm", no_m1_vmm},
+        {"no_m1_scoped_vae", no_m1_vae},
+        {"no_m2_dual_path", no_m2_dual},
+        {"no_m2_pacer_numa", no_m2_pacer},
         {"no_m3_cow_loopback", no_m3},
-        {"no_m2_dual_path", no_m2},
-        {"no_m1_tripool_vmm", no_m1},
+        {"no_m4_layer_chunk", no_m4},
     };
 }
 

@@ -211,7 +211,8 @@ std::vector<int> parse_int_vec(const nlohmann::json& j, const char* key) {
     if (j.is_object() && j.contains(key) && j[key].is_array()) {
         out.reserve(j[key].size());
         for (const auto& v : j[key]) {
-            if (v.is_number()) out.push_back(v.get<int>());
+            if (v.is_boolean()) out.push_back(v.get<bool>() ? 1 : 0);
+            else if (v.is_number()) out.push_back(v.get<int>());
         }
     }
     return out;
@@ -2023,7 +2024,10 @@ char* ms_ctrl_evaluate_session_slos_json(const char* policy_json, const char* re
             heights,
             steps,
             parse_nested_double_vec(j, "ar_turn_tpots_ms"),
-            j.value("slo_time_scale", 1.0));
+            j.value("slo_time_scale", 1.0),
+            parse_int_vec(j, "ar_turn_has_image"),
+            parse_int_vec(j, "ar_turn_num_images"),
+            parse_int_vec(j, "ar_turn_image_res"));
         return dup_json_str(res);
     }
     MS_CAPI_CATCH_RETURN(nullptr)

@@ -13,9 +13,10 @@
 
 namespace morphserve::control {
 
-inline constexpr std::array<const char*, 6> kValidPolicies = {
+inline constexpr std::array<const char*, 7> kValidPolicies = {
     "morphserve",
     "monolithic_dp",
+    "monolithic_kv_swap",
     "twostage_shm",
     "static_nccl_fission",
     "prism_tetriserve_coloc",
@@ -46,6 +47,7 @@ struct PolicyConfig {
     bool allow_cascade_cfg_split = false;
     bool use_naive_offload = false;
     bool kv_vmm_only = false;
+    bool use_idle_kv_swap = false;
     std::string preemption_mode = "layer_chunk";
     std::vector<int> static_und_ranks;
     std::vector<int> static_gen_ranks;
@@ -53,10 +55,10 @@ struct PolicyConfig {
 
     double slo_scale_k = 2.0;
     double dit_slo_scale_k = 3.0;
-    double ar_tpot_slo_ms = 125.64;
+    double ar_tpot_slo_ms = 101.40;
     double ar_ttft_slo_ms = 1500.0;
-    double dit_512_slo_ms = 18360.0;
-    double dit_1024_slo_ms = 65160.0;
+    double dit_512_slo_ms = 14916.30;
+    double dit_1024_slo_ms = 57219.60;
     std::optional<double> dit_turn_slo_override_ms;
     int max_oom_retries = 1;
     std::pair<double, double> inter_turn_think_s_range = {2.0, 25.0};
@@ -66,7 +68,8 @@ struct PolicyConfig {
     std::string ar_tpot_slo_mode = "turn_p95";
     std::string steady_window_mode = "time";
     double warmup_window_s = 60.0;
-    double steady_window_s = 180.0;
+    double steady_window_s = 150.0;
+    double cooldown_s = 30.0;
     double steady_state_trim_frac = 0.15;
     std::optional<double> gpu_memory_fraction;
     std::optional<double> gpu_memory_quota_mib;
@@ -81,6 +84,11 @@ struct PolicyConfig {
     std::string cptg_architecture() const;
     std::string role_of(int rank) const;
     double dit_turn_slo_for(int height, int steps = 20, std::optional<double> k_opt = std::nullopt) const;
+    double ar_ttft_slo_for(
+        bool has_image,
+        int num_images = 0,
+        int image_res = 512,
+        std::optional<double> k_opt = std::nullopt) const;
 
     nlohmann::json to_json() const;
     static PolicyConfig from_json(const nlohmann::json& j);

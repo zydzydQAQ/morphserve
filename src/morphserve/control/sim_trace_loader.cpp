@@ -172,17 +172,55 @@ std::vector<double> load_gentd26_csv(const std::filesystem::path& p, size_t max_
     return normalize_interarrivals(deltas);
 }
 
-std::vector<double> scale_arrivals_to_qps(const std::vector<double>& norm_deltas, double target_qps, size_t count) {
+std::vector<double> scale_arrivals_to_span(
+    const std::vector<double>& norm_deltas,
+    size_t count,
+    double target_span_s) {
     if (count == 0) return {};
-    const double qps = std::max(target_qps, 1e-6);
+    if (count == 1 || target_span_s <= 0.0) {
+        return std::vector<double>(count, 0.0);
+    }
+    const size_t n_gaps = count - 1;
+    std::vector<double> raw_d(n_gaps, 1.0);
+    double sum_d = 0.0;
+    if (!norm_deltas.empty()) {
+        for (size_t i = 0; i < n_gaps; ++i) {
+            raw_d[i] = std::max(0.0, norm_deltas[i % norm_deltas.size()]);
+            sum_d += raw_d[i];
+        }
+    }
     std::vector<double> offsets;
     offsets.reserve(count);
     offsets.push_back(0.0);
-    for (size_t i = 1; i < count; ++i) {
-        const double d = norm_deltas.empty() ? 1.0 : norm_deltas[(i - 1) % norm_deltas.size()];
-        offsets.push_back(round_4(offsets.back() + d / qps));
+    if (sum_d <= 1e-12) {
+        const double step = target_span_s / static_cast<double>(n_gaps);
+        for (size_t i = 1; i < count; ++i) {
+            offsets.push_back(round_4(static_cast<double>(i) * step));
+        }
+    } else {
+        const double scale = target_span_s / sum_d;
+        double acc = 0.0;
+        for (size_t i = 0; i < n_gaps; ++i) {
+            acc += raw_d[i] * scale;
+            offsets.push_back(round_4(acc));
+        }
     }
     return offsets;
+}
+
+bool is_ar_initiating_session(const RawSuiteSession& s) noexcept {
+    if (!s.turns.empty()) {
+        const std::string& p0 = s.turns[0].modality_plan;
+        if (p0 == "dit_t2i" || p0 == "dit_edit") {
+            return false;
+        }
+        if (p0 == "ar_only" || p0 == "cot_then_dit") {
+            return true;
+        }
+    }
+    const std::string& q = s.quadrant;
+    return (q == "multi_image_vqa" || q == "visual_cot" || q == "visual_cot_highres" ||
+            q == "interleaved_co_creation");
 }
 
 struct CachedSuiteBundle {
@@ -215,7 +253,12 @@ CachedSuiteBundle load_cached_suite_bundle(
         } else if (skew_tag == "ar20_dit80") {
             cand_rels = {"suites/skew_ar20_dit80.json"};
         } else if (skew_tag.empty() || skew_tag == "main_mix") {
-            cand_rels = {"suites/main_mix_80.json", "suites/main_mix_v2.json", "suites/main_mix.json"};
+            cand_rels = {
+                "suites/main_mix_v2_80.json",
+                "suites/main_mix_80.json",
+                "suites/main_mix_v2.json",
+                "suites/main_mix.json",
+            };
         } else {
             cand_rels = {"suites/" + skew_tag + ".json", "suites/skew_" + skew_tag + ".json"};
         }
@@ -428,36 +471,31 @@ std::vector<SimSessionSpec> build_sim_session_stream(
     int extra_edit_turns,
     const std::string& skew_tag,
     const std::string& bench_root,
-    const std::string& sources_dir) {
+    const std::string& sources_dir,
+    double arrival_duration_s) {
     if (num_sessions <= 0) {
         return {};
     }
+    const double eff_qps = std::max(0.05, offered_qps);
     const auto cached = load_cached_suite_bundle(skew_tag, bench_root, sources_dir);
     if (cached.valid) {
         std::vector<RawSuiteSession> cloned = scale_raw_sessions(cached.sessions, num_sessions);
-        const double eff_qps = std::max(0.05, offered_qps);
+        const double target_span_s =
+            std::max(std::max(0.0, arrival_duration_s), static_cast<double>(cloned.size()) / eff_qps);
         if (!cached.burst_deltas.empty() && !cached.gentd_deltas.empty()) {
             std::vector<size_t> ar_idx;
             std::vector<size_t> dit_idx;
             for (size_t i = 0; i < cloned.size(); ++i) {
-                const auto& q = cloned[i].quadrant;
-                const bool is_ar_init =
-                    (q == "multi_image_vqa" || q == "visual_cot" || q == "visual_cot_highres" ||
-                     q == "interleaved_co_creation") ||
-                    (q != "multiturn_edit" && q != "highres_t2i" && !cloned[i].turns.empty() &&
-                     (cloned[i].turns[0].modality_plan == "ar_only" ||
-                      cloned[i].turns[0].modality_plan == "cot_then_dit"));
-                if (is_ar_init) {
+                if (is_ar_initiating_session(cloned[i])) {
                     ar_idx.push_back(i);
                 } else {
                     dit_idx.push_back(i);
                 }
             }
-            const double tot = static_cast<double>(std::max<size_t>(1, cloned.size()));
-            const double ar_qps = std::max(1e-4, eff_qps * (static_cast<double>(ar_idx.size()) / tot));
-            const double dit_qps = std::max(1e-4, eff_qps * (static_cast<double>(dit_idx.size()) / tot));
-            const auto ar_offs = scale_arrivals_to_qps(cached.burst_deltas, ar_qps, ar_idx.size());
-            const auto dit_offs = scale_arrivals_to_qps(cached.gentd_deltas, dit_qps, dit_idx.size());
+            // Independently re-normalize truncated AR (BurstGPT) and DiT (GenTD26) delta prefixes onto
+            // [0, target_span_s] so realized arrival QPS matches offered_qps within <2%.
+            const auto ar_offs = scale_arrivals_to_span(cached.burst_deltas, ar_idx.size(), target_span_s);
+            const auto dit_offs = scale_arrivals_to_span(cached.gentd_deltas, dit_idx.size(), target_span_s);
             for (size_t pos = 0; pos < ar_idx.size(); ++pos) cloned[ar_idx[pos]].arrival_offset_s = ar_offs[pos];
             for (size_t pos = 0; pos < dit_idx.size(); ++pos) cloned[dit_idx[pos]].arrival_offset_s = dit_offs[pos];
             std::sort(cloned.begin(), cloned.end(), [](const RawSuiteSession& a, const RawSuiteSession& b) {
@@ -465,9 +503,10 @@ std::vector<SimSessionSpec> build_sim_session_stream(
                 return a.session_id < b.session_id;
             });
         } else {
-            const double mean_inter_s = 1.0 / eff_qps;
+            const double step_s =
+                (cloned.size() > 1) ? (target_span_s / static_cast<double>(cloned.size() - 1)) : 0.0;
             for (size_t idx = 0; idx < cloned.size(); ++idx) {
-                cloned[idx].arrival_offset_s = static_cast<double>(idx) * mean_inter_s;
+                cloned[idx].arrival_offset_s = round_4(static_cast<double>(idx) * step_s);
             }
         }
         std::vector<SimSessionSpec> out;
@@ -487,7 +526,7 @@ std::vector<SimSessionSpec> build_sim_session_stream(
     std::mt19937_64 rng(seed);
     std::uniform_real_distribution<double> dist(0.85, 1.15);
     const auto& base = canonical_28_trace();
-    const double mean_inter_ms = 1000.0 / std::max(0.05, offered_qps);
+    const double mean_inter_ms = 1000.0 / eff_qps;
     double t_cur = 0.0;
     std::vector<SimSessionSpec> out;
     out.reserve(static_cast<size_t>(num_sessions));
@@ -516,6 +555,14 @@ std::vector<SimSessionSpec> build_sim_session_stream(
         }
         out.push_back(SimSessionSpec{t_cur, q, std::move(turns), "", ""});
     }
+    if (out.size() >= 2 && out.back().arrival_ms > 1e-6) {
+        const double target_span_ms =
+            std::max(std::max(0.0, arrival_duration_s), static_cast<double>(out.size()) / eff_qps) * 1000.0;
+        const double scale = target_span_ms / out.back().arrival_ms;
+        for (auto& s : out) {
+            s.arrival_ms = round_4(s.arrival_ms * scale);
+        }
+    }
     return out;
 }
 
@@ -527,9 +574,18 @@ std::vector<SimSessionSpec> ClusterSimulator::build_session_stream(
     int extra_edit_turns,
     const std::string& skew_tag,
     const std::string& bench_root,
-    const std::string& sources_dir) {
+    const std::string& sources_dir,
+    double arrival_duration_s) {
     return build_sim_session_stream(
-        num_sessions, offered_qps, num_gpus, seed, extra_edit_turns, skew_tag, bench_root, sources_dir);
+        num_sessions,
+        offered_qps,
+        num_gpus,
+        seed,
+        extra_edit_turns,
+        skew_tag,
+        bench_root,
+        sources_dir,
+        arrival_duration_s);
 }
 
 }  // namespace morphserve::control

@@ -414,6 +414,25 @@ def test_vmm_out_of_memory_error_uniform_on_exhaustion() -> None:
         cache.close()
         vmm.shutdown()
 
+    # Verify explicit `max_pool_bytes` cap is accepted cleanly (used by `kv_vmm_only` / `prism_tetriserve_coloc`)
+    vmm_cap = TriPoolVMM(
+        device=0,
+        super_pool_mib=8,
+        fine_kv_pool_mib=4,
+        super_handle_mib=8,
+        transient_va_gib=1,
+        kv_va_gib=1,
+        allow_overflow=False,
+        simulated=True,
+        max_pool_bytes=12 * MIB,
+        init_torch_cuda=False,
+    )
+    try:
+        assert vmm_cap.max_pool_bytes == 12 * MIB
+        assert vmm_cap.stats().total_physical_pool_bytes >= 12 * MIB
+    finally:
+        vmm_cap.shutdown()
+
 
 def test_numa_memfd_mirror_cross_fd_shared_mapping() -> None:
     payload = bytes((i * 73 + 19) & 0xFF for i in range(4096))

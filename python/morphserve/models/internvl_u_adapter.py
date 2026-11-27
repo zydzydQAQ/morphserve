@@ -23,6 +23,75 @@ from .internvl_u_loader import load_internvlu_pipeline
 MIB = 1024**2
 GIB = 1024**3
 
+try:
+    from transformers.generation.streamers import BaseStreamer as _HFBaseStreamer  # type: ignore
+except Exception:
+    class _HFBaseStreamer:  # type: ignore[no-redef]
+        def put(self, value: Any) -> None:
+            return None
+
+        def end(self) -> None:
+            return None
+
+
+class _TokenTimingStreamer(_HFBaseStreamer):
+    """Lightweight HuggingFace streamer recording wall-clock `perf_counter()` per generated token step."""
+
+    def __init__(self) -> None:
+        self.step_timestamps_s: list[float] = []
+        self._prompt_skipped: bool = False
+
+    def put(self, value: Any) -> None:
+        ndim = int(getattr(value, "ndim", 1))
+        shape = getattr(value, "shape", None)
+        if not self._prompt_skipped:
+            self._prompt_skipped = True
+            # `GenerationMixin.generate()` emits the prompt `input_ids` as a 2D `[B, L_prompt]`
+            # tensor (with `L_prompt == 0` when using `inputs_embeds`) before decode step 0.
+            if ndim >= 2:
+                return
+        if ndim >= 2 and shape is not None and len(shape) >= 2 and int(shape[-1]) == 0:
+            return
+        self.step_timestamps_s.append(time.perf_counter())
+
+    def end(self) -> None:
+        return None
+
+
+def _format_prompt_with_history(
+    prompt: str,
+    history: list[tuple[str, str]],
+    *,
+    max_turns: int = 6,
+) -> str:
+    """Format rolling multi-turn conversation history cleanly into the current VLM turn prompt."""
+    if not history:
+        return prompt
+    lines: list[str] = []
+    for old_q, old_a in history[-max(1, int(max_turns)) :]:
+        q_s = str(old_q).strip()
+        a_s = str(old_a).strip()
+        if q_s:
+            lines.append(f"User: {q_s}")
+        if a_s:
+            lines.append(f"Assistant: {a_s}")
+    if not lines:
+        return prompt
+    lines.append(f"User: {str(prompt).strip()}")
+    return "\n".join(lines)
+
+
+def _estimate_vlm_context_bytes(
+    history: list[tuple[str, str]],
+    prompt: str,
+    num_images: int = 0,
+) -> int:
+    """Estimate accumulated multi-turn VLM context KV footprint (`>= 4096` B) for InternVL-U."""
+    text_chars = len(str(prompt)) + sum(len(str(q)) + len(str(a)) for q, a in history)
+    est_tokens = max(1, text_chars // 4) + max(0, int(num_images)) * 256
+    # InternVL-U Qwen2.5 VLM: 36 layers * 2 (K+V) * 2 KV heads * 128 head_dim * 2 bytes (bf16) = 36,864 B/tok.
+    return max(4096, int(est_tokens) * 36_864)
+
 
 def compute_internvlu_memory_plan(
     *,
@@ -267,14 +336,19 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
 
             self.device = torch.device(f"cuda:{self.rank}")
 
-        is_static_fission = policy.routing_mode == "static_nccl_fission"
+        is_static_fission = policy.routing_mode in ("static_nccl_fission", "twostage_shm")
         raw_frac = getattr(policy, "gpu_memory_fraction", None)
         raw_quota = getattr(policy, "gpu_memory_quota_mib", None)
+        is_quota_constrained = bool(
+            (raw_quota is not None and float(raw_quota) > 0.0)
+            or (raw_frac is not None and float(raw_frac) < 0.999)
+        )
+        self._quota_constrained = is_quota_constrained
         copage_vlm = bool(
             (not is_static_fission)
             and policy.use_tripool_vmm
             and policy.use_expert_pager
-            and ((raw_quota is not None and float(raw_quota) > 0.0) or (raw_frac is not None and float(raw_frac) < 0.999))
+            and is_quota_constrained
         )
 
         if pipeline is not None:
@@ -303,10 +377,13 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             )
 
         if getattr(self.pipe, "generation_decoder", None) is not None:
+            # Regime A (40 GiB unconstrained) zero-overhead fast-path: skip per-layer forward hooks
+            # and scoped VAE transient arena wrappers when VLM + Decoder fit comfortably at alpha=1.0.
             dec_spec = ExpertPartitionSpec.for_internvlu(
                 self.pipe,
                 super_handle_mib=policy.super_handle_mib,
-                wrap_vae=policy.use_scoped_vae,
+                wrap_vae=bool(policy.use_scoped_vae and is_quota_constrained),
+                install_module_hooks=bool(is_quota_constrained),
                 vae_encode_restore="none",
                 vae_output_cloner=_clone_diffusers_output,
             )
@@ -379,6 +456,8 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         gc.collect()
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
         if is_cuda:
+            self._ensure_nvml_poller()
+            self._update_hwm()
             torch.cuda.empty_cache()
             free_b, total_b = torch.cuda.mem_get_info(self.device)
             total_dev_mib = float(total_b / MIB)
@@ -418,11 +497,17 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 allow_overflow=bool(plan["allow_overflow"]),
             )
             if self.pager is not None:
-                init_alpha = 0.0 if self.vlm_pager is not None else float(self.policy.initial_alphas.get(self.rank, 1.0))
-                if not bool(plan["allow_overflow"]):
-                    max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
-                    max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
-                    init_alpha = min(init_alpha, max_fit_alpha)
+                if not self._quota_constrained:
+                    # Regime A (40 GiB unconstrained): keep Decoder 100% resident (`alpha=1.0`) alongside VLM.
+                    init_alpha = 1.0
+                else:
+                    init_alpha = (
+                        0.0 if self.vlm_pager is not None else float(self.policy.initial_alphas.get(self.rank, 1.0))
+                    )
+                    if not bool(plan["allow_overflow"]):
+                        max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
+                        max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
+                        init_alpha = min(init_alpha, max_fit_alpha)
                 self._initial_bound_alpha = float(init_alpha)
                 self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
             if self.vlm_pager is not None:
@@ -431,9 +516,16 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 self._initial_vlm_alpha = float(vlm_init_alpha)
                 self.vlm_pager.bind_vmm(self.vmm, initial_alpha=vlm_init_alpha)
         else:
-            self._quota_constrained = getattr(self.policy, "gpu_memory_fraction", None) is not None
+            self._quota_constrained = bool(
+                (getattr(self.policy, "gpu_memory_quota_mib", None) or 0.0) > 0.0
+                or (
+                    getattr(self.policy, "gpu_memory_fraction", None) is not None
+                    and float(getattr(self.policy, "gpu_memory_fraction")) < 0.999
+                )
+            )
 
         if is_cuda:
+            self._update_hwm()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(self.device)
             pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
@@ -490,12 +582,64 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         with self.vlm_pager.generation_mode(prefetch_all=True):
             yield
 
+    def _run_vlm_text_generate(
+        self,
+        prompt_arg: str | list[str],
+        image_arg: Any,
+        max_new_tokens: int,
+    ) -> tuple[Any, float, _TokenTimingStreamer]:
+        """Run VLM greedy text generation with `_TokenTimingStreamer` for real TTFT & per-token TPOT."""
+        import torch
+
+        streamer = _TokenTimingStreamer()
+        t0 = time.perf_counter()
+        pipe_gen_fn = getattr(self.pipe, "_generate", None)
+        vlm_gen_fn = getattr(getattr(self.pipe, "vlm", None), "generate", None)
+        proc_fn = getattr(self.pipe, "processor", None)
+        if callable(pipe_gen_fn) and callable(vlm_gen_fn) and callable(proc_fn):
+            # Bypass `InternVLUPipeline._split_kwargs`, which drops `streamer` into `unused_kwargs`,
+            # while preserving the exact `processor(...) -> _generate(...) -> vlm.generate(...)` path.
+            inputs = proc_fn(
+                prompt=prompt_arg,
+                image=image_arg,
+                generation_mode="text",
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in inputs.items()}
+            out = pipe_gen_fn(
+                **inputs,
+                max_new_tokens=int(max_new_tokens),
+                do_sample=False,
+                streamer=streamer,
+            )
+            return out, t0, streamer
+
+        call_kwargs: dict[str, Any] = {
+            "prompt": prompt_arg,
+            "image": image_arg,
+            "generation_mode": "text",
+            "max_new_tokens": int(max_new_tokens),
+            "do_sample": False,
+        }
+        try:
+            sig = inspect.signature(self.pipe.__call__).parameters
+            if "streamer" in sig or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.values()):
+                call_kwargs["streamer"] = streamer
+        except Exception:
+            pass
+        out = self.pipe(**call_kwargs)
+        return out, t0, streamer
+
     def prepare_turn(self, ctx_id: str, cmd: dict[str, Any]) -> int:
         import torch
 
         prompt = str(cmd["prompt"])
         prep_dit = bool(cmd.get("prepare_for_dit", False))
         prev_ent = self._ctx_store.get(ctx_id)
+        history: list[tuple[str, str]] = list(prev_ent.get("history") or []) if prev_ent is not None else []
+        images: list[Any] = list(prev_ent.get("images") or []) if prev_ent is not None else []
+
         use_prev = cmd.get("use_prev_image")
         pil_img = None
         if use_prev:
@@ -508,12 +652,26 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             pil_img = self._load_pil_if_any(cmd)
         if pil_img is None and use_prev is None and prev_ent is not None and not (cmd.get("image_paths")):
             pil_img = prev_ent.get("pil_img")
+
+        if pil_img is not None and (not images or images[-1] is not pil_img):
+            images.append(pil_img)
+            if len(images) > 4:
+                images = images[-4:]
+
         if not prep_dit:
-            self._ctx_store[ctx_id] = {"prompt": prompt, "pil_img": pil_img, "bridge_bytes": 4096}
-            return 4096
+            est_b = _estimate_vlm_context_bytes(history, prompt, num_images=len(images))
+            self._ctx_store[ctx_id] = {
+                "prompt": prompt,
+                "pil_img": pil_img,
+                "images": images,
+                "history": history,
+                "bridge_bytes": est_b,
+            }
+            return est_b
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
         if self._quota_constrained and is_cuda:
+            self._update_hwm()
             torch.cuda.empty_cache()
 
         h = int(cmd.get("height", 512))
@@ -549,12 +707,15 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             meta, flat = pack_internvlu_bridge_state(diff_inp, device=self.device)
         if is_cuda:
             torch.cuda.current_stream(self.device).synchronize()
-            if self._quota_constrained:
-                torch.cuda.empty_cache()
+        self._update_hwm()
+        if self._quota_constrained and is_cuda:
+            torch.cuda.empty_cache()
         b_bytes = int(meta["total_bytes"])
         self._ctx_store[ctx_id] = {
             "prompt": prompt,
             "pil_img": pil_img,
+            "images": images,
+            "history": history,
             "diff_inp": diff_inp,
             "gh": gh,
             "gw": gw,
@@ -562,43 +723,59 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             "packed_flat": flat,
             "bridge_bytes": b_bytes,
         }
-        self._update_hwm()
         return b_bytes
 
     def decode_ar(self, ctx_id: str, max_tokens: int) -> dict[str, Any]:
         import torch
 
         entry = self._ctx_store[ctx_id]
-        prompt = entry["prompt"]
+        prompt = str(entry["prompt"])
+        history: list[tuple[str, str]] = list(entry.get("history") or [])
+        eff_prompt = _format_prompt_with_history(prompt, history)
         pil_img = entry.get("pil_img")
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
         if self._quota_constrained and is_cuda:
+            self._update_hwm()
             torch.cuda.empty_cache()
-        t0 = time.perf_counter()
         with self._vlm_execution_scope(), torch.inference_mode():
-            out = self.pipe(
-                prompt=prompt,
-                image=pil_img,
-                generation_mode="text",
-                max_new_tokens=int(max_tokens),
-                do_sample=False,
-            )
+            out, t0, streamer = self._run_vlm_text_generate(eff_prompt, pil_img, int(max_tokens))
         if is_cuda:
             torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t0) * 1000.0
+        self._update_hwm()
+        if self._quota_constrained and is_cuda:
+            torch.cuda.empty_cache()
+
         tok_seq = _trim_internvlu_generated_tokens(out.generate_output[0], self.pipe.tokenizer)
         n_tok = max(1, int(len(tok_seq)))
         txt = self.pipe.tokenizer.decode(tok_seq, skip_special_tokens=True) if tok_seq else ""
-        per_tok = dt_ms / float(n_tok)
-        if self._quota_constrained and is_cuda:
-            torch.cuda.empty_cache()
-        self._update_hwm()
+
+        stamps = streamer.step_timestamps_s
+        if stamps:
+            used_stamps = stamps[:n_tok]
+            ttft_ms = max(0.0, (used_stamps[0] - t0) * 1000.0)
+            tpots_ms = [
+                round(max(0.0, (used_stamps[i] - used_stamps[i - 1]) * 1000.0), 2)
+                for i in range(1, len(used_stamps))
+            ]
+        else:
+            per_tok = dt_ms / float(n_tok)
+            ttft_ms = per_tok
+            tpots_ms = [round(per_tok, 2) for _ in range(max(0, n_tok - 1))]
+
+        history.append((prompt, txt))
+        entry["history"] = history
+        kv_b = max(
+            int(entry.get("bridge_bytes", 4096)),
+            _estimate_vlm_context_bytes(history, prompt, num_images=len(entry.get("images") or [])),
+        )
+        entry["bridge_bytes"] = kv_b
         return {
             "text": txt,
             "tokens": n_tok,
-            "ttft_ms": round(per_tok, 2),
-            "tpots_ms": [round(per_tok, 2) for _ in range(max(0, n_tok - 1))],
-            "kv_bytes": int(entry.get("bridge_bytes", 4096)),
+            "ttft_ms": round(ttft_ms, 2),
+            "tpots_ms": tpots_ms,
+            "kv_bytes": kv_b,
             "resident_alpha": self.resident_alpha(),
             "kv_free_bytes": self.available_kv_bytes(),
         }
@@ -640,34 +817,32 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             return super().decode_ar_batch(batch_cmds)
 
         t_start = time.perf_counter()
+        raw_prompts: list[str] = []
         prompts: list[str] = []
         max_toks: list[int] = []
         for cmd in batch_cmds:
             cid = str(cmd["ctx_id"])
             if not cmd.get("_skip_prepare", False):
                 self.prepare_turn(cid, cmd)
-            prompts.append(str(self._ctx_store[cid]["prompt"]))
+            ent = self._ctx_store[cid]
+            raw_p = str(ent["prompt"])
+            raw_prompts.append(raw_p)
+            prompts.append(_format_prompt_with_history(raw_p, list(ent.get("history") or [])))
             max_toks.append(max(1, int(cmd.get("max_ar_tokens", 32))))
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
         if self._quota_constrained and is_cuda:
+            self._update_hwm()
             torch.cuda.empty_cache()
 
-        t_gen0 = time.perf_counter()
         with self._vlm_execution_scope(), torch.inference_mode():
-            out = self.pipe(
-                prompt=prompts,
-                image=None,
-                generation_mode="text",
-                max_new_tokens=max(max_toks),
-                do_sample=False,
-            )
+            out, t_gen0, streamer = self._run_vlm_text_generate(prompts, None, max(max_toks))
         if is_cuda:
             torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t_gen0) * 1000.0
+        self._update_hwm()
         if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
-        self._update_hwm()
 
         alpha_now = self.resident_alpha()
         free_kv_now = self.available_kv_bytes()
@@ -677,20 +852,42 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         ]
         max_steps_executed = max((max(1, len(s)) for s in trimmed_seqs), default=1)
         per_step_ms = dt_ms / float(max_steps_executed)
+        stamps = streamer.step_timestamps_s
         results = []
         for idx, cmd in enumerate(batch_cmds):
+            cid = str(cmd["ctx_id"])
+            ent = self._ctx_store[cid]
             enq_s = self.normalized_enqueue_time_s(cmd)
             q_wait_ms = max(0.0, (t_start - enq_s) * 1000.0) if enq_s > 0.0 else 0.0
             seq = trimmed_seqs[idx]
             n_tok = max(1, int(len(seq)))
             txt = self.pipe.tokenizer.decode(seq, skip_special_tokens=True) if seq else ""
+            if stamps:
+                used_stamps = stamps[:n_tok]
+                req_ttft_ms = q_wait_ms + max(0.0, (used_stamps[0] - t_start) * 1000.0)
+                req_tpots_ms = [
+                    round(max(0.0, (used_stamps[k] - used_stamps[k - 1]) * 1000.0), 2)
+                    for k in range(1, len(used_stamps))
+                ]
+            else:
+                req_ttft_ms = q_wait_ms + per_step_ms
+                req_tpots_ms = [round(per_step_ms, 2) for _ in range(max(0, n_tok - 1))]
+
+            hist = list(ent.get("history") or [])
+            hist.append((raw_prompts[idx], txt))
+            ent["history"] = hist
+            kv_b = max(
+                int(ent.get("bridge_bytes", 4096)),
+                _estimate_vlm_context_bytes(hist, raw_prompts[idx], num_images=len(ent.get("images") or [])),
+            )
+            ent["bridge_bytes"] = kv_b
             results.append(
                 {
                     "text": txt,
                     "tokens": n_tok,
-                    "ttft_ms": round(q_wait_ms + per_step_ms, 2),
-                    "tpots_ms": [round(per_step_ms, 2) for _ in range(max(0, n_tok - 1))],
-                    "kv_bytes": 4096,
+                    "ttft_ms": round(req_ttft_ms, 2),
+                    "tpots_ms": req_tpots_ms,
+                    "kv_bytes": kv_b,
                     "resident_alpha": alpha_now,
                     "kv_free_bytes": free_kv_now,
                     "batched_width": len(batch_cmds),
@@ -708,13 +905,22 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             meta = dict(raw_meta, gh=entry["gh"], gw=entry["gw"])
         total_b = int(meta["total_bytes"])
         meta["logical_bytes"] = total_b
+        meta["prompt"] = str(entry.get("prompt", ""))
+        meta["history"] = [[str(q), str(a)] for q, a in (entry.get("history") or [])]
         return PackedTransferState(meta=meta, payload=flat, logical_bytes=total_b)
 
     def unpack_state(self, new_ctx_id: str, meta: dict[str, Any], raw_payload: Any) -> int:
         diff_inp = unpack_internvlu_bridge_state(meta, raw_payload)
         total_b = int(meta["total_bytes"])
+        restored_hist = [
+            (str(pair[0]), str(pair[1]))
+            for pair in (meta.get("history") or [])
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2
+        ]
         self._ctx_store[new_ctx_id] = {
-            "prompt": "",
+            "prompt": str(meta.get("prompt", "")),
+            "history": restored_hist,
+            "images": [],
             "diff_inp": diff_inp,
             "gh": int(meta["gh"]),
             "gw": int(meta["gw"]),
@@ -759,18 +965,33 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
         if self._quota_constrained and is_cuda:
+            self._update_hwm()
             torch.cuda.empty_cache()
 
+        vmm_st0 = self.vmm.stats_dict() if (self.pager is not None and self.vmm is not None) else None
+        h2d_weight_ms = 0.0
+        vae_ms = 0.0
         t0 = time.perf_counter()
         if self.naive_offloader is not None:
-            self.naive_offloader.swap_in_sync()
+            t_sw0 = time.perf_counter()
+            if self.naive_offloader.swap_in_sync():
+                h2d_weight_ms += (time.perf_counter() - t_sw0) * 1000.0
+
+        # Regime A (40 GiB unconstrained) zero-overhead fast-path: when Decoder is already 100% resident
+        # (`alpha=1.0`), bypass `generation_mode`, per-layer waits, and latent/VAE split cleanly.
+        use_regime_a_fast_path = (
+            (not self._quota_constrained)
+            and self.pager is not None
+            and self.vmm is not None
+            and self.vmm.expert_resident_count(self.pager.expert_id) == self.pager.num_layers
+        )
 
         gen = torch.Generator(device=self.device).manual_seed(seed)
         try:
             if self.vlm_pager is not None and self.vmm is not None and self.vlm_pager.expert_id >= 0:
                 self.vmm.set_expert_pinned(self.vlm_pager.expert_id, False)
             with torch.inference_mode():
-                if self.pager is not None and self.vmm is not None:
+                if self.pager is not None and self.vmm is not None and not use_regime_a_fast_path:
                     with self.pager.generation_mode(prefetch_all=True, pacer=self.pacer, rank=self.rank):
                         # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
                         # `generation_decoder.prepare_forward_input` before `transformer_blocks[0]`'s pre-hook.
@@ -792,8 +1013,13 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                     lat_bf16 = latents_out.to(torch.bfloat16)
                     del latents_out
                     if self._quota_constrained and is_cuda:
+                        self._update_hwm()
                         torch.cuda.empty_cache()
+                    t_vae0 = time.perf_counter()
                     imgs_t = self.pipe.image_pipeline.latents_to_pixels(lat_bf16)
+                    if is_cuda:
+                        torch.cuda.current_stream(self.device).synchronize()
+                    vae_ms = (time.perf_counter() - t_vae0) * 1000.0
                     del lat_bf16
                 else:
                     call_kwargs: dict[str, Any] = {
@@ -811,12 +1037,30 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                         call_kwargs["generator_device"] = None
                     imgs_t = self.pipe.image_pipeline(**call_kwargs).images
         finally:
+            if is_cuda:
+                try:
+                    torch.cuda.current_stream(self.device).synchronize()
+                except Exception:
+                    pass
+            # Always sample peak HBM BEFORE dropping naive-offloaded decoder weights!
+            self._update_hwm()
             if self.naive_offloader is not None:
                 self.naive_offloader.drop_from_gpu()
 
-        if is_cuda:
-            torch.cuda.current_stream(self.device).synchronize()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        if vmm_st0 is not None and self.vmm is not None:
+            vmm_st1 = self.vmm.stats_dict()
+            d_map_us = max(0.0, float(vmm_st1.get("expert_map_us", 0.0)) - float(vmm_st0.get("expert_map_us", 0.0)))
+            d_sub_us = max(
+                0.0,
+                float(vmm_st1.get("expert_h2d_submit_us", 0.0)) - float(vmm_st0.get("expert_h2d_submit_us", 0.0)),
+            )
+            d_wait_us = max(
+                0.0,
+                float(vmm_st1.get("expert_wait_us", 0.0)) - float(vmm_st0.get("expert_wait_us", 0.0)),
+            )
+            h2d_weight_ms += (d_map_us + d_sub_us + d_wait_us) / 1000.0
+
         release_after_dit = bool(cmd.get("release_after_dit", False))
         if (not release_after_dit) or save_tmp_path:
             img0 = imgs_t[0]
@@ -827,18 +1071,24 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 pil_img = Image.fromarray((out_c.cpu().float().numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
             if not release_after_dit:
                 entry["pil_img"] = pil_img
+                imgs_hist = list(entry.get("images") or [])
+                imgs_hist.append(pil_img)
+                entry["images"] = imgs_hist[-4:]
             if save_tmp_path:
                 Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
                 pil_img.save(save_tmp_path, format="PNG")
         del imgs_t
+        self._update_hwm()
         if self._quota_constrained and is_cuda:
             torch.cuda.empty_cache()
 
-        self._update_hwm()
         return {
             "status": "ok",
             "ctx_id": ctx_id,
             "elapsed_ms": round(elapsed_ms, 2),
+            "h2d_weight_ms": round(h2d_weight_ms, 2),
+            "vae_ms": round(vae_ms, 2),
+            "preempt_yield_ms": 0.0,
             "kv_bytes": int(entry.get("bridge_bytes", 0)),
             "resident_alpha": self.resident_alpha(),
             "kv_free_bytes": self.available_kv_bytes(),
@@ -859,6 +1109,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
 
         self._ctx_store.pop(ctx_id, None)
         if (self.vmm is None or self._quota_constrained) and torch.cuda.is_available():
+            self._update_hwm()
             torch.cuda.empty_cache()
 
     def memory_and_vmm_stats(self) -> dict[str, Any]:
@@ -869,6 +1120,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
     def close(self) -> None:
         import torch
 
+        self._stop_nvml_poller()
         self._ctx_store.clear()
         if self.vlm_pager is not None:
             self.vlm_pager.close()

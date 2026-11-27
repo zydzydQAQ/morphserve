@@ -572,15 +572,6 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
     std::unique_lock<std::mutex>* opt_lock,
     int32_t exclude_region_id) {
     while (free_fine_handles_.empty()) {
-        if (cfg_.allow_overflow && cfg_.max_pool_bytes > 0) {
-            const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
-            if (cur_pool_b + min_gran_ <= cfg_.max_pool_bytes) {
-                free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
-                ++fine_pool_total_;
-                ++overflow_creates_;
-                break;
-            }
-        }
         if (!free_super_handles_.empty()) {
             const uint64_t super_h = free_super_handles_.back();
             free_super_handles_.pop_back();
@@ -2311,12 +2302,15 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
             free_super_handles_.pop_back();
             return SuperSlot{h, {}};
         }
-        // Strict-cap safe lazy coalescing: allowed even when `allow_overflow == false` because
-        // `try_coalesce_fine_to_super_locked(1)` releases `sub_pages_` fine handles before creating
-        // 1 super handle, strictly preserving `max_pool_bytes`.
-        if (free_fine_handles_.size() >= sub_pages_ &&
-            fine_pool_total_ >= base_fine_pages_ + sub_pages_) {
-            if (try_coalesce_fine_to_super_locked(1) > 0 && !free_super_handles_.empty()) {
+        // Reuse excess carved fine pages as zero-allocation fine-to-super bundles by default;
+        // lazily coalesce back to a 64 MiB super handle only when overflow is enabled and free
+        // fine pages exceed a 2*sub_pages_ hysteresis margin above base_fine_pages_ (preventing
+        // carve<->coalesce thrashing and preserving strict-cap fine-to-super bundling).
+        if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
+            if (cfg_.allow_overflow &&
+                free_fine_handles_.size() >= base_fine_pages_ + 2 * sub_pages_ &&
+                try_coalesce_fine_to_super_locked(1) > 0 &&
+                !free_super_handles_.empty()) {
                 const uint64_t h = free_super_handles_.back();
                 free_super_handles_.pop_back();
                 return SuperSlot{h, {}};

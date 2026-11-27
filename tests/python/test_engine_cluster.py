@@ -18,6 +18,7 @@ from morphserve.engine import (
     InterleavedSession,
     InterleavedTurn,
     LocalNodeWorkerHost,
+    MAIN_QPS_POLICIES,
     MorphServeClusterEngine,
     MultinodeCoordinatorHub,
     RunWindowOptions,
@@ -125,6 +126,11 @@ def _make_multiturn_suite(name: str = "unit_multiturn") -> WorkloadSuite:
 
 
 def test_policy_config_presets_serialization_ablations_and_run_window_options(tmp_path: Path) -> None:
+    assert len(VALID_POLICIES) == 7
+    assert "monolithic_kv_swap" in VALID_POLICIES
+    assert len(MAIN_QPS_POLICIES) == 5
+    assert "monolithic_kv_swap" in MAIN_QPS_POLICIES
+
     for pname in VALID_POLICIES + STATIC_SPLIT_POLICIES:
         cfg = EnginePolicyConfig.from_preset(pname, num_gpus=8)
         assert cfg.policy_name == pname
@@ -133,16 +139,46 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
         rebuilt_json = EnginePolicyConfig.from_json(cfg.to_json())
         assert rebuilt_json == cfg
 
+    # Verify unified SLO & window defaults + `monolithic_kv_swap` fairness preset
+    p_ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
+    p_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=8)
+    p_mono_swap = EnginePolicyConfig.from_preset("monolithic_kv_swap", num_gpus=8)
+    assert p_ms.ar_tpot_slo_ms == pytest.approx(101.40, abs=1e-2)
+    assert p_ms.dit_512_slo_ms == pytest.approx(14916.30, abs=1e-2)
+    assert p_ms.dit_1024_slo_ms == pytest.approx(57219.60, abs=1e-2)
+    assert p_ms.warmup_window_s == pytest.approx(60.0)
+    assert p_ms.steady_window_s == pytest.approx(150.0)
+    assert p_ms.cooldown_s == pytest.approx(30.0)
+    assert p_ms.ar_ttft_slo_for(False, 0, 512) == pytest.approx(250.0, abs=1e-2)
+    assert p_ms.ar_ttft_slo_for(True, 1, 512) == pytest.approx(2800.0, abs=1e-2)
+    assert p_ms.ar_ttft_slo_for(True, 1, 1024) > p_ms.ar_ttft_slo_for(True, 1, 512)
+    assert p_ms.use_idle_kv_swap is True
+    assert p_mono.use_idle_kv_swap is False
+    assert p_mono_swap.use_idle_kv_swap is True
+    assert p_mono_swap.use_tripool_vmm is False
+    assert p_mono_swap.use_scoped_vae is False
+    assert p_mono_swap.routing_mode == p_mono.routing_mode
+
     ablations = dict(build_ablation_configs(num_gpus=8))
     assert set(ablations) == {
         "full_morphserve",
-        "no_m4_layer_chunk",
-        "no_m3_cow_loopback",
-        "no_m2_dual_path",
         "no_m1_tripool_vmm",
+        "no_m1_scoped_vae",
+        "no_m2_dual_path",
+        "no_m2_pacer_numa",
+        "no_m3_cow_loopback",
+        "no_m4_layer_chunk",
     }
     assert ablations["full_morphserve"].use_tripool_vmm is True
     assert ablations["no_m1_tripool_vmm"].use_tripool_vmm is False
+    assert ablations["no_m1_tripool_vmm"].use_scoped_vae is False
+    assert ablations["no_m1_scoped_vae"].use_tripool_vmm is True
+    assert ablations["no_m1_scoped_vae"].use_scoped_vae is False
+    assert ablations["no_m2_dual_path"].routing_mode == "in_place_only"
+    assert ablations["no_m2_dual_path"].use_h2d_pacer is True
+    assert ablations["no_m2_pacer_numa"].routing_mode == "dual_path"
+    assert ablations["no_m2_pacer_numa"].use_h2d_pacer is False
+    assert ablations["no_m2_pacer_numa"].use_shared_numa_mirror is False
     assert ablations["no_m3_cow_loopback"].use_module3_cow_loopback is False
     assert ablations["no_m4_layer_chunk"].preemption_mode != "layer_chunk"
 
@@ -156,12 +192,14 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
     base = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
     orig_ttft = base.ar_ttft_slo_ms
     orig_warmup = base.warmup_window_s
+    orig_cooldown = base.cooldown_s
     opts = RunWindowOptions(
         inter_turn_think_s_range=(0.5, 2.5),
         think_time_dist="uniform",
         steady_window_mode="time",
         warmup_window_s=15.0,
         steady_window_s=60.0,
+        cooldown_s=20.0,
         slo_scale_k=4.0,
         dit_slo_scale_k=6.0,
         ar_tpot_slo_mode="turn_mean",
@@ -169,11 +207,13 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
     eff = opts.apply_to_policy(base)
     assert base.ar_ttft_slo_ms == orig_ttft
     assert base.warmup_window_s == orig_warmup
+    assert base.cooldown_s == orig_cooldown
     assert eff.inter_turn_think_s_range == (0.5, 2.5)
     assert eff.think_time_dist == "uniform"
     assert eff.steady_window_mode == "time"
     assert eff.warmup_window_s == 15.0
     assert eff.steady_window_s == 60.0
+    assert eff.cooldown_s == 20.0
     assert eff.ar_tpot_slo_mode == "turn_mean"
     assert eff.slo_scale_k == 4.0
     assert eff.dit_slo_scale_k == 6.0
@@ -233,7 +273,16 @@ def test_hamilton_apportion_invariants() -> None:
 def test_topology_defaults_and_router_operator_profile_readonly_and_telemetry_seq() -> None:
     op_default = default_operator_profile()
     assert op_default.bagel_expert_bytes > 0
-    assert op_default.ar_tpot_ms > 0
+    assert op_default.ar_tpot_ms == pytest.approx(50.70, abs=1e-2)
+    assert op_default.internvlu_ar_tpot_ms == pytest.approx(44.0, abs=1e-2)
+    assert op_default.ar_text_unloaded_ttft_ms == pytest.approx(125.0, abs=1e-2)
+    assert op_default.ar_img_512_unloaded_ttft_ms == pytest.approx(1400.0, abs=1e-2)
+    slos_bagel = op_default.slo_thresholds_ms(k=2.0, model_family="bagel")
+    assert slos_bagel["ar_ttft_slo_text_ms"] == pytest.approx(250.0, abs=1e-2)
+    assert slos_bagel["ar_ttft_slo_img512_ms"] == pytest.approx(2800.0, abs=1e-2)
+    assert slos_bagel["ar_ttft_slo_img1024_ms"] > slos_bagel["ar_ttft_slo_img512_ms"]
+    slos_ivlu = op_default.slo_thresholds_ms(k=2.0, model_family="internvl_u")
+    assert slos_ivlu["ar_tpot_slo_ms"] == pytest.approx(88.0, abs=1e-2)
 
     topo_4 = default_topology_for(4)
     assert topo_4.num_gpus == 4
@@ -311,6 +360,29 @@ def test_topology_defaults_and_router_operator_profile_readonly_and_telemetry_se
         assert dec_mut.dst_gpu == dec_ro.dst_gpu
         assert ship_mut == ship_ro
         assert r_default.get_worker_state(dec_mut.dst_gpu).queue_wait_ms >= snap_before[dec_mut.dst_gpu].queue_wait_ms + 4999.0
+
+        # Fair load-balanced `twostage_shm` gen selection (no rigid 2k -> 2k+1 pairing bottleneck)
+        p_shm = EnginePolicyConfig.from_preset("twostage_shm", num_gpus=8)
+        shm_workers = {
+            g: WorkerState(
+                gpu_id=g,
+                role=p_shm.role_of(g),
+                expert_alpha=1.0 if g in p_shm.static_gen_ranks else 0.0,
+                queue_wait_ms=9000.0 if g == p_shm.static_gen_ranks[0] else 0.0,
+                kv_free_bytes=16 * (1024**3),
+            )
+            for g in range(8)
+        }
+        chosen_gen = r_default.select_static_gen_gpu(
+            routing_mode="twostage_shm",
+            static_und_ranks=p_shm.static_und_ranks,
+            static_gen_ranks=p_shm.static_gen_ranks,
+            src_und_gpu=p_shm.static_und_ranks[0],
+            workers=shm_workers,
+            gpu_busy={p_shm.static_gen_ranks[0]: True},
+        )
+        assert chosen_gen in p_shm.static_gen_ranks
+        assert chosen_gen != p_shm.static_gen_ranks[0]
     finally:
         r_default.close()
         r_heavy.close()
@@ -496,6 +568,14 @@ def test_cluster_engine_multiturn_continuity_run_options_and_canonical_report(tm
         assert "full_trace_joint_slo_attainment_pct" in rep_dict
         assert "vmm_physical_pool_mib" in rep_dict
         assert "kv_host_swap_ins" in rep_dict
+        assert "alpha_timeline" in rep_dict
+        assert "latency_breakdown_ms" in rep_dict
+        assert "nvml_sm_util_mean_pct" in rep_dict
+        assert "actual_steady_arrival_qps" in rep_dict
+        assert "steady_turn_slo_goodput_rps" in rep_dict
+        assert set(rep_dict["latency_breakdown_ms"]).issuperset(
+            {"queue_ms", "h2d_weight_ms", "kv_transfer_ms", "vae_ms", "preempt_yield_ms"}
+        )
         # Verify multi-turn image outputs were saved cleanly
         assert (save_dir / "sess_interleaved_0_t1.png").is_file()
         assert (save_dir / "sess_interleaved_0_t3.png").is_file()

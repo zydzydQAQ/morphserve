@@ -6,7 +6,6 @@ from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import gc
-import io
 import json
 import os
 from pathlib import Path
@@ -379,6 +378,7 @@ class BagelSessionContext:
         cfg_img_ctx: dict[str, Any] | None = None,
         cfg_text_prefix_len: int = 0,
         pending_deferral: PendingDitDeferral | None = None,
+        pending_vae_only_paths: list[str] | None = None,
         last_img_u8: Any = None,
         last_img_pil: Any = None,
     ) -> None:
@@ -389,6 +389,7 @@ class BagelSessionContext:
         self.pending_deferral: PendingDitDeferral | None = (
             None if (pending_deferral is None or pending_deferral.is_empty) else pending_deferral
         )
+        self.pending_vae_only_paths: list[str] = [str(p) for p in (pending_vae_only_paths or [])]
         self.last_img_u8: Any = last_img_u8
         self.last_img_pil: Any = last_img_pil
         self._swapped_host_bundle: dict[str, Any] | None = None
@@ -452,6 +453,7 @@ class BagelSessionContext:
         orig_kv_lens = list(self.main_ctx["kv_lens"]) if self.main_ctx is not None else [0]
         orig_ropes = list(self.main_ctx["ropes"]) if self.main_ctx is not None else [0]
         orig_deferral = self.pending_deferral.copy() if self.pending_deferral is not None else None
+        orig_pending_vae_only = list(self.pending_vae_only_paths)
         try:
             yield self
         except BaseException:
@@ -461,6 +463,7 @@ class BagelSessionContext:
                 self.main_ctx["kv_lens"] = orig_kv_lens
                 self.main_ctx["ropes"] = orig_ropes
             self.pending_deferral = orig_deferral
+            self.pending_vae_only_paths = orig_pending_vae_only
             raise
 
     def fork_cfg_text(self, aux_cache_factory: Callable[[int], Any], *, use_cow: bool) -> int:
@@ -661,6 +664,7 @@ class BagelSessionContext:
         self.drop_cfg_branches()
         self.main_ctx = None
         self.pending_deferral = None
+        self.pending_vae_only_paths.clear()
         self.last_img_u8 = None
         self.last_img_pil = None
         return released_host_b
@@ -743,6 +747,7 @@ def pack_bagel_multi_context(
         "cfg_text_ropes": cfg_text_ropes,
         "cfg_text_kv_lens": cfg_text_kv_lens,
         "include_cfg_text_dup": bool(include_cfg_text_dup),
+        "pending_vae_only_paths": list(session.pending_vae_only_paths),
         **defer_meta,
         "sections": sections,
         "image_sections": image_sections,
@@ -816,6 +821,7 @@ def unpack_bagel_multi_context(
         cfg_img_ctx=cfg_img_ctx,
         cfg_text_prefix_len=prefix_len,
         pending_deferral=PendingDitDeferral.from_meta(meta),
+        pending_vae_only_paths=[str(p) for p in (meta.get("pending_vae_only_paths") or [])],
         last_img_u8=last_img_u8,
         last_img_pil=last_img_pil,
     )
@@ -892,6 +898,9 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         self._kv_host_pinned_bytes: int = 0
         self._calibrated_ar_step_ms: float | None = None
         self._calibrated_layer_ms_by_hw: dict[tuple[int, int], float] = {}
+        self._naive_offload_held_ctx_ids: set[str] = set()
+        self._pending_h2d_weight_ms: dict[str, float] = {}
+        self._pending_vae_encode_ms: dict[str, float] = {}
 
         if getattr(self.pipeline.bagel, "language_model", None) is not None:
             gen_spec = ExpertPartitionSpec.for_bagel(
@@ -1005,6 +1014,22 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         )
         return max(0, int(free_drv) + unused_cached - 1024 * MIB)
 
+    def _auto_idle_kv_swap_enabled(self) -> bool:
+        val = getattr(self.policy, "use_idle_kv_swap", None)
+        if val is not None:
+            return bool(val)
+        return bool(self.pager is not None or getattr(self.policy, "kv_vmm_only", False))
+
+    def _release_naive_hold(self, ctx_id: str | None = None, *, force: bool = False) -> None:
+        if ctx_id is not None:
+            self._naive_offload_held_ctx_ids.discard(ctx_id)
+        if force:
+            self._naive_offload_held_ctx_ids.clear()
+        if self.naive_offloader is not None and (force or not self._naive_offload_held_ctx_ids):
+            if bool(getattr(self.naive_offloader, "_resident_on_gpu", False)):
+                self._update_hwm()
+                self.naive_offloader.drop_from_gpu(force=force)
+
     def evict_idle_kv_to_host(
         self,
         target_free_bytes: int,
@@ -1039,14 +1064,16 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             import torch
 
             if torch.cuda.is_available():
+                self._update_hwm()
                 torch.cuda.empty_cache()
         return evicted_total
 
     def _ensure_ctx_resident(self, ctx_id: str, extra_needed_bytes: int = 0) -> BagelSessionContext:
         session = self._ctx_store[ctx_id]
+        allow_auto_swap = self._auto_idle_kv_swap_enabled()
         if session.is_swapped:
             req_b = session.logical_bytes() + int(extra_needed_bytes) + 256 * MIB
-            if self.available_kv_bytes() < req_b:
+            if allow_auto_swap and self.available_kv_bytes() < req_b:
                 self.evict_idle_kv_to_host(req_b, exclude_ctx_ids=(ctx_id,))
             try:
                 restored_b, from_bundle = session.ensure_resident(
@@ -1057,7 +1084,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     vmm=self.vmm,
                 )
             except BaseException as exc:
-                if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)) > 0:
+                if (
+                    allow_auto_swap
+                    and is_oom_exception(exc)
+                    and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)) > 0
+                ):
                     restored_b, from_bundle = session.ensure_resident(
                         device=self.device,
                         main_cache_factory=self._main_cache_factory(),
@@ -1074,7 +1105,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 self._sync_ctx_vmm_activity(ctx_id, active=True)
             return session
 
-        if extra_needed_bytes > 0:
+        if allow_auto_swap and extra_needed_bytes > 0:
             watermark_b = int(extra_needed_bytes) + 512 * MIB
             if self.available_kv_bytes() < watermark_b:
                 self.evict_idle_kv_to_host(watermark_b, exclude_ctx_ids=(ctx_id,))
@@ -1085,15 +1116,18 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
         self.pacer = pacer
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        if is_cuda:
+            self._ensure_nvml_poller()
         if self.policy.use_tripool_vmm:
             gc.collect()
             if is_cuda:
+                self._update_hwm()
                 torch.cuda.empty_cache()
             init_pool_mib = int(self.policy.super_pool_mib + self.policy.fine_kv_pool_mib)
             self._vmm_initial_pool_mib = float(init_pool_mib)
             max_pool_b = 0
             if (
-                self.pager is not None
+                (self.pager is not None or bool(getattr(self.policy, "kv_vmm_only", False)))
                 and self.policy.allow_vmm_overflow
                 and getattr(self.policy, "gpu_memory_fraction", None) is None
                 and getattr(self.policy, "gpu_memory_quota_mib", None) is None
@@ -1167,7 +1201,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     self.sched.last_effective_chunk_layers = self.sched.compute_adaptive_chunk_layers()
             self.release_context("__warm_ar__")
 
-        if self.role != "und" and self.naive_offloader is None:
+        if self.role != "und":
             w_main = self._new_aux_ctx()
             w_img = self._new_aux_ctx()
             self._update_text_ctx(w_main, "Warmup.")
@@ -1223,20 +1257,30 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         img_or_u8: Any,
         update_vae: bool = True,
         update_vit: bool = True,
+        *,
+        keep_naive_resident: bool = False,
+        timing_out: dict[str, float] | None = None,
     ) -> None:
         """Unified PIL & GPU-uint8 image injection sharing VAE seed and running ViT prep outside autocast(bf16)."""
         import numpy as np
         import torch
 
         swapped = False
+        failed = False
         if update_vae and self.naive_offloader is not None:
+            t_sw0 = time.perf_counter()
             swapped = self.naive_offloader.swap_in_sync()
+            if swapped and timing_out is not None:
+                timing_out["h2d_weight_ms"] = timing_out.get("h2d_weight_ms", 0.0) + (
+                    (time.perf_counter() - t_sw0) * 1000.0
+                )
         try:
             is_u8 = torch.is_tensor(img_or_u8)
             dev_type = getattr(self.device, "type", "cuda")
             ac_enabled = dev_type != "cpu"
             with torch.inference_mode():
                 if update_vae:
+                    t_vae0 = time.perf_counter()
                     vae_seed = 10007 + (int(ctx["ropes"][0]) if ctx.get("ropes") else 0)
                     torch.manual_seed(vae_seed)
                     if torch.cuda.is_available():
@@ -1267,6 +1311,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             self.pipeline.vae, ctx["past_key_values"], **vi
                         )
                     ctx["kv_lens"], ctx["ropes"] = nl, nr
+                    if timing_out is not None:
+                        timing_out["vae_ms"] = timing_out.get("vae_ms", 0.0) + (
+                            (time.perf_counter() - t_vae0) * 1000.0
+                        )
 
                 if update_vit:
                     # Prepare ViT tensors strictly outside `autocast(bf16)` for both PIL and GPU-uint8 paths.
@@ -1298,8 +1346,12 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             ctx["past_key_values"], **vti
                         )
                     ctx["kv_lens"], ctx["ropes"] = nlv, nrv
+        except BaseException:
+            failed = True
+            raise
         finally:
-            if swapped and self.naive_offloader is not None:
+            if swapped and self.naive_offloader is not None and (failed or not keep_naive_resident):
+                self._update_hwm()
                 self.naive_offloader.drop_from_gpu()
 
     def _apply_dit_turn_images_and_prompt(
@@ -1309,44 +1361,99 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         *,
         can_run_vae: bool,
         prep_dit: bool,
+        timing_out: dict[str, float] | None = None,
     ) -> None:
-        from PIL import Image
-
         assert session.main_ctx is not None
         main_ctx = session.main_ctx
         use_cow = bool(self.policy.use_module3_cow_loopback)
+        keep_naive = bool(prep_dit and self.naive_offloader is not None)
 
         if cmd.get("use_prev_image"):
             if cmd.get("prev_image_path"):
                 p_prev = str(cmd["prev_image_path"])
-                self._update_image_ctx(main_ctx, self._load_pil(p_prev), update_vae=can_run_vae, update_vit=True)
+                self._update_image_ctx(
+                    main_ctx,
+                    self._load_pil(p_prev),
+                    update_vae=can_run_vae,
+                    update_vit=True,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if prep_dit and not can_run_vae:
                     session.ensure_deferral().vae_paths.append(p_prev)
             elif use_cow and session.last_img_u8 is not None:
-                self._update_image_ctx(main_ctx, session.last_img_u8, update_vae=can_run_vae, update_vit=True)
+                self._update_image_ctx(
+                    main_ctx,
+                    session.last_img_u8,
+                    update_vae=can_run_vae,
+                    update_vit=True,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if prep_dit and not can_run_vae:
                     session.ensure_deferral().vae_u8 = True
             elif session.last_img_pil is not None:
+                # Keep in-memory `prev_pil` directly (no artificial PNG encode/decode penalty for non-CoW baselines).
                 prev_pil = session.last_img_pil
-                if not use_cow:
-                    buf = io.BytesIO()
-                    prev_pil.save(buf, format="PNG")
-                    buf.seek(0)
-                    prev_pil = Image.open(buf).convert("RGB")
-                    prev_pil.load()
-                    session.last_img_pil = prev_pil
-                self._update_image_ctx(main_ctx, prev_pil, update_vae=can_run_vae, update_vit=True)
+                self._update_image_ctx(
+                    main_ctx,
+                    prev_pil,
+                    update_vae=can_run_vae,
+                    update_vit=True,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if prep_dit and not can_run_vae:
                     session.ensure_deferral().vae_pil = True
             elif session.last_img_u8 is not None:
-                self._update_image_ctx(main_ctx, session.last_img_u8, update_vae=can_run_vae, update_vit=True)
+                self._update_image_ctx(
+                    main_ctx,
+                    session.last_img_u8,
+                    update_vae=can_run_vae,
+                    update_vit=True,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if prep_dit and not can_run_vae:
                     session.ensure_deferral().vae_u8 = True
 
-        for rel_img in cmd.get("image_paths", []):
-            self._update_image_ctx(main_ctx, self._load_pil(rel_img), update_vae=can_run_vae, update_vit=True)
+        explicit_img_paths = list(cmd.get("image_paths") or [])
+        for rel_img in explicit_img_paths:
+            self._update_image_ctx(
+                main_ctx,
+                self._load_pil(rel_img),
+                update_vae=can_run_vae,
+                update_vit=True,
+                keep_naive_resident=keep_naive,
+                timing_out=timing_out,
+            )
             if prep_dit and not can_run_vae:
                 session.ensure_deferral().vae_paths.append(str(rel_img))
+            elif (not prep_dit) and (not can_run_vae):
+                # Q1 `interleaved_co_creation` Turn 0 (`ar_only`) ran ViT-only; remember source path
+                # so Turn 1 (`dit_edit`) injects VAE latents without duplicating ViT tokens.
+                session.pending_vae_only_paths.append(str(rel_img))
+
+        has_prior_gen_img = bool(
+            cmd.get("prev_image_path")
+            or session.last_img_u8 is not None
+            or session.last_img_pil is not None
+        )
+        if prep_dit and (not explicit_img_paths) and (not has_prior_gen_img) and session.pending_vae_only_paths:
+            pending_vae_paths = list(session.pending_vae_only_paths)
+            session.pending_vae_only_paths.clear()
+            for vae_rel in pending_vae_paths:
+                if can_run_vae:
+                    self._update_image_ctx(
+                        main_ctx,
+                        self._load_pil(vae_rel),
+                        update_vae=True,
+                        update_vit=False,
+                        keep_naive_resident=keep_naive,
+                        timing_out=timing_out,
+                    )
+                else:
+                    session.ensure_deferral().vae_paths.append(vae_rel)
 
         prompt = str(cmd["prompt"])
         if prep_dit:
@@ -1365,12 +1472,18 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             self._update_text_ctx(main_ctx, prompt)
 
     def _prepare_turn_inner(self, ctx_id: str, cmd: dict[str, Any]) -> int:
-        has_images = bool(cmd.get("use_prev_image") or cmd.get("image_paths"))
+        existing_session = self._ctx_store.get(ctx_id)
+        has_images = bool(
+            cmd.get("use_prev_image")
+            or cmd.get("image_paths")
+            or (existing_session is not None and bool(existing_session.pending_vae_only_paths))
+        )
         est_delta = (768 * MIB) if (has_images or cmd.get("prepare_for_dit")) else (128 * MIB)
+        allow_auto_swap = self._auto_idle_kv_swap_enabled()
 
-        session = self._ctx_store.get(ctx_id)
+        session = existing_session
         if session is None:
-            if self.available_kv_bytes() < est_delta + 512 * MIB:
+            if allow_auto_swap and self.available_kv_bytes() < est_delta + 512 * MIB:
                 self.evict_idle_kv_to_host(est_delta + 512 * MIB, exclude_ctx_ids=(ctx_id,))
             session = BagelSessionContext(self._new_main_ctx())
             self._ctx_store[ctx_id] = session
@@ -1379,9 +1492,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         else:
             session = self._ensure_ctx_resident(ctx_id, extra_needed_bytes=est_delta)
 
+        has_images = bool(cmd.get("use_prev_image") or cmd.get("image_paths") or session.pending_vae_only_paths)
         prep_dit = bool(cmd.get("prepare_for_dit", False))
         is_ar_cmd = bool(cmd.get("max_ar_tokens")) or (cmd.get("op") in ("EXEC_AR", "EXEC_AR_PREEMPT"))
-        is_fission_und = self.policy.routing_mode == "static_nccl_fission" and self.role == "und"
+        is_fission_und = self.policy.routing_mode in ("static_nccl_fission", "twostage_shm") and self.role == "und"
         pager_partial = self.pager is not None and self.vmm is not None and self.resident_alpha() < 0.999
 
         if prep_dit and (not is_ar_cmd) and has_images and pager_partial and (not is_fission_und):
@@ -1392,18 +1506,41 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 "image_paths": img_paths_list,
                 "prompt": str(cmd["prompt"]),
             }
-            n_pending_imgs = (1 if cmd.get("use_prev_image") else 0) + len(img_paths_list)
+            n_pending_imgs = (
+                (1 if cmd.get("use_prev_image") else 0)
+                + len(img_paths_list)
+                + len(session.pending_vae_only_paths)
+            )
             self._update_hwm()
             return session.logical_bytes() + max(1, n_pending_imgs) * (192 * MIB)
 
         can_run_vae_here = prep_dit and (not is_fission_und) and (not pager_partial)
-        with session.atomic_kv_update():
-            self._apply_dit_turn_images_and_prompt(
-                session,
-                cmd,
-                can_run_vae=can_run_vae_here,
-                prep_dit=prep_dit,
-            )
+        timing_out: dict[str, float] = {"h2d_weight_ms": 0.0, "vae_ms": 0.0}
+        try:
+            with session.atomic_kv_update():
+                self._apply_dit_turn_images_and_prompt(
+                    session,
+                    cmd,
+                    can_run_vae=can_run_vae_here,
+                    prep_dit=prep_dit,
+                    timing_out=timing_out,
+                )
+        except BaseException:
+            if prep_dit and self.naive_offloader is not None:
+                self._release_naive_hold(ctx_id)
+            raise
+
+        if prep_dit:
+            if timing_out["h2d_weight_ms"] > 0.0:
+                self._pending_h2d_weight_ms[ctx_id] = (
+                    self._pending_h2d_weight_ms.get(ctx_id, 0.0) + timing_out["h2d_weight_ms"]
+                )
+            if timing_out["vae_ms"] > 0.0:
+                self._pending_vae_encode_ms[ctx_id] = (
+                    self._pending_vae_encode_ms.get(ctx_id, 0.0) + timing_out["vae_ms"]
+                )
+            if self.naive_offloader is not None and bool(getattr(self.naive_offloader, "_resident_on_gpu", False)):
+                self._naive_offload_held_ctx_ids.add(ctx_id)
 
         self._update_hwm()
         return session.logical_bytes()
@@ -1418,7 +1555,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     partial = self._ctx_store.pop(ctx_id, None)
                     if partial is not None:
                         partial.close()
-                if is_oom_exception(exc):
+                if self._auto_idle_kv_swap_enabled() and is_oom_exception(exc):
                     freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
                     if freed > 0:
                         return self._prepare_turn_inner(ctx_id, cmd)
@@ -1497,7 +1634,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         except BaseException as exc:
                             for st, plen in zip(active, prev_ar_lens):
                                 st["session"].rollback_main_kv(plen)
-                            if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0:
+                            if (
+                                self._auto_idle_kv_swap_enabled()
+                                and is_oom_exception(exc)
+                                and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0
+                            ):
                                 for st in active:
                                     pkv_re = st["ctx"]["past_key_values"]
                                     if callable(getattr(pkv_re, "set_fast_ar_mode", None)):
@@ -1565,11 +1706,17 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 )
             return outputs
 
-    def _apply_pending_deferral(self, session: BagelSessionContext) -> None:
+    def _apply_pending_deferral(
+        self,
+        session: BagelSessionContext,
+        *,
+        timing_out: dict[str, float] | None = None,
+    ) -> None:
         """Execute deferred `[VAE, ViT, Prompt]` or VAE-only updates atomically before `EXEC_DIT`."""
         deferral = session.pending_deferral
         if deferral is None or deferral.is_empty:
             return
+        keep_naive = self.naive_offloader is not None
         early_pacer_cm = (
             self.pacer.acquire_process_slot(self.rank)
             if (
@@ -1588,23 +1735,66 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     deferral.turn_cmd,
                     can_run_vae=True,
                     prep_dit=True,
+                    timing_out=timing_out,
                 )
             assert session.main_ctx is not None
             main_ctx = session.main_ctx
             cfg_text_ctx = session.cfg_text_ctx
             if deferral.vae_u8 and session.last_img_u8 is not None:
-                self._update_image_ctx(main_ctx, session.last_img_u8, update_vae=True, update_vit=False)
+                self._update_image_ctx(
+                    main_ctx,
+                    session.last_img_u8,
+                    update_vae=True,
+                    update_vit=False,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if cfg_text_ctx is not None:
-                    self._update_image_ctx(cfg_text_ctx, session.last_img_u8, update_vae=True, update_vit=False)
+                    self._update_image_ctx(
+                        cfg_text_ctx,
+                        session.last_img_u8,
+                        update_vae=True,
+                        update_vit=False,
+                        keep_naive_resident=keep_naive,
+                        timing_out=timing_out,
+                    )
             if deferral.vae_pil and session.last_img_pil is not None:
-                self._update_image_ctx(main_ctx, session.last_img_pil, update_vae=True, update_vit=False)
+                self._update_image_ctx(
+                    main_ctx,
+                    session.last_img_pil,
+                    update_vae=True,
+                    update_vit=False,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if cfg_text_ctx is not None:
-                    self._update_image_ctx(cfg_text_ctx, session.last_img_pil, update_vae=True, update_vit=False)
+                    self._update_image_ctx(
+                        cfg_text_ctx,
+                        session.last_img_pil,
+                        update_vae=True,
+                        update_vit=False,
+                        keep_naive_resident=keep_naive,
+                        timing_out=timing_out,
+                    )
             for pend_img in deferral.vae_paths:
                 pil_v = self._load_pil(pend_img)
-                self._update_image_ctx(main_ctx, pil_v, update_vae=True, update_vit=False)
+                self._update_image_ctx(
+                    main_ctx,
+                    pil_v,
+                    update_vae=True,
+                    update_vit=False,
+                    keep_naive_resident=keep_naive,
+                    timing_out=timing_out,
+                )
                 if cfg_text_ctx is not None:
-                    self._update_image_ctx(cfg_text_ctx, pil_v, update_vae=True, update_vit=False)
+                    self._update_image_ctx(
+                        cfg_text_ctx,
+                        pil_v,
+                        update_vae=True,
+                        update_vit=False,
+                        keep_naive_resident=keep_naive,
+                        timing_out=timing_out,
+                    )
 
     def generate_dit(
         self,
@@ -1626,8 +1816,20 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
         dev_type = getattr(self.device, "type", "cuda")
         is_cuda = torch.cuda.is_available() and dev_type == "cuda"
+        height = int(cmd.get("height", 512))
+        width = int(cmd.get("width", 512))
+        steps = int(cmd.get("dit_steps", 20))
+        seed = int(cmd.get("seed", 52))
+        prompt = str(cmd.get("prompt", ""))
+        want_pil = bool(cmd.get("return_pil", False))
+        save_tmp_path = cmd.get("save_tmp_image_path")
+        use_idle_kv_swap = bool(getattr(self.policy, "use_idle_kv_swap", False))
 
         with self._pinned_ctx(ctx_id):
+            h2d_weight_ms = float(self._pending_h2d_weight_ms.pop(ctx_id, 0.0))
+            vae_ms = float(self._pending_vae_encode_ms.pop(ctx_id, 0.0))
+            vmm_st0 = self.vmm.stats_dict() if (self.pager is not None and self.vmm is not None) else None
+
             session = self._ensure_ctx_resident(ctx_id)
             has_pending = session.has_pending_deferral
             if self.pager is not None and self.vmm is not None:
@@ -1635,22 +1837,37 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 needed_for_dit = int(self.pager.total_mirror_bytes) + extra_dit_kv
                 if self.available_kv_bytes(for_dit=False) < needed_for_dit:
                     self.evict_idle_kv_to_host(needed_for_dit, exclude_ctx_ids=(ctx_id,), for_dit=False)
+            elif use_idle_kv_swap:
+                # Fair symmetric idle-KV protection for `monolithic_kv_swap` & `prism_tetriserve_coloc`:
+                # proactively reclaim idle KV if free HBM is below estimated DiT+VAE spike (`4.5 GiB` / `7.5 GiB`).
+                est_dit_vae_bytes = int(7.5 * GIB) if (height >= 1024 or width >= 1024) else int(4.5 * GIB)
+                if is_cuda:
+                    free_drv, _ = torch.cuda.mem_get_info(self.device)
+                    unused_pt = max(
+                        0,
+                        int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+                    )
+                    free_hbm_est = int(free_drv) + unused_pt
+                else:
+                    free_hbm_est = self.available_kv_bytes(for_dit=False)
+                if free_hbm_est < est_dit_vae_bytes:
+                    deficit = est_dit_vae_bytes - free_hbm_est
+                    target_avail = max(est_dit_vae_bytes, self.available_kv_bytes(for_dit=False) + deficit)
+                    reclaimed_b = self.evict_idle_kv_to_host(target_avail, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                    if reclaimed_b > 0 and is_cuda:
+                        self._update_hwm()
+                        torch.cuda.empty_cache()
 
             if has_pending:
-                self._apply_pending_deferral(session)
+                defer_timing: dict[str, float] = {"h2d_weight_ms": 0.0, "vae_ms": 0.0}
+                self._apply_pending_deferral(session, timing_out=defer_timing)
+                h2d_weight_ms += defer_timing["h2d_weight_ms"]
+                vae_ms += defer_timing["vae_ms"]
 
             assert session.main_ctx is not None
             main_ctx = session.main_ctx
             cfg_text_ctx = session.cfg_text_ctx
             cfg_img_ctx = session.cfg_img_ctx
-
-            height = int(cmd.get("height", 512))
-            width = int(cmd.get("width", 512))
-            steps = int(cmd.get("dit_steps", 20))
-            seed = int(cmd.get("seed", 52))
-            prompt = str(cmd.get("prompt", ""))
-            want_pil = bool(cmd.get("return_pil", False))
-            save_tmp_path = cmd.get("save_tmp_image_path")
 
             sampling = OmniDiffusionSamplingParams(
                 height=height,
@@ -1676,7 +1893,9 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 sampling.cfg_img_kv_metadata = {"ropes": cfg_img_ctx["ropes"], "image_shape": [height, width]}
 
             if self.naive_offloader is not None:
-                self.naive_offloader.swap_in_sync()
+                t_sw0 = time.perf_counter()
+                if self.naive_offloader.swap_in_sync():
+                    h2d_weight_ms += (time.perf_counter() - t_sw0) * 1000.0
 
             def _admit_preempt_cmd(ar_msg: dict[str, Any], now_s: float) -> tuple[ArDecodeTask, tuple[str, str, BagelSessionContext]]:
                 ar_cid = str(ar_msg["ctx_id"])
@@ -1749,6 +1968,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     return
                 if exc is not None and is_oom_exception(exc):
                     if is_cuda:
+                        self._update_hwm()
                         torch.cuda.empty_cache()
                     emit_preempt_ack({"cmd_id": c_id, "rank": self.rank, "status": "oom", "error": str(exc)[:200]})
                 elif exc is not None:
@@ -1776,21 +1996,27 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
             hw_key = (height, width)
             has_prior_hw = hw_key in self._calibrated_layer_ms_by_hw
-            preempt_session = PreemptionSession(
-                self.sched,
-                poll_cmds=poll_preempt_cmds,
-                admit_cmd=_admit_preempt_cmd if (poll_preempt_cmds is not None) else None,
-                on_complete=_complete_preempt_task if (emit_preempt_ack is not None) else None,
-                on_abort=_abort_preempt_handle,
-                on_abort_deferred=_abort_deferred_cmd,
-                on_oom_reclaim=lambda _tasks: self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)),
-                drain_context_factory=lambda: torch.autocast(
-                    device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16
-                ),
-                init_layer_ms=self._calibrated_layer_ms_by_hw.get(hw_key, 37.0 if height >= 1024 else 10.5),
-                preserve_layer_calibration=has_prior_hw,
-                init_ar_step_ms=self._calibrated_ar_step_ms,
-            )
+
+            def _make_preempt_session() -> PreemptionSession:
+                return PreemptionSession(
+                    self.sched,
+                    poll_cmds=poll_preempt_cmds,
+                    admit_cmd=_admit_preempt_cmd if (poll_preempt_cmds is not None) else None,
+                    on_complete=_complete_preempt_task if (emit_preempt_ack is not None) else None,
+                    on_abort=_abort_preempt_handle,
+                    on_abort_deferred=_abort_deferred_cmd,
+                    on_oom_reclaim=(
+                        (lambda _tasks: self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)))
+                        if self._auto_idle_kv_swap_enabled()
+                        else None
+                    ),
+                    drain_context_factory=lambda: torch.autocast(
+                        device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16
+                    ),
+                    init_layer_ms=self._calibrated_layer_ms_by_hw.get(hw_key, 37.0 if height >= 1024 else 10.5),
+                    preserve_layer_calibration=has_prior_hw,
+                    init_ar_step_ms=self._calibrated_ar_step_ms,
+                )
 
             if is_cuda:
                 torch.cuda.current_stream(self.device).synchronize()
@@ -1798,108 +2024,191 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             latents = None
             img_shape = (height, width)
             excl_sids = (session.main_session_id,) if session.main_session_id > 0 else ()
+            max_dit_oom_retries = 2 if (use_idle_kv_swap or (self.pager is not None and self.vmm is not None)) else 0
+            total_yield_count = 0
+            preempt_yield_ms = 0.0
+            vae_decode_ev_pair: tuple[Any, Any] | None = None
+            vae_decode_wall_ms = 0.0
+
             try:
-                with torch.inference_mode(), preempt_session:
-                    prep = self.pipeline._forward_single(
-                        {"prompt": prompt, "modalities": ["image"]},
-                        sampling,
-                        prepare_only=True,
-                    )
-                    gp = prep["gen_params"]
-                    img_shape = prep["image_shape"]
+                with torch.inference_mode():
+                    # Phase 1: DiT denoising (with bounded OOM -> evict_idle_kv_to_host -> retry for idle-KV swap policies)
+                    for dit_attempt in range(max_dit_oom_retries + 1):
+                        preempt_session = _make_preempt_session()
+                        try:
+                            with preempt_session:
+                                prep = self.pipeline._forward_single(
+                                    {"prompt": prompt, "modalities": ["image"]},
+                                    sampling,
+                                    prepare_only=True,
+                                )
+                                gp = prep["gen_params"]
+                                img_shape = prep["image_shape"]
 
-                    if (
-                        (int(img_shape[0]) >= 1024 or int(img_shape[1]) >= 1024)
-                        and is_cuda
-                        and (int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)))
-                        >= 768 * MIB
-                    ):
-                        torch.cuda.empty_cache()
+                                if (
+                                    (int(img_shape[0]) >= 1024 or int(img_shape[1]) >= 1024)
+                                    and is_cuda
+                                    and (
+                                        int(torch.cuda.memory_reserved(self.device))
+                                        - int(torch.cuda.memory_allocated(self.device))
+                                    )
+                                    >= 768 * MIB
+                                ):
+                                    self._update_hwm()
+                                    torch.cuda.empty_cache()
 
-                    with self.interceptor.generation_session(
-                        pager=self.pager,
-                        use_cfg_patch=self.policy.use_module3_cow_loopback,
-                        scheduler=self.sched,
-                        pacer=self.pacer,
-                        rank=self.rank,
-                        prefetch_all=True,
-                        reset_cfg_stats=True,
-                        exclude_session_ids=excl_sids,
-                    ):
-                        with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
-                            latents, *_ = self.pipeline.bagel.generate_image(
-                                past_key_values=prep["gen_context"]["past_key_values"],
-                                cfg_text_past_key_values=prep["cfg_text_context"]["past_key_values"],
-                                cfg_img_past_key_values=prep["cfg_img_context"]["past_key_values"],
-                                num_timesteps=gp.num_timesteps,
-                                timestep_shift=gp.timestep_shift,
-                                cfg_text_scale=gp.cfg_text_scale,
-                                cfg_img_scale=gp.cfg_img_scale,
-                                cfg_interval=gp.cfg_interval,
-                                cfg_renorm_min=gp.cfg_renorm_min,
-                                cfg_renorm_type=gp.cfg_renorm_type,
-                                **prep["generation_input"],
-                                cfg_text_packed_position_ids=prep["cfg_text_packed_position_ids"],
-                                cfg_img_packed_position_ids=prep["cfg_img_packed_position_ids"],
-                                return_trajectory_latents=False,
-                                scheduler=self.pipeline.scheduler,
-                                scheduler_kwargs=self.pipeline.scheduler_kwargs,
-                            )
+                                with self.interceptor.generation_session(
+                                    pager=self.pager,
+                                    use_cfg_patch=self.policy.use_module3_cow_loopback,
+                                    scheduler=self.sched,
+                                    pacer=self.pacer,
+                                    rank=self.rank,
+                                    prefetch_all=True,
+                                    reset_cfg_stats=True,
+                                    exclude_session_ids=excl_sids,
+                                ):
+                                    with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
+                                        latents, *_ = self.pipeline.bagel.generate_image(
+                                            past_key_values=prep["gen_context"]["past_key_values"],
+                                            cfg_text_past_key_values=prep["cfg_text_context"]["past_key_values"],
+                                            cfg_img_past_key_values=prep["cfg_img_context"]["past_key_values"],
+                                            num_timesteps=gp.num_timesteps,
+                                            timestep_shift=gp.timestep_shift,
+                                            cfg_text_scale=gp.cfg_text_scale,
+                                            cfg_img_scale=gp.cfg_img_scale,
+                                            cfg_interval=gp.cfg_interval,
+                                            cfg_renorm_min=gp.cfg_renorm_min,
+                                            cfg_renorm_type=gp.cfg_renorm_type,
+                                            **prep["generation_input"],
+                                            cfg_text_packed_position_ids=prep["cfg_text_packed_position_ids"],
+                                            cfg_img_packed_position_ids=prep["cfg_img_packed_position_ids"],
+                                            return_trajectory_latents=False,
+                                            scheduler=self.pipeline.scheduler,
+                                            scheduler_kwargs=self.pipeline.scheduler_kwargs,
+                                        )
 
-                    cal_ms = preempt_session.calibrated_layer_ms
-                    if cal_ms is not None:
-                        self._calibrated_layer_ms_by_hw[hw_key] = cal_ms
+                                cal_ms = preempt_session.calibrated_layer_ms
+                                if cal_ms is not None:
+                                    self._calibrated_layer_ms_by_hw[hw_key] = cal_ms
 
-                    # Drain any in-flight preempted AR tasks before FLUX `vae.decode` so VAE decode never stalls TPOT.
-                    if emit_preempt_ack is not None:
-                        preempt_session.drain(stop_polling_after=True)
+                                # Drain any in-flight preempted AR tasks before FLUX `vae.decode` so VAE decode never stalls TPOT.
+                                if emit_preempt_ack is not None:
+                                    preempt_session.drain(stop_polling_after=True)
+                                total_yield_count += preempt_session.yield_count
+                                if self.sched is not None:
+                                    preempt_yield_ms += float(self.sched.ar_compute_total_ms)
+                            break
+                        except BaseException as exc:
+                            if dit_attempt < max_dit_oom_retries and is_oom_exception(exc):
+                                self._update_hwm()
+                                freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                if is_cuda:
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                if freed > 0:
+                                    continue
+                            raise
 
                     # Drop per-turn CFG branch caches immediately after denoising completes.
                     session.drop_cfg_branches()
 
-                    # Run FLUX VAE decode outside `generation_session` so expert slices remain unpinned.
-                    if self.policy.use_module3_cow_loopback:
-                        with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
-                            img_u8 = decode_latent_to_u8_gpu(
-                                self.pipeline.bagel, self.pipeline.vae, latents[0], img_shape
-                            )
-                        session.last_img_u8 = img_u8
-                        if want_pil or save_tmp_path:
-                            pil_img = Image.fromarray(img_u8.permute(1, 2, 0).contiguous().cpu().numpy())
-                            session.last_img_pil = pil_img
-                            if save_tmp_path:
-                                Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
-                                pil_img.save(save_tmp_path, format="PNG")
-                        else:
-                            session.last_img_pil = None
-                    else:
-                        with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
-                            pil_img = self.pipeline._decode_image_from_latent(
-                                self.pipeline.bagel, self.pipeline.vae, latents[0], img_shape
-                            )
-                        if isinstance(pil_img, (list, tuple)) and pil_img:
-                            pil_img = pil_img[0]
-                        session.last_img_pil = pil_img
-                        session.last_img_u8 = None
-                        if save_tmp_path:
-                            Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
-                            pil_img.save(save_tmp_path, format="PNG")
+                    # Phase 2: FLUX VAE decode outside `generation_session` (bounded OOM retry reuses `latents`!).
+                    for vae_attempt in range(max_dit_oom_retries + 1):
+                        try:
+                            ev0 = torch.cuda.Event(enable_timing=True) if is_cuda else None
+                            ev1 = torch.cuda.Event(enable_timing=True) if is_cuda else None
+                            t_vd0 = time.perf_counter()
+                            if ev0 is not None:
+                                ev0.record(torch.cuda.current_stream(self.device))
+                            if self.policy.use_module3_cow_loopback:
+                                with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
+                                    img_u8 = decode_latent_to_u8_gpu(
+                                        self.pipeline.bagel, self.pipeline.vae, latents[0], img_shape
+                                    )
+                                if ev1 is not None:
+                                    ev1.record(torch.cuda.current_stream(self.device))
+                                vae_decode_wall_ms = (time.perf_counter() - t_vd0) * 1000.0
+                                vae_decode_ev_pair = (ev0, ev1) if (ev0 is not None and ev1 is not None) else None
+                                session.last_img_u8 = img_u8
+                                if want_pil or save_tmp_path:
+                                    pil_img = Image.fromarray(img_u8.permute(1, 2, 0).contiguous().cpu().numpy())
+                                    session.last_img_pil = pil_img
+                                    if save_tmp_path:
+                                        Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+                                        pil_img.save(save_tmp_path, format="PNG")
+                                else:
+                                    session.last_img_pil = None
+                            else:
+                                with torch.autocast(device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16):
+                                    pil_img = self.pipeline._decode_image_from_latent(
+                                        self.pipeline.bagel, self.pipeline.vae, latents[0], img_shape
+                                    )
+                                if ev1 is not None:
+                                    ev1.record(torch.cuda.current_stream(self.device))
+                                vae_decode_wall_ms = (time.perf_counter() - t_vd0) * 1000.0
+                                vae_decode_ev_pair = (ev0, ev1) if (ev0 is not None and ev1 is not None) else None
+                                if isinstance(pil_img, (list, tuple)) and pil_img:
+                                    pil_img = pil_img[0]
+                                session.last_img_pil = pil_img
+                                session.last_img_u8 = None
+                                if save_tmp_path:
+                                    Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
+                                    pil_img.save(save_tmp_path, format="PNG")
+                            break
+                        except BaseException as exc:
+                            if vae_attempt < max_dit_oom_retries and is_oom_exception(exc):
+                                self._update_hwm()
+                                freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                if is_cuda:
+                                    gc.collect()
+                                    torch.cuda.empty_cache()
+                                if freed > 0:
+                                    continue
+                            raise
             finally:
-                if self.naive_offloader is not None:
-                    self.naive_offloader.drop_from_gpu()
+                if is_cuda:
+                    try:
+                        torch.cuda.current_stream(self.device).synchronize()
+                    except Exception:
+                        pass
+                # Always record peak HBM BEFORE dropping offloaded expert weights / emptying cache!
+                self._update_hwm()
+                self._release_naive_hold(ctx_id)
 
-            if is_cuda:
-                torch.cuda.current_stream(self.device).synchronize()
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            if vae_decode_ev_pair is not None:
+                try:
+                    vae_ms += float(vae_decode_ev_pair[0].elapsed_time(vae_decode_ev_pair[1]))
+                except Exception:
+                    vae_ms += vae_decode_wall_ms
+            else:
+                vae_ms += vae_decode_wall_ms
+
+            if vmm_st0 is not None and self.vmm is not None:
+                vmm_st1 = self.vmm.stats_dict()
+                d_map_us = max(0.0, float(vmm_st1.get("expert_map_us", 0.0)) - float(vmm_st0.get("expert_map_us", 0.0)))
+                d_sub_us = max(
+                    0.0,
+                    float(vmm_st1.get("expert_h2d_submit_us", 0.0)) - float(vmm_st0.get("expert_h2d_submit_us", 0.0)),
+                )
+                d_wait_us = max(
+                    0.0,
+                    float(vmm_st1.get("expert_wait_us", 0.0)) - float(vmm_st0.get("expert_wait_us", 0.0)),
+                )
+                h2d_weight_ms += (d_map_us + d_sub_us + d_wait_us) / 1000.0
+
             self._update_hwm()
             return {
                 "status": "ok",
                 "ctx_id": ctx_id,
                 "elapsed_ms": round(elapsed_ms, 2),
+                "h2d_weight_ms": round(h2d_weight_ms, 2),
+                "vae_ms": round(vae_ms, 2),
+                "preempt_yield_ms": round(preempt_yield_ms, 2),
                 "kv_bytes": session.logical_bytes(),
                 "resident_alpha": self.resident_alpha(),
                 "kv_free_bytes": self.available_kv_bytes(),
-                "yield_count": preempt_session.yield_count,
+                "yield_count": total_yield_count,
             }
 
     def pack_state(self, ctx_id: str, include_cfg_dup: bool = False) -> PackedTransferState:
@@ -1909,9 +2218,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
     def unpack_state(self, new_ctx_id: str, meta: dict[str, Any], raw_payload: Any) -> int:
         self.release_context(new_ctx_id)
+        allow_auto_swap = self._auto_idle_kv_swap_enabled()
         with self._pinned_ctx(new_ctx_id):
             est_b = int(meta.get("logical_bytes", meta.get("total_bytes", 0)))
-            if est_b > 0 and self.available_kv_bytes() < est_b + 512 * MIB:
+            if allow_auto_swap and est_b > 0 and self.available_kv_bytes() < est_b + 512 * MIB:
                 self.evict_idle_kv_to_host(est_b + 512 * MIB, exclude_ctx_ids=(new_ctx_id,))
             main_factory = self._main_cache_factory()
             aux_factory = self._aux_cache_factory()
@@ -1924,7 +2234,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     use_cow_rebind=self.policy.use_module3_cow_loopback,
                 )
             except BaseException as exc:
-                if is_oom_exception(exc) and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(new_ctx_id,)) > 0:
+                if (
+                    allow_auto_swap
+                    and is_oom_exception(exc)
+                    and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(new_ctx_id,)) > 0
+                ):
                     session = unpack_bagel_multi_context(
                         meta,
                         raw_payload,
@@ -1945,13 +2259,24 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
         self._active_ctx_pins.pop(ctx_id, None)
         self._ctx_last_used_s.pop(ctx_id, None)
+        self._pending_h2d_weight_ms.pop(ctx_id, None)
+        self._pending_vae_encode_ms.pop(ctx_id, None)
+        if ctx_id in self._naive_offload_held_ctx_ids:
+            self._release_naive_hold(ctx_id)
         old = self._ctx_store.pop(ctx_id, None)
         if old is not None:
             freed_host_b = old.close()
             if freed_host_b > 0:
                 self._kv_host_pinned_bytes = max(0, self._kv_host_pinned_bytes - freed_host_b)
         if self.vmm is None and torch.cuda.is_available():
+            self._update_hwm()
             torch.cuda.empty_cache()
+
+    def reset_for_new_suite(self) -> float:
+        self._pending_h2d_weight_ms.clear()
+        self._pending_vae_encode_ms.clear()
+        self._release_naive_hold(force=True)
+        return super().reset_for_new_suite()
 
     def memory_and_vmm_stats(self) -> dict[str, Any]:
         stats = super().memory_and_vmm_stats()
@@ -1964,6 +2289,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
     def close(self) -> None:
         import torch
 
+        self._stop_nvml_poller()
+        self._pending_h2d_weight_ms.clear()
+        self._pending_vae_encode_ms.clear()
+        self._release_naive_hold(force=True)
         for cid in list(self._ctx_store.keys()):
             self.release_context(cid)
         self.interceptor.uninstall()

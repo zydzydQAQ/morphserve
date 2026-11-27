@@ -35,6 +35,7 @@ from morphserve.bench.interleaved_bench import (
 )
 from morphserve.engine.config import (
     EnginePolicyConfig,
+    MAIN_QPS_POLICIES,
     RunWindowOptions,
     VALID_POLICIES,
     build_ablation_configs,
@@ -47,26 +48,16 @@ DEFAULT_SKEW_SESSIONS = 80
 
 DEFAULT_ARRIVAL_DURATION_S = 240.0
 DEFAULT_WARMUP_S = 60.0
-DEFAULT_STEADY_S = 180.0
+DEFAULT_STEADY_S = 150.0
+DEFAULT_COOLDOWN_S = 30.0
 DEFAULT_MIN_SESSIONS = 40
 
 DEFAULT_SUITE_A_QPS = (0.15, 0.30, 0.50, 0.80, 1.10)
 DEFAULT_LOWQPS_POINTS = (0.05, 0.10, 0.15, 0.25, 0.40, 0.80)
-DEFAULT_THINK_TIME_POLICIES = (
-    "morphserve",
-    "monolithic_dp",
-    "prism_tetriserve_coloc",
-    "static_nccl_fission",
-)
+DEFAULT_THINK_TIME_POLICIES = MAIN_QPS_POLICIES
 DEFAULT_THINK_TIMES_S = (0.0, 5.0, 20.0, 60.0)
-DEFAULT_PHASE_SHIFT_POLICIES = (
-    "morphserve",
-    "monolithic_dp",
-    "prism_tetriserve_coloc",
-    "static_nccl_fission",
-    "static_2und_6gen",
-    "static_6und_2gen",
-)
+DEFAULT_PHASE_SHIFT_POLICIES = (*MAIN_QPS_POLICIES, "static_2und_6gen", "static_6und_2gen")
+SINGLE_POINT_REFERENCE_POLICIES = ("twostage_shm", "naive_host_offload")
 
 
 def stratify_suite(suite: WorkloadSuite, max_sessions: int) -> WorkloadSuite:
@@ -168,6 +159,7 @@ def _v2_time_window_policy_overrides(
     *,
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
+    cooldown_s: float = DEFAULT_COOLDOWN_S,
     think_range: tuple[float, float] = (2.0, 25.0),
     think_dist: str = "lognormal",
     think_median_s: float = 6.0,
@@ -182,6 +174,7 @@ def _v2_time_window_policy_overrides(
         "steady_window_mode": "time",
         "warmup_window_s": float(warmup_s),
         "steady_window_s": float(steady_s),
+        "cooldown_s": float(cooldown_s),
     }
 
 
@@ -225,14 +218,15 @@ def run_suite_a_qps_and_ablations(
     arrival_duration_s: float = DEFAULT_ARRIVAL_DURATION_S,
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
+    cooldown_s: float = DEFAULT_COOLDOWN_S,
     qps_points: tuple[float, ...] = DEFAULT_SUITE_A_QPS,
     ablation_qps: float = 0.80,
-    policies: tuple[str, ...] = VALID_POLICIES,
+    policies: tuple[str, ...] = MAIN_QPS_POLICIES,
     *,
     engine_factory: Callable[..., Any] | None = None,
     fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
-    """Suite A (1x8 GPUs): Interleaved-Bench v2 240s time-windowed QPS sweep + LOO M1-M4 ablations."""
+    """Suite A (1x8 GPUs): Interleaved-Bench v2 240s time-windowed QPS sweep + LOO M1-M4 ablations & refs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     raw_main = load_main_mix_suite(bench_root)
 
@@ -252,6 +246,7 @@ def run_suite_a_qps_and_ablations(
             max_sessions=max_sessions,
             warmup_s=warmup_s,
             steady_s=steady_s,
+            cooldown_s=cooldown_s,
         )
     ablation_suite = suites_by_qps.get(float(ablation_qps)) or build_time_window_suite(
         raw_main,
@@ -263,9 +258,10 @@ def run_suite_a_qps_and_ablations(
         max_sessions=max_sessions,
         warmup_s=warmup_s,
         steady_s=steady_s,
+        cooldown_s=cooldown_s,
     )
 
-    v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
+    v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s, cooldown_s=cooldown_s)
     runner = BenchmarkRunner(
         model_dir=model_dir,
         bench_root=bench_root,
@@ -285,6 +281,7 @@ def run_suite_a_qps_and_ablations(
                     steady_window_mode="time",
                     warmup_window_s=float(suites_by_qps[float(qps)].warmup_s),
                     steady_window_s=effective_steady_window_s(suites_by_qps[float(qps)]),
+                    cooldown_s=float(suites_by_qps[float(qps)].cooldown_s),
                 ),
             )
             for qps in qps_points
@@ -321,13 +318,25 @@ def run_suite_a_qps_and_ablations(
     ab_ov = _v2_time_window_policy_overrides(
         warmup_s=float(ablation_suite.warmup_s),
         steady_s=effective_steady_window_s(ablation_suite),
+        cooldown_s=float(ablation_suite.cooldown_s),
     )
     ab_run_opts = RunWindowOptions(
         steady_window_mode="time",
         warmup_window_s=float(ablation_suite.warmup_s),
         steady_window_s=effective_steady_window_s(ablation_suite),
+        cooldown_s=float(ablation_suite.cooldown_s),
     )
-    for ab_name, ab_cfg in build_ablation_configs(num_gpus=num_gpus, **ab_ov):
+    ablation_specs: list[tuple[str, EnginePolicyConfig]] = list(
+        build_ablation_configs(num_gpus=num_gpus, **ab_ov)
+    )
+    seen_ab_names = {name for name, _ in ablation_specs}
+    for ref_preset in SINGLE_POINT_REFERENCE_POLICIES:
+        if ref_preset not in seen_ab_names:
+            ablation_specs.append(
+                (ref_preset, EnginePolicyConfig.from_preset(ref_preset, num_gpus=num_gpus, **ab_ov))
+            )
+
+    for ab_name, ab_cfg in ablation_specs:
         def _log_ab(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _ab_name: str = ab_name) -> None:
             errs = compact.get("error_samples") or ()
             print(
@@ -378,11 +387,13 @@ def run_suite_a_qps_and_ablations(
         "arrival_duration_s": float(arrival_duration_s),
         "warmup_s": float(warmup_s),
         "steady_s": float(steady_s),
+        "cooldown_s": float(cooldown_s),
         "min_sessions": int(min_sessions),
         "max_sessions_cap": max_sessions,
         "sessions_by_qps": {str(q): len(suites_by_qps[float(q)].sessions) for q in qps_points},
         "ablation_sessions_per_point": len(ablation_suite.sessions),
         "ablation_design": "leave_one_out_vs_full_morphserve",
+        "single_point_references": list(SINGLE_POINT_REFERENCE_POLICIES),
         "think_time_config": {
             "dist": v2_ov["think_time_dist"],
             "range_s": list(v2_ov["inter_turn_think_s_range"]),
@@ -412,9 +423,10 @@ def run_suite_a_lowqps_and_cdf(
     arrival_duration_s: float = DEFAULT_ARRIVAL_DURATION_S,
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
+    cooldown_s: float = DEFAULT_COOLDOWN_S,
     min_sessions: int = DEFAULT_MIN_SESSIONS,
     max_sessions: int | None = None,
-    policies: tuple[str, ...] = VALID_POLICIES,
+    policies: tuple[str, ...] = MAIN_QPS_POLICIES,
     merge_suite_a_report: Path | None = None,
     *,
     engine_factory: Callable[..., Any] | None = None,
@@ -441,9 +453,10 @@ def run_suite_a_lowqps_and_cdf(
             max_sessions=max_sessions,
             warmup_s=warmup_s,
             steady_s=steady_s,
+            cooldown_s=cooldown_s,
         )
 
-    v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
+    v2_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s, cooldown_s=cooldown_s)
     runner = BenchmarkRunner(
         model_dir=model_dir,
         bench_root=bench_root,
@@ -462,6 +475,7 @@ def run_suite_a_lowqps_and_cdf(
                     steady_window_mode="time",
                     warmup_window_s=float(suites_by_qps[float(qps)].warmup_s),
                     steady_window_s=effective_steady_window_s(suites_by_qps[float(qps)]),
+                    cooldown_s=float(suites_by_qps[float(qps)].cooldown_s),
                 ),
             )
             for qps in qps_points
@@ -511,6 +525,7 @@ def run_suite_a_lowqps_and_cdf(
         "arrival_duration_s": float(arrival_duration_s),
         "warmup_s": float(warmup_s),
         "steady_s": float(steady_s),
+        "cooldown_s": float(cooldown_s),
         "min_sessions": int(min_sessions),
         "sessions_by_qps": {str(q): len(suites_by_qps[float(q)].sessions) for q in qps_points},
         "qps_points": [float(q) for q in qps_points],
@@ -534,6 +549,7 @@ def run_think_time_sweep(
     arrival_duration_s: float = DEFAULT_ARRIVAL_DURATION_S,
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
+    cooldown_s: float = DEFAULT_COOLDOWN_S,
     min_sessions: int = DEFAULT_MIN_SESSIONS,
     max_sessions: int | None = None,
     policies: tuple[str, ...] = DEFAULT_THINK_TIME_POLICIES,
@@ -559,6 +575,7 @@ def run_think_time_sweep(
         max_sessions=max_sessions,
         warmup_s=warmup_s,
         steady_s=steady_s,
+        cooldown_s=cooldown_s,
     )
     eff_steady_s = effective_steady_window_s(window_suite)
 
@@ -576,6 +593,7 @@ def run_think_time_sweep(
         init_ov = _v2_time_window_policy_overrides(
             warmup_s=float(window_suite.warmup_s),
             steady_s=eff_steady_s,
+            cooldown_s=float(window_suite.cooldown_s),
             think_range=(0.0, 0.0),
             think_dist="constant",
             think_median_s=0.0,
@@ -594,6 +612,7 @@ def run_think_time_sweep(
                     steady_window_mode="time",
                     warmup_window_s=float(window_suite.warmup_s),
                     steady_window_s=eff_steady_s,
+                    cooldown_s=float(window_suite.cooldown_s),
                 ),
                 extra_fields={"think_time_s": max(0.0, float(t_think))},
             )
@@ -646,7 +665,8 @@ def run_think_time_sweep(
         "offered_qps": float(offered_qps),
         "arrival_duration_s": float(window_suite.arrival_duration_s),
         "warmup_s": float(window_suite.warmup_s),
-        "steady_s": float(window_suite.steady_s),
+        "steady_s": eff_steady_s,
+        "cooldown_s": float(window_suite.cooldown_s),
         "num_sessions": len(window_suite.sessions),
         "think_times_s": [float(t) for t in think_times_s],
         "policies": list(policies),
@@ -670,11 +690,12 @@ def run_suite_b_skews_and_parity(
     include_static_skews: bool = False,
     skew_sessions: int = DEFAULT_SKEW_SESSIONS,
     skew_qps: float = 0.80,
-    policies: tuple[str, ...] = VALID_POLICIES,
+    policies: tuple[str, ...] = MAIN_QPS_POLICIES,
     allow_eval_download: bool = False,
     arrival_duration_s: float = DEFAULT_ARRIVAL_DURATION_S,
     warmup_s: float = DEFAULT_WARMUP_S,
     steady_s: float = DEFAULT_STEADY_S,
+    cooldown_s: float = DEFAULT_COOLDOWN_S,
     min_sessions: int = DEFAULT_MIN_SESSIONS,
     *,
     engine_factory: Callable[..., Any] | None = None,
@@ -706,6 +727,7 @@ def run_suite_b_skews_and_parity(
     phase_ov = _v2_time_window_policy_overrides(
         warmup_s=float(phase_suite.warmup_s),
         steady_s=float(phase_suite.steady_s),
+        cooldown_s=float(getattr(phase_suite, "cooldown_s", 0.0)),
     )
 
     phase_shift_results: list[dict[str, Any]] = []
@@ -760,11 +782,12 @@ def run_suite_b_skews_and_parity(
                     max_sessions=skew_sessions if skew_sessions > 0 else None,
                     warmup_s=warmup_s,
                     steady_s=steady_s,
+                    cooldown_s=cooldown_s,
                 ),
             )
             for tag, rel in skew_files
         ]
-        sk_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s)
+        sk_ov = _v2_time_window_policy_overrides(warmup_s=warmup_s, steady_s=steady_s, cooldown_s=cooldown_s)
         for preset in policies:
             policy = EnginePolicyConfig.from_preset(preset, num_gpus=num_gpus, **sk_ov)
             sk_specs = [
@@ -774,7 +797,8 @@ def run_suite_b_skews_and_parity(
                     run_options=RunWindowOptions(
                         steady_window_mode="time",
                         warmup_window_s=float(sk_suite.warmup_s),
-                        steady_window_s=float(sk_suite.steady_s),
+                        steady_window_s=effective_steady_window_s(sk_suite),
+                        cooldown_s=float(sk_suite.cooldown_s),
                     ),
                     extra_fields={"skew_tag": skew_tag},
                 )
@@ -997,6 +1021,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--arrival-duration-s", type=float, default=DEFAULT_ARRIVAL_DURATION_S)
     parser.add_argument("--warmup-s", type=float, default=DEFAULT_WARMUP_S)
     parser.add_argument("--steady-s", type=float, default=DEFAULT_STEADY_S)
+    parser.add_argument("--cooldown-s", type=float, default=DEFAULT_COOLDOWN_S)
     parser.add_argument("--min-sessions", type=int, default=DEFAULT_MIN_SESSIONS)
     parser.add_argument("--max-sessions", type=int, default=None)
     parser.add_argument("--qps-points", type=str, default=None)
@@ -1030,9 +1055,10 @@ def main(argv: list[str] | None = None) -> int:
             arrival_duration_s=args.arrival_duration_s,
             warmup_s=args.warmup_s,
             steady_s=args.steady_s,
+            cooldown_s=args.cooldown_s,
             qps_points=parsed_qps or DEFAULT_SUITE_A_QPS,
             ablation_qps=args.ablation_qps,
-            policies=parsed_policies or VALID_POLICIES,
+            policies=parsed_policies or MAIN_QPS_POLICIES,
         )
     elif args.mode == "suite_a_lowqps":
         rep = run_suite_a_lowqps_and_cdf(
@@ -1044,9 +1070,10 @@ def main(argv: list[str] | None = None) -> int:
             arrival_duration_s=args.arrival_duration_s,
             warmup_s=args.warmup_s,
             steady_s=args.steady_s,
+            cooldown_s=args.cooldown_s,
             min_sessions=args.min_sessions,
             max_sessions=args.max_sessions,
-            policies=parsed_policies or VALID_POLICIES,
+            policies=parsed_policies or MAIN_QPS_POLICIES,
             merge_suite_a_report=args.merge_suite_a_report,
         )
     elif args.mode == "think_time_sweep":
@@ -1064,6 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
             arrival_duration_s=args.arrival_duration_s,
             warmup_s=args.warmup_s,
             steady_s=args.steady_s,
+            cooldown_s=args.cooldown_s,
             min_sessions=args.min_sessions,
             max_sessions=args.max_sessions,
             policies=parsed_policies or DEFAULT_THINK_TIME_POLICIES,
@@ -1089,11 +1117,12 @@ def main(argv: list[str] | None = None) -> int:
             include_static_skews=args.include_static_skews,
             skew_sessions=eff_skew,
             skew_qps=args.skew_qps,
-            policies=parsed_policies or VALID_POLICIES,
+            policies=parsed_policies or MAIN_QPS_POLICIES,
             allow_eval_download=args.allow_eval_download,
             arrival_duration_s=args.arrival_duration_s,
             warmup_s=args.warmup_s,
             steady_s=args.steady_s,
+            cooldown_s=args.cooldown_s,
             min_sessions=args.min_sessions,
         )
     return 0 if rep.get("status") == "ok" else 2

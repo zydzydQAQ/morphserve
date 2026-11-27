@@ -50,7 +50,8 @@ class WorkloadSuite:
     sessions: list[InterleavedSession]
     schema: str = "morphserve.interleaved_bench.v2"
     warmup_s: float = 60.0
-    steady_s: float = 180.0
+    steady_s: float = 150.0
+    cooldown_s: float = 30.0
     arrival_duration_s: float = 240.0
     phase_schedule: list[dict[str, Any]] = field(default_factory=list)
 
@@ -63,6 +64,7 @@ class WorkloadSuite:
             "num_sessions": len(self.sessions),
             "warmup_s": float(self.warmup_s),
             "steady_s": float(self.steady_s),
+            "cooldown_s": float(self.cooldown_s),
             "arrival_duration_s": float(self.arrival_duration_s),
             "phase_schedule": [dict(p) for p in self.phase_schedule],
             "sessions": [asdict(s) for s in self.sessions],
@@ -90,7 +92,8 @@ class WorkloadSuite:
             sessions=sessions,
             schema=data.get("schema", "morphserve.interleaved_bench.v2"),
             warmup_s=float(data.get("warmup_s", 60.0)),
-            steady_s=float(data.get("steady_s", 180.0)),
+            steady_s=float(data.get("steady_s", 150.0)),
+            cooldown_s=float(data.get("cooldown_s", 30.0)),
             arrival_duration_s=float(data.get("arrival_duration_s", 240.0)),
             phase_schedule=[dict(p) for p in (data.get("phase_schedule") or [])],
         )
@@ -154,21 +157,50 @@ def hamilton_apportion(
     return counts
 
 
-def scale_arrivals_to_qps(norm_deltas: list[float], target_qps: float, count: int) -> list[float]:
-    """Convert normalized inter-arrival deltas (`mean=1.0`) into absolute arrival offsets in seconds."""
-    if count <= 0:
+def scale_arrivals_to_qps(
+    norm_deltas: list[float],
+    target_qps: float,
+    count: int,
+    *,
+    target_span_s: float | None = None,
+) -> list[float]:
+    """Re-normalize a truncated inter-arrival delta prefix into absolute arrival offsets over `[0.0, target_span]`."""
+    n = int(count)
+    if n <= 0:
         return []
+    if n == 1:
+        return [0.0]
     qps = max(float(target_qps), 1e-6)
+    eff_span = max(0.0, float(target_span_s)) if target_span_s is not None else (float(n - 1) / qps)
+    if eff_span <= 0.0:
+        return [0.0] * n
+
     deltas = norm_deltas if norm_deltas else [1.0]
+    raw_prefix = [max(0.0, float(deltas[i % len(deltas)])) for i in range(n - 1)]
+    raw_sum = sum(raw_prefix)
     offsets = [0.0]
-    for i in range(1, count):
-        d = float(deltas[(i - 1) % len(deltas)])
-        offsets.append(round(offsets[-1] + d / qps, 4))
+    if raw_sum > 0.0:
+        scale = eff_span / raw_sum
+        acc = 0.0
+        for d in raw_prefix:
+            acc += d * scale
+            offsets.append(round(min(acc, eff_span), 4))
+        offsets[-1] = round(eff_span, 4)
+    else:
+        step = eff_span / float(n - 1)
+        for i in range(1, n):
+            offsets.append(round(i * step, 4))
     return offsets
 
 
 def _is_ar_initiating_session(session: InterleavedSession) -> bool:
     """Return True for AR-initiating sessions (BurstGPT trace), False for DiT-initiating sessions (GenTD26)."""
+    if session.turns:
+        first_plan = session.turns[0].modality_plan
+        if first_plan in ("dit_edit", "dit_t2i"):
+            return False
+        if first_plan in ("ar_only", "cot_then_dit"):
+            return True
     if session.quadrant in (
         "multi_image_vqa",
         "visual_cot",
@@ -178,10 +210,6 @@ def _is_ar_initiating_session(session: InterleavedSession) -> bool:
         return True
     if session.quadrant in ("multiturn_edit", "highres_t2i"):
         return False
-    if session.turns and session.turns[0].modality_plan in ("ar_only", "cot_then_dit"):
-        return True
-    if session.turns and session.turns[0].modality_plan in ("dit_edit", "dit_t2i"):
-        return False
     return False
 
 
@@ -190,16 +218,26 @@ def assign_dual_trace_arrivals(
     burstgpt_deltas: list[float],
     gentd26_deltas: list[float],
     target_qps: float,
+    *,
+    target_span_s: float | None = None,
 ) -> list[InterleavedSession]:
-    """Assign BurstGPT offsets to AR-initiating sessions and GenTD26 offsets to DiT-initiating sessions."""
+    """Assign independently re-normalized BurstGPT (AR) and GenTD26 (DiT) offsets across `[0.0, target_span]`."""
+    if not sessions:
+        return sessions
     ar_indices = [i for i, s in enumerate(sessions) if _is_ar_initiating_session(s)]
     dit_indices = [i for i, s in enumerate(sessions) if not _is_ar_initiating_session(s)]
-    total = max(1, len(sessions))
-    ar_qps = max(1e-4, target_qps * (len(ar_indices) / float(total)))
-    dit_qps = max(1e-4, target_qps * (len(dit_indices) / float(total)))
+    total = len(sessions)
+    eff_qps = max(1e-4, float(target_qps))
+    if target_span_s is not None:
+        eff_span = max(0.0, float(target_span_s))
+    else:
+        eff_span = (float(total) / eff_qps) if total >= 2 else 0.0
 
-    ar_offs = scale_arrivals_to_qps(burstgpt_deltas, ar_qps, len(ar_indices))
-    dit_offs = scale_arrivals_to_qps(gentd26_deltas, dit_qps, len(dit_indices))
+    ar_qps = max(1e-4, eff_qps * (len(ar_indices) / float(max(1, total))))
+    dit_qps = max(1e-4, eff_qps * (len(dit_indices) / float(max(1, total))))
+
+    ar_offs = scale_arrivals_to_qps(burstgpt_deltas, ar_qps, len(ar_indices), target_span_s=eff_span)
+    dit_offs = scale_arrivals_to_qps(gentd26_deltas, dit_qps, len(dit_indices), target_span_s=eff_span)
 
     for pos, idx in enumerate(ar_indices):
         sessions[idx].arrival_offset_s = ar_offs[pos]
@@ -219,14 +257,36 @@ def build_time_window_suite(
     min_sessions: int = 40,
     max_sessions: int | None = None,
     warmup_s: float = 60.0,
-    steady_s: float = 180.0,
+    steady_s: float | None = None,
+    cooldown_s: float | None = None,
 ) -> WorkloadSuite:
-    """Build a fixed-duration time-window suite preserving quadrant proportions and assigning arrivals."""
+    """Build a fixed-duration time-window suite preserving quadrant proportions and exact arrival rate."""
     eff_qps = max(float(target_qps), 1e-4)
     eff_dur = max(0.0, float(arrival_duration_s))
-    target_n = max(int(min_sessions), int(round(eff_qps * eff_dur)))
+    raw_target_n = max(int(min_sessions), int(round(eff_qps * eff_dur)))
+    capped_by_max = False
+    target_n = raw_target_n
     if max_sessions is not None:
-        target_n = min(target_n, max(1, int(max_sessions)))
+        max_cap = max(1, int(max_sessions))
+        if max_cap < target_n:
+            target_n = max_cap
+            capped_by_max = True
+
+    if target_n >= 2:
+        target_span = (float(target_n) / eff_qps) if capped_by_max else max(eff_dur, float(target_n) / eff_qps)
+    else:
+        target_span = 0.0
+
+    eff_warmup = max(0.0, float(warmup_s))
+    if cooldown_s is not None:
+        eff_cooldown = max(0.0, float(cooldown_s))
+        eff_steady = float(steady_s) if steady_s is not None else max(1.0, target_span - eff_warmup - eff_cooldown)
+    elif steady_s is not None:
+        eff_steady = float(steady_s)
+        eff_cooldown = max(0.0, eff_dur - eff_warmup - eff_steady)
+    else:
+        eff_cooldown = 30.0 if target_span > eff_warmup + 30.0 else 0.0
+        eff_steady = max(1.0, target_span - eff_warmup - eff_cooldown)
 
     if not base_suite.sessions or target_n <= 0:
         return WorkloadSuite(
@@ -235,9 +295,10 @@ def build_time_window_suite(
             base_qps=eff_qps,
             sessions=[],
             schema="morphserve.interleaved_bench.v2",
-            warmup_s=float(warmup_s),
-            steady_s=float(steady_s),
-            arrival_duration_s=float(arrival_duration_s),
+            warmup_s=eff_warmup,
+            steady_s=round(eff_steady, 3),
+            cooldown_s=round(eff_cooldown, 3),
+            arrival_duration_s=round(target_span, 3) if target_span > 0.0 else float(arrival_duration_s),
             phase_schedule=[dict(p) for p in base_suite.phase_schedule],
         )
 
@@ -279,10 +340,17 @@ def build_time_window_suite(
         expanded.append(cloned)
 
     if burstgpt_deltas and gentd26_deltas:
-        assign_dual_trace_arrivals(expanded, burstgpt_deltas, gentd26_deltas, target_qps=eff_qps)
+        assign_dual_trace_arrivals(
+            expanded,
+            burstgpt_deltas,
+            gentd26_deltas,
+            target_qps=eff_qps,
+            target_span_s=target_span,
+        )
     else:
+        step = (target_span / float(len(expanded) - 1)) if len(expanded) > 1 else 0.0
         for idx_s, s_item in enumerate(expanded):
-            s_item.arrival_offset_s = round(idx_s / eff_qps, 4)
+            s_item.arrival_offset_s = round(idx_s * step, 4)
 
     return WorkloadSuite(
         name=base_suite.name,
@@ -290,9 +358,10 @@ def build_time_window_suite(
         base_qps=eff_qps,
         sessions=expanded,
         schema="morphserve.interleaved_bench.v2",
-        warmup_s=float(warmup_s),
-        steady_s=float(steady_s),
-        arrival_duration_s=float(arrival_duration_s),
+        warmup_s=eff_warmup,
+        steady_s=round(eff_steady, 3),
+        cooldown_s=round(eff_cooldown, 3),
+        arrival_duration_s=round(target_span, 3) if target_span > 0.0 else float(arrival_duration_s),
         phase_schedule=[dict(p) for p in base_suite.phase_schedule],
     )
 

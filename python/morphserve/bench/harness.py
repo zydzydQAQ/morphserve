@@ -59,10 +59,11 @@ def load_main_mix_suite(path: str | Path) -> WorkloadSuite:
 
 
 def effective_steady_window_s(suite: WorkloadSuite) -> float:
-    """Return `suite.steady_s`, expanding to `max_arrival - warmup_s` when `min_sessions` extends a trace."""
+    """Return steady-state window duration strictly excluding leading `warmup_s` and trailing `cooldown_s`."""
     max_arr = max((float(s.arrival_offset_s) for s in suite.sessions), default=0.0)
-    span_after_warmup = max(0.0, max_arr - float(suite.warmup_s))
-    return round(max(float(suite.steady_s), span_after_warmup), 3)
+    warmup_s = max(0.0, float(suite.warmup_s))
+    cooldown_s = max(0.0, float(getattr(suite, "cooldown_s", 30.0)))
+    return round(max(1.0, max_arr - warmup_s - cooldown_s), 3)
 
 
 def parse_csv_floats(raw: str | None) -> list[float]:

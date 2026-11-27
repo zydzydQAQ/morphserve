@@ -18,20 +18,36 @@ constexpr int64_t kMiB = 1024LL * 1024LL;
 constexpr int64_t kGiB = 1024LL * 1024LL * 1024LL;
 
 struct OperatorLatencyProfile {
-    double ar_prefill_ms = 64.8;
-    double ar_tpot_ms = 62.82;
-    double prep_overhead_ms = 240.0;
-    double bagel_dit_512_step_ms = 287.0;
-    double bagel_dit_1024_step_ms = 1040.0;
-    double bagel_vae_512_ms = 140.0;
-    double bagel_vae_1024_ms = 680.0;
+    // Unified Stage-1 A100 calibrated unloaded latency truth (`results/osdi27-v2/stage1-gate/`).
+    double ar_prefill_ms = 64.80;
+    double ar_tpot_ms = 50.70;                  // module4-report.json unloaded_ar_tpot_p50_ms
+    double internvlu_ar_tpot_ms = 44.0;         // m24-internvlu-report.json unloaded AR TPOT
+    double ar_text_unloaded_ttft_ms = 125.0;    // text-only unloaded prefill + dispatch floor (2x = 250 ms)
+    double ar_img_512_unloaded_ttft_ms = 1400.0; // bagel-1gpu-smoke.json 512^2 1-image prefill (~1398.31 ms)
+    double prep_overhead_ms = 64.80;
+    double bagel_dit_512_step_ms = 242.735;     // 20*242.735 + 52.60 + 64.80 == 4972.10 ms (module1-report.json)
+    double bagel_dit_1024_step_ms = 939.804;    // 10*939.804 + 212.32 + 64.80 == 9675.16 ms (module1-report.json)
+    double bagel_vae_512_ms = 52.60;
+    double bagel_vae_1024_ms = 212.32;
     int64_t bagel_expert_bytes = 12446LL * kMiB;
-    double internvlu_dit_512_step_ms = 145.0;
-    double internvlu_dit_1024_step_ms = 420.0;
+    double internvlu_dit_512_step_ms = 145.0;   // 16-step unloaded == 2494.80 ms
+    double internvlu_dit_1024_step_ms = 420.0;  // 16-step unloaded == 7124.80 ms
     double internvlu_vae_512_ms = 110.0;
     double internvlu_vae_1024_ms = 340.0;
     int64_t internvlu_expert_bytes = 4350LL * kMiB;
 
+    double ar_tpot_ms_for(const std::string& model_family) const noexcept;
+    double unloaded_ar_ttft_ms(
+        bool has_image,
+        int num_images = 0,
+        int image_res = 512,
+        const std::string& model_family = "bagel") const noexcept;
+    double ar_ttft_slo_for(
+        bool has_image,
+        int num_images = 0,
+        int image_res = 512,
+        double k_ar = 2.0,
+        const std::string& model_family = "bagel") const noexcept;
     double step_ms(const std::string& model_family, int height) const noexcept;
     double vae_ms(const std::string& model_family, int height) const noexcept;
     int64_t expert_bytes(const std::string& model_family) const noexcept;
@@ -131,31 +147,31 @@ struct ClusterPhysicsProfile {
     int num_expert_layers = 28;
     int layer_stride_mib = 448;
     double packed_expert_data_mib = 12446.64;
-    double dit_512_20step_base_ms = 4953.31;
+    double dit_512_20step_base_ms = 4972.10;
     double dit_512_transient_mib = 1088.0;
-    double dit_1024_step_ms = 966.335;
-    double vmm_full_expert_map_ms = 11.677;
+    double dit_1024_step_ms = 967.516;
+    double vmm_full_expert_map_ms = 12.128;
 
-    double cpu_pil_prep_only_ms = 72.30;
-    double gpu_inplace_prep_only_ms = 2.487;
-    double stock_loopback_turn_ms = 896.973;
-    double morphserve_loopback_turn_ms = 796.203;
+    double cpu_pil_prep_only_ms = 71.78;
+    double gpu_inplace_prep_only_ms = 2.731;
+    double stock_loopback_turn_ms = 895.99;
+    double morphserve_loopback_turn_ms = 802.49;
     double non_cow_kv_mult = 1.9979;
     double turn_edit_512_kv_delta_mib = 325.28;
     double kv_mib_per_token = 0.05469;
-    double stock_dit_512_ms_per_kv_tok = 0.10734;
-    double morphserve_dit_512_ms_per_kv_tok = 0.095679;
+    double stock_dit_512_ms_per_kv_tok = 0.107963;
+    double morphserve_dit_512_ms_per_kv_tok = 0.097355;
 
     double ar_prefill_ms = 64.80;
-    double ar_unloaded_tpot_p50_ms = 49.91;
-    double ar_unloaded_tpot_p99_ms = 52.57;
-    double ar_batched2_step_p50_ms = 55.88;
-    double vmm_ar_kv_step_overhead_ms = 9.60;
-    double dit_512_cfg_step_mean_ms = 288.02;
-    double dit_512_layer_p50_ms = 10.26;
+    double ar_unloaded_tpot_p50_ms = 50.70;
+    double ar_unloaded_tpot_p99_ms = 55.20;
+    double ar_batched2_step_p50_ms = 57.29;
+    double vmm_ar_kv_step_overhead_ms = 1.43;
+    double dit_512_cfg_step_mean_ms = 287.61;
+    double dit_512_layer_p50_ms = 11.48;
     int m4_adaptive_chunk_layers = 4;
-    double m4_colocated_ar_tpot_p50_ms = 87.01;
-    double step_preempt_ar_tpot_p50_ms = 333.12;
+    double m4_colocated_ar_tpot_p50_ms = 80.00;
+    double step_preempt_ar_tpot_p50_ms = 339.37;
 
     double paced_h2d_per_gpu_gbps = 12.34;
     double unpaced_4gpu_half_h2d_per_gpu_gbps = 3.10;

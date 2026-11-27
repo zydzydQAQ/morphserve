@@ -29,8 +29,8 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
             {"ar_tpot_p95_mape_pct", 0.0},
             {"dit_p95_mape_pct", 0.0},
             {"max_point_error_pct", 0.0},
-            {"within_8pct_oos_gate", true},
-            {"within_5pct_gate", true},
+            {"within_8pct_oos_gate", false},
+            {"within_5pct_gate", false},
             {"per_point", nlohmann::json::array()},
         };
     }
@@ -74,6 +74,7 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
                                   "steady_window_mode",
                                   "warmup_window_s",
                                   "steady_window_s",
+                                  "cooldown_s",
                                   "steady_state_trim_frac"}) {
             if (ref.contains(opt_k) && !ref[opt_k].is_null()) {
                 ref_ov[opt_k] = ref[opt_k];
@@ -111,23 +112,19 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
         double sim_gp = 0.0;
         const bool is_canonical_ref =
             ref.contains("steady_joint_slo_goodput_rps") || ref.contains("full_trace_goodput_rps");
-        if (ref.contains("steady_turn_slo_goodput_rps") && ref["steady_turn_slo_goodput_rps"].is_number() &&
-            ref["steady_turn_slo_goodput_rps"].get<double>() > 0.0) {
+        if (ref.contains("steady_turn_slo_goodput_rps") && ref["steady_turn_slo_goodput_rps"].is_number()) {
             real_gp = ref["steady_turn_slo_goodput_rps"].get<double>();
             sim_gp = sim.at("steady_turn_slo_goodput_rps").get<double>();
         } else if (is_canonical_ref && ref.contains("joint_slo_goodput_rps") &&
-                   ref["joint_slo_goodput_rps"].is_number() &&
-                   ref["joint_slo_goodput_rps"].get<double>() > 0.0) {
+                   ref["joint_slo_goodput_rps"].is_number()) {
             real_gp = ref["joint_slo_goodput_rps"].get<double>();
             sim_gp = sim.at("joint_slo_goodput_rps").get<double>();
         } else if (ref.contains("effective_slo_throughput_rps") && ref["effective_slo_throughput_rps"].is_number() &&
-                   ref["effective_slo_throughput_rps"].get<double>() > 0.0 &&
                    ref.value("steady_state_window_mode", "") == "time") {
             real_gp = ref["effective_slo_throughput_rps"].get<double>();
             sim_gp = sim.at("joint_slo_goodput_rps").get<double>();
         } else if (!is_canonical_ref && ref.contains("joint_slo_goodput_rps") &&
-                   ref["joint_slo_goodput_rps"].is_number() &&
-                   ref["joint_slo_goodput_rps"].get<double>() > 0.0) {
+                   ref["joint_slo_goodput_rps"].is_number()) {
             // Historical pre-canonical live reports stored full-trace goodput under `joint_slo_goodput_rps`.
             real_gp = ref["joint_slo_goodput_rps"].get<double>();
             sim_gp = sim.at("full_trace_goodput_rps").get<double>();
@@ -135,31 +132,65 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
             real_gp = ref.value("steady_state_goodput_rps", 0.0);
             sim_gp = sim.at("joint_slo_goodput_rps").get<double>();
         }
-        real_gp = std::max(1e-4, real_gp);
 
-        const double sim_tp = sim.at("ar_tpot_p95_ms").get<double>();
-        const double real_tp = std::max(
-            1.0,
-            (ref.contains("ar_tpot_p95_ms") && ref["ar_tpot_p95_ms"].is_number() &&
-             ref["ar_tpot_p95_ms"].get<double>() > 0.0)
-                ? ref["ar_tpot_p95_ms"].get<double>()
-                : sim_tp);
-
-        const double sim_dt = sim.at("dit_turn_p95_ms").get<double>();
-        const double real_dt = std::max(
-            1.0,
-            (ref.contains("dit_turn_p95_ms") && ref["dit_turn_p95_ms"].is_number() &&
-             ref["dit_turn_p95_ms"].get<double>() > 0.0)
-                ? ref["dit_turn_p95_ms"].get<double>()
-                : sim_dt);
-
-        const double gp_e = std::abs(sim_gp - real_gp) / real_gp * 100.0;
-        const double tp_e = std::abs(sim_tp - real_tp) / real_tp * 100.0;
-        const double dt_e = std::abs(sim_dt - real_dt) / real_dt * 100.0;
+        double gp_e = 0.0;
+        std::string gp_status = "ok";
+        if (real_gp <= 1e-9 && sim_gp <= 1e-9) {
+            gp_e = 0.0;
+            gp_status = "both_zero_oom";
+        } else if (real_gp <= 1e-9 || sim_gp <= 1e-9) {
+            gp_e = 100.0;
+            gp_status = "oom_mismatch";
+        } else {
+            gp_e = std::abs(sim_gp - real_gp) / real_gp * 100.0;
+        }
         gp_errs.push_back(gp_e);
-        tp_errs.push_back(tp_e);
-        dt_errs.push_back(dt_e);
-        max_err = std::max({max_err, gp_e, tp_e, dt_e});
+        max_err = std::max(max_err, gp_e);
+
+        // Transparent zero-real OOM handling: NEVER overwrite real <= 0 with sim!
+        const bool has_real_tp = ref.contains("ar_tpot_p95_ms") && ref["ar_tpot_p95_ms"].is_number();
+        const double raw_real_tp = has_real_tp ? ref["ar_tpot_p95_ms"].get<double>() : 0.0;
+        const double sim_tp = sim.at("ar_tpot_p95_ms").get<double>();
+        nlohmann::json tp_err_j = nullptr;
+        std::string tp_status = "ok";
+        if (!has_real_tp) {
+            tp_status = "missing_real";
+        } else if (raw_real_tp <= 1e-9 && sim_tp <= 1e-9) {
+            tp_status = "both_zero_oom";
+        } else if (raw_real_tp <= 1e-9 || sim_tp <= 1e-9) {
+            const double tp_e = 100.0;
+            tp_errs.push_back(tp_e);
+            max_err = std::max(max_err, tp_e);
+            tp_err_j = round_2(tp_e);
+            tp_status = "oom_mismatch";
+        } else {
+            const double tp_e = std::abs(sim_tp - raw_real_tp) / raw_real_tp * 100.0;
+            tp_errs.push_back(tp_e);
+            max_err = std::max(max_err, tp_e);
+            tp_err_j = round_2(tp_e);
+        }
+
+        const bool has_real_dt = ref.contains("dit_turn_p95_ms") && ref["dit_turn_p95_ms"].is_number();
+        const double raw_real_dt = has_real_dt ? ref["dit_turn_p95_ms"].get<double>() : 0.0;
+        const double sim_dt = sim.at("dit_turn_p95_ms").get<double>();
+        nlohmann::json dt_err_j = nullptr;
+        std::string dt_status = "ok";
+        if (!has_real_dt) {
+            dt_status = "missing_real";
+        } else if (raw_real_dt <= 1e-9 && sim_dt <= 1e-9) {
+            dt_status = "both_zero_oom";
+        } else if (raw_real_dt <= 1e-9 || sim_dt <= 1e-9) {
+            const double dt_e = 100.0;
+            dt_errs.push_back(dt_e);
+            max_err = std::max(max_err, dt_e);
+            dt_err_j = round_2(dt_e);
+            dt_status = "oom_mismatch";
+        } else {
+            const double dt_e = std::abs(sim_dt - raw_real_dt) / raw_real_dt * 100.0;
+            dt_errs.push_back(dt_e);
+            max_err = std::max(max_err, dt_e);
+            dt_err_j = round_2(dt_e);
+        }
 
         per_pt.push_back({
             {"policy_name", pol},
@@ -168,14 +199,24 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
             {"real_goodput_rps", round_4(real_gp)},
             {"sim_goodput_rps", round_4(sim_gp)},
             {"goodput_err_pct", round_2(gp_e)},
-            {"ar_tpot_p95_err_pct", round_2(tp_e)},
-            {"dit_p95_err_pct", round_2(dt_e)},
+            {"goodput_status", gp_status},
+            {"real_ar_tpot_p95_ms", has_real_tp ? nlohmann::json(round_2(raw_real_tp)) : nlohmann::json(nullptr)},
+            {"sim_ar_tpot_p95_ms", round_2(sim_tp)},
+            {"ar_tpot_p95_err_pct", tp_err_j},
+            {"ar_tpot_p95_status", tp_status},
+            {"real_dit_p95_ms", has_real_dt ? nlohmann::json(round_2(raw_real_dt)) : nlohmann::json(nullptr)},
+            {"sim_dit_p95_ms", round_2(sim_dt)},
+            {"dit_p95_err_pct", dt_err_j},
+            {"dit_p95_status", dt_status},
         });
     }
 
+    const bool has_points = !per_pt.empty();
     const double mgp = round_2(mean_raw(gp_errs));
     const double mtp = round_2(mean_raw(tp_errs));
     const double mdt = round_2(mean_raw(dt_errs));
+    const bool within_8 = has_points && (mgp < 8.0) && (tp_errs.empty() || mtp < 8.0) && (dt_errs.empty() || mdt < 8.0);
+    const bool within_5 = has_points && (mgp < 5.0) && (tp_errs.empty() || mtp < 5.0) && (dt_errs.empty() || mdt < 5.0);
 
     return {
         {"reference_source", "live_cluster_out_of_sample"},
@@ -185,8 +226,8 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
         {"ar_tpot_p95_mape_pct", mtp},
         {"dit_p95_mape_pct", mdt},
         {"max_point_error_pct", round_2(max_err)},
-        {"within_8pct_oos_gate", (mgp < 8.0 && mtp < 8.0 && mdt < 8.0)},
-        {"within_5pct_gate", (mgp < 5.0 && mtp < 5.0 && mdt < 5.0)},
+        {"within_8pct_oos_gate", within_8},
+        {"within_5pct_gate", within_5},
         {"per_point", per_pt},
     };
 }

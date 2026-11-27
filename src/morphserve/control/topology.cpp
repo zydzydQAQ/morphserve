@@ -35,6 +35,37 @@ std::optional<std::filesystem::path> first_existing_file(
 
 }  // namespace
 
+double OperatorLatencyProfile::ar_tpot_ms_for(const std::string& model_family) const noexcept {
+    if (model_family == "internvl_u") {
+        return internvlu_ar_tpot_ms;
+    }
+    return ar_tpot_ms;
+}
+
+double OperatorLatencyProfile::unloaded_ar_ttft_ms(
+    bool has_image,
+    int num_images,
+    int image_res,
+    const std::string& model_family) const noexcept {
+    if (!has_image && num_images <= 0) {
+        return ar_text_unloaded_ttft_ms;
+    }
+    const int n_img = std::max(1, num_images);
+    const double res_scale = (image_res >= 1024) ? 2.0 : 1.0;
+    const double fam_scale = (model_family == "internvl_u") ? 0.70 : 1.0;
+    const double per_img_ms = std::max(0.0, ar_img_512_unloaded_ttft_ms - ar_text_unloaded_ttft_ms);
+    return ar_text_unloaded_ttft_ms + static_cast<double>(n_img) * per_img_ms * res_scale * fam_scale;
+}
+
+double OperatorLatencyProfile::ar_ttft_slo_for(
+    bool has_image,
+    int num_images,
+    int image_res,
+    double k_ar,
+    const std::string& model_family) const noexcept {
+    return round_n(k_ar * unloaded_ar_ttft_ms(has_image, num_images, image_res, model_family), 2);
+}
+
 double OperatorLatencyProfile::step_ms(const std::string& model_family, int height) const noexcept {
     const bool is_1024 = height >= 1024;
     if (model_family == "internvl_u") {
@@ -75,12 +106,16 @@ double OperatorLatencyProfile::dit_turn_slo_ms(
 std::map<std::string, double> OperatorLatencyProfile::slo_thresholds_ms(
     double k,
     const std::string& model_family) const {
+    const int steps_512 = (model_family == "internvl_u") ? 16 : 20;
     const int steps_1024 = (model_family == "internvl_u") ? 16 : 20;
     return {
         {"slo_scale_k", k},
-        {"ar_tpot_slo_ms", round_n(k * ar_tpot_ms, 2)},
+        {"ar_tpot_slo_ms", round_n(k * ar_tpot_ms_for(model_family), 2)},
         {"ar_ttft_slo_ms", round_n(750.0 * k, 2)},
-        {"dit_512_slo_ms", dit_turn_slo_ms(512, k, model_family, 20)},
+        {"ar_ttft_slo_text_ms", ar_ttft_slo_for(false, 0, 512, k, model_family)},
+        {"ar_ttft_slo_img512_ms", ar_ttft_slo_for(true, 1, 512, k, model_family)},
+        {"ar_ttft_slo_img1024_ms", ar_ttft_slo_for(true, 1, 1024, k, model_family)},
+        {"dit_512_slo_ms", dit_turn_slo_ms(512, k, model_family, steps_512)},
         {"dit_1024_slo_ms", dit_turn_slo_ms(1024, k, model_family, steps_1024)},
     };
 }
@@ -89,6 +124,9 @@ nlohmann::json OperatorLatencyProfile::to_json() const {
     return {
         {"ar_prefill_ms", ar_prefill_ms},
         {"ar_tpot_ms", ar_tpot_ms},
+        {"internvlu_ar_tpot_ms", internvlu_ar_tpot_ms},
+        {"ar_text_unloaded_ttft_ms", ar_text_unloaded_ttft_ms},
+        {"ar_img_512_unloaded_ttft_ms", ar_img_512_unloaded_ttft_ms},
         {"prep_overhead_ms", prep_overhead_ms},
         {"bagel_dit_512_step_ms", bagel_dit_512_step_ms},
         {"bagel_dit_1024_step_ms", bagel_dit_1024_step_ms},
@@ -110,6 +148,9 @@ OperatorLatencyProfile OperatorLatencyProfile::from_json(const nlohmann::json& j
     }
     p.ar_prefill_ms = j.value("ar_prefill_ms", p.ar_prefill_ms);
     p.ar_tpot_ms = j.value("ar_tpot_ms", p.ar_tpot_ms);
+    p.internvlu_ar_tpot_ms = j.value("internvlu_ar_tpot_ms", p.internvlu_ar_tpot_ms);
+    p.ar_text_unloaded_ttft_ms = j.value("ar_text_unloaded_ttft_ms", p.ar_text_unloaded_ttft_ms);
+    p.ar_img_512_unloaded_ttft_ms = j.value("ar_img_512_unloaded_ttft_ms", p.ar_img_512_unloaded_ttft_ms);
     p.prep_overhead_ms = j.value("prep_overhead_ms", p.prep_overhead_ms);
     p.bagel_dit_512_step_ms = j.value("bagel_dit_512_step_ms", p.bagel_dit_512_step_ms);
     p.bagel_dit_1024_step_ms = j.value("bagel_dit_1024_step_ms", p.bagel_dit_1024_step_ms);

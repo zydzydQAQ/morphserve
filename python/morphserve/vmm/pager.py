@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 import gc
 import math
 import threading
-from typing import Any, Callable
+import time
+from typing import Any, Callable, Iterator
 
 from .tripool import NumaMemfdMirror
 
@@ -842,30 +843,82 @@ class StaticFissionDropper:
 
 
 class NaiveHostOffloader:
-    """Baseline synchronous `.to(device)` CPU weight offloader driven by `ExpertPartitionSpec`."""
+    """Baseline pinned-CPU async H2D/D2H weight offloader driven by `ExpertPartitionSpec`.
+
+    Upgrades host staging buffers to pinned CPU memory (`pin_memory=True` when CUDA is available)
+    with asynchronous `non_blocking=True` transfers and explicit stream synchronization, plus a
+    reference-counted `hold_resident()` guard so multi-stage turns (`prepare_turn` -> `generate_dit`)
+    do not offload and reload the full secondary expert twice within a single turn.
+    """
 
     def __init__(self, spec: ExpertPartitionSpec, device: Any) -> None:
         self.spec = spec
         self.device = device
         self._cpu_shadows: list[tuple[Any, Any]] = []
-        self._resident_on_gpu = True
+        self._resident_on_gpu: bool = True
+        self._hold_depth: int = 0
+        self._pinned_host: bool = False
+        self.swap_in_count: int = 0
+        self.last_h2d_ms: float = 0.0
+        self.total_h2d_ms: float = 0.0
+
+    @property
+    def is_resident(self) -> bool:
+        return self._resident_on_gpu
+
+    @property
+    def is_pinned_host(self) -> bool:
+        return self._pinned_host
+
+    @property
+    def hold_depth(self) -> int:
+        return self._hold_depth
+
+    def _is_cuda_device(self) -> bool:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        dev_type = getattr(self.device, "type", None)
+        if dev_type is not None:
+            return str(dev_type) == "cuda"
+        return str(self.device).startswith("cuda")
 
     def offload_to_cpu(self) -> int:
         import torch
 
+        is_cuda = self._is_cuda_device()
         moved_bytes = 0
         self._cpu_shadows.clear()
+        pinned_all = is_cuda
+        params_to_empty: list[Any] = []
         for plan in self.spec.plans:
             for ps in plan.params:
                 p = ps.param_ref
                 if p is not None and hasattr(p, "detach"):
-                    cpu_t = p.detach().contiguous().cpu()
+                    src = p.detach().contiguous()
+                    if is_cuda:
+                        try:
+                            cpu_t = torch.empty(src.shape, dtype=src.dtype, device="cpu", pin_memory=True)
+                            cpu_t.copy_(src, non_blocking=True)
+                        except RuntimeError:
+                            pinned_all = False
+                            cpu_t = src.cpu()
+                    else:
+                        pinned_all = False
+                        cpu_t = src.cpu().clone()
                     self._cpu_shadows.append((p, cpu_t))
-                    p.data = torch.empty(0, dtype=p.dtype, device=self.device)
+                    params_to_empty.append(p)
                     moved_bytes += ps.nbytes
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
+        for p in params_to_empty:
+            p.data = torch.empty(0, dtype=p.dtype, device=self.device)
+        self._pinned_host = bool(pinned_all and self._cpu_shadows)
         self._resident_on_gpu = False
+        self._hold_depth = 0
         gc.collect()
-        if torch.cuda.is_available():
+        if is_cuda:
             torch.cuda.empty_cache()
         return moved_bytes
 
@@ -874,24 +927,73 @@ class NaiveHostOffloader:
             return False
         import torch
 
+        is_cuda = self._is_cuda_device()
+        t0 = time.perf_counter()
         for p, cpu_t in self._cpu_shadows:
             if p.numel() == 0:
-                p.data = cpu_t.to(self.device)
-        if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
-            torch.cuda.synchronize(self.device)
+                if is_cuda:
+                    p.data = cpu_t.to(self.device, non_blocking=True)
+                else:
+                    p.data = cpu_t.to(self.device)
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self.last_h2d_ms = round(dt_ms, 3)
+        self.total_h2d_ms += dt_ms
+        self.swap_in_count += 1
         self._resident_on_gpu = True
         return True
 
-    def drop_from_gpu(self) -> None:
-        if not self._cpu_shadows:
+    def drop_from_gpu(self, *, force: bool = False) -> None:
+        if (not force) and self._hold_depth > 0:
+            return
+        if not self._cpu_shadows or not self._resident_on_gpu:
             return
         import torch
 
+        is_cuda = self._is_cuda_device()
+        if is_cuda:
+            torch.cuda.current_stream(self.device).synchronize()
         for p, _ in self._cpu_shadows:
             p.data = torch.empty(0, dtype=p.dtype, device=self.device)
         self._resident_on_gpu = False
-        if torch.cuda.is_available():
+        if is_cuda:
             torch.cuda.empty_cache()
 
+    def acquire_resident(self, *, swap_in: bool = True) -> bool:
+        """Increment residency hold refcount and swap expert weights onto GPU if not already resident."""
+        self._hold_depth += 1
+        if swap_in:
+            try:
+                return self.swap_in_sync()
+            except BaseException:
+                self._hold_depth = max(0, self._hold_depth - 1)
+                raise
+        return False
+
+    def release_resident(self, *, drop_when_zero: bool = True) -> None:
+        """Decrement residency hold refcount; drops GPU weights once refcount reaches 0."""
+        if self._hold_depth > 0:
+            self._hold_depth -= 1
+        if self._hold_depth == 0 and drop_when_zero:
+            self.drop_from_gpu()
+
+    @contextmanager
+    def hold_resident(
+        self,
+        *,
+        swap_in: bool = True,
+        drop_on_release: bool = True,
+    ) -> Iterator["NaiveHostOffloader"]:
+        """Keep expert weights resident across nested `prepare_turn` -> `generate_dit` phases."""
+        self.acquire_resident(swap_in=swap_in)
+        try:
+            yield self
+        finally:
+            self.release_resident(drop_when_zero=drop_on_release)
+
     def close(self) -> None:
+        self._hold_depth = 0
+        self._resident_on_gpu = False
+        self._pinned_host = False
         self._cpu_shadows.clear()

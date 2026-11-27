@@ -11,6 +11,7 @@ import gc
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
@@ -225,6 +226,209 @@ class CPTGModelAdapter(ABC):
         """Release VMM, pager, hooks, and contexts cleanly."""
 
 
+class _NvmlMemoryStruct(ctypes.Structure):
+    _fields_ = [
+        ("total", ctypes.c_ulonglong),
+        ("free", ctypes.c_ulonglong),
+        ("used", ctypes.c_ulonglong),
+    ]
+
+
+class _NvmlUtilizationStruct(ctypes.Structure):
+    _fields_ = [
+        ("gpu", ctypes.c_uint),
+        ("memory", ctypes.c_uint),
+    ]
+
+
+class _GpuNvmlPoller:
+    """Lightweight background NVML poller tracking true peak HBM (`MiB`) and SM utilization (`%`)."""
+
+    def __init__(self, device: Any, rank: int = 0, interval_s: float = 0.075) -> None:
+        self.device = device
+        self.rank = int(rank)
+        self.interval_s = max(0.025, float(interval_s))
+        self._lock = threading.Lock()
+        self._stop_ev = threading.Event()
+        self._thread: threading.Thread | None = None
+
+        self._backend: str = "none"
+        self._pynvml: Any = None
+        self._nvml_lib: Any = None
+        self._nvml_handle: Any = None
+
+        self._peak_used_mib: float = 0.0
+        self._sm_util_sum: float = 0.0
+        self._sm_util_samples: int = 0
+
+        self._init_backend()
+
+    def _resolve_device_selector(self) -> tuple[str, int | str]:
+        dev_idx = getattr(self.device, "index", None)
+        logical_idx = int(dev_idx) if dev_idx is not None else int(self.rank)
+        raw_vis = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if raw_vis:
+            entries = [tok.strip() for tok in raw_vis.split(",") if tok.strip()]
+            if 0 <= logical_idx < len(entries):
+                entry = entries[logical_idx]
+                if entry.startswith("GPU-") or entry.startswith("MIG-"):
+                    return ("uuid", entry)
+                try:
+                    return ("index", int(entry))
+                except ValueError:
+                    pass
+        return ("index", max(0, logical_idx))
+
+    def _init_backend(self) -> None:
+        kind, selector = self._resolve_device_selector()
+
+        # 1. Preferred: `pynvml` (`nvidia-ml-py`)
+        try:
+            import pynvml  # type: ignore
+
+            pynvml.nvmlInit()
+            if kind == "uuid":
+                handle = pynvml.nvmlDeviceGetHandleByUUID(str(selector).encode("utf-8"))
+            else:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(int(selector))
+            self._pynvml = pynvml
+            self._nvml_handle = handle
+            self._backend = "pynvml"
+            return
+        except Exception:
+            pass
+
+        # 2. Zero-dependency Linux driver library via `ctypes`: `libnvidia-ml.so.1`
+        try:
+            lib = ctypes.CDLL("libnvidia-ml.so.1")
+            init_fn = getattr(lib, "nvmlInit_v2", getattr(lib, "nvmlInit", None))
+            if init_fn is not None and int(init_fn()) == 0:
+                handle = ctypes.c_void_p()
+                rc = -1
+                if kind == "uuid":
+                    by_uuid = getattr(lib, "nvmlDeviceGetHandleByUUID", None)
+                    if by_uuid is not None:
+                        by_uuid.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p)]
+                        by_uuid.restype = ctypes.c_int
+                        rc = int(by_uuid(str(selector).encode("utf-8"), ctypes.byref(handle)))
+                else:
+                    by_idx = getattr(
+                        lib, "nvmlDeviceGetHandleByIndex_v2", getattr(lib, "nvmlDeviceGetHandleByIndex", None)
+                    )
+                    if by_idx is not None:
+                        by_idx.argtypes = [ctypes.c_uint, ctypes.POINTER(ctypes.c_void_p)]
+                        by_idx.restype = ctypes.c_int
+                        rc = int(by_idx(ctypes.c_uint(int(selector)), ctypes.byref(handle)))
+                if rc == 0 and handle.value:
+                    mem_fn = lib.nvmlDeviceGetMemoryInfo
+                    mem_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NvmlMemoryStruct)]
+                    mem_fn.restype = ctypes.c_int
+                    util_fn = getattr(lib, "nvmlDeviceGetUtilizationRates", None)
+                    if util_fn is not None:
+                        util_fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(_NvmlUtilizationStruct)]
+                        util_fn.restype = ctypes.c_int
+                    self._nvml_lib = lib
+                    self._nvml_handle = handle
+                    self._backend = "ctypes_nvml"
+                    return
+        except Exception:
+            pass
+
+        # 3. Fallback: CUDA driver `mem_get_info` (memory only; avoids CUDA context contention if NVML exists)
+        self._backend = "cuda_mem_info"
+
+    def _query_raw(self) -> tuple[float, float | None]:
+        if self._backend == "pynvml" and self._pynvml is not None and self._nvml_handle is not None:
+            try:
+                mem = self._pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                used_mib = float(mem.used) / MIB
+            except Exception:
+                used_mib = 0.0
+            sm_pct: float | None = None
+            try:
+                util = self._pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                sm_pct = float(util.gpu)
+            except Exception:
+                sm_pct = None
+            return used_mib, sm_pct
+
+        if self._backend == "ctypes_nvml" and self._nvml_lib is not None and self._nvml_handle is not None:
+            used_mib = 0.0
+            sm_pct = None
+            try:
+                mem_s = _NvmlMemoryStruct()
+                if int(self._nvml_lib.nvmlDeviceGetMemoryInfo(self._nvml_handle, ctypes.byref(mem_s))) == 0:
+                    used_mib = float(mem_s.used) / MIB
+            except Exception:
+                used_mib = 0.0
+            try:
+                util_fn = getattr(self._nvml_lib, "nvmlDeviceGetUtilizationRates", None)
+                if util_fn is not None:
+                    util_s = _NvmlUtilizationStruct()
+                    if int(util_fn(self._nvml_handle, ctypes.byref(util_s))) == 0:
+                        sm_pct = float(util_s.gpu)
+            except Exception:
+                sm_pct = None
+            return used_mib, sm_pct
+
+        try:
+            import torch
+
+            if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
+                free_b, total_b = torch.cuda.mem_get_info(self.device)
+                if int(total_b) > 0:
+                    return float(int(total_b) - int(free_b)) / MIB, None
+        except Exception:
+            pass
+        return 0.0, None
+
+    def sample_once(self) -> float:
+        used_mib, sm_pct = self._query_raw()
+        with self._lock:
+            if used_mib > self._peak_used_mib:
+                self._peak_used_mib = used_mib
+            if sm_pct is not None:
+                self._sm_util_sum += sm_pct
+                self._sm_util_samples += 1
+        return used_mib
+
+    def reset(self) -> float:
+        used_mib, _ = self._query_raw()
+        with self._lock:
+            self._peak_used_mib = used_mib
+            self._sm_util_sum = 0.0
+            self._sm_util_samples = 0
+        return used_mib
+
+    def snapshot(self) -> tuple[float, float, int]:
+        with self._lock:
+            mean_sm = (self._sm_util_sum / float(self._sm_util_samples)) if self._sm_util_samples > 0 else 0.0
+            return float(self._peak_used_mib), float(mean_sm), int(self._sm_util_samples)
+
+    def _run_loop(self) -> None:
+        while not self._stop_ev.wait(self.interval_s):
+            self.sample_once()
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_ev.clear()
+        self.sample_once()
+        self._thread = threading.Thread(
+            target=self._run_loop,
+            name=f"ms-nvml-poller-r{self.rank}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_ev.set()
+        thr = self._thread
+        self._thread = None
+        if thr is not None and thr.is_alive():
+            thr.join(timeout=1.0)
+
+
 class GpuCPTGAdapterMixin(CPTGModelAdapter):
     """Shared GPU lifecycle, HWM/VMM accounting, and 3-way expert partition binding for production adapters."""
 
@@ -242,6 +446,9 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
     _max_reserved_mib: float
     _max_driver_used_mib: float
     _max_pytorch_reserved_mib: float
+    _nvml_poller: _GpuNvmlPoller | None
+    _nvml_sm_util_mean_pct: float
+    _nvml_sm_util_samples: int
 
     def _init_gpu_lifecycle_state(self) -> None:
         self.pager = None
@@ -254,6 +461,34 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         self._max_reserved_mib = 0.0
         self._max_driver_used_mib = 0.0
         self._max_pytorch_reserved_mib = 0.0
+        self._nvml_poller = None
+        self._nvml_sm_util_mean_pct = 0.0
+        self._nvml_sm_util_samples = 0
+
+    def _ensure_nvml_poller(self) -> _GpuNvmlPoller | None:
+        import torch
+
+        if not torch.cuda.is_available() or getattr(self.device, "type", "cuda") != "cuda":
+            return None
+        if self._nvml_poller is None:
+            self._nvml_poller = _GpuNvmlPoller(self.device, rank=self.rank, interval_s=0.075)
+        self._nvml_poller.start()
+        return self._nvml_poller
+
+    def _stop_nvml_poller(self) -> None:
+        poller = getattr(self, "_nvml_poller", None)
+        if poller is None:
+            return
+        try:
+            pk, sm_mean, sm_n = poller.snapshot()
+            self._max_driver_used_mib = max(self._max_driver_used_mib, pk)
+            self._max_reserved_mib = max(self._max_reserved_mib, pk)
+            if sm_n > 0:
+                self._nvml_sm_util_mean_pct = sm_mean
+                self._nvml_sm_util_samples = sm_n
+        finally:
+            poller.stop()
+            self._nvml_poller = None
 
     def bind_expert_partition(
         self,
@@ -263,13 +498,15 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         vae_output_cloner: Callable[[Any], Any] | None = None,
     ) -> LayerExpertPager | None:
         """Bind a secondary expert via 3-way policy dispatch (`StaticFissionDropper` / `NaiveHostOffloader` / `LayerExpertPager`)."""
-        if self.policy.routing_mode == "static_nccl_fission":
+        if self.policy.routing_mode in ("static_nccl_fission", "twostage_shm"):
             if drop_for_fission:
                 self.fission_dropper = StaticFissionDropper(spec, device=self.device)
+                self._update_hwm()
                 self.fission_dropper.drop()
             return None
         if self.policy.use_naive_offload:
             self.naive_offloader = NaiveHostOffloader(spec, device=self.device)
+            self._update_hwm()
             self.naive_offloader.offload_to_cpu()
             return None
         if self.policy.use_expert_pager:
@@ -302,10 +539,14 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             self._max_pytorch_reserved_mib = 0.0
             self._max_driver_used_mib = self._vmm_physical_pool_mib()
             self._max_reserved_mib = self._max_driver_used_mib
+            self._nvml_sm_util_mean_pct = 0.0
+            self._nvml_sm_util_samples = 0
             return
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats(self.device)
+        poller = self._ensure_nvml_poller()
+        poller_base = poller.reset() if poller is not None else 0.0
         pt_mib = float(torch.cuda.memory_reserved(self.device) / MIB)
         free_drv, total_drv = torch.cuda.mem_get_info(self.device)
         drv_used_mib = (
@@ -313,9 +554,12 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             if int(total_drv) > 0
             else (pt_mib + self._vmm_physical_pool_mib())
         )
+        base_phys = max(drv_used_mib, poller_base)
         self._max_pytorch_reserved_mib = pt_mib
-        self._max_driver_used_mib = drv_used_mib
-        self._max_reserved_mib = drv_used_mib
+        self._max_driver_used_mib = base_phys
+        self._max_reserved_mib = base_phys
+        self._nvml_sm_util_mean_pct = 0.0
+        self._nvml_sm_util_samples = 0
 
     def _update_hwm(self) -> None:
         import torch
@@ -326,18 +570,32 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         pk = float(torch.cuda.max_memory_reserved(self.device) / MIB)
         pt_peak = max(cur, pk)
         self._max_pytorch_reserved_mib = max(self._max_pytorch_reserved_mib, pt_peak)
-        # Sample instantaneous driver/NVML physical HBM (`cuMemGetInfo_v2`) so PyTorch peak at t1
-        # and VMM pool size at t2 are never double-counted across timestamps.
+        poller_peak = 0.0
+        poller = getattr(self, "_nvml_poller", None)
+        if poller is not None:
+            sample_used = poller.sample_once()
+            p_pk, sm_mean, sm_n = poller.snapshot()
+            poller_peak = max(p_pk, sample_used)
+            if sm_n > 0:
+                self._nvml_sm_util_mean_pct = sm_mean
+                self._nvml_sm_util_samples = sm_n
+        # Sample instantaneous driver/NVML physical HBM (`cuMemGetInfo_v2` + background NVML poller)
+        # so PyTorch peak at t1 and dynamic VMM pool size at t2 are never double-counted across timestamps,
+        # while transient allocator spikes (`pt_peak`) are never lost.
         free_drv, total_drv = torch.cuda.mem_get_info(self.device)
+        vmm_pool_mib = self._vmm_physical_pool_mib()
         if int(total_drv) > 0:
             drv_used_mib = float((int(total_drv) - int(free_drv)) / MIB)
             tot_mib = float(int(total_drv) / MIB)
-            inst_comb_mib = min(tot_mib, cur + self._vmm_physical_pool_mib())
-            phys_now = max(drv_used_mib, inst_comb_mib)
-            self._max_driver_used_mib = max(self._max_driver_used_mib, drv_used_mib)
+            nvml_now = min(tot_mib, max(drv_used_mib, poller_peak))
+            inst_comb_mib = min(tot_mib, cur + vmm_pool_mib)
+            phys_now = max(nvml_now, inst_comb_mib, min(tot_mib, pt_peak))
+            if self.vmm is None or not bool(getattr(self.policy, "allow_vmm_overflow", True)):
+                phys_now = max(phys_now, min(tot_mib, pt_peak + vmm_pool_mib))
+            self._max_driver_used_mib = max(self._max_driver_used_mib, nvml_now)
             self._max_reserved_mib = max(self._max_reserved_mib, phys_now)
         else:
-            self._max_reserved_mib = max(self._max_reserved_mib, cur + self._vmm_physical_pool_mib())
+            self._max_reserved_mib = max(self._max_reserved_mib, pt_peak + vmm_pool_mib)
 
     def set_residency_alpha(self, alpha: float) -> float:
         if self.pager is not None and self.vmm is not None:
@@ -357,6 +615,9 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             "peak_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "combined_physical_mib": round(self._max_reserved_mib, 2),
             "nvml_peak_used_mib": round(nvml_peak, 2),
+            "peak_nvml_used_mib": round(nvml_peak, 2),
+            "nvml_sm_util_mean_pct": round(self._nvml_sm_util_mean_pct, 2),
+            "nvml_sm_util_samples": int(self._nvml_sm_util_samples),
             "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
             "vmm_stats": vmm_st,
@@ -803,6 +1064,9 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
                 "status": "ok",
                 "ctx_id": ctx_id,
                 "elapsed_ms": round(elapsed_ms, 2),
+                "h2d_weight_ms": 0.0,
+                "vae_ms": 0.0,
+                "preempt_yield_ms": 0.0,
                 "kv_bytes": entry.logical_bytes,
                 "resident_alpha": self.resident_alpha(),
                 "kv_free_bytes": self.available_kv_bytes(),
@@ -881,6 +1145,10 @@ class SyntheticCPTGAdapter(CPTGModelAdapter):
         return {
             "peak_reserved_mib": round(self._peak_mib, 2),
             "combined_physical_mib": round(self._peak_mib + vmm_pool_mib, 2),
+            "nvml_peak_used_mib": round(self._peak_mib + vmm_pool_mib, 2),
+            "peak_nvml_used_mib": round(self._peak_mib + vmm_pool_mib, 2),
+            "nvml_sm_util_mean_pct": 0.0,
+            "nvml_sm_util_samples": 0,
             "vmm_physical_pool_mib": vmm_pool_mib,
             "vmm_stats": vmm_st,
             "active_contexts": len(self._contexts),

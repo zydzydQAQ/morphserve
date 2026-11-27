@@ -180,7 +180,7 @@ PY
 _enforce_shared_under_80pct
 export MORPHSERVE_EVAL_MODELS_DIR="${EVAL_MODELS_DIR}"
 
-# (b2) Validate / rebuild Interleaved-Bench v2 suites in ${BENCH_DIR} if not yet upgraded to v2
+# (b2) Validate / rebuild Interleaved-Bench v2 suites in ${BENCH_DIR} if missing or stale (pre-PhaseShift/BurstGPT fix)
 echo "== [Stage 1 / Step b2] Verifying Interleaved-Bench v2 suites in ${BENCH_DIR}"
 BENCH_NEEDS_V2_BUILD=0
 python3 - "${BENCH_DIR}" <<'PY' || BENCH_NEEDS_V2_BUILD=1
@@ -190,18 +190,51 @@ import sys
 
 bdir = Path(sys.argv[1])
 manifest_p = bdir / "BENCH_MANIFEST.json"
-main_p = bdir / "suites/main_mix_80.json"
+main_v2_p = bdir / "suites/main_mix_v2_80.json"
+main_p = main_v2_p if main_v2_p.is_file() else (bdir / "suites/main_mix_80.json")
 ps_p = bdir / "suites/phase_shift_360s.json"
-if not (manifest_p.is_file() and main_p.is_file() and ps_p.is_file()):
+if not (manifest_p.is_file() and main_v2_p.is_file() and ps_p.is_file()):
+    print(f"[bench_v2] missing required suite files under {bdir}; triggering rebuild", flush=True)
     raise SystemExit(1)
 man = json.loads(manifest_p.read_text(encoding="utf-8"))
 main_doc = json.loads(main_p.read_text(encoding="utf-8"))
+ps_doc = json.loads(ps_p.read_text(encoding="utf-8"))
 quads = {s.get("quadrant") for s in main_doc.get("sessions", [])}
 if "v2" not in str(man.get("schema", "")) or main_doc.get("schema") != "morphserve.interleaved_bench.v2":
+    print("[bench_v2] stale schema detected; triggering rebuild", flush=True)
     raise SystemExit(1)
 if "interleaved_co_creation" not in quads or "visual_cot_highres" not in quads:
+    print(f"[bench_v2] missing v2 quadrants ({sorted(quads)}); triggering rebuild", flush=True)
     raise SystemExit(1)
-print(f"[bench_v2] verified v2 suites in {bdir} (quadrants={sorted(quads)})", flush=True)
+if "cooldown_s" not in main_doc:
+    print("[bench_v2] main_mix_v2_80.json lacks cooldown_s; triggering rebuild", flush=True)
+    raise SystemExit(1)
+max_ar_tok = max(
+    (int(t.get("max_ar_tokens", 0)) for s in main_doc.get("sessions", []) for t in s.get("turns", [])),
+    default=0,
+)
+if max_ar_tok <= 64:
+    print(f"[bench_v2] stale max_ar_tokens={max_ar_tok} <= 64 (pre-BurstGPT fix); triggering rebuild", flush=True)
+    raise SystemExit(1)
+p2_ar_offs = [
+    float(s.get("arrival_offset_s", 0.0))
+    for s in ps_doc.get("sessions", [])
+    if s.get("phase_label") == "ar50_dit50"
+    and s.get("turns")
+    and s["turns"][0].get("modality_plan") in ("ar_only", "cot_then_dit")
+]
+p2_ar_span = (max(p2_ar_offs) - min(p2_ar_offs)) if len(p2_ar_offs) >= 2 else 0.0
+if p2_ar_span < 80.0:
+    print(
+        f"[bench_v2] stale phase_shift_360s.json Phase-2 AR arrival span={p2_ar_span:.2f}s < 80.0s; triggering rebuild",
+        flush=True,
+    )
+    raise SystemExit(1)
+print(
+    f"[bench_v2] verified fresh v2 suites in {bdir} "
+    f"(quadrants={sorted(quads)}, max_ar_tokens={max_ar_tok}, phase2_ar_span={p2_ar_span:.1f}s)",
+    flush=True,
+)
 PY
 
 if [ "${BENCH_NEEDS_V2_BUILD}" -eq 1 ]; then
@@ -680,6 +713,7 @@ gates = {
         "status": "ok" if (m3.get("status") == "ok" and m3_eval_ok) else "check_failed",
         "owlv2_backend": m3_t4.get("owlv2_backend") if isinstance(m3_t4, dict) else None,
         "clip_backend": m3_t4.get("clip_backend") if isinstance(m3_t4, dict) else None,
+        "mmvet_vqa_parity_valid": m3_t4.get("mmvet_vqa_parity_valid") if isinstance(m3_t4, dict) else None,
         "report_path": str(run_dir / "module3/module3-report.json"),
     },
     "module4_preemption": {

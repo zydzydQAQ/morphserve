@@ -67,6 +67,24 @@ void test_sim_memory_ledger() {
     ms_ledger.reclaim_empty_slabs_to_super();
     MS_CHECK(ms_ledger.active_session_count() == 0);
     MS_CHECK(ms_ledger.active_kv_mib() == 0.0);
+
+    // Fair baseline ledger parity:
+    // 1) `twostage_shm` `und` rank drops 12.4 GiB Gen weights identically to `static_nccl_fission` `und`.
+    // 2) `monolithic_kv_swap` (`use_idle_kv_swap=true`) supports idle KV eviction whereas `monolithic_dp` does not.
+    const PolicyConfig shm_pol = PolicyConfig::from_preset("twostage_shm", 8);
+    const PolicyConfig fis_pol = PolicyConfig::from_preset("static_nccl_fission", 8);
+    const PolicyConfig mono_swap_pol = PolicyConfig::from_preset("monolithic_kv_swap", 8);
+    SimGpuMemoryLedger shm_und(0, 40960.0, shm_pol, "und", 0, 28, 448, ph);
+    SimGpuMemoryLedger fis_und(0, 40960.0, fis_pol, "und", 0, 28, 448, ph);
+    MS_CHECK(std::abs(shm_und.base_weights_mib() - fis_und.base_weights_mib()) < 1e-6);
+
+    SimGpuMemoryLedger swap_ledger(0, 40960.0, mono_swap_pol, "hybrid", 28, 28, 448, ph);
+    for (int sid = 0; sid < 4; ++sid) {
+        MS_CHECK(swap_ledger.upsert_session_kv(sid, 1800.0));
+    }
+    MS_CHECK(mono_ledger.evict_idle_kv_to_host(1800.0, 0) == 0.0);
+    MS_CHECK(swap_ledger.evict_idle_kv_to_host(1800.0, 0) >= 1800.0);
+    MS_CHECK(swap_ledger.kv_host_swap_outs() >= 1);
 }
 
 void test_sim_trace_loader_helpers() {
@@ -102,9 +120,10 @@ void test_sim_trace_loader_helpers() {
         MS_CHECK(scaled[i].arrival_offset_s >= scaled[i - 1].arrival_offset_s);
     }
 
-    // Built-in canonical stream requires zero on-disk fixture files.
-    const auto built = build_sim_session_stream(12, 0.8, 8, 2026, 0, "", "", "");
-    MS_CHECK(built.size() == 12);
+    // Built-in canonical stream requires zero on-disk fixture files and normalizes arrival span to target_n / qps.
+    const auto built = build_sim_session_stream(80, 0.8, 8, 2026, 0, "", "", "");
+    MS_CHECK(built.size() == 80);
+    MS_CHECK(std::abs(built.back().arrival_ms / 1000.0 - 100.0) < 0.05);
     const auto interleaved = build_sim_session_stream(6, 0.5, 8, 2026, 0, "interleaved_co_creation", "", "");
     MS_CHECK(interleaved.size() == 6);
     MS_CHECK(interleaved[0].quadrant == "interleaved_co_creation");
@@ -176,23 +195,23 @@ void test_cot_decoupling_and_edf_controller_integration() {
         {0.0, "visual_cot_highres", {{"cot_then_dit", 512, 20, 48, 0, false}}, "solo_cot_0", "main"},
     };
 
-    // D3 timing decoupling + PreemptEdfController (guard_ms = 14.0, chunk_layers_512 = 5 on A100 1x).
+    // D3 timing decoupling + PreemptEdfController (guard_ms = 24.0 aligned with live bagel_adapter.py).
     const auto rep = ClusterSimulator::simulate_cluster_point(
         "morphserve", 8, hw0, 0.1, 1, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &cot_solo);
     MS_CHECK(rep.at("dit_turn_p50_ms").get<double>() < 6500.0);
     MS_CHECK(std::abs(rep.at("steady_turn_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
-    MS_CHECK(std::abs(rep.at("edf_guard_ms").get<double>() - 14.0) < 1e-6);
+    MS_CHECK(std::abs(rep.at("edf_guard_ms").get<double>() - 24.0) < 1e-6);
 
     const PreemptEdfController ref_edf = MorphControlEngine::make_edf_controller(
         ph.num_expert_layers,
-        125.64,
+        101.40,
         ph.dit_512_layer_p50_ms,
         ph.ar_unloaded_tpot_p50_ms + ph.vmm_ar_kv_step_overhead_ms,
         1.0);
-    MS_CHECK(ref_edf.compute_adaptive_chunk_layers() == 5);
+    MS_CHECK(ref_edf.compute_adaptive_chunk_layers() == 2);
     MS_CHECK(rep.at("edf_chunk_layers_512").get<int>() == ref_edf.compute_adaptive_chunk_layers());
 
-    // Loose AR TPOT SLO (`250.0 ms`) MUST yield `edf_chunk_layers_512 == 17 > 8` (no legacy cap of 8).
+    // Loose AR TPOT SLO (`250.0 ms`) MUST yield `edf_chunk_layers_512 == 15 > 8` (no legacy cap of 8).
     const auto rep_loose = ClusterSimulator::simulate_cluster_point(
         "morphserve",
         8,
@@ -207,7 +226,7 @@ void test_cot_decoupling_and_edf_controller_integration() {
         "",
         &cot_solo,
         {{"ar_tpot_slo_ms", 250.0}});
-    MS_CHECK(rep_loose.at("edf_chunk_layers_512").get<int>() == 17);
+    MS_CHECK(rep_loose.at("edf_chunk_layers_512").get<int>() == 15);
 }
 
 void test_canonical_schema_parity_and_internvlu_steps() {
@@ -241,19 +260,19 @@ void test_canonical_schema_parity_and_internvlu_steps() {
     MS_CHECK(rep_bagel.contains("full_trace_goodput_rps"));
     MS_CHECK(rep_bagel.contains("full_trace_joint_slo_attainment_pct"));
     MS_CHECK(std::abs(rep_bagel.at("vmm_physical_pool_mib").get<double>() - 14592.0) < 1e-6);
-    MS_CHECK(std::abs(rep_bagel.at("slo_config").at("dit_1024_slo_ms").get<double>() - 65160.0) < 1e-6);
-    MS_CHECK(std::abs(rep_bagel.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 65160.0) < 1e-6);
-    MS_CHECK(std::abs(rep_bagel.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 65160.0) < 1e-6);
+    MS_CHECK(std::abs(rep_bagel.at("slo_config").at("dit_1024_slo_ms").get<double>() - 57219.60) < 1e-6);
+    MS_CHECK(std::abs(rep_bagel.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 57219.60) < 1e-6);
+    MS_CHECK(std::abs(rep_bagel.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 57219.60) < 1e-6);
 
-    // InternVL-U (`model_family="internvl_u"`) uses 16 steps for 1024px (`dit_1024_slo_ms == 21900.0` at 3.0x).
+    // InternVL-U (`model_family="internvl_u"`) uses 16 steps for both 512px and 1024px.
     nlohmann::json ivl_ov = win_ov;
     ivl_ov["model_family"] = "internvl_u";
     const auto rep_ivl = ClusterSimulator::simulate_cluster_point(
         "morphserve", 8, hw0, 0.4, 5, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &timed_sessions, ivl_ov);
-    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_512_slo_ms").get<double>() - 9750.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_512_slo_ms").get<double>() - 7484.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
 }
 
 void test_oom_retry_and_hbm_conservation_under_pressure() {
@@ -332,6 +351,30 @@ void test_calibration_evaluate_against_real_runs_in_memory() {
     MS_CHECK(cal.at("goodput_mape_pct").get<double>() < 1e-6);
     MS_CHECK(cal.at("within_5pct_gate").get<bool>());
     MS_CHECK(cal.at("within_8pct_oos_gate").get<bool>());
+
+    // 3. Empty calibration input MUST fail OOS gate (`points_checked == 0 -> within_8pct_oos_gate == false`).
+    const auto cal_empty = ClusterSimulator::evaluate_against_real_runs(nlohmann::json::array(), ph, "", "");
+    MS_CHECK(cal_empty.at("points_checked").get<int>() == 0);
+    MS_CHECK(cal_empty.at("within_8pct_oos_gate").get<bool>() == false);
+    MS_CHECK(cal_empty.at("within_5pct_gate").get<bool>() == false);
+
+    // 4. Zero-real OOM point against healthy sim MUST NOT overwrite real with sim (100% OOM mismatch error).
+    const nlohmann::json zero_real = {
+        {"policy_name", "morphserve"},
+        {"num_gpus", 8},
+        {"offered_qps", 0.4},
+        {"total_sessions", 16},
+        {"steady_turn_slo_goodput_rps", 0.0},
+        {"ar_tpot_p95_ms", 0.0},
+        {"dit_turn_p95_ms", 0.0},
+    };
+    const auto cal_oom = ClusterSimulator::evaluate_against_real_runs(
+        nlohmann::json::array({zero_real}), ph, "", "");
+    MS_CHECK(cal_oom.at("points_checked").get<int>() == 1);
+    MS_CHECK(cal_oom.at("within_8pct_oos_gate").get<bool>() == false);
+    MS_CHECK(cal_oom.at("per_point")[0].at("goodput_status").get<std::string>() == "oom_mismatch");
+    MS_CHECK(std::abs(cal_oom.at("per_point")[0].at("ar_tpot_p95_err_pct").get<double>() - 100.0) < 1e-6);
+    MS_CHECK(std::abs(cal_oom.at("per_point")[0].at("dit_p95_err_pct").get<double>() - 100.0) < 1e-6);
 }
 
 }  // namespace

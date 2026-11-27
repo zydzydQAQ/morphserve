@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 from pathlib import Path
 import shutil
@@ -10,15 +11,28 @@ import time
 from typing import Any, Callable
 
 from morphserve.bench.exactness import ExactnessEvaluator
-from morphserve.bench.harness import BenchmarkRunner, local_tmp_base, resolve_sources_dir
+from morphserve.bench.harness import (
+    BenchmarkRunner,
+    effective_steady_window_s,
+    local_tmp_base,
+    resolve_sources_dir,
+)
 from morphserve.bench.interleaved_bench import (
     InterleavedSession,
     InterleavedTurn,
     POST_DIT_INSPECT_PROMPT,
     REFINEMENT_TEMPLATES,
     WorkloadSuite,
+    load_burstgpt_interarrivals,
+    load_gentd26_interarrivals,
 )
 from morphserve.engine.config import EnginePolicyConfig, RunWindowOptions, WorkerBudgetPlanner
+from morphserve.engine.workload import build_time_window_suite
+
+DEFAULT_INTERNVLU_ARRIVAL_DURATION_S = 180.0
+DEFAULT_INTERNVLU_WARMUP_S = 30.0
+DEFAULT_INTERNVLU_STEADY_S = 120.0
+DEFAULT_INTERNVLU_COOLDOWN_S = 30.0
 
 
 def _load_optional_bench_prompts(bench_root: Path | None) -> tuple[list[dict[str, str]], list[str]]:
@@ -281,6 +295,7 @@ def build_internvlu_suite(
         schema="morphserve.interleaved_bench.v2",
         warmup_s=round(min(20.0, span_s * 0.2), 3),
         steady_s=round(max(0.0, span_s - min(20.0, span_s * 0.2)), 3),
+        cooldown_s=0.0,
         arrival_duration_s=span_s,
     )
 
@@ -349,6 +364,50 @@ def _think_time_overrides(smoke_1gpu: bool) -> dict[str, Any]:
     }
 
 
+def _load_optional_trace_deltas(bench_root: Path | None) -> tuple[list[float] | None, list[float] | None]:
+    if bench_root is None or not Path(bench_root).is_dir():
+        return None, None
+    sources_dir = resolve_sources_dir(bench_root)
+    bg_path = sources_dir / "burstgpt_1_sample.csv"
+    gt_path = sources_dir / "gentd26_lora_request_trace.csv"
+    if not (bg_path.is_file() and gt_path.is_file()):
+        return None, None
+    try:
+        return load_burstgpt_interarrivals(bg_path), load_gentd26_interarrivals(gt_path)
+    except Exception:
+        return None, None
+
+
+def _build_windowed_internvlu_suite(
+    base_suite: WorkloadSuite,
+    *,
+    offered_qps: float,
+    bench_root: Path | None,
+    arrival_duration_s: float = DEFAULT_INTERNVLU_ARRIVAL_DURATION_S,
+    warmup_s: float = DEFAULT_INTERNVLU_WARMUP_S,
+    steady_s: float = DEFAULT_INTERNVLU_STEADY_S,
+    cooldown_s: float = DEFAULT_INTERNVLU_COOLDOWN_S,
+    min_sessions: int = 48,
+) -> WorkloadSuite:
+    """Expand an InternVL-U base suite into a fixed `>= 120s` steady-state time-windowed trace."""
+    burst_deltas, gentd_deltas = _load_optional_trace_deltas(bench_root)
+    kwargs: dict[str, Any] = {
+        "arrival_duration_s": float(arrival_duration_s),
+        "min_sessions": max(1, int(min_sessions)),
+        "warmup_s": float(warmup_s),
+        "steady_s": float(steady_s),
+    }
+    if "cooldown_s" in inspect.signature(build_time_window_suite).parameters:
+        kwargs["cooldown_s"] = float(cooldown_s)
+    return build_time_window_suite(
+        base_suite,
+        float(offered_qps),
+        burst_deltas,
+        gentd_deltas,
+        **kwargs,
+    )
+
+
 def run_internvlu_generality_validation(
     model_dir: Path,
     vendor_dir: Path,
@@ -360,11 +419,15 @@ def run_internvlu_generality_validation(
     total_gpu_gib: float | None = None,
     smoke_1gpu: bool = False,
     bench_root: Path | None = None,
+    arrival_duration_s: float = DEFAULT_INTERNVLU_ARRIVAL_DURATION_S,
+    warmup_s: float = DEFAULT_INTERNVLU_WARMUP_S,
+    steady_s: float = DEFAULT_INTERNVLU_STEADY_S,
+    cooldown_s: float = DEFAULT_INTERNVLU_COOLDOWN_S,
     *,
     engine_factory: Callable[..., Any] | None = None,
     fleet_factory: Callable[[EnginePolicyConfig], Any] | None = None,
 ) -> dict[str, Any]:
-    """Drive `InternVL-U` (`bridge_mllm_dit`) across Regime A (40GB burst) & Regime B (strict `<= 12 GiB` quota)."""
+    """Drive `InternVL-U` (`bridge_mllm_dit`) across Regime A (40GB non-regression check) & Regime B (12 GiB quota)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     tmp_base = local_tmp_base()
     eff_total_gib = _detect_gpu_total_gib(40.0) if total_gpu_gib is None else float(total_gpu_gib)
@@ -374,17 +437,32 @@ def run_internvlu_generality_validation(
         num_gpus = 1
         num_sessions = min(int(num_sessions), 4)
 
-    suite_a = build_internvlu_suite(
-        num_sessions=num_sessions,
+    base_suite_a = build_internvlu_suite(
+        num_sessions=max(40, int(num_sessions)) if not smoke_1gpu else num_sessions,
         offered_qps=offered_qps,
         highres_size=1024,
         bench_root=bench_root,
     )
+    suite_a = (
+        base_suite_a
+        if smoke_1gpu
+        else _build_windowed_internvlu_suite(
+            base_suite_a,
+            offered_qps=offered_qps,
+            bench_root=bench_root,
+            arrival_duration_s=arrival_duration_s,
+            warmup_s=warmup_s,
+            steady_s=steady_s,
+            cooldown_s=cooldown_s,
+            min_sessions=max(40, int(num_sessions)),
+        )
+    )
+    eff_steady_a_s = float(suite_a.steady_s) if smoke_1gpu else effective_steady_window_s(suite_a)
     parity_slice = WorkloadSuite(
         name="internvlu_multiturn_parity_4",
         trace_source="deterministic",
         base_qps=0.5,
-        sessions=suite_a.sessions[:4],
+        sessions=base_suite_a.sessions[:4],
         schema="morphserve.interleaved_bench.v2",
         warmup_s=0.0,
         steady_s=0.0,
@@ -408,23 +486,27 @@ def run_internvlu_generality_validation(
     )
 
     think_ov = _think_time_overrides(smoke_1gpu)
+    # Regime A (40 GiB unconstrained): non-regression / overhead check comparing MorphServe against
+    # monolithic_dp and static_nccl_fission when the full 14 GiB InternVL-U model fits easily in HBM.
     regime_a_policies = (
         ("morphserve", "monolithic_dp")
-        if smoke_1gpu
-        else ("morphserve", "monolithic_dp", "static_nccl_fission", "naive_host_offload")
+        if (smoke_1gpu or num_gpus < 2)
+        else ("morphserve", "monolithic_dp", "static_nccl_fission")
     )
     regime_a_results: list[dict[str, Any]] = []
     parity_outcomes: dict[str, list[dict[str, Any]]] = {}
 
     for pol_name in regime_a_policies:
+        eff_cooldown_a_s = float(getattr(suite_a, "cooldown_s", 0.0 if smoke_1gpu else cooldown_s))
         cfg = EnginePolicyConfig.from_preset(
             pol_name,
             num_gpus=num_gpus,
             model_family="internvl_u",
             vendor_dir=str(vendor_dir),
             steady_window_mode="session_trim" if smoke_1gpu else "time",
-            warmup_window_s=suite_a.warmup_s,
-            steady_window_s=suite_a.steady_s,
+            warmup_window_s=float(suite_a.warmup_s),
+            steady_window_s=eff_steady_a_s,
+            cooldown_s=eff_cooldown_a_s,
             **think_ov,
         )
         with runner.session(cfg, tmp_tag=f"ms_ivlu_a_{pol_name}") as sess:
@@ -442,13 +524,21 @@ def run_internvlu_generality_validation(
                 regime_a_results.append(d)
                 parity_outcomes[pol_name] = list(p_rep.sessions)
             else:
+                run_opts_a = RunWindowOptions(
+                    steady_window_mode="time",
+                    warmup_window_s=float(suite_a.warmup_s),
+                    steady_window_s=eff_steady_a_s,
+                    cooldown_s=eff_cooldown_a_s,
+                )
                 _, d = sess.run_compact(
                     suite_a,
                     target_qps=offered_qps,
+                    run_options=run_opts_a,
                     include_failed_sessions=True,
                     attach_init_shmem=False,
                 )
-                d["regime"] = "regime_a_40gb_burst"
+                d["regime"] = "regime_a_40gb_unconstrained_overhead_check"
+                d["effective_steady_window_s"] = eff_steady_a_s
                 regime_a_results.append(d)
 
                 if pol_name in ("morphserve", "monolithic_dp"):
@@ -463,17 +553,36 @@ def run_internvlu_generality_validation(
 
     # Regime B: Strict `12 GiB` Per-GPU Quota (`PyTorch reserved + VMM physical pool <= 12 GiB`)
     regime_b_qps = 0.5 if smoke_1gpu else round(offered_qps * 0.75, 2)
-    b_sessions = 2 if smoke_1gpu else num_sessions
-    suite_b = build_internvlu_suite(
+    b_sessions = 2 if smoke_1gpu else max(40, int(num_sessions))
+    base_suite_b = build_internvlu_suite(
         num_sessions=b_sessions,
         offered_qps=regime_b_qps,
         highres_size=1024,
         bench_root=bench_root,
     )
+    suite_b = (
+        base_suite_b
+        if smoke_1gpu
+        else _build_windowed_internvlu_suite(
+            base_suite_b,
+            offered_qps=regime_b_qps,
+            bench_root=bench_root,
+            arrival_duration_s=arrival_duration_s,
+            warmup_s=warmup_s,
+            steady_s=steady_s,
+            cooldown_s=cooldown_s,
+            min_sessions=b_sessions,
+        )
+    )
+    eff_steady_b_s = float(suite_b.steady_s) if smoke_1gpu else effective_steady_window_s(suite_b)
     regime_b_policies = (
         ("morphserve", "monolithic_dp")
         if smoke_1gpu
-        else ("morphserve", "monolithic_dp", "naive_host_offload")
+        else (
+            ("morphserve", "monolithic_dp", "naive_host_offload")
+            if num_gpus < 2
+            else ("morphserve", "monolithic_dp", "static_nccl_fission", "naive_host_offload")
+        )
     )
     regime_b_results: list[dict[str, Any]] = []
     morphserve_quota_ok = False
@@ -486,16 +595,29 @@ def run_internvlu_generality_validation(
             constrained_gib=constrained_gib,
             total_gpu_gib=eff_total_gib,
         )
+        eff_cooldown_b_s = float(getattr(suite_b, "cooldown_s", 0.0 if smoke_1gpu else cooldown_s))
         overrides.update(think_ov)
         overrides["steady_window_mode"] = "session_trim" if smoke_1gpu else "time"
-        overrides["warmup_window_s"] = suite_b.warmup_s
-        overrides["steady_window_s"] = suite_b.steady_s
+        overrides["warmup_window_s"] = float(suite_b.warmup_s)
+        overrides["steady_window_s"] = eff_steady_b_s
+        overrides["cooldown_s"] = eff_cooldown_b_s
 
         cfg = EnginePolicyConfig.from_preset(pol_name, num_gpus=num_gpus, **overrides)
+        run_opts_b = (
+            None
+            if smoke_1gpu
+            else RunWindowOptions(
+                steady_window_mode="time",
+                warmup_window_s=float(suite_b.warmup_s),
+                steady_window_s=eff_steady_b_s,
+                cooldown_s=eff_cooldown_b_s,
+            )
+        )
         with runner.session(cfg, tmp_tag=f"ms_ivlu_b_{pol_name}") as sess:
             rep, d = sess.run_compact(
                 suite_b,
                 target_qps=regime_b_qps,
+                run_options=run_opts_b,
                 include_failed_sessions=True,
                 attach_init_shmem=False,
             )
@@ -503,6 +625,7 @@ def run_internvlu_generality_validation(
             d["peak_pytorch_reserved_mib"] = round(float(rep.peak_pytorch_reserved_mib), 2)
             d["vmm_physical_pool_mib"] = round(float(rep.vmm_physical_pool_mib), 2)
             d["regime"] = f"regime_b_{int(constrained_gib)}gib_capped"
+            d["effective_steady_window_s"] = eff_steady_b_s
             d["quota_budget_plan"] = budget_plan
             audit = verify_internvlu_memory_quota(d, cfg, constrained_gib=constrained_gib)
             d["memory_quota_audit"] = audit
@@ -516,6 +639,14 @@ def run_internvlu_generality_validation(
             regime_b_results.append(d)
 
     regime_a_ms = next((r for r in regime_a_results if r.get("policy_name") == "morphserve"), None)
+    regime_a_mono = next((r for r in regime_a_results if r.get("policy_name") == "monolithic_dp"), None)
+    regime_a_overhead_pct: float | None = None
+    if regime_a_ms is not None and regime_a_mono is not None:
+        mono_jct = float(regime_a_mono.get("active_jct_p50_ms") or regime_a_mono.get("session_e2e_p50_ms") or 0.0)
+        ms_jct = float(regime_a_ms.get("active_jct_p50_ms") or regime_a_ms.get("session_e2e_p50_ms") or 0.0)
+        if mono_jct > 0.0:
+            regime_a_overhead_pct = round(100.0 * (ms_jct - mono_jct) / mono_jct, 2)
+
     regime_a_morphserve_ok = bool(
         regime_a_ms is not None
         and int(regime_a_ms.get("oom_sessions", 0)) == 0
@@ -543,10 +674,22 @@ def run_internvlu_generality_validation(
         shutil.rmtree(tmp_base / f"ivlu_parity_{pol_clean}", ignore_errors=True)
 
     report = {
-        "schema": "morphserve.osdi27.m24_internvlu.v4",
+        "schema": "morphserve.osdi27.m24_internvlu.v5",
         "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "num_gpus": num_gpus,
         "constrained_quota_gib": constrained_gib,
+        "steady_window_config": {
+            "arrival_duration_s": float(arrival_duration_s),
+            "warmup_s": float(warmup_s),
+            "steady_s": float(steady_s),
+            "cooldown_s": float(cooldown_s),
+            "regime_a_effective_steady_s": eff_steady_a_s,
+            "regime_b_effective_steady_s": eff_steady_b_s,
+            "regime_a_sessions": len(suite_a.sessions),
+            "regime_b_sessions": len(suite_b.sessions),
+        },
+        "regime_a_framing": "unconstrained_40gb_non_regression_overhead_check",
+        "regime_a_morphserve_vs_monolithic_p50_overhead_pct": regime_a_overhead_pct,
         "think_time_config": think_ov,
         "bench_root_used": str(bench_root) if bench_root is not None else None,
         "morphserve_12gib_quota_verified": morphserve_quota_ok,
@@ -576,6 +719,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--qps", type=float, default=1.6)
     parser.add_argument("--constrained-gib", type=float, default=12.0)
     parser.add_argument("--total-gpu-gib", type=float, default=None)
+    parser.add_argument("--arrival-duration-s", type=float, default=DEFAULT_INTERNVLU_ARRIVAL_DURATION_S)
+    parser.add_argument("--warmup-s", type=float, default=DEFAULT_INTERNVLU_WARMUP_S)
+    parser.add_argument("--steady-s", type=float, default=DEFAULT_INTERNVLU_STEADY_S)
+    parser.add_argument("--cooldown-s", type=float, default=DEFAULT_INTERNVLU_COOLDOWN_S)
     parser.add_argument("--smoke-1gpu", action="store_true")
     return parser
 
@@ -593,6 +740,10 @@ def main(argv: list[str] | None = None) -> int:
         total_gpu_gib=args.total_gpu_gib,
         smoke_1gpu=args.smoke_1gpu,
         bench_root=args.bench_root,
+        arrival_duration_s=args.arrival_duration_s,
+        warmup_s=args.warmup_s,
+        steady_s=args.steady_s,
+        cooldown_s=args.cooldown_s,
     )
     return 0 if rep.get("status") == "ok" else 2
 

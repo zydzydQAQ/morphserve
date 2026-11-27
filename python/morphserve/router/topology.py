@@ -26,11 +26,17 @@ class OperatorLatencyProfile:
     internvlu_vae_512_ms: float
     internvlu_vae_1024_ms: float
     internvlu_expert_bytes: int
+    internvlu_ar_tpot_ms: float = 44.0
+    ar_text_unloaded_ttft_ms: float = 125.0
+    ar_img_512_unloaded_ttft_ms: float = 1400.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ar_prefill_ms": float(self.ar_prefill_ms),
             "ar_tpot_ms": float(self.ar_tpot_ms),
+            "internvlu_ar_tpot_ms": float(self.internvlu_ar_tpot_ms),
+            "ar_text_unloaded_ttft_ms": float(self.ar_text_unloaded_ttft_ms),
+            "ar_img_512_unloaded_ttft_ms": float(self.ar_img_512_unloaded_ttft_ms),
             "prep_overhead_ms": float(self.prep_overhead_ms),
             "bagel_dit_512_step_ms": float(self.bagel_dit_512_step_ms),
             "bagel_dit_1024_step_ms": float(self.bagel_dit_1024_step_ms),
@@ -49,6 +55,9 @@ class OperatorLatencyProfile:
         return cls(
             ar_prefill_ms=float(d["ar_prefill_ms"]),
             ar_tpot_ms=float(d["ar_tpot_ms"]),
+            internvlu_ar_tpot_ms=float(d.get("internvlu_ar_tpot_ms", 44.0)),
+            ar_text_unloaded_ttft_ms=float(d.get("ar_text_unloaded_ttft_ms", 125.0)),
+            ar_img_512_unloaded_ttft_ms=float(d.get("ar_img_512_unloaded_ttft_ms", 1400.0)),
             prep_overhead_ms=float(d["prep_overhead_ms"]),
             bagel_dit_512_step_ms=float(d["bagel_dit_512_step_ms"]),
             bagel_dit_1024_step_ms=float(d["bagel_dit_1024_step_ms"]),
@@ -67,6 +76,34 @@ class OperatorLatencyProfile:
         """Fetch the canonical default `OperatorLatencyProfile` from C++ with optional field overrides."""
         base = default_operator_profile()
         return replace(base, **overrides) if overrides else base
+
+    def ar_tpot_ms_for(self, model_family: str = "bagel") -> float:
+        return self.internvlu_ar_tpot_ms if model_family == "internvl_u" else self.ar_tpot_ms
+
+    def unloaded_ar_ttft_ms(
+        self,
+        has_image: bool,
+        num_images: int = 0,
+        image_res: int = 512,
+        model_family: str = "bagel",
+    ) -> float:
+        if (not has_image) and int(num_images) <= 0:
+            return float(self.ar_text_unloaded_ttft_ms)
+        n_img = max(1, int(num_images))
+        res_scale = 2.0 if int(image_res) >= 1024 else 1.0
+        fam_scale = 0.70 if model_family == "internvl_u" else 1.0
+        per_img_ms = max(0.0, float(self.ar_img_512_unloaded_ttft_ms) - float(self.ar_text_unloaded_ttft_ms))
+        return float(self.ar_text_unloaded_ttft_ms) + float(n_img) * per_img_ms * res_scale * fam_scale
+
+    def ar_ttft_slo_for(
+        self,
+        has_image: bool,
+        num_images: int = 0,
+        image_res: int = 512,
+        k: float = 2.0,
+        model_family: str = "bagel",
+    ) -> float:
+        return round(float(k) * self.unloaded_ar_ttft_ms(has_image, num_images, image_res, model_family), 2)
 
     def step_ms(self, model_family: str, height: int) -> float:
         is_1024 = int(height) >= 1024
@@ -92,14 +129,16 @@ class OperatorLatencyProfile:
 
     def slo_thresholds_ms(self, k: float = 2.0, model_family: str = "bagel") -> dict[str, float]:
         fk = float(k)
+        eff_steps = 16 if model_family == "internvl_u" else 20
         return {
             "slo_scale_k": fk,
-            "ar_tpot_slo_ms": round(fk * self.ar_tpot_ms, 2),
+            "ar_tpot_slo_ms": round(fk * self.ar_tpot_ms_for(model_family), 2),
             "ar_ttft_slo_ms": round(750.0 * fk, 2),
-            "dit_512_slo_ms": self.dit_turn_slo_ms(512, k=fk, model_family=model_family, steps=20),
-            "dit_1024_slo_ms": self.dit_turn_slo_ms(
-                1024, k=fk, model_family=model_family, steps=16 if model_family == "internvl_u" else 20
-            ),
+            "ar_ttft_slo_text_ms": self.ar_ttft_slo_for(False, 0, 512, k=fk, model_family=model_family),
+            "ar_ttft_slo_img512_ms": self.ar_ttft_slo_for(True, 1, 512, k=fk, model_family=model_family),
+            "ar_ttft_slo_img1024_ms": self.ar_ttft_slo_for(True, 1, 1024, k=fk, model_family=model_family),
+            "dit_512_slo_ms": self.dit_turn_slo_ms(512, k=fk, model_family=model_family, steps=eff_steps),
+            "dit_1024_slo_ms": self.dit_turn_slo_ms(1024, k=fk, model_family=model_family, steps=eff_steps),
         }
 
 

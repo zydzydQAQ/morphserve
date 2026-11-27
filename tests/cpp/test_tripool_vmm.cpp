@@ -153,18 +153,19 @@ void test_pool_conservation_carving_bundling_and_coalesce() {
     MS_EXPECT(vmm->shutdown() == 0);
 }
 
-void test_strict_cap_lazy_coalescing_and_no_phantom_overflow() {
-    // 1. Strict-cap (allow_overflow=false) lazy coalescing inside acquire_super_slot_locked
+void test_strict_cap_bundling_carve_before_overflow_and_no_phantom_overflow() {
+    // 1. Strict-cap (allow_overflow=false) preserves fine-to-super bundling without eager coalescing
+    //    (Module 1 Test 5 contract: fine_to_super_bundles > 0, overflow_creates == 0, explicit coalesce still works).
     {
         TriPoolVMMConfig cfg;
         cfg.device = 0;
-        cfg.super_pool_mib = 128;   // 2 x 64 MiB
+        cfg.super_pool_mib = 256;   // 4 x 64 MiB
         cfg.fine_kv_pool_mib = 64;  // 32 x 2 MiB (base_fine_pages_ = 32)
         cfg.super_handle_mib = 64;
         cfg.transient_va_gib = 1;
         cfg.kv_va_gib = 1;
         cfg.allow_overflow = false;
-        cfg.max_pool_bytes = 192 * kMiB;
+        cfg.max_pool_bytes = 320 * kMiB;
         cfg.simulated = true;
         cfg.materialize_sim_va = false;
 
@@ -172,40 +173,87 @@ void test_strict_cap_lazy_coalescing_and_no_phantom_overflow() {
         const uint64_t sid_a = vmm->kv_session_create();
         const uint64_t sid_b = vmm->kv_session_create();
         const int32_t rid_a = vmm->kv_region_alloc(64 * kMiB, sid_a);
-        const int32_t rid_b = vmm->kv_region_alloc(64 * kMiB, sid_b);
+        const int32_t rid_b = vmm->kv_region_alloc(192 * kMiB, sid_b);
         MS_EXPECT(vmm->kv_region_ensure(rid_a, 64 * kMiB, nullptr) != 0);
-        MS_EXPECT(vmm->kv_region_ensure(rid_b, 64 * kMiB, nullptr) != 0);
+        MS_EXPECT(vmm->kv_region_ensure(rid_b, 192 * kMiB, nullptr) != 0);
 
-        // Session B carved 1 super handle -> super_pool_total=1, fine_pool_total=64
+        // Session B carved 3 super handles -> super_pool_total=1, fine_pool_total=128
         UnifiedVmmStatsPod st{};
         vmm->get_stats(&st);
+        MS_EXPECT(st.super_to_fine_carves == 3);
         MS_EXPECT(st.super_pool_total_handles == 1);
-        MS_EXPECT(st.fine_pool_total_pages == 64);
-        MS_EXPECT(st.pool_total_bytes == 192 * kMiB);
+        MS_EXPECT(st.fine_pool_total_pages == 128);
+        MS_EXPECT(st.pool_total_bytes == 320 * kMiB);
 
-        // Free Session B -> 32 free fine pages while Session A keeps 32 mapped fine pages
+        // Free Session B -> 96 free fine pages (>= base_fine_pages_ + sub_pages_ = 64)
         MS_EXPECT(vmm->kv_region_free(rid_b, nullptr) == 0);
 
-        // 128 MiB transient allocation takes the 1 free super handle + lazily coalesces the 32 excess fine pages
+        // 192 MiB transient allocation takes 1 free super handle + 2 fine-to-super bundles (NO eager coalesce / thrashing)
         vmm->scope_begin();
-        void* tr = vmm->transient_alloc(128 * kMiB, nullptr);
+        void* tr = vmm->transient_alloc(192 * kMiB, nullptr);
         MS_EXPECT(tr != nullptr);
         vmm->get_stats(&st);
-        MS_EXPECT(st.super_pool_total_handles == 2);
-        MS_EXPECT(st.fine_pool_total_pages == 32);
-        MS_EXPECT(st.transient_fine_bundles_current == 0);
+        MS_EXPECT(st.fine_to_super_bundles == 2);
+        MS_EXPECT(st.transient_fine_bundles_current == 2);
         MS_EXPECT(st.overflow_creates == 0);
-        MS_EXPECT(st.pool_total_bytes == 192 * kMiB);
+        MS_EXPECT(st.pool_total_bytes == 320 * kMiB);
 
-        vmm->transient_free(tr, 128 * kMiB, nullptr);
+        vmm->transient_free(tr, 192 * kMiB, nullptr);
         MS_EXPECT(vmm->scope_end(nullptr) == 0);
+
+        // Explicit coalesce_fine_to_super still works cleanly under strict cap
+        MS_EXPECT(vmm->coalesce_fine_to_super(1) == 1);
+        vmm->get_stats(&st);
+        MS_EXPECT(st.super_pool_total_handles == 2);
+        MS_EXPECT(st.fine_pool_total_pages == 96);
+        MS_EXPECT(st.pool_total_bytes == 320 * kMiB);
+        MS_EXPECT(st.overflow_creates == 0);
+
         MS_EXPECT(vmm->kv_region_free(rid_a, nullptr) == 0);
         vmm->kv_session_destroy(sid_a);
         vmm->kv_session_destroy(sid_b);
         MS_EXPECT(vmm->shutdown() == 0);
     }
 
-    // 2. Verify HostMmapPageAdapter has no phantom 8 GiB overflow when allow_overflow=true
+    // 2. pop_fine_handle_locked MUST carve free_super_handles_ BEFORE allocating overflow handles
+    //    when allow_overflow=true && max_pool_bytes > 0.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 128;   // 2 x 64 MiB
+        cfg.fine_kv_pool_mib = 4;   // 2 x 2 MiB
+        cfg.super_handle_mib = 64;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = true;
+        cfg.max_pool_bytes = 256 * kMiB;
+        cfg.simulated = true;
+        cfg.materialize_sim_va = false;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const uint64_t sid = vmm->kv_session_create();
+        const int32_t rid = vmm->kv_region_alloc(140 * kMiB, sid);
+        MS_EXPECT(vmm->kv_region_ensure(rid, 6 * kMiB, nullptr) != 0);
+
+        UnifiedVmmStatsPod st{};
+        vmm->get_stats(&st);
+        MS_EXPECT(st.super_to_fine_carves == 1);
+        MS_EXPECT(st.overflow_creates == 0);
+        MS_EXPECT(st.pool_total_bytes == 132 * kMiB);
+
+        // Only after all free super handles are carved does fallback overflow trigger
+        MS_EXPECT(vmm->kv_region_ensure(rid, 134 * kMiB, nullptr) != 0);
+        vmm->get_stats(&st);
+        MS_EXPECT(st.super_to_fine_carves == 2);
+        MS_EXPECT(st.overflow_creates == 1);
+        MS_EXPECT(st.pool_total_bytes == 134 * kMiB);
+
+        MS_EXPECT(vmm->kv_region_free(rid, nullptr) == 0);
+        vmm->kv_session_destroy(sid);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
+
+    // 3. Verify HostMmapPageAdapter has no phantom 8 GiB overflow when allow_overflow=true
     {
         TriPoolVMMConfig cfg;
         cfg.device = 0;
@@ -669,7 +717,7 @@ void test_oom_exceptions_strict_and_capped() {
 
 int main() {
     test_pool_conservation_carving_bundling_and_coalesce();
-    test_strict_cap_lazy_coalescing_and_no_phantom_overflow();
+    test_strict_cap_bundling_carve_before_overflow_and_no_phantom_overflow();
     test_async_streamer_expert_h2d_bit_exact();
     test_async_kv_swap_roundtrip_and_cancel_race();
     test_session_pinned_multi_exclude_and_ensure_expert_headroom();

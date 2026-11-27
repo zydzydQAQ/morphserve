@@ -82,10 +82,21 @@ void test_hash_util_and_operator_profile() {
 
     const auto bagel_slo = default_operator_profile().slo_thresholds_ms(3.0, "bagel");
     const auto ivl_slo = default_operator_profile().slo_thresholds_ms(3.0, "internvl_u");
-    MS_CHECK(std::abs(bagel_slo.at("dit_512_slo_ms") - 18360.0) < 1e-6);
-    MS_CHECK(std::abs(bagel_slo.at("dit_1024_slo_ms") - 65160.0) < 1e-6);
-    MS_CHECK(std::abs(ivl_slo.at("dit_512_slo_ms") - 9750.0) < 1e-6);
-    MS_CHECK(std::abs(ivl_slo.at("dit_1024_slo_ms") - 21900.0) < 1e-6);
+    MS_CHECK(std::abs(bagel_slo.at("ar_tpot_slo_ms") - 152.10) < 1e-6);
+    MS_CHECK(std::abs(bagel_slo.at("dit_512_slo_ms") - 14916.30) < 1e-6);
+    MS_CHECK(std::abs(bagel_slo.at("dit_1024_slo_ms") - 57219.60) < 1e-6);
+    MS_CHECK(std::abs(default_operator_profile().unloaded_dit_turn_ms("bagel", 1024, 10) - 9675.16) < 1e-6);
+    MS_CHECK(std::abs(ivl_slo.at("ar_tpot_slo_ms") - 132.0) < 1e-6);
+    MS_CHECK(std::abs(ivl_slo.at("dit_512_slo_ms") - 7484.40) < 1e-6);
+    MS_CHECK(std::abs(ivl_slo.at("dit_1024_slo_ms") - 21374.40) < 1e-6);
+
+    // Modality-normalized AR TTFT thresholds (text-only vs 512^2 / 1024^2 image inputs).
+    MS_CHECK(std::abs(default_operator_profile().ar_ttft_slo_for(false, 0, 512, 2.0, "bagel") - 250.0) < 1e-6);
+    MS_CHECK(std::abs(default_operator_profile().ar_ttft_slo_for(true, 1, 512, 2.0, "bagel") - 2800.0) < 1e-6);
+    MS_CHECK(default_operator_profile().ar_ttft_slo_for(true, 2, 512, 2.0, "bagel") >
+             default_operator_profile().ar_ttft_slo_for(true, 1, 512, 2.0, "bagel"));
+    MS_CHECK(default_operator_profile().ar_ttft_slo_for(true, 1, 1024, 2.0, "bagel") >
+             default_operator_profile().ar_ttft_slo_for(true, 1, 512, 2.0, "bagel"));
 }
 
 void test_policy_presets_and_overrides() {
@@ -121,6 +132,25 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(p44.static_und_ranks == (std::vector<int>{0, 1, 4, 5}));
     MS_CHECK(p44.static_gen_ranks == (std::vector<int>{2, 3, 6, 7}));
 
+    // `use_idle_kv_swap` policy contract & `monolithic_kv_swap` preset parity.
+    const PolicyConfig p_ms = PolicyConfig::from_preset("morphserve", 8);
+    const PolicyConfig p_mono = PolicyConfig::from_preset("monolithic_dp", 8);
+    const PolicyConfig p_mono_swap = PolicyConfig::from_preset("monolithic_kv_swap", 8);
+    const PolicyConfig p_prism = PolicyConfig::from_preset("prism_tetriserve_coloc", 8);
+    const PolicyConfig p_shm = PolicyConfig::from_preset("twostage_shm", 8);
+    const PolicyConfig p_naive = PolicyConfig::from_preset("naive_host_offload", 8);
+    MS_CHECK(p_ms.use_idle_kv_swap == true);
+    MS_CHECK(p_mono.use_idle_kv_swap == false);
+    MS_CHECK(p_mono_swap.use_idle_kv_swap == true);
+    MS_CHECK(p_mono_swap.routing_mode == p_mono.routing_mode && !p_mono_swap.use_tripool_vmm && !p_mono_swap.use_scoped_vae);
+    MS_CHECK(p_prism.use_idle_kv_swap == true);
+    MS_CHECK(p_shm.use_idle_kv_swap == false);
+    MS_CHECK(p_naive.use_idle_kv_swap == false);
+    MS_CHECK(p44.use_idle_kv_swap == false);
+    MS_CHECK(std::abs(p_ms.warmup_window_s - 60.0) < 1e-9);
+    MS_CHECK(std::abs(p_ms.steady_window_s - 150.0) < 1e-9);
+    MS_CHECK(std::abs(p_ms.cooldown_s - 30.0) < 1e-9);
+
     // Full override coverage + JSON round-trip.
     const PolicyConfig custom = PolicyConfig::from_preset(
         "morphserve",
@@ -128,6 +158,7 @@ void test_policy_presets_and_overrides() {
         {
             {"dit_slo_scale_k", 3.5},
             {"allow_cascade_cfg_split", true},
+            {"use_idle_kv_swap", false},
             {"think_time_dist", "constant"},
             {"think_time_median_s", 11.5},
             {"think_time_sigma", 0.4},
@@ -135,12 +166,14 @@ void test_policy_presets_and_overrides() {
             {"steady_window_mode", "session_trim"},
             {"warmup_window_s", 45.0},
             {"steady_window_s", 150.0},
+            {"cooldown_s", 20.0},
             {"steady_state_trim_frac", 0.2},
             {"gpu_memory_quota_mib", 12288.0},
         });
     const PolicyConfig rt = PolicyConfig::from_json(custom.to_json());
     MS_CHECK(std::abs(rt.dit_slo_scale_k - 3.5) < 1e-9);
     MS_CHECK(rt.allow_cascade_cfg_split == true);
+    MS_CHECK(rt.use_idle_kv_swap == false);
     MS_CHECK(rt.think_time_dist == "constant");
     MS_CHECK(std::abs(rt.think_time_median_s - 11.5) < 1e-9);
     MS_CHECK(std::abs(rt.think_time_sigma - 0.4) < 1e-9);
@@ -148,17 +181,25 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(rt.steady_window_mode == "session_trim");
     MS_CHECK(std::abs(rt.warmup_window_s - 45.0) < 1e-9);
     MS_CHECK(std::abs(rt.steady_window_s - 150.0) < 1e-9);
+    MS_CHECK(std::abs(rt.cooldown_s - 20.0) < 1e-9);
     MS_CHECK(std::abs(rt.steady_state_trim_frac - 0.2) < 1e-9);
     MS_CHECK(rt.gpu_memory_quota_mib.has_value() && std::abs(*rt.gpu_memory_quota_mib - 12288.0) < 1e-9);
 
-    // Leave-One-Out M1-M4 ablation suite & static split suite propagate overrides.
+    // Decoupled 6-mechanism Leave-One-Out M1-M4 ablation suite & static split suite propagate overrides.
     const auto abl = build_ablation_configs(8, {{"dit_slo_scale_k", 3.5}});
-    MS_CHECK(abl.size() == 5);
+    MS_CHECK(abl.size() == 7);
     MS_CHECK(abl[0].first == "full_morphserve" && abl[0].second.use_tripool_vmm && abl[0].second.preemption_mode == "layer_chunk");
-    MS_CHECK(abl[1].first == "no_m4_layer_chunk" && abl[1].second.preemption_mode == "non_preemptive");
-    MS_CHECK(abl[2].first == "no_m3_cow_loopback" && !abl[2].second.use_module3_cow_loopback);
-    MS_CHECK(abl[3].first == "no_m2_dual_path" && abl[3].second.routing_mode == "sticky_least_loaded");
-    MS_CHECK(abl[4].first == "no_m1_tripool_vmm" && !abl[4].second.use_tripool_vmm);
+    MS_CHECK(abl[1].first == "no_m1_tripool_vmm" && !abl[1].second.use_tripool_vmm && !abl[1].second.use_expert_pager &&
+             abl[1].second.use_scoped_vae && abl[1].second.use_h2d_pacer && abl[1].second.use_shared_numa_mirror);
+    MS_CHECK(abl[2].first == "no_m1_scoped_vae" && !abl[2].second.use_scoped_vae && abl[2].second.use_tripool_vmm &&
+             abl[2].second.use_expert_pager);
+    MS_CHECK(abl[3].first == "no_m2_dual_path" && abl[3].second.routing_mode == "sticky_least_loaded" &&
+             abl[3].second.use_h2d_pacer && abl[3].second.use_shared_numa_mirror);
+    MS_CHECK(abl[4].first == "no_m2_pacer_numa" && !abl[4].second.use_h2d_pacer && !abl[4].second.use_shared_numa_mirror &&
+             abl[4].second.routing_mode == "dual_path");
+    MS_CHECK(abl[5].first == "no_m3_cow_loopback" && !abl[5].second.use_module3_cow_loopback && abl[5].second.use_tripool_vmm);
+    MS_CHECK(abl[6].first == "no_m4_layer_chunk" && abl[6].second.preemption_mode == "non_preemptive" &&
+             abl[6].second.use_tripool_vmm);
     for (const auto& [_, cfg] : abl) {
         MS_CHECK(std::abs(cfg.dit_slo_scale_k - 3.5) < 1e-9);
     }
@@ -254,6 +295,12 @@ void test_router_seams() {
 
     MS_CHECK(
         router_ship.select_static_gen_gpu("static_nccl_fission", {0, 2}, {1, 3}, 0, nullptr, {}, 256 * kMiB) == 1);
+
+    // `twostage_shm` load-balances across ALL static_gen_ranks instead of hardcoded 2k -> 2k+1 pairing.
+    router_ship.set_worker_state_fields(1, std::nullopt, 5000.0, std::nullopt, std::nullopt, std::nullopt);
+    MS_CHECK(
+        router_ship.select_static_gen_gpu("twostage_shm", {0, 2}, {1, 3}, 0, nullptr, {}, 256 * kMiB) == 3);
+    router_ship.set_worker_state_fields(1, std::nullopt, 0.0, std::nullopt, std::nullopt, std::nullopt);
 
     const auto batch_decs = router_ship.route_batch({req_ship, req_ship}, router_ship.worker_states_snapshot(), 0.0);
     MS_CHECK(batch_decs.size() == 2);
@@ -462,7 +509,7 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
     MS_CHECK(r_fission->get_worker_state(mut_plan.dst_gpu).queue_wait_ms > 0.0);
     MS_CHECK(r_fission->get_worker_state(mut_plan.dst_gpu).kv_free_bytes < 16 * kGiB);
 
-    // `twostage_shm` ships over SHM with CFG duplication on wire (`include_cfg_dup_on_wire == true`).
+    // `twostage_shm` ships over SHM WITHOUT redundant CFG duplication on wire (`include_cfg_dup_on_wire == false`).
     const PolicyConfig pol_shm = PolicyConfig::from_preset("twostage_shm", 8);
     auto r_shm = std::make_shared<DualPathMorphRouter>(topo);
     r_shm->init_workers(
@@ -475,7 +522,7 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
     const auto shm_plan = eng_shm.plan_turn_transition_readonly(
         "sess_shm", "ctx_shm", 1, 0, 0, 320 * kMiB, "dit_edit", 512, 20, true, true, 0.0);
     MS_CHECK(shm_plan.ship_mode == "shm_static");
-    MS_CHECK(shm_plan.include_cfg_dup_on_wire == true);
+    MS_CHECK(shm_plan.include_cfg_dup_on_wire == false);
     MS_CHECK(shm_plan.ephemeral_gen_ctx == true);
     MS_CHECK(shm_plan.dit_ctx_id == "ctx_shm_gen_t1");
 
@@ -558,16 +605,25 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
     MS_CHECK(r_smax.at("ar_slo_met").get<bool>() == false);
     MS_CHECK(r_smax == r_tmax);
 
-    // `slo_time_scale` tightens AR TPOT cap cleanly (80 ms passes at 1.0x=125.64ms, fails at 0.5x=62.82ms).
+    // `slo_time_scale` tightens AR TPOT cap cleanly (80 ms passes at 1.0x=101.40ms, fails at 0.5x=50.70ms).
     const auto r_1x = MorphControlEngine::evaluate_session_slos(
-        pol_p95, {300.0}, {80.0, 80.0}, {4000.0}, {512}, {20}, {{80.0, 80.0}}, 1.0);
+        pol_p95, {200.0}, {80.0, 80.0}, {4000.0}, {512}, {20}, {{80.0, 80.0}}, 1.0);
     const auto r_half = MorphControlEngine::evaluate_session_slos(
-        pol_p95, {300.0}, {80.0, 80.0}, {4000.0}, {512}, {20}, {{80.0, 80.0}}, 0.5);
+        pol_p95, {200.0}, {80.0, 80.0}, {4000.0}, {512}, {20}, {{80.0, 80.0}}, 0.5);
     MS_CHECK(r_1x.at("ar_slo_met").get<bool>() == true);
     MS_CHECK(r_half.at("ar_slo_met").get<bool>() == false);
 
-    // 4. Canonical `aggregate_cluster_run_report`: steady vs full-trace semantics, `vmm_physical_pool_mib`,
-    //    InternVL-U (16 steps) vs BAGEL (20 steps) parity, and D1-D5 multi-turn SLO contract.
+    // Modality-normalized AR TTFT in `evaluate_session_slos`: 300ms fails text-only (250ms), 1800ms passes 512^2 image (2800ms).
+    const auto r_text_fail = MorphControlEngine::evaluate_session_slos(
+        pol_p95, {300.0}, {60.0}, {}, {}, {}, {{60.0}}, 1.0, {0}, {0}, {512});
+    const auto r_img_ok = MorphControlEngine::evaluate_session_slos(
+        pol_p95, {1800.0}, {60.0}, {}, {}, {}, {{60.0}}, 1.0, {1}, {1}, {512});
+    MS_CHECK(r_text_fail.at("ar_slo_met").get<bool>() == false);
+    MS_CHECK(r_img_ok.at("ar_slo_met").get<bool>() == true);
+
+    // 4. Canonical `aggregate_cluster_run_report`: cooldown window, actual-rate goodput, `vmm_physical_pool_mib`,
+    //    real-time `alpha_timeline`, `latency_breakdown_ms`, `nvml_sm_util_mean_pct`, InternVL-U 16-step parity,
+    //    and unbiased `per_turn_stats` + improper DiT CDF.
     const PolicyConfig pol_win = PolicyConfig::from_preset(
         "morphserve",
         8,
@@ -575,6 +631,7 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
             {"steady_window_mode", "time"},
             {"warmup_window_s", 60.0},
             {"steady_window_s", 180.0},
+            {"cooldown_s", 30.0},
         });
     auto mk_out = [](const std::string& sid, double arr_s, const std::string& st, bool ok_slo) -> nlohmann::json {
         return {
@@ -596,10 +653,11 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
             {"ar_slo_met", ok_slo},
             {"dit_slo_met", ok_slo},
             {"joint_slo_met", ok_slo},
+            {"resident_alpha_sample", 0.99},
             {"turn_records",
              nlohmann::json::array({
-                 {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", st}, {"ar_ttft_ms", 220.0}, {"ar_tpots_ms", nlohmann::json::array({50.0, 52.0})}},
-                 {{"turn_idx", 1}, {"modality_plan", "dit_edit"}, {"status", st}, {"dit_ms", 4200.0}, {"height", 512}, {"dit_steps", 20}},
+                 {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", st}, {"ar_ttft_ms", 220.0}, {"ar_tpots_ms", nlohmann::json::array({50.0, 52.0})}, {"queue_ms", 12.0}, {"preempt_yield_ms", 5.0}},
+                 {{"turn_idx", 1}, {"modality_plan", "dit_edit"}, {"status", st}, {"dit_ms", 4200.0}, {"height", 512}, {"dit_steps", 20}, {"h2d_weight_ms", 40.0}, {"kv_transfer_ms", 18.0}, {"vae_ms", 52.6}},
              })},
         };
     };
@@ -609,49 +667,79 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
         mk_out("s1", 150.0, "ok", true),
         mk_out("d0", 260.0, "oom", false),
     });
-    const nlohmann::json wstats = nlohmann::json::array({
-        {
-            {"nvml_peak_used_mib", 11800.0},
-            {"pytorch_reserved_mib", 5100.0},
-            {"vmm_stats", {{"pool_total_bytes", 6688LL * kMiB}, {"kv_swap_outs_total", 4}, {"kv_swap_ins_total", 3}}},
-        },
-        {
-            {"nvml_peak_used_mib", 11500.0},
-            {"pytorch_reserved_mib", 4900.0},
-            {"vmm_physical_pool_mib", 6688.0},
-            {"kv_host_swap_outs", 2},
-            {"kv_host_swap_ins", 1},
-        },
-    });
+    const nlohmann::json wstats = {
+        {"nvml_sm_util_mean_pct", 78.5},
+        {"alpha_timeline",
+         nlohmann::json::array({
+             {{"t_s", 12.0}, {"mean_alpha", 0.25}},
+             {{"t_s", 85.0}, {"mean_alpha", 0.75}},
+         })},
+        {"workers",
+         nlohmann::json::array({
+             {
+                 {"nvml_peak_used_mib", 11800.0},
+                 {"pytorch_reserved_mib", 5100.0},
+                 {"vmm_stats", {{"pool_total_bytes", 6688LL * kMiB}, {"kv_swap_outs_total", 4}, {"kv_swap_ins_total", 3}}},
+             },
+             {
+                 {"nvml_peak_used_mib", 11500.0},
+                 {"pytorch_reserved_mib", 4900.0},
+                 {"vmm_physical_pool_mib", 6688.0},
+                 {"kv_host_swap_outs", 2},
+                 {"kv_host_swap_ins", 1},
+             },
+         })},
+    };
     const auto rep = MorphControlEngine::aggregate_cluster_run_report(
         pol_win, "unit_canonical_window", 0.5, 300.0, 0.0, outcomes_win, wstats);
 
+    // Steady window: [60.0, min(240.0, 260.0 - 30.0)] == [60.0, 230.0] (170.0 s), actual-rate goodput = 2 / 170.0.
     MS_CHECK(rep.at("steady_state_sessions").get<int>() == 2);
-    MS_CHECK(std::abs(rep.at("joint_slo_goodput_rps").get<double>() - 0.5) < 1e-6);
-    MS_CHECK(std::abs(rep.at("steady_joint_slo_goodput_rps").get<double>() - 0.5) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_window_end_s").get<double>() - 230.0) < 1e-6);
+    const double expected_steady_rps = round_4(2.0 / 170.0);
+    MS_CHECK(std::abs(rep.at("actual_steady_arrival_qps").get<double>() - expected_steady_rps) < 1e-6);
+    MS_CHECK(std::abs(rep.at("joint_slo_goodput_rps").get<double>() - expected_steady_rps) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_joint_slo_goodput_rps").get<double>() - expected_steady_rps) < 1e-6);
+    MS_CHECK(std::abs(rep.at("steady_turn_goodput_tps").get<double>() - round_4(4.0 / 170.0)) < 1e-6);
     MS_CHECK(std::abs(rep.at("joint_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
     MS_CHECK(std::abs(rep.at("steady_joint_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
-    MS_CHECK(std::abs(rep.at("full_trace_goodput_rps").get<double>() - 0.25) < 1e-6);
+    MS_CHECK(rep.at("actual_arrival_qps").get<double>() > 0.0);
     MS_CHECK(std::abs(rep.at("full_trace_joint_slo_attainment_pct").get<double>() - 50.0) < 1e-6);
     MS_CHECK(std::abs(rep.at("vmm_physical_pool_mib").get<double>() - 6688.0) < 1e-6);
     MS_CHECK(rep.at("kv_host_swap_outs").get<int>() == 6);
     MS_CHECK(rep.at("kv_host_swap_ins").get<int>() == 4);
-    MS_CHECK(std::abs(rep.at("slo_config").at("dit_1024_slo_ms").get<double>() - 65160.0) < 1e-6);
-    MS_CHECK(std::abs(rep.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 65160.0) < 1e-6);
+    MS_CHECK(std::abs(rep.at("nvml_sm_util_mean_pct").get<double>() - 78.5) < 1e-6);
+    MS_CHECK(std::abs(rep.at("latency_breakdown_ms").at("vae_ms").at("mean").get<double>() - 52.6) < 1e-6);
+    MS_CHECK(std::abs(rep.at("latency_breakdown_ms").at("queue_ms").at("mean").get<double>() - 12.0) < 1e-6);
+    // Verify real-time `alpha_timeline` took precedence over session `resident_alpha_sample = 0.99`.
+    bool checked_alpha_bucket = false;
+    for (const auto& b : rep.at("time_series_10s")) {
+        if (std::abs(b.at("t_start_s").get<double>() - 80.0) < 1e-6) {
+            MS_CHECK(std::abs(b.at("mean_alpha").get<double>() - 0.75) < 1e-6);
+            checked_alpha_bucket = true;
+        }
+    }
+    MS_CHECK(checked_alpha_bucket);
+    MS_CHECK(std::abs(rep.at("slo_config").at("dit_1024_slo_ms").get<double>() - 57219.60) < 1e-6);
+    MS_CHECK(std::abs(rep.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 57219.60) < 1e-6);
 
-    // InternVL-U 16-step 1024px parity in `slo_config`, `slo_curve_by_k`, and `slo_curve_by_dit_k`.
+    // InternVL-U 16-step 512px & 1024px parity in `slo_config`, `slo_curve_by_k`, and `slo_curve_by_dit_k`.
     const PolicyConfig pol_ivl_win = PolicyConfig::from_preset(
         "morphserve",
         8,
         {{"model_family", "internvl_u"}, {"steady_window_mode", "time"}, {"warmup_window_s", 60.0}, {"steady_window_s", 180.0}});
     const auto rep_ivl = MorphControlEngine::aggregate_cluster_run_report(
         pol_ivl_win, "unit_ivl_steps", 0.5, 300.0, 0.0, outcomes_win, wstats);
-    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_512_slo_ms").get<double>() - 9750.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
-    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21900.0) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_512_slo_ms").get<double>() - 7484.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_config").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
+    MS_CHECK(std::abs(rep_ivl.at("slo_curve_by_dit_k").at("3.0x").at("dit_1024_slo_ms").get<double>() - 21374.40) < 1e-6);
 
-    // D1-D5 planned-turns denominator with mid-session OOM.
+    // D1-D5 planned-turns denominator + unbiased `per_turn_stats` + improper DiT CDF with mid-session OOM.
+    const PolicyConfig pol_trim = PolicyConfig::from_preset(
+        "morphserve",
+        8,
+        {{"steady_window_mode", "session_trim"}, {"steady_state_trim_frac", 0.0}});
     const nlohmann::json out_a = {
         {"session_id", "s_a"},
         {"arrival_offset_s", 80.0},
@@ -662,10 +750,10 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
         {"planned_turns", 4},
         {"planned_ar_turns", 3},
         {"planned_dit_turns", 2},
-        {"ar_ttfts_ms", nlohmann::json::array({300.0, 400.0, 350.0})},
+        {"ar_ttfts_ms", nlohmann::json::array({180.0, 200.0, 350.0})},
         {"ar_tpots_ms", nlohmann::json::array({55.0, 60.0, 58.0})},
         {"ar_turn_tpots_ms", nlohmann::json::array({{55.0}, {60.0}, {58.0}})},
-        {"dit_turns_ms", nlohmann::json::array({15000.0, 20000.0})},
+        {"dit_turns_ms", nlohmann::json::array({12000.0, 17500.0})},
         {"dit_turn_heights", nlohmann::json::array({512, 512})},
         {"dit_turn_steps", nlohmann::json::array({20, 20})},
         {"ar_slo_met", true},
@@ -673,10 +761,10 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
         {"joint_slo_met", false},
         {"turn_records",
          nlohmann::json::array({
-             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 300.0}, {"ar_tpot_p95_ms", 55.0}},
-             {{"turn_idx", 1}, {"modality_plan", "cot_then_dit"}, {"status", "ok"}, {"ar_ttft_ms", 400.0}, {"ar_tpot_p95_ms", 60.0}, {"dit_ms", 15000.0}, {"height", 512}, {"dit_steps", 20}},
-             {{"turn_idx", 2}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 350.0}, {"ar_tpot_p95_ms", 58.0}},
-             {{"turn_idx", 3}, {"modality_plan", "dit_edit"}, {"status", "ok"}, {"dit_ms", 20000.0}, {"height", 512}, {"dit_steps", 20}},
+             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 180.0}, {"ar_tpot_p95_ms", 55.0}, {"has_image", false}},
+             {{"turn_idx", 1}, {"modality_plan", "cot_then_dit"}, {"status", "ok"}, {"ar_ttft_ms", 200.0}, {"ar_tpot_p95_ms", 60.0}, {"has_image", false}, {"dit_ms", 12000.0}, {"height", 512}, {"dit_steps", 20}},
+             {{"turn_idx", 2}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 350.0}, {"ar_tpot_p95_ms", 58.0}, {"has_image", true}, {"num_images", 1}, {"image_res", 512}},
+             {{"turn_idx", 3}, {"modality_plan", "dit_edit"}, {"status", "ok"}, {"dit_ms", 17500.0}, {"height", 512}, {"dit_steps", 20}},
          })},
     };
     const nlohmann::json out_b = {
@@ -688,7 +776,7 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
         {"planned_turns", 4},
         {"planned_ar_turns", 2},
         {"planned_dit_turns", 2},
-        {"ar_ttfts_ms", nlohmann::json::array({250.0})},
+        {"ar_ttfts_ms", nlohmann::json::array({190.0})},
         {"ar_tpots_ms", nlohmann::json::array({50.0})},
         {"dit_turns_ms", nlohmann::json::array()},
         {"ar_slo_met", false},
@@ -696,18 +784,63 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
         {"joint_slo_met", false},
         {"turn_records",
          nlohmann::json::array({
-             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 250.0}, {"ar_tpot_p95_ms", 50.0}},
+             {{"turn_idx", 0}, {"modality_plan", "ar_only"}, {"status", "ok"}, {"ar_ttft_ms", 190.0}, {"ar_tpot_p95_ms", 50.0}, {"has_image", false}},
              {{"turn_idx", 1}, {"modality_plan", "dit_edit"}, {"status", "oom"}, {"height", 512}, {"dit_steps", 20}},
          })},
     };
     const auto rep_d = MorphControlEngine::aggregate_cluster_run_report(
-        pol_win, "unit_d1_d5", 0.5, 200.0, 0.0, nlohmann::json::array({out_a, out_b}), nlohmann::json::array());
+        pol_trim, "unit_d1_d5", 0.5, 200.0, 0.0, nlohmann::json::array({out_a, out_b}), nlohmann::json::array());
     MS_CHECK(rep_d.at("steady_planned_turns").get<int>() == 8);
     MS_CHECK(rep_d.at("steady_completed_turns").get<int>() == 5);
     MS_CHECK(std::abs(rep_d.at("steady_turn_survival_pct").get<double>() - 62.5) < 1e-6);
     MS_CHECK(std::abs(rep_d.at("steady_turn_slo_attainment_pct").get<double>() - 50.0) < 1e-6);
     MS_CHECK(std::abs(rep_d.at("slo_curve_by_dit_k").at("2.0x").at("turn_attainment_pct").get<double>() - 37.5) < 1e-6);
     MS_CHECK(std::abs(rep_d.at("slo_curve_by_dit_k").at("4.0x").at("session_attainment_pct").get<double>() - 50.0) < 1e-6);
+    // Unbiased per_turn_stats: turn_2 & turn_3 include dead session s_b (total == 2, unreached == 1, survival == 50%).
+    MS_CHECK(rep_d.at("per_turn_stats").at("turn_2").at("total").get<int>() == 2);
+    MS_CHECK(rep_d.at("per_turn_stats").at("turn_2").at("unreached").get<int>() == 1);
+    MS_CHECK(std::abs(rep_d.at("per_turn_stats").at("turn_2").at("survival_pct").get<double>() - 50.0) < 1e-6);
+    MS_CHECK(rep_d.at("per_turn_stats").at("turn_3").at("total").get<int>() == 2);
+    MS_CHECK(rep_d.at("per_turn_stats").at("turn_3").at("unreached").get<int>() == 1);
+    // Improper DiT CDF uses planned DiT turns (4) as denominator: 2 ok / 4 planned == 50.0%, p90 is null.
+    MS_CHECK(std::abs(rep_d.at("dit_turn_survival_pct").get<double>() - 50.0) < 1e-6);
+    MS_CHECK(std::abs(rep_d.at("all_session_dit_p50_ms").get<double>() - 17500.0) < 1e-6);
+    MS_CHECK(rep_d.at("all_session_dit_p90_ms").is_null());
+
+    // Session-level AR/DiT SLO denominators exclude sessions without that modality.
+    const nlohmann::json pure_ar_fail = {
+        {"session_id", "pure_ar"},
+        {"arrival_offset_s", 1.0},
+        {"status", "ok"},
+        {"planned_turns", 1},
+        {"planned_ar_turns", 1},
+        {"planned_dit_turns", 0},
+        {"ar_ttfts_ms", nlohmann::json::array({999.0})},
+        {"ar_tpots_ms", nlohmann::json::array({50.0})},
+        {"ar_slo_met", false},
+        {"dit_slo_met", true},
+        {"joint_slo_met", false},
+    };
+    const nlohmann::json pure_dit_ok = {
+        {"session_id", "pure_dit"},
+        {"arrival_offset_s", 2.0},
+        {"status", "ok"},
+        {"planned_turns", 1},
+        {"planned_ar_turns", 0},
+        {"planned_dit_turns", 1},
+        {"dit_turns_ms", nlohmann::json::array({4500.0})},
+        {"dit_turn_heights", nlohmann::json::array({512})},
+        {"dit_turn_steps", nlohmann::json::array({20})},
+        {"ar_slo_met", true},
+        {"dit_slo_met", true},
+        {"joint_slo_met", true},
+    };
+    const auto rep_mod = MorphControlEngine::aggregate_cluster_run_report(
+        pol_trim, "unit_mod_denom", 1.0, 10.0, 0.0, nlohmann::json::array({pure_ar_fail, pure_dit_ok}), nlohmann::json::array());
+    MS_CHECK(rep_mod.at("steady_sessions_with_ar").get<int>() == 1);
+    MS_CHECK(rep_mod.at("steady_sessions_with_dit").get<int>() == 1);
+    MS_CHECK(std::abs(rep_mod.at("steady_ar_slo_attainment_pct").get<double>() - 0.0) < 1e-6);
+    MS_CHECK(std::abs(rep_mod.at("steady_dit_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
 }
 
 }  // namespace

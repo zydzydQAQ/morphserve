@@ -345,8 +345,15 @@ def _update_text_ctx(pipeline, ctx: dict, prompt: str) -> None:
     ctx["ropes"] = new_rope
 
 
-def _update_image_ctx_cpu_pil(pipeline, ctx: dict, pil_img) -> float:
-    """Stock CPU PIL/PNG round-trip + VAE/ViT KV update; returns CPU loopback overhead ms."""
+def _update_image_ctx_cpu_pil(
+    pipeline,
+    ctx: dict,
+    pil_img,
+    *,
+    update_vae: bool = True,
+    update_vit: bool = True,
+) -> float:
+    """Stock CPU PIL/PNG round-trip + configurable VAE/ViT KV update; returns CPU loopback overhead ms."""
     import numpy as np
     from PIL import Image
     import torch
@@ -364,33 +371,47 @@ def _update_image_ctx_cpu_pil(pipeline, ctx: dict, pil_img) -> float:
     def vit_transforms(img):
         return pipeline.image_processor(images=img, return_tensors="pt").pixel_values[0]
 
-    vae_inp, new_lens, new_rope = pipeline.bagel.prepare_vae_images(
-        curr_kvlens=ctx["kv_lens"],
-        curr_rope=ctx["ropes"],
-        images=[reloaded],
-        transforms=vae_transforms,
-        new_token_ids=pipeline.new_token_ids,
-    )
-    vae_inp = {k: (v.to(pipeline.device) if torch.is_tensor(v) else v) for k, v in vae_inp.items()}
-    vit_inp, new_lens_vit, new_rope_vit = pipeline.bagel.prepare_vit_images(
-        curr_kvlens=new_lens,
-        curr_rope=new_rope,
-        images=[reloaded],
-        transforms=vit_transforms,
-        new_token_ids=pipeline.new_token_ids,
-    )
-    vit_inp = {k: (v.to(pipeline.device) if torch.is_tensor(v) else v) for k, v in vit_inp.items()}
+    curr_lens = ctx["kv_lens"]
+    curr_rope = ctx["ropes"]
+    vae_inp = None
+    new_lens_vae = curr_lens
+    new_rope_vae = curr_rope
+    if update_vae:
+        vae_inp, new_lens_vae, new_rope_vae = pipeline.bagel.prepare_vae_images(
+            curr_kvlens=curr_lens,
+            curr_rope=curr_rope,
+            images=[reloaded],
+            transforms=vae_transforms,
+            new_token_ids=pipeline.new_token_ids,
+        )
+        vae_inp = {k: (v.to(pipeline.device) if torch.is_tensor(v) else v) for k, v in vae_inp.items()}
+        curr_lens, curr_rope = new_lens_vae, new_rope_vae
+
+    vit_inp = None
+    new_lens_vit = curr_lens
+    new_rope_vit = curr_rope
+    if update_vit:
+        vit_inp, new_lens_vit, new_rope_vit = pipeline.bagel.prepare_vit_images(
+            curr_kvlens=curr_lens,
+            curr_rope=curr_rope,
+            images=[reloaded],
+            transforms=vit_transforms,
+            new_token_ids=pipeline.new_token_ids,
+        )
+        vit_inp = {k: (v.to(pipeline.device) if torch.is_tensor(v) else v) for k, v in vit_inp.items()}
     cpu_prep_ms = (time.perf_counter() - t_cpu0) * 1000.0
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vae(
-            pipeline.vae, ctx["past_key_values"], **vae_inp
-        )
-        ctx["kv_lens"] = new_lens
-        ctx["ropes"] = new_rope
-        ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vit(ctx["past_key_values"], **vit_inp)
-        ctx["kv_lens"] = new_lens_vit
-        ctx["ropes"] = new_rope_vit
+        if update_vae and vae_inp is not None:
+            ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vae(
+                pipeline.vae, ctx["past_key_values"], **vae_inp
+            )
+            ctx["kv_lens"] = new_lens_vae
+            ctx["ropes"] = new_rope_vae
+        if update_vit and vit_inp is not None:
+            ctx["past_key_values"] = pipeline.bagel.forward_cache_update_vit(ctx["past_key_values"], **vit_inp)
+            ctx["kv_lens"] = new_lens_vit
+            ctx["ropes"] = new_rope_vit
     return cpu_prep_ms
 
 
@@ -820,12 +841,14 @@ def run_validation(
             )
             sh_l, sh_c = 0, 0
 
-        # Post-generation VQA turn exercising loopback -> AR VQA (`MMVet` rubric)
+        # Post-generation VQA turn exercising loopback -> AR VQA (`MMVet` rubric).
+        # Use IDENTICAL `update_vae=False, update_vit=True` flags on both CPU and GPU loopback paths
+        # to prevent artificial KV-context divergence between stock and MorphServe AR VQA.
         vqa_ctx = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
         if use_ms and u8_cot is not None:
             loopback.update_context_from_u8_gpu(vqa_ctx, u8_cot, update_vae=False, update_vit=True)
         else:
-            _update_image_ctx_cpu_pil(pipeline, vqa_ctx, im)
+            _update_image_ctx_cpu_pil(pipeline, vqa_ctx, im, update_vae=False, update_vit=True)
         _update_text_ctx(pipeline, vqa_ctx, "What color is the fire hydrant in this image?")
         vqa_ans = _generate_ar_text(pipeline, vqa_ctx, max_tokens=160)
         del ctx_m, ct_ctx, ci_ctx, vqa_ctx, u8_cot
@@ -851,11 +874,28 @@ def run_validation(
     mmvet_ms_score = score_mmvet_answer(cot_vqa_ms, "blue")
     # Extract whole words (never mid-word character slices) for deterministic CoT rubric parity check
     mmvet_cot_parity = score_mmvet_answer(cot_think_ms, _extract_cot_rubric_clause(cot_think_stock))
+    cot_think_exact_match = cot_think_stock == cot_think_ms
+    cot_vqa_exact_match = cot_vqa_stock == cot_vqa_ms
+    # Honest VQA parity gate: NEVER pass on trivial `0.0 == 0.0` divergent wrong answers!
+    # Require either exact non-empty VQA text equality OR valid non-zero score parity.
+    mmvet_parity_valid = bool(
+        (mmvet_ref_score > 0.0 and abs(mmvet_ms_score - mmvet_ref_score) <= 1e-6)
+        or (cot_vqa_exact_match and bool(cot_vqa_ms.strip()) and mmvet_ms_score >= mmvet_ref_score - 1e-6)
+    )
+    test4_lossless_pass = bool(
+        cot_l_shared > 0
+        and cot_sh_calls > 0
+        and cot_think_exact_match
+        and cot_qual["ssim"] >= 0.985
+        and mmvet_parity_valid
+    )
 
     report["test4_visual_cot_and_downstream"] = {
         "cot_shared_prefix_len": cot_l_shared,
         "cot_shared_attn_calls": cot_sh_calls,
-        "cot_think_exact_match": cot_think_stock == cot_think_ms,
+        "cot_think_exact_match": cot_think_exact_match,
+        "cot_vqa_exact_match": cot_vqa_exact_match,
+        "cot_vqa_loopback_flags": {"update_vae": False, "update_vit": True},
         "cot_stock_gen_ms": round(cot_stock_ms, 2),
         "cot_morphserve_gen_ms": round(cot_ms_ms, 2),
         "cot_ssim": cot_qual["ssim"],
@@ -866,7 +906,9 @@ def run_validation(
         "owlv2_morphserve_score": owl_ms["score"],
         "mmvet_vqa_ref_score": mmvet_ref_score,
         "mmvet_vqa_morphserve_score": mmvet_ms_score,
+        "mmvet_vqa_parity_valid": mmvet_parity_valid,
         "mmvet_rubric_smoke_score": mmvet_cot_parity,
+        "lossless_pass": test4_lossless_pass,
     }
 
     interceptor.uninstall()
@@ -893,15 +935,12 @@ def run_validation(
         and all(t["shared_triton_attn_calls"] > 0 for t in turn_comparisons if t["turn"] >= 1)
         and same_ctx_turn3_qual["ssim"] >= 0.995
         and lossless_t3_bit_exact
-        and cot_l_shared > 0
-        and cot_sh_calls > 0
-        and cot_qual["ssim"] >= 0.985
+        and test4_lossless_pass
         and turn_comparisons[0]["ssim"] >= 0.99
         and mean_4turn_ssim >= 0.965
         and all(t["ssim"] >= 0.945 for t in turn_comparisons)
         and (owl_ms["score"] is None or owl_ref["score"] is None or float(owl_ms["score"]) >= float(owl_ref["score"]) - 1e-6)
         and (not clip_turn_deltas or abs(sum(clip_turn_deltas) / len(clip_turn_deltas)) <= 0.5)
-        and abs(mmvet_ms_score - mmvet_ref_score) <= 1e-6
         and all(t["kv_hbm_saved_pct"] >= 45.0 for t in turn_comparisons if t["turn"] >= 1)
         and report["test3_4turn_interleaved_e2e"]["total_morphserve_gen_ms"]
         < report["test3_4turn_interleaved_e2e"]["total_stock_gen_ms"]

@@ -13,10 +13,19 @@ from morphserve.router.topology import default_operator_profile
 VALID_POLICIES = (
     "morphserve",
     "monolithic_dp",
+    "monolithic_kv_swap",
     "twostage_shm",
     "static_nccl_fission",
     "prism_tetriserve_coloc",
     "naive_host_offload",
+)
+
+MAIN_QPS_POLICIES = (
+    "morphserve",
+    "monolithic_dp",
+    "monolithic_kv_swap",
+    "static_nccl_fission",
+    "prism_tetriserve_coloc",
 )
 
 STATIC_SPLIT_POLICIES = (
@@ -74,6 +83,7 @@ class EnginePolicyConfig:
     use_module3_cow_loopback: bool = True
     allow_cascade_cfg_split: bool = False
     use_naive_offload: bool = False
+    use_idle_kv_swap: bool = False
     kv_vmm_only: bool = False
     preemption_mode: str = "layer_chunk"  # "non_preemptive" | "step_preemptive" | "layer_chunk"
     static_und_ranks: tuple[int, ...] = ()
@@ -83,10 +93,10 @@ class EnginePolicyConfig:
     # Per-class decoupled k_AR / k_DiT normalized unloaded SLOs (`D1-D5`) & bounded OOM recovery
     slo_scale_k: float = 2.0
     dit_slo_scale_k: float = 3.0
-    ar_tpot_slo_ms: float = 125.64
+    ar_tpot_slo_ms: float = 101.40
     ar_ttft_slo_ms: float = 1500.0
-    dit_512_slo_ms: float = 18360.0
-    dit_1024_slo_ms: float = 65160.0
+    dit_512_slo_ms: float = 14916.30
+    dit_1024_slo_ms: float = 57219.60
     dit_turn_slo_override_ms: float | None = None
     max_oom_retries: int = 1
     inter_turn_think_s_range: tuple[float, float] = (2.0, 25.0)
@@ -96,7 +106,8 @@ class EnginePolicyConfig:
     ar_tpot_slo_mode: str = "turn_p95"
     steady_window_mode: str = "time"
     warmup_window_s: float = 60.0
-    steady_window_s: float = 180.0
+    steady_window_s: float = 150.0
+    cooldown_s: float = 30.0
     steady_state_trim_frac: float = 0.15
     gpu_memory_fraction: float | None = None
     gpu_memory_quota_mib: float | None = None
@@ -126,6 +137,22 @@ class EnginePolicyConfig:
             steps=steps,
         )
 
+    def ar_ttft_slo_for(
+        self,
+        has_image: bool,
+        num_images: int = 0,
+        image_res: int = 512,
+        k: float | None = None,
+    ) -> float:
+        eff_k = self.slo_scale_k if k is None else float(k)
+        return default_operator_profile().ar_ttft_slo_for(
+            has_image=has_image,
+            num_images=num_images,
+            image_res=image_res,
+            k=eff_k,
+            model_family="internvl_u" if self.model_family == "internvl_u" else "bagel",
+        )
+
     def role_of(self, rank: int) -> str:
         if self.static_und_ranks and rank in self.static_und_ranks:
             return "und"
@@ -149,6 +176,7 @@ class EnginePolicyConfig:
             float(self.inter_turn_think_s_range[1]),
         ]
         raw["allow_cascade_cfg_split"] = bool(self.allow_cascade_cfg_split)
+        raw["use_idle_kv_swap"] = bool(self.use_idle_kv_swap)
         raw["think_time_dist"] = str(self.think_time_dist)
         raw["think_time_median_s"] = float(self.think_time_median_s)
         raw["think_time_sigma"] = float(self.think_time_sigma)
@@ -156,6 +184,7 @@ class EnginePolicyConfig:
         raw["steady_window_mode"] = str(self.steady_window_mode)
         raw["warmup_window_s"] = float(self.warmup_window_s)
         raw["steady_window_s"] = float(self.steady_window_s)
+        raw["cooldown_s"] = float(self.cooldown_s)
         return raw
 
     def to_json(self) -> str:
@@ -184,11 +213,12 @@ class EnginePolicyConfig:
             d["inter_turn_think_s_range"] = (2.0, 25.0)
         else:
             d["inter_turn_think_s_range"] = (float(tr[0]), float(tr[1]))
-        if "allow_cascade_cfg_split" in d:
-            if d["allow_cascade_cfg_split"] is None:
-                d.pop("allow_cascade_cfg_split")
-            else:
-                d["allow_cascade_cfg_split"] = bool(d["allow_cascade_cfg_split"])
+        for bool_key in ("allow_cascade_cfg_split", "use_idle_kv_swap"):
+            if bool_key in d:
+                if d[bool_key] is None:
+                    d.pop(bool_key)
+                else:
+                    d[bool_key] = bool(d[bool_key])
         for str_key in ("think_time_dist", "ar_tpot_slo_mode", "steady_window_mode"):
             if str_key in d:
                 if d[str_key] is None:
@@ -201,6 +231,7 @@ class EnginePolicyConfig:
             "think_time_sigma",
             "warmup_window_s",
             "steady_window_s",
+            "cooldown_s",
         ):
             if flt_key in d:
                 if d[flt_key] is None:
@@ -240,6 +271,7 @@ class RunWindowOptions:
     steady_window_mode: str | None = None
     warmup_window_s: float | None = None
     steady_window_s: float | None = None
+    cooldown_s: float | None = None
     steady_state_trim_frac: float | None = None
     slo_scale_k: float | None = None
     dit_slo_scale_k: float | None = None
@@ -265,6 +297,8 @@ class RunWindowOptions:
             updates["warmup_window_s"] = float(self.warmup_window_s)
         if self.steady_window_s is not None:
             updates["steady_window_s"] = float(self.steady_window_s)
+        if self.cooldown_s is not None:
+            updates["cooldown_s"] = float(self.cooldown_s)
         if self.steady_state_trim_frac is not None:
             updates["steady_state_trim_frac"] = float(self.steady_state_trim_frac)
         if self.ar_tpot_slo_mode is not None:
@@ -400,6 +434,7 @@ class WorkerBudgetPlanner:
 
 __all__ = [
     "EnginePolicyConfig",
+    "MAIN_QPS_POLICIES",
     "RunWindowOptions",
     "STATIC_SPLIT_POLICIES",
     "VALID_POLICIES",

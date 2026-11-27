@@ -47,6 +47,15 @@ struct TurnRecordInput {
     int height = 0;
     int dit_steps = 0;
     std::optional<double> kv_mib;
+    std::optional<bool> has_image;
+    std::optional<int> num_images;
+    int image_res = 0;
+    bool use_prev_image = false;
+    std::optional<double> queue_ms;
+    std::optional<double> h2d_weight_ms;
+    std::optional<double> kv_transfer_ms;
+    std::optional<double> vae_ms;
+    std::optional<double> preempt_yield_ms;
 
     static TurnRecordInput from_json(const nlohmann::json& j, int default_turn_idx);
 };
@@ -54,6 +63,7 @@ struct TurnRecordInput {
 // Typed per-session input parsed once from canonical live or simulator outcomes.
 struct SessionOutcomeInput {
     std::string status = "error";
+    std::string quadrant;
     std::string phase_label;
     double arrival_offset_s = 0.0;
     std::optional<double> e2e_ms;
@@ -65,6 +75,9 @@ struct SessionOutcomeInput {
     std::vector<double> ar_ttfts_ms;
     std::vector<double> ar_tpots_ms;
     std::vector<std::vector<double>> ar_turn_tpots_ms;
+    std::vector<int> ar_turn_has_image;
+    std::vector<int> ar_turn_num_images;
+    std::vector<int> ar_turn_image_res;
     std::vector<double> dit_turns_ms;
     std::vector<int> dit_turn_heights;
     std::vector<int> dit_turn_steps;
@@ -74,6 +87,11 @@ struct SessionOutcomeInput {
     std::optional<bool> dit_slo_met;
     std::optional<bool> joint_slo_met;
     std::optional<double> resident_alpha_sample;
+    std::optional<double> queue_ms;
+    std::optional<double> h2d_weight_ms;
+    std::optional<double> kv_transfer_ms;
+    std::optional<double> vae_ms;
+    std::optional<double> preempt_yield_ms;
     int path_a_ships = 0;
     int path_b_morphs = 0;
     int preempted_ar_turns = 0;
@@ -92,6 +110,7 @@ struct WorkerStatsInput {
     double combined_physical_mib = 0.0;
     double pytorch_reserved_mib = 0.0;
     double vmm_physical_pool_mib = 0.0;
+    std::optional<double> nvml_sm_util_mean_pct;
     int oom_count = 0;
     int kv_host_swap_outs = 0;
     int kv_host_swap_ins = 0;
@@ -116,7 +135,7 @@ public:
     std::shared_ptr<DualPathMorphRouter> router() const noexcept { return router_; }
 
     // Canonical `PreemptEdfController` constructor shared across live workers and `ClusterSimulator`
-    // (preserves `PreemptEdfController`'s default `guard_ms = 14.0 * time_scale` without ad-hoc caps).
+    // (aligned with live `bagel_adapter.py`: `guard_ms = 24.0 * time_scale`).
     static PreemptEdfController make_edf_controller(
         int num_layers,
         double tpot_slo_ms,
@@ -188,7 +207,10 @@ public:
         const std::vector<int>& dit_heights,
         const std::vector<int>& dit_steps,
         const std::vector<std::vector<double>>& ar_turn_tpots_ms = {},
-        double slo_time_scale = 1.0);
+        double slo_time_scale = 1.0,
+        const std::vector<int>& ar_turn_has_image = {},
+        const std::vector<int>& ar_turn_num_images = {},
+        const std::vector<int>& ar_turn_image_res = {});
 
     // Single canonical report aggregator shared by live `MorphServeClusterEngine` and `ClusterSimulator`.
     static nlohmann::json aggregate_cluster_run_report(

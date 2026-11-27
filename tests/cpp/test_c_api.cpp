@@ -203,20 +203,33 @@ void test_policy_and_sim_override_forwarding() {
     MS_CHECK(ms_policy_from_preset_json("nonexistent_policy_xyz", 8, nullptr) == nullptr);
     MS_CHECK(ms_last_error_code() == MS_ERR_INVALID_ARG);
 
-    // 2. `ms_policy_build_ablation_configs_json`
+    // 1b. `monolithic_kv_swap` preset exposes `use_idle_kv_swap=true` & `cooldown_s=30.0`
+    const auto mono_swap = take_json(ms_policy_from_preset_json("monolithic_kv_swap", 8, nullptr));
+    MS_CHECK(mono_swap.at("policy_name").get<std::string>() == "monolithic_kv_swap");
+    MS_CHECK(mono_swap.at("use_idle_kv_swap").get<bool>() == true);
+    MS_CHECK(std::fabs(mono_swap.at("cooldown_s").get<double>() - 30.0) < 1e-6);
+
+    // 2. `ms_policy_build_ablation_configs_json` (full + 6 decoupled single-mechanism LOO ablations)
     const auto ablations = take_json(ms_policy_build_ablation_configs_json(8, "{\"slo_scale_k\":2.5}"));
-    MS_CHECK(ablations.is_array() && ablations.size() == 5);
-    if (ablations.size() == 5) {
+    MS_CHECK(ablations.is_array() && ablations.size() == 7);
+    if (ablations.size() == 7) {
         MS_CHECK(ablations[0].at("label").get<std::string>() == "full_morphserve");
-        MS_CHECK(ablations[1].at("label").get<std::string>() == "no_m4_layer_chunk");
-        MS_CHECK(ablations[2].at("label").get<std::string>() == "no_m3_cow_loopback");
+        MS_CHECK(ablations[1].at("label").get<std::string>() == "no_m1_tripool_vmm");
+        MS_CHECK(ablations[2].at("label").get<std::string>() == "no_m1_scoped_vae");
         MS_CHECK(ablations[3].at("label").get<std::string>() == "no_m2_dual_path");
-        MS_CHECK(ablations[4].at("label").get<std::string>() == "no_m1_tripool_vmm");
+        MS_CHECK(ablations[4].at("label").get<std::string>() == "no_m2_pacer_numa");
+        MS_CHECK(ablations[5].at("label").get<std::string>() == "no_m3_cow_loopback");
+        MS_CHECK(ablations[6].at("label").get<std::string>() == "no_m4_layer_chunk");
         MS_CHECK(std::fabs(ablations[0].at("config").at("slo_scale_k").get<double>() - 2.5) < 1e-6);
-        MS_CHECK(ablations[1].at("config").at("preemption_mode").get<std::string>() == "non_preemptive");
-        MS_CHECK(ablations[2].at("config").at("use_module3_cow_loopback").get<bool>() == false);
+        MS_CHECK(ablations[1].at("config").at("use_tripool_vmm").get<bool>() == false);
+        MS_CHECK(ablations[1].at("config").at("use_scoped_vae").get<bool>() == true);
+        MS_CHECK(ablations[2].at("config").at("use_scoped_vae").get<bool>() == false);
         MS_CHECK(ablations[3].at("config").at("routing_mode").get<std::string>() == "sticky_least_loaded");
-        MS_CHECK(ablations[4].at("config").at("use_tripool_vmm").get<bool>() == false);
+        MS_CHECK(ablations[3].at("config").at("use_h2d_pacer").get<bool>() == true);
+        MS_CHECK(ablations[4].at("config").at("use_h2d_pacer").get<bool>() == false);
+        MS_CHECK(ablations[4].at("config").at("use_shared_numa_mirror").get<bool>() == false);
+        MS_CHECK(ablations[5].at("config").at("use_module3_cow_loopback").get<bool>() == false);
+        MS_CHECK(ablations[6].at("config").at("preemption_mode").get<std::string>() == "non_preemptive");
     }
 
     // 3. `ms_policy_build_static_split_configs_json`
@@ -428,6 +441,18 @@ void test_router_and_control_engine_c_api() {
     MS_CHECK(slo_fail.at("ar_slo_met").get<bool>() == true);
     MS_CHECK(slo_fail.at("dit_slo_met").get<bool>() == false);
     MS_CHECK(slo_fail.at("joint_slo_met").get<bool>() == false);
+
+    // Modality-normalized AR TTFT through C API (`ar_turn_has_image` / `ar_turn_num_images` / `ar_turn_image_res`)
+    const nlohmann::json slo_text_ttft_fail = {
+        {"ar_ttfts_ms", nlohmann::json::array({320.0})},
+        {"ar_tpots_ms", nlohmann::json::array({55.0})},
+        {"ar_turn_has_image", nlohmann::json::array({false})},
+        {"ar_turn_num_images", nlohmann::json::array({0})},
+        {"ar_turn_image_res", nlohmann::json::array({512})},
+    };
+    const auto slo_mod_fail =
+        take_json(ms_ctrl_evaluate_session_slos_json(pol_s.c_str(), slo_text_ttft_fail.dump().c_str()));
+    MS_CHECK(slo_mod_fail.at("ar_slo_met").get<bool>() == false);
 
     // 6. `ms_ctrl_aggregate_report_json`
     const nlohmann::json outcomes = nlohmann::json::array({

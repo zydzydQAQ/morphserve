@@ -15,6 +15,7 @@ from typing import Any, Callable, Sequence
 from morphserve.bench.harness import (
     BenchmarkRunner,
     SuiteRunSpec,
+    effective_steady_window_s,
     parse_csv_strings,
     resolve_default_main_suite_path,
     resolve_sources_dir,
@@ -29,7 +30,9 @@ from morphserve.bench.interleaved_bench import (
 )
 from morphserve.engine import (
     EnginePolicyConfig,
+    MAIN_QPS_POLICIES,
     MultinodeCoordinatorHub,
+    RunWindowOptions,
     TcpMultinodeWorkerFleet,
     run_multinode_worker_daemon,
 )
@@ -529,6 +532,7 @@ def _build_synthetic_multinode_suite(num_sessions: int, offered_qps: float) -> W
         schema="morphserve.interleaved_bench.v2",
         warmup_s=0.0,
         steady_s=span_s,
+        cooldown_s=0.0,
         arrival_duration_s=span_s,
     )
 
@@ -542,7 +546,8 @@ def _prepare_e2e_suite(
     *,
     arrival_duration_s: float = 240.0,
     warmup_s: float = 60.0,
-    steady_s: float = 180.0,
+    steady_s: float = 150.0,
+    cooldown_s: float = 30.0,
     min_sessions: int = 40,
 ) -> WorkloadSuite:
     if synthetic_e2e:
@@ -571,6 +576,7 @@ def _prepare_e2e_suite(
         max_sessions=eff_max,
         warmup_s=float(warmup_s),
         steady_s=float(steady_s),
+        cooldown_s=float(cooldown_s),
     )
     suite.name = f"{raw.name}_2x8_n{len(suite.sessions)}"
     return suite
@@ -587,9 +593,10 @@ def run_multinode_e2e_benchmark(
     offered_qps: float = 1.6,
     arrival_duration_s: float = 240.0,
     warmup_s: float = 60.0,
-    steady_s: float = 180.0,
+    steady_s: float = 150.0,
+    cooldown_s: float = 30.0,
     min_sessions: int = 40,
-    policies: Sequence[str] = ("morphserve", "static_nccl_fission", "monolithic_dp"),
+    policies: Sequence[str] = MAIN_QPS_POLICIES,
     model_family: str = "bagel",
     intra_bw: float = 8.37,
     socket_bw: float = 8.59,
@@ -640,6 +647,7 @@ def run_multinode_e2e_benchmark(
         arrival_duration_s=arrival_duration_s,
         warmup_s=warmup_s,
         steady_s=steady_s,
+        cooldown_s=cooldown_s,
         min_sessions=min_sessions,
     )
     quadrant_counts: dict[str, int] = defaultdict(int)
@@ -666,6 +674,8 @@ def run_multinode_e2e_benchmark(
     summary_by_policy: dict[str, dict[str, Any]] = {}
     ms_max_inter_ship_bytes = 0
     window_mode = "session_trim" if backend == "inproc_synthetic" else "time"
+    eff_steady_s = float(suite.steady_s) if backend == "inproc_synthetic" else effective_steady_window_s(suite)
+    eff_cooldown_s = float(getattr(suite, "cooldown_s", cooldown_s))
 
     try:
         hub.wait_for_remote_nodes()
@@ -675,7 +685,8 @@ def run_multinode_e2e_benchmark(
                 "ar_tpot_slo_mode": "turn_p95",
                 "steady_window_mode": window_mode,
                 "warmup_window_s": float(suite.warmup_s),
-                "steady_window_s": float(suite.steady_s),
+                "steady_window_s": eff_steady_s,
+                "cooldown_s": eff_cooldown_s,
             }
             if backend == "inproc_synthetic":
                 pol_overrides.update(
@@ -697,6 +708,12 @@ def run_multinode_e2e_benchmark(
                 )
 
             cfg = EnginePolicyConfig.from_preset(pol_name, num_gpus=world_size, **pol_overrides)
+            run_opts = RunWindowOptions(
+                steady_window_mode=window_mode,
+                warmup_window_s=float(suite.warmup_s),
+                steady_window_s=eff_steady_s,
+                cooldown_s=eff_cooldown_s,
+            )
 
             def _on_pol(spec: SuiteRunSpec, rep: Any, compact: dict[str, Any], _pol_name: str = pol_name) -> None:
                 nonlocal ms_max_inter_ship_bytes
@@ -745,7 +762,7 @@ def run_multinode_e2e_benchmark(
             results.extend(
                 runner.run_policy_sweep(
                     cfg,
-                    [SuiteRunSpec(suite=suite, target_qps=float(offered_qps))],
+                    [SuiteRunSpec(suite=suite, target_qps=float(offered_qps), run_options=run_opts)],
                     tmp_tag=f"_tmp_m25_{pol_name}",
                     max_error_samples=5,
                     attach_init_shmem=False,
@@ -769,7 +786,8 @@ def run_multinode_e2e_benchmark(
         "steady_state_window_mode": window_mode,
         "arrival_duration_s": float(suite.arrival_duration_s),
         "warmup_s": float(suite.warmup_s),
-        "steady_s": float(suite.steady_s),
+        "steady_s": eff_steady_s,
+        "cooldown_s": eff_cooldown_s,
         "num_sessions": len(suite.sessions),
         "quadrant_counts": dict(sorted(quadrant_counts.items())),
         "calibrated_gbps": {
@@ -805,13 +823,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-sessions", type=int, default=None)
     parser.add_argument("--arrival-duration-s", type=float, default=240.0)
     parser.add_argument("--warmup-s", type=float, default=60.0)
-    parser.add_argument("--steady-s", type=float, default=180.0)
+    parser.add_argument("--steady-s", type=float, default=150.0)
+    parser.add_argument("--cooldown-s", type=float, default=30.0)
     parser.add_argument("--min-sessions", type=int, default=40)
     parser.add_argument("--qps", type=float, default=1.6)
     parser.add_argument(
         "--policies",
         type=str,
-        default="morphserve,static_nccl_fission,monolithic_dp",
+        default=",".join(MAIN_QPS_POLICIES),
         help="Comma-separated policy presets for E2E multi-node benchmark",
     )
     parser.add_argument("--model-family", choices=("bagel", "internvl_u", "synthetic"), default="bagel")
@@ -857,6 +876,7 @@ def main(argv: list[str] | None = None) -> int:
         arrival_duration_s=args.arrival_duration_s,
         warmup_s=args.warmup_s,
         steady_s=args.steady_s,
+        cooldown_s=args.cooldown_s,
         min_sessions=args.min_sessions,
         policies=pol_list,
         model_family=args.model_family,

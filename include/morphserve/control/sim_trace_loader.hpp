@@ -47,6 +47,7 @@ std::vector<SimSessionSpec> build_sim_session_stream(
     int extra_edit_turns = 0,
     const std::string& skew_tag = "",
     const std::string& bench_root = "",
-    const std::string& sources_dir = "");
+    const std::string& sources_dir = "",
+    double arrival_duration_s = 0.0);
 
 }  // namespace morphserve::control

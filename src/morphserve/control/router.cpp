@@ -28,15 +28,9 @@ int select_static_gen_gpu_unlocked(
     const std::map<int, WorkerState>& w_map,
     const std::map<int, bool>& gpu_busy,
     int64_t required_kv_bytes) {
+    (void)static_und_ranks;
     if (static_gen_ranks.empty()) {
         return src_und_gpu;
-    }
-    if (routing_mode == "twostage_shm") {
-        auto it = std::find(static_und_ranks.begin(), static_und_ranks.end(), src_und_gpu);
-        const size_t idx = (it != static_und_ranks.end())
-                               ? static_cast<size_t>(std::distance(static_und_ranks.begin(), it))
-                               : 0;
-        return static_gen_ranks[idx % static_gen_ranks.size()];
     }
 
     const int64_t need_b = std::max<int64_t>(64LL * kMiB, required_kv_bytes);
@@ -54,6 +48,25 @@ int select_static_gen_gpu_unlocked(
     };
 
     std::vector<int> cands = static_gen_ranks;
+    if (routing_mode == "twostage_shm") {
+        // Fair baseline: load-balance across ALL static_gen_ranks (preferring same-node SHM,
+        // sufficient free KV, lowest queue wait, and idle ranks) instead of hardcoded 2k->2k+1 pairing.
+        std::sort(cands.begin(), cands.end(), [&](int a, int b) {
+            auto key_of = [&](int g) {
+                const auto& wg = w_map.at(g);
+                return std::make_tuple(
+                    topo.same_node(src_und_gpu, g) ? 0 : 1,
+                    wg.kv_free_bytes >= need_b ? 0 : 1,
+                    round_3(wg.queue_wait_ms),
+                    is_busy(g),
+                    tier_rank(g),
+                    g);
+            };
+            return key_of(a) < key_of(b);
+        });
+        return cands.front();
+    }
+
     std::sort(cands.begin(), cands.end(), [&](int a, int b) {
         auto key_of = [&](int g) {
             const double bw = std::max(0.5, topo.effective_p2p_gbps(src_und_gpu, g));

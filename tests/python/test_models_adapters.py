@@ -525,8 +525,119 @@ def test_bagel_adapter_non_vmm_host_swap_and_unified_image_update(tmp_path: Path
         )
         assert dit_out["status"] == "ok"
         assert out_png.is_file()
+
+        # Non-CoW `use_prev_image=True` reuses in-memory `last_img_pil` directly (no PNG disk reload)
+        sess_keep = adapter._ctx_store["s_keep"]
+        assert sess_keep.last_img_pil is not None
+        load_calls: list[str] = []
+        orig_load_pil = adapter._load_pil
+
+        def _spy_load_pil(rel_path: str) -> Any:
+            load_calls.append(rel_path)
+            return orig_load_pil(rel_path)
+
+        adapter._load_pil = _spy_load_pil  # type: ignore[method-assign]
+        adapter.prepare_turn("s_keep", {"prompt": "inspect prev", "use_prev_image": True, "prepare_for_dit": False})
+        assert load_calls == []
     finally:
         adapter.close()
+
+
+def test_bagel_adapter_q1_pending_vae_idle_kv_swap_retry_and_hwm_order(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+
+    img_path = tmp_path / "q1_src.png"
+    Image.new("RGB", (32, 32), color=(110, 70, 190)).save(img_path)
+
+    # 1. Q1 Turn 0 (`ar_only` + image) records `pending_vae_only_paths` -> Turn 1 (`dit_edit`) injects VAE once without duplicating ViT
+    pipe, cache_cls = _build_bagel_stub(torch)
+    pol_swap = EnginePolicyConfig.from_preset(
+        "monolithic_kv_swap",
+        num_gpus=1,
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        use_module3_cow_loopback=False,
+        preemption_mode="non_preemptive",
+    )
+    adapter = BagelCPTGAdapter(
+        rank=0,
+        policy=pol_swap,
+        bench_root=tmp_path,
+        pipeline=pipe,
+        naive_cache_cls=cache_cls,
+        device=torch.device("cpu"),
+    )
+    try:
+        adapter.bind_runtime_resources()
+        adapter.prepare_turn(
+            "q1_sess",
+            {"prompt": "describe source image", "image_paths": [str(img_path)], "prepare_for_dit": False},
+        )
+        assert len(pipe.bagel.vit_autocast_flags) == 1
+        assert pipe.bagel.vae_calls == 0
+        assert adapter._ctx_store["q1_sess"].pending_vae_only_paths == [str(img_path)]
+
+        # Turn 1: `dit_edit` with no explicit `image_paths` consumes `pending_vae_only_paths` for VAE-only update!
+        adapter.prepare_turn(
+            "q1_sess",
+            {"prompt": "turn into oil painting", "image_paths": [], "use_prev_image": False, "prepare_for_dit": True},
+        )
+        assert pipe.bagel.vae_calls == 1
+        assert len(pipe.bagel.vit_autocast_flags) == 1
+        assert adapter._ctx_store["q1_sess"].pending_vae_only_paths == []
+
+        # 2. `monolithic_kv_swap` (`use_idle_kv_swap=True`) recovers from transient OOM by evicting idle KV and retrying!
+        adapter.prepare_turn("idle_victim", {"prompt": "old idle context", "prepare_for_dit": False})
+        pipe.bagel.fail_text_oom_on_call = pipe.bagel.text_calls + 1
+        kv_after_retry = adapter.prepare_turn("fresh_req", {"prompt": "retry after swap", "prepare_for_dit": False})
+        assert kv_after_retry > 0
+        assert adapter.memory_and_vmm_stats()["kv_host_swap_outs"] >= 1
+    finally:
+        adapter.close()
+
+    # 3. Verify `_update_hwm()` executes BEFORE `naive_offloader.drop_from_gpu()` in `generate_dit` teardown.
+    pipe2, cache_cls2 = _build_bagel_stub(torch)
+    pol_naive = EnginePolicyConfig.from_preset(
+        "naive_host_offload",
+        num_gpus=1,
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        use_naive_offload=True,
+        use_module3_cow_loopback=False,
+        preemption_mode="non_preemptive",
+    )
+    adapter2 = BagelCPTGAdapter(
+        rank=0,
+        policy=pol_naive,
+        bench_root=tmp_path,
+        pipeline=pipe2,
+        naive_cache_cls=cache_cls2,
+        device=torch.device("cpu"),
+    )
+    try:
+        adapter2.bind_runtime_resources()
+        assert adapter2.naive_offloader is not None
+        adapter2.prepare_turn("n0", {"prompt": "draw bridge", "prepare_for_dit": True})
+        order: list[str] = []
+        orig_hwm = adapter2._update_hwm
+        orig_drop = adapter2.naive_offloader.drop_from_gpu
+
+        def _rec_hwm() -> None:
+            order.append("hwm")
+            orig_hwm()
+
+        def _rec_drop(*, force: bool = False) -> None:
+            order.append("drop")
+            orig_drop(force=force)
+
+        adapter2._update_hwm = _rec_hwm  # type: ignore[method-assign]
+        adapter2.naive_offloader.drop_from_gpu = _rec_drop  # type: ignore[method-assign]
+        out = adapter2.generate_dit("n0", {"height": 512, "width": 512, "dit_steps": 2, "prompt": "draw bridge"})
+        assert out["status"] == "ok"
+        assert "drop" in order
+        assert order.index("hwm") < order.index("drop")
+    finally:
+        adapter2.close()
 
 
 # ==================== 4. InternVLUCPTGAdapter Public Seams ====================
@@ -608,6 +719,86 @@ def test_internvl_u_adapter_edit_preencode_no_monkeypatch_and_hwm(tmp_path: Path
         adapter.close()
 
 
+def test_internvl_u_adapter_token_timing_streamer_and_rolling_history(tmp_path: Path) -> None:
+    torch = pytest.importorskip("torch")
+    import time
+
+    pipe = _build_internvlu_stub(torch)
+    seen_prompts: list[str] = []
+
+    def _stub_generate(input_ids, attention_mask, max_new_tokens=8, do_sample=False, streamer=None, **_kw):
+        if streamer is not None:
+            # Prompt 2D tensor must be skipped; each subsequent 1D token step records a real timestamp.
+            streamer.put(torch.zeros((1, 4), dtype=torch.long))
+            for tok_id in (11, 22, 99):
+                time.sleep(0.002)
+                streamer.put(torch.tensor([tok_id], dtype=torch.long))
+            streamer.end()
+        return SimpleNamespace(generate_output=torch.tensor([[11, 22, 99, 0]], dtype=torch.long))
+
+    orig_proc = pipe.processor.__call__
+
+    def _spy_proc(prompt, image=None, generation_mode="image", padding=True, return_tensors="pt", height=512, width=512):
+        if generation_mode == "text":
+            seen_prompts.append(str(prompt))
+        return orig_proc(
+            prompt=prompt,
+            image=image,
+            generation_mode=generation_mode,
+            padding=padding,
+            return_tensors=return_tensors,
+            height=height,
+            width=width,
+        )
+
+    pipe.processor = _spy_proc
+    pipe.vlm.generate = lambda **kw: None
+    pipe._generate = _stub_generate
+
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=1,
+        model_family="internvl_u",
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        preemption_mode="non_preemptive",
+    )
+    adapter = InternVLUCPTGAdapter(
+        rank=0,
+        policy=pol,
+        bench_root=tmp_path,
+        pipeline=pipe,
+        device=torch.device("cpu"),
+    )
+    try:
+        kv0 = adapter.prepare_turn("hist0", {"prompt": "What is in the room?", "prepare_for_dit": False})
+        out0 = adapter.decode_ar("hist0", max_tokens=4)
+        assert out0["tokens"] == 3
+        assert out0["ttft_ms"] > 0.0
+        assert len(out0["tpots_ms"]) == 2
+        assert all(t > 0.0 for t in out0["tpots_ms"])
+
+        # Turn 2 must prepend rolling multi-turn User/Assistant history into the VLM prompt and grow context bytes.
+        kv1 = adapter.prepare_turn("hist0", {"prompt": "What color is the chair?", "prepare_for_dit": False})
+        assert kv1 > kv0
+        _ = adapter.decode_ar("hist0", max_tokens=4)
+        assert len(seen_prompts) == 2
+        assert "User: What is in the room?" in seen_prompts[1]
+        assert "Assistant:" in seen_prompts[1]
+        assert "User: What color is the chair?" in seen_prompts[1]
+
+        # Rolling history must survive `pack_state` / `unpack_state` across GPU handoff!
+        adapter._ctx_store["hist0"]["diff_inp"] = {"prompt_embeds": torch.ones((1, 2, 4), dtype=torch.float32)}
+        adapter._ctx_store["hist0"]["gh"] = 512
+        adapter._ctx_store["hist0"]["gw"] = 512
+        packed = adapter.pack_state("hist0")
+        assert len(packed.meta["history"]) == 2
+        adapter.unpack_state("hist0_rx", packed.meta, packed.payload)
+        assert len(adapter._ctx_store["hist0_rx"]["history"]) == 2
+    finally:
+        adapter.close()
+
+
 # ==================== 5. NaiveHostOffloader & StaticFissionDropper ====================
 
 
@@ -626,15 +817,41 @@ def test_naive_host_offloader_and_static_fission_dropper_lifecycle() -> None:
     try:
         moved = offloader.offload_to_cpu()
         assert moved > 0
+        assert offloader.is_resident is False
+        assert offloader.hold_depth == 0
         assert all(p.numel() == 0 for p in gen_params)
         assert all(p.numel() > 0 for p in und_params)
 
         assert offloader.swap_in_sync() is True
+        assert offloader.is_resident is True
         assert all(torch.equal(p.detach(), orig) for p, orig in zip(gen_params, originals))
         assert offloader.swap_in_sync() is False  # Already resident
 
         offloader.drop_from_gpu()
+        assert offloader.is_resident is False
         assert all(p.numel() == 0 for p in gen_params)
+
+        # Reference-counted `hold_resident()` + `acquire_resident()` / `release_resident()` prevent double H2D
+        with offloader.hold_resident():
+            assert offloader.is_resident is True
+            assert offloader.hold_depth == 1
+            # Non-forced drop must be deferred while held
+            offloader.drop_from_gpu()
+            assert offloader.is_resident is True
+            assert offloader.acquire_resident(swap_in=True) is False
+            assert offloader.hold_depth == 2
+            offloader.release_resident(drop_when_zero=True)
+            assert offloader.hold_depth == 1
+            assert offloader.is_resident is True
+        assert offloader.hold_depth == 0
+        assert offloader.is_resident is False
+
+        # Forced drop overrides active hold depth cleanly
+        offloader.acquire_resident(swap_in=True)
+        assert offloader.is_resident is True
+        offloader.drop_from_gpu(force=True)
+        assert offloader.is_resident is False
+        offloader.release_resident(drop_when_zero=False)
     finally:
         offloader.close()
 

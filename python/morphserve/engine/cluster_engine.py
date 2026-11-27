@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import threading
 import time
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from morphserve._core import call_json, encode_json, get_core_lib, last_error
 from morphserve.router import (
@@ -134,6 +134,14 @@ class SessionOutcome:
     planned_dit_turns: int = 0
     completed_offset_s: float = 0.0
     resident_alpha_sample: float = 1.0
+    ar_turn_has_image: list[bool] = field(default_factory=list)
+    ar_turn_num_images: list[int] = field(default_factory=list)
+    ar_turn_image_res: list[int] = field(default_factory=list)
+    queue_ms: float = 0.0
+    h2d_weight_ms: float = 0.0
+    kv_transfer_ms: float = 0.0
+    vae_ms: float = 0.0
+    preempt_yield_ms: float = 0.0
 
 
 @dataclass
@@ -239,6 +247,13 @@ class ClusterRunReport:
     kv_host_swap_ins: int = 0
     per_turn_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     time_series_10s: list[dict[str, Any]] = field(default_factory=list)
+    actual_arrival_qps: float = 0.0
+    actual_steady_arrival_qps: float = 0.0
+    steady_sessions_with_ar: int = 0
+    steady_sessions_with_dit: int = 0
+    nvml_sm_util_mean_pct: float | None = None
+    alpha_timeline: list[dict[str, float]] = field(default_factory=list)
+    latency_breakdown_ms: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -294,6 +309,27 @@ class MorphServeClusterEngine:
         self._suites_completed = 0
         self._started = False
         self.host_shmem_delta_gib = 0.0
+        self._image_res_cache: dict[str, int] = {}
+
+    def _probe_image_max_edge(self, rel_path: str, fallback: int = 512) -> int:
+        key = str(rel_path)
+        cached = self._image_res_cache.get(key)
+        if cached is not None:
+            return cached
+        p = Path(key) if os.path.isabs(key) else (self.bench_root / key)
+        res = int(fallback)
+        if p.is_file():
+            try:
+                from PIL import Image
+
+                with Image.open(p) as im:
+                    w, h = im.size
+                    res = max(int(w), int(h))
+            except Exception:
+                res = int(fallback)
+        if len(self._image_res_cache) < 1024:
+            self._image_res_cache[key] = res
+        return res
 
     def __del__(self) -> None:
         h = getattr(self, "_ctrl_handle", 0)
@@ -541,8 +577,12 @@ class MorphServeClusterEngine:
         dit_turns_ms: list[float],
         dit_turn_heights: list[int],
         dit_turn_steps: list[int],
+        ar_turn_has_image: list[bool] | None = None,
+        ar_turn_num_images: list[int] | None = None,
+        ar_turn_image_res: list[int] | None = None,
+        turn_records: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        req = {
+        req: dict[str, Any] = {
             "ar_ttfts_ms": [float(x) for x in ar_ttfts_ms],
             "ar_tpots_ms": [float(x) for x in ar_tpots_ms],
             "ar_turn_tpots_ms": [[float(v) for v in row] for row in ar_turn_tpots_ms],
@@ -553,6 +593,14 @@ class MorphServeClusterEngine:
             "dit_turn_steps": [int(st) for st in dit_turn_steps],
             "slo_time_scale": 1.0,
         }
+        if ar_turn_has_image is not None:
+            req["ar_turn_has_image"] = [bool(x) for x in ar_turn_has_image]
+        if ar_turn_num_images is not None:
+            req["ar_turn_num_images"] = [int(x) for x in ar_turn_num_images]
+        if ar_turn_image_res is not None:
+            req["ar_turn_image_res"] = [int(x) for x in ar_turn_image_res]
+        if turn_records is not None:
+            req["turn_records"] = turn_records
         return call_json(
             self._lib,
             self._lib.ms_ctrl_evaluate_session_slos_json,
@@ -596,6 +644,8 @@ class MorphServeClusterEngine:
             finally:
                 self._active_preemptions[resident_gpu] -= 1
             was_mid_dit = bool(ar_res.get("preempted_mid_dit", True)) and ar_res.get("status") == "ok"
+            if ar_res.get("status") == "ok":
+                ar_res = dict(ar_res, queue_ms=round(float(ar_res.get("queue_ms", 0.0)), 2))
             return ar_res, was_mid_dit
 
         t_enq = time.perf_counter()
@@ -630,8 +680,13 @@ class MorphServeClusterEngine:
                 self._inflight_ar_on_gpu[resident_gpu] = rem
                 if rem == 0:
                     self._ar_drained_events[resident_gpu].set()
-            if ar_res.get("status") == "ok" and coord_queue_wait_ms > 0.0:
-                ar_res = dict(ar_res, ttft_ms=round(float(ar_res.get("ttft_ms", 0.0)) + coord_queue_wait_ms, 2))
+            if ar_res.get("status") == "ok":
+                worker_q_ms = float(ar_res.get("queue_ms", 0.0))
+                ar_res = dict(
+                    ar_res,
+                    ttft_ms=round(float(ar_res.get("ttft_ms", 0.0)) + coord_queue_wait_ms, 2),
+                    queue_ms=round(coord_queue_wait_ms + worker_q_ms, 2),
+                )
             return ar_res, False
         finally:
             self.router.release_ar_queue(resident_gpu, est_ar_ms)
@@ -664,7 +719,10 @@ class MorphServeClusterEngine:
         """
         self._ensure_async_primitives()
 
+        t_src_q0 = time.perf_counter()
         await self._acquire_exclusive_gpu(src_gpu)
+        src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
+        t_pack0 = time.perf_counter()
         try:
             pack_res = await self._rpc(
                 src_gpu,
@@ -675,6 +733,7 @@ class MorphServeClusterEngine:
                     "release_after_pack": release_src_ctx,
                 },
             )
+            pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
         finally:
             self._gpu_locks[src_gpu].release()
 
@@ -687,8 +746,11 @@ class MorphServeClusterEngine:
         wire_bytes = int(meta["total_bytes"])
         logical_bytes = int(meta.get("logical_bytes", wire_bytes))
 
+        t_dst_q_acc = 0.0
         staging_sem = self._dst_staging_sems[dst_gpu]
+        t_sem0 = time.perf_counter()
         await staging_sem.acquire()
+        t_dst_q_acc += max(0.0, (time.perf_counter() - t_sem0) * 1000.0)
         holding_sem = True
         holding_dst_lock = False
         recv_id: str | None = None
@@ -697,7 +759,9 @@ class MorphServeClusterEngine:
             alloc_res = await self._rpc(dst_gpu, {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": True})
             if alloc_res.get("status") != "ok":
                 if self._gpu_locks[dst_gpu].locked() or self._active_dit_ranks.get(dst_gpu, 0) > 0:
+                    t_dq0 = time.perf_counter()
                     await self._acquire_exclusive_gpu(dst_gpu)
+                    t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
                     holding_dst_lock = True
                 alloc_res = await self._rpc(
                     dst_gpu,
@@ -709,6 +773,7 @@ class MorphServeClusterEngine:
 
             recv_id = str(alloc_res["recv_id"])
             lo, hi = (src_gpu, dst_gpu) if src_gpu < dst_gpu else (dst_gpu, src_gpu)
+            t_xf0 = time.perf_counter()
             async with self._xfer_locks[lo]:
                 async with self._xfer_locks[hi]:
                     s_res, r_res = await asyncio.gather(
@@ -716,6 +781,7 @@ class MorphServeClusterEngine:
                         self._rpc(dst_gpu, {"op": "RECV_NCCL", "src_rank": src_gpu, "recv_id": recv_id, "meta": meta}),
                     )
                     packed_consumed = True
+            xfer_wall_ms = max(0.0, (time.perf_counter() - t_xf0) * 1000.0)
 
             if s_res.get("status") != "ok" or r_res.get("status") != "ok":
                 yield {"status": "oom", "packed_ok": True, "error": "nccl_xfer_oom"}
@@ -723,13 +789,17 @@ class MorphServeClusterEngine:
 
             ship_ms = max(float(s_res.get("ship_ms", 0.0)), float(r_res.get("ship_ms", 0.0)))
             if not holding_dst_lock:
+                t_dq1 = time.perf_counter()
                 await self._acquire_exclusive_gpu(dst_gpu)
+                t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq1) * 1000.0)
                 holding_dst_lock = True
 
+            t_unp0 = time.perf_counter()
             u_res = await self._rpc(
                 dst_gpu,
                 {"op": "UNPACK_CTX", "recv_id": recv_id, "new_ctx_id": new_ctx_id, "meta": meta},
             )
+            unpack_ms = max(0.0, (time.perf_counter() - t_unp0) * 1000.0)
             recv_id = None
             staging_sem.release()
             holding_sem = False
@@ -748,6 +818,8 @@ class MorphServeClusterEngine:
                 "status": "ok",
                 "packed_ok": True,
                 "ship_ms": ship_ms,
+                "kv_transfer_ms": round(pack_ms + max(ship_ms, xfer_wall_ms) + unpack_ms, 2),
+                "queue_ms": round(src_queue_ms + t_dst_q_acc, 2),
                 "bytes": logical_bytes,
                 "kv_free_bytes": u_res.get("kv_free_bytes"),
                 "telemetry_seq": u_res.get("telemetry_seq"),
@@ -785,7 +857,10 @@ class MorphServeClusterEngine:
             )
         self._ensure_async_primitives()
         shm_name = f"ms_shm_{os.getpid()}_{src_gpu}_{dst_gpu}_{self._next_cmd_id()}"
+        t_sq0 = time.perf_counter()
         await self._acquire_exclusive_gpu(src_gpu)
+        src_q_ms = max(0.0, (time.perf_counter() - t_sq0) * 1000.0)
+        t_s0 = time.perf_counter()
         try:
             s_res = await self._rpc(
                 src_gpu,
@@ -797,19 +872,26 @@ class MorphServeClusterEngine:
                     "release_after_send": release_src_ctx,
                 },
             )
+            send_ms = max(0.0, (time.perf_counter() - t_s0) * 1000.0)
             if s_res.get("status") != "ok":
                 return dict(s_res, sent_ok=False)
         finally:
             self._gpu_locks[src_gpu].release()
 
+        t_dq0 = time.perf_counter()
         await self._acquire_exclusive_gpu(dst_gpu)
+        dst_q_ms = max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
+        t_r0 = time.perf_counter()
         try:
             r_res = await self._rpc(
                 dst_gpu,
                 {"op": "RECV_SHM", "shm_name": shm_name, "new_ctx_id": new_ctx_id, "meta": s_res["meta"]},
             )
+            recv_ms = max(0.0, (time.perf_counter() - t_r0) * 1000.0)
             r_res["bytes"] = int(s_res.get("bytes", 0))
             r_res["sent_ok"] = True
+            r_res["kv_transfer_ms"] = round(send_ms + recv_ms, 2)
+            r_res["queue_ms"] = round(src_q_ms + dst_q_ms, 2)
             return r_res
         finally:
             self._gpu_locks[dst_gpu].release()
@@ -867,6 +949,14 @@ class MorphServeClusterEngine:
         ar_tpots_ms: list[float] | None = None,
         shipped: bool = False,
         morphed: bool = False,
+        has_image: bool = False,
+        num_images: int = 0,
+        image_res: int = 0,
+        queue_ms: float = 0.0,
+        h2d_weight_ms: float = 0.0,
+        kv_transfer_ms: float = 0.0,
+        vae_ms: float = 0.0,
+        preempt_yield_ms: float = 0.0,
     ) -> tuple[bool, int, int, int, str]:
         """Release partial context(s), decide bounded Turn-0 OOM retry vs terminal OOM turn record."""
         for g_clean, c_clean in cleanup_targets:
@@ -901,6 +991,14 @@ class MorphServeClusterEngine:
                 "kv_bytes": int(kv_bytes),
                 "shipped": bool(shipped),
                 "morphed": bool(morphed),
+                "has_image": bool(has_image),
+                "num_images": int(num_images),
+                "image_res": int(image_res),
+                "queue_ms": round(float(queue_ms), 2),
+                "h2d_weight_ms": round(float(h2d_weight_ms), 2),
+                "kv_transfer_ms": round(float(kv_transfer_ms), 2),
+                "vae_ms": round(float(vae_ms), 2),
+                "preempt_yield_ms": round(float(preempt_yield_ms), 2),
             }
         )
         return False, attempt, oom_retries, failed_gpu, ""
@@ -912,6 +1010,7 @@ class MorphServeClusterEngine:
         eff_policy: EnginePolicyConfig,
         ctrl_handle: int,
         save_outputs_dir: Path | None = None,
+        on_turn_complete: Callable[[], float] | None = None,
     ) -> SessionOutcome:
         delay = (suite_t0 + sess.arrival_offset_s) - time.perf_counter()
         if delay > 0.0:
@@ -924,10 +1023,14 @@ class MorphServeClusterEngine:
         kv_bytes = 0
         prev_tmp_img: str | None = None
         owned_tmp_imgs: list[str] = []
+        last_generated_res = 0
 
         ar_ttfts: list[float] = []
         ar_tpots: list[float] = []
         ar_turn_tpots: list[list[float]] = []
+        ar_turn_has_image: list[bool] = []
+        ar_turn_num_images: list[int] = []
+        ar_turn_image_res: list[int] = []
         dit_turns: list[float] = []
         dit_heights: list[int] = []
         dit_steps_list: list[int] = []
@@ -944,10 +1047,18 @@ class MorphServeClusterEngine:
         total_yields = 0
         oom_retries = 0
         think_time_ms = 0.0
+        sess_queue_ms = 0.0
+        sess_h2d_weight_ms = 0.0
+        sess_kv_transfer_ms = 0.0
+        sess_vae_ms = 0.0
+        sess_preempt_yield_ms = 0.0
         is_tight_mot = eff_policy.cptg_architecture == "tight_mot"
         cur_turn_idx = 0
         cur_turn_plan = ""
         cur_turn_height = 0
+        cur_turn_has_image = False
+        cur_turn_num_images = 0
+        cur_turn_image_res = 0
 
         def _sample_resident_alpha() -> float:
             ws = self.router.worker_states_snapshot()
@@ -1014,6 +1125,14 @@ class MorphServeClusterEngine:
                 planned_dit_turns=planned_dit_turns,
                 completed_offset_s=completed_offset_s,
                 resident_alpha_sample=_sample_resident_alpha(),
+                ar_turn_has_image=ar_turn_has_image,
+                ar_turn_num_images=ar_turn_num_images,
+                ar_turn_image_res=ar_turn_image_res,
+                queue_ms=round(sess_queue_ms, 2),
+                h2d_weight_ms=round(sess_h2d_weight_ms, 2),
+                kv_transfer_ms=round(sess_kv_transfer_ms, 2),
+                vae_ms=round(sess_vae_ms, 2),
+                preempt_yield_ms=round(sess_preempt_yield_ms, 2),
             )
 
         try:
@@ -1030,7 +1149,34 @@ class MorphServeClusterEngine:
 
                 plan = turn.modality_plan
                 is_edit_followup = (plan == "dit_edit") and (ti > 0)
-                turn_use_prev_image = (ti > 0) and (bool(turn.use_prev_image) or (plan == "dit_edit"))
+                has_prior_dit = any(t.modality_plan != "ar_only" for t in sess.turns[:ti])
+                # Preserve Q1 Turn 1 (`dit_edit` after `ar_only` Turn 0): only request `use_prev_image`
+                # when explicitly set or when a prior DiT turn actually produced an image, so
+                # `bagel_adapter.py`'s `pending_vae_only_paths` handles Turn 1 VAE cleanly.
+                turn_use_prev_image = (ti > 0) and (
+                    bool(turn.use_prev_image) or (plan == "dit_edit" and has_prior_dit)
+                )
+                eff_prep_img_paths = (
+                    []
+                    if (is_edit_followup and turn_use_prev_image)
+                    else list(turn.image_paths)
+                )
+                eff_turn_img_paths = list(turn.image_paths) if plan in ("ar_only", "cot_then_dit") else eff_prep_img_paths
+                turn_num_images = len(eff_turn_img_paths) + (1 if turn_use_prev_image else 0)
+                turn_has_image = turn_num_images > 0
+                turn_image_res = 0
+                if turn_has_image:
+                    fallback_res = max(int(turn.height), int(turn.width), 512)
+                    res_cands: list[int] = []
+                    if turn_use_prev_image:
+                        res_cands.append(last_generated_res if last_generated_res > 0 else fallback_res)
+                    for rp in eff_turn_img_paths:
+                        res_cands.append(self._probe_image_max_edge(rp, fallback=fallback_res))
+                    turn_image_res = max(res_cands) if res_cands else fallback_res
+                cur_turn_has_image = turn_has_image
+                cur_turn_num_images = turn_num_images
+                cur_turn_image_res = turn_image_res
+
                 has_more_turns = (ti + 1) < len(sess.turns)
                 has_more_edits = any(t.modality_plan == "dit_edit" for t in sess.turns[ti + 1 :])
                 has_future_prev_image = any(
@@ -1069,6 +1215,9 @@ class MorphServeClusterEngine:
                                 cleanup_targets={(resident_gpu, ctx_id)},
                                 kv_bytes=kv_bytes,
                                 turn_records=turn_records,
+                                has_image=turn_has_image,
+                                num_images=turn_num_images,
+                                image_res=turn_image_res,
                             )
                             if should_retry:
                                 ctx_id = next_cid
@@ -1081,9 +1230,20 @@ class MorphServeClusterEngine:
                         kv_bytes = int(ar_res.get("kv_bytes", kv_bytes))
                         turn_ttft = float(ar_res.get("ttft_ms", 0.0))
                         turn_tpots = [float(x) for x in ar_res.get("tpots_ms", [])]
+                        turn_q_ms = float(ar_res.get("queue_ms", 0.0))
+                        turn_h2d_ms = float(ar_res.get("h2d_weight_ms", 0.0))
+                        turn_kv_xfer_ms = float(ar_res.get("kv_transfer_ms", 0.0))
+                        turn_vae_ms = float(ar_res.get("vae_ms", 0.0))
+                        sess_queue_ms += turn_q_ms
+                        sess_h2d_weight_ms += turn_h2d_ms
+                        sess_kv_transfer_ms += turn_kv_xfer_ms
+                        sess_vae_ms += turn_vae_ms
                         ar_ttfts.append(turn_ttft)
                         ar_tpots.extend(turn_tpots)
                         ar_turn_tpots.append(turn_tpots)
+                        ar_turn_has_image.append(turn_has_image)
+                        ar_turn_num_images.append(turn_num_images)
+                        ar_turn_image_res.append(turn_image_res)
                         ar_texts.append(str(ar_res.get("text", "")))
                         turn_records.append(
                             {
@@ -1102,8 +1262,19 @@ class MorphServeClusterEngine:
                                 "kv_bytes": int(kv_bytes),
                                 "shipped": False,
                                 "morphed": False,
+                                "has_image": bool(turn_has_image),
+                                "num_images": int(turn_num_images),
+                                "image_res": int(turn_image_res),
+                                "use_prev_image": bool(turn_use_prev_image),
+                                "queue_ms": round(turn_q_ms, 2),
+                                "h2d_weight_ms": round(turn_h2d_ms, 2),
+                                "kv_transfer_ms": round(turn_kv_xfer_ms, 2),
+                                "vae_ms": round(turn_vae_ms, 2),
+                                "preempt_yield_ms": 0.0,
                             }
                         )
+                        if on_turn_complete is not None:
+                            on_turn_complete()
                         break
 
                     # ---- Branch 2: Visual-CoT / DiT Edit / High-Res T2I ----
@@ -1113,6 +1284,11 @@ class MorphServeClusterEngine:
                     turn_ar_tpots: list[float] = []
                     turn_shipped = False
                     turn_morphed = False
+                    turn_q_ms = 0.0
+                    turn_h2d_ms = 0.0
+                    turn_kv_xfer_ms = 0.0
+                    turn_vae_ms = 0.0
+                    turn_yield_ms = 0.0
 
                     if plan == "cot_then_dit":
                         cot_res, did_preempt = await self._execute_ar_phase(
@@ -1137,6 +1313,9 @@ class MorphServeClusterEngine:
                                 cleanup_targets={(resident_gpu, ctx_id)},
                                 kv_bytes=kv_bytes,
                                 turn_records=turn_records,
+                                has_image=turn_has_image,
+                                num_images=turn_num_images,
+                                image_res=turn_image_res,
                             )
                             if should_retry:
                                 ctx_id = next_cid
@@ -1149,16 +1328,25 @@ class MorphServeClusterEngine:
                         kv_bytes = int(cot_res.get("kv_bytes", kv_bytes))
                         turn_ar_ttft = float(cot_res.get("ttft_ms", 0.0))
                         turn_ar_tpots = [float(x) for x in cot_res.get("tpots_ms", [])]
+                        turn_q_ms += float(cot_res.get("queue_ms", 0.0))
+                        turn_h2d_ms += float(cot_res.get("h2d_weight_ms", 0.0))
+                        turn_kv_xfer_ms += float(cot_res.get("kv_transfer_ms", 0.0))
+                        turn_vae_ms += float(cot_res.get("vae_ms", 0.0))
                         ar_ttfts.append(turn_ar_ttft)
                         ar_tpots.extend(turn_ar_tpots)
                         ar_turn_tpots.append(turn_ar_tpots)
+                        ar_turn_has_image.append(turn_has_image)
+                        ar_turn_num_images.append(turn_num_images)
+                        ar_turn_image_res.append(turn_image_res)
                         cot_text_pending = str(cot_res.get("text", ""))
                         t_dit0 = time.perf_counter()
                     else:
                         est_prep_ms = default_operator_profile().prep_overhead_ms
                         self.router.reserve_ar_queue(resident_gpu, est_prep_ms)
                         try:
+                            t_pq0 = time.perf_counter()
                             await self._acquire_exclusive_gpu(resident_gpu)
+                            turn_q_ms += max(0.0, (time.perf_counter() - t_pq0) * 1000.0)
                             try:
                                 prep_res = await self._rpc(
                                     resident_gpu,
@@ -1168,11 +1356,7 @@ class MorphServeClusterEngine:
                                         "prompt": turn.prompt,
                                         "height": turn.height,
                                         "width": turn.width,
-                                        "image_paths": (
-                                            turn.image_paths
-                                            if (ti == 0)
-                                            else ([] if is_edit_followup else turn.image_paths)
-                                        ),
+                                        "image_paths": eff_prep_img_paths,
                                         "use_prev_image": turn_use_prev_image,
                                         "prev_image_path": eff_prev_img,
                                         "prepare_for_dit": True,
@@ -1196,6 +1380,10 @@ class MorphServeClusterEngine:
                                 cleanup_targets={(resident_gpu, ctx_id)},
                                 kv_bytes=kv_bytes,
                                 turn_records=turn_records,
+                                has_image=turn_has_image,
+                                num_images=turn_num_images,
+                                image_res=turn_image_res,
+                                queue_ms=turn_q_ms,
                             )
                             if should_retry:
                                 ctx_id = next_cid
@@ -1203,6 +1391,8 @@ class MorphServeClusterEngine:
                             return _make_outcome("oom", error=prep_res.get("error", "oom"))
                         src_ctx_alive = True
                         kv_bytes = int(prep_res.get("kv_bytes", kv_bytes))
+                        turn_h2d_ms += float(prep_res.get("h2d_weight_ms", 0.0))
+                        turn_vae_ms += float(prep_res.get("vae_ms", 0.0))
 
                     # Plan cross-paradigm transition & atomically reserve router/pacer state in C++ `MorphControlEngine`.
                     now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
@@ -1278,6 +1468,8 @@ class MorphServeClusterEngine:
                                         cross_node_ship_bytes_list.append(fwd_b)
                                     ship_bytes_list.append(fwd_b)
                                     ship_ms_list.append(float(ship.get("ship_ms", 0.0)))
+                                    turn_kv_xfer_ms += float(ship.get("kv_transfer_ms", ship.get("ship_ms", 0.0)))
+                                    turn_q_ms += float(ship.get("queue_ms", 0.0))
                                     dit_res = await self._exec_dit_on_locked_gpu(
                                         dst_gpu,
                                         dit_ctx_id,
@@ -1316,12 +1508,16 @@ class MorphServeClusterEngine:
                                         cross_node_ships += 1
                                         cross_node_ship_bytes_list.append(fwd_b)
                                     ship_bytes_list.append(fwd_b)
+                                    turn_kv_xfer_ms += float(ship.get("kv_transfer_ms", 0.0))
+                                    turn_q_ms += float(ship.get("queue_ms", 0.0))
                             elif eff_policy.routing_mode == "dual_path":
                                 path_b_morphs += 1
                                 turn_morphed = True
 
                             if dit_res.get("status") != "oom":
+                                t_dq_dit = time.perf_counter()
                                 await self._acquire_exclusive_gpu(dst_gpu)
+                                turn_q_ms += max(0.0, (time.perf_counter() - t_dq_dit) * 1000.0)
                                 try:
                                     dit_res = await self._exec_dit_on_locked_gpu(
                                         dst_gpu,
@@ -1382,6 +1578,8 @@ class MorphServeClusterEngine:
                             src_ctx_alive = True
                             ret_b = int(ret_ship.get("bytes", ret_kv_b))
                             kv_bytes = ret_b
+                            turn_kv_xfer_ms += float(ret_ship.get("kv_transfer_ms", ret_ship.get("ship_ms", 0.0)))
+                            turn_q_ms += float(ret_ship.get("queue_ms", 0.0))
                             if not self.topo.same_node(dst_gpu, resident_gpu):
                                 cross_node_ships += 1
                                 cross_node_ship_bytes_list.append(ret_b)
@@ -1407,6 +1605,14 @@ class MorphServeClusterEngine:
                             ar_tpots_ms=turn_ar_tpots,
                             shipped=turn_shipped,
                             morphed=turn_morphed,
+                            has_image=turn_has_image,
+                            num_images=turn_num_images,
+                            image_res=turn_image_res,
+                            queue_ms=turn_q_ms,
+                            h2d_weight_ms=turn_h2d_ms,
+                            kv_transfer_ms=turn_kv_xfer_ms,
+                            vae_ms=turn_vae_ms,
+                            preempt_yield_ms=turn_yield_ms,
                         )
                         if should_retry:
                             ctx_id = next_cid
@@ -1424,6 +1630,18 @@ class MorphServeClusterEngine:
                         if save_outputs_dir is not None:
                             image_paths_out.append(save_tmp)
 
+                    turn_q_ms += float(dit_res.get("queue_ms", 0.0))
+                    turn_h2d_ms += float(dit_res.get("h2d_weight_ms", 0.0))
+                    turn_kv_xfer_ms += float(dit_res.get("kv_transfer_ms", 0.0))
+                    turn_vae_ms += float(dit_res.get("vae_ms", 0.0))
+                    turn_yield_ms += float(dit_res.get("preempt_yield_ms", 0.0))
+                    sess_queue_ms += turn_q_ms
+                    sess_h2d_weight_ms += turn_h2d_ms
+                    sess_kv_transfer_ms += turn_kv_xfer_ms
+                    sess_vae_ms += turn_vae_ms
+                    sess_preempt_yield_ms += turn_yield_ms
+
+                    last_generated_res = max(int(turn.height), int(turn.width))
                     dit_ms = (time.perf_counter() - t_dit0) * 1000.0
                     dit_turns.append(dit_ms)
                     dit_heights.append(int(turn.height))
@@ -1447,8 +1665,19 @@ class MorphServeClusterEngine:
                             "kv_bytes": int(kv_bytes),
                             "shipped": turn_shipped,
                             "morphed": turn_morphed,
+                            "has_image": bool(turn_has_image),
+                            "num_images": int(turn_num_images),
+                            "image_res": int(turn_image_res),
+                            "use_prev_image": bool(turn_use_prev_image),
+                            "queue_ms": round(turn_q_ms, 2),
+                            "h2d_weight_ms": round(turn_h2d_ms, 2),
+                            "kv_transfer_ms": round(turn_kv_xfer_ms, 2),
+                            "vae_ms": round(turn_vae_ms, 2),
+                            "preempt_yield_ms": round(turn_yield_ms, 2),
                         }
                     )
+                    if on_turn_complete is not None:
+                        on_turn_complete()
                     break
 
             slo_eval = self._evaluate_session_slos(
@@ -1459,6 +1688,10 @@ class MorphServeClusterEngine:
                 dit_turns_ms=dit_turns,
                 dit_turn_heights=dit_heights,
                 dit_turn_steps=dit_steps_list,
+                ar_turn_has_image=ar_turn_has_image,
+                ar_turn_num_images=ar_turn_num_images,
+                ar_turn_image_res=ar_turn_image_res,
+                turn_records=turn_records,
             )
             return _make_outcome(
                 "ok",
@@ -1483,6 +1716,14 @@ class MorphServeClusterEngine:
                     "kv_bytes": int(kv_bytes),
                     "shipped": False,
                     "morphed": False,
+                    "has_image": bool(cur_turn_has_image),
+                    "num_images": int(cur_turn_num_images),
+                    "image_res": int(cur_turn_image_res),
+                    "queue_ms": 0.0,
+                    "h2d_weight_ms": 0.0,
+                    "kv_transfer_ms": 0.0,
+                    "vae_ms": 0.0,
+                    "preempt_yield_ms": 0.0,
                 }
             )
             return _make_outcome("error", error=f"{type(exc).__name__}: {exc}")
@@ -1557,20 +1798,55 @@ class MorphServeClusterEngine:
                 for idx_s, s_item in enumerate(sessions):
                     s_item.arrival_offset_s = round(idx_s / eff_qps, 4)
 
+        alpha_timeline: list[dict[str, float]] = []
         with self._scoped_ctrl_handle(eff_policy) as ctrl_handle:
             t0 = time.perf_counter()
-            outcomes = await asyncio.gather(
-                *(
-                    self._run_session_coro(
-                        s,
-                        t0,
-                        eff_policy=eff_policy,
-                        ctrl_handle=ctrl_handle,
-                        save_outputs_dir=save_outputs_dir,
-                    )
-                    for s in sessions
+            t_run0 = time.monotonic()
+
+            def _record_alpha_sample() -> float:
+                ws = self.router.worker_states_snapshot()
+                mean_alpha = (
+                    round(sum(float(w.expert_alpha) for w in ws.values()) / float(len(ws)), 4)
+                    if ws
+                    else 1.0
                 )
-            )
+                alpha_timeline.append(
+                    {
+                        "t_s": round(max(0.0, time.monotonic() - t_run0), 3),
+                        "alpha": mean_alpha,
+                        "resident_alpha": mean_alpha,
+                    }
+                )
+                return mean_alpha
+
+            async def _alpha_ticker(interval_s: float = 2.0) -> None:
+                while True:
+                    await asyncio.sleep(interval_s)
+                    _record_alpha_sample()
+
+            _record_alpha_sample()
+            ticker_task = asyncio.create_task(_alpha_ticker(2.0))
+            try:
+                outcomes = await asyncio.gather(
+                    *(
+                        self._run_session_coro(
+                            s,
+                            t0,
+                            eff_policy=eff_policy,
+                            ctrl_handle=ctrl_handle,
+                            save_outputs_dir=save_outputs_dir,
+                            on_turn_complete=_record_alpha_sample,
+                        )
+                        for s in sessions
+                    )
+                )
+            finally:
+                ticker_task.cancel()
+                try:
+                    await ticker_task
+                except asyncio.CancelledError:
+                    pass
+            _record_alpha_sample()
             wall_s = max(time.perf_counter() - t0, 1e-6)
 
         stat_res: list[dict[str, Any]] = []
@@ -1578,11 +1854,34 @@ class MorphServeClusterEngine:
             *(self._rpc(g, {"op": "GET_STATS"}) for g in range(n_gpus)),
             return_exceptions=True,
         )
+        sm_util_samples: list[float] = []
         for item in raw_stats:
             if isinstance(item, Mapping):
-                stat_res.append(dict(item))
+                st_d = dict(item)
+                sm_val = st_d.get("nvml_sm_util_mean_pct")
+                has_sm = isinstance(sm_val, (int, float)) and int(
+                    st_d.get("nvml_sm_util_samples", 1 if float(sm_val) > 0.0 else 0)
+                ) > 0
+                if has_sm:
+                    sm_f = round(float(sm_val), 2)
+                    st_d["nvml_sm_util_mean_pct"] = sm_f
+                    sm_util_samples.append(sm_f)
+                else:
+                    st_d.pop("nvml_sm_util_mean_pct", None)
+                stat_res.append(st_d)
             else:
                 stat_res.append({"oom_count": 0})
+
+        cluster_sm_util_pct: float | None = (
+            round(sum(sm_util_samples) / float(len(sm_util_samples)), 2) if sm_util_samples else None
+        )
+        if stat_res:
+            stat_res[0]["alpha_timeline"] = alpha_timeline
+        else:
+            entry: dict[str, Any] = {"oom_count": 0, "alpha_timeline": alpha_timeline}
+            if cluster_sm_util_pct is not None:
+                entry["nvml_sm_util_mean_pct"] = cluster_sm_util_pct
+            stat_res.append(entry)
 
         agg = call_json(
             self._lib,
@@ -1595,6 +1894,12 @@ class MorphServeClusterEngine:
             encode_json([asdict(o) for o in outcomes]),
             encode_json(stat_res),
         )
+        if "nvml_sm_util_mean_pct" not in agg or (
+            agg.get("nvml_sm_util_mean_pct") is None and cluster_sm_util_pct is not None
+        ):
+            agg["nvml_sm_util_mean_pct"] = cluster_sm_util_pct
+        if "alpha_timeline" not in agg:
+            agg["alpha_timeline"] = alpha_timeline
         return ClusterRunReport.from_dict(agg)
 
     def run_suite(

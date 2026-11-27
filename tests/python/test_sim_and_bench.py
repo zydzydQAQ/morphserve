@@ -75,13 +75,14 @@ from morphserve.engine.config import (
     build_ablation_configs,
     build_static_split_configs,
 )
-from morphserve.engine.workload import build_time_window_suite, hamilton_apportion
+from morphserve.engine.workload import assign_dual_trace_arrivals, build_time_window_suite, hamilton_apportion
 from morphserve.runtime.peer_transport import find_free_tcp_port
 from morphserve.sim.cluster_simulator import (
     HardwareInterconnectSpec,
     MeasuredPhysicsProfile,
     SimGpuMemoryLedger,
     WorkloadScaleSpec,
+    evaluate_against_real_runs,
     simulate_cluster_point,
 )
 
@@ -156,6 +157,57 @@ def test_sim_gpu_memory_ledger_physical_conservation_and_swap() -> None:
     for sid in range(1, 6):
         ledger.release_session(sid)
     assert ledger.active_kv_mib == 0.0
+
+    # `monolithic_kv_swap` must allow idle-KV eviction while `monolithic_dp` does not.
+    pol_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=8)
+    pol_mono_swap = EnginePolicyConfig.from_preset("monolithic_kv_swap", num_gpus=8)
+    with SimGpuMemoryLedger(
+        gpu_id=0,
+        total_hbm_mib=physics.driver_total_hbm_40g_mib,
+        policy=pol_mono,
+        role="gen",
+        resident_expert_layers=28,
+        physics=physics,
+    ) as led_mono, SimGpuMemoryLedger(
+        gpu_id=0,
+        total_hbm_mib=physics.driver_total_hbm_40g_mib,
+        policy=pol_mono_swap,
+        role="gen",
+        resident_expert_layers=28,
+        physics=physics,
+    ) as led_swap:
+        assert led_mono.upsert_session_kv(1, 1200.0) is True
+        assert led_mono.upsert_session_kv(2, 1200.0) is True
+        assert led_mono.evict_idle_kv(1000.0, exclude_sid=2) == 0.0
+        assert led_swap.upsert_session_kv(1, 1200.0) is True
+        assert led_swap.upsert_session_kv(2, 1200.0) is True
+        assert led_swap.evict_idle_kv(1000.0, exclude_sid=2) >= 1200.0
+        assert led_swap.kv_host_swap_outs >= 1
+
+    # Strict calibration gate: 0 real runs MUST fail both 8% OOS and 5% gates.
+    empty_val = evaluate_against_real_runs([], physics=physics)
+    assert empty_val.points_checked == 0
+    assert empty_val.within_8pct_oos_gate is False
+    assert empty_val.within_5pct_gate is False
+
+    # Simulator supports `monolithic_kv_swap` end-to-end.
+    hw_a100 = HardwareInterconnectSpec.presets(physics)[0]
+    swap_sim = simulate_cluster_point(
+        "monolithic_kv_swap",
+        num_gpus=8,
+        hw=hw_a100,
+        offered_qps=0.4,
+        num_sessions=8,
+        seed=2026,
+        physics=physics,
+        workload_scale=WorkloadScaleSpec.bagel_7b_standard(),
+        custom_sessions=[
+            (0.0, "interleaved_co_creation", (("ar_only", 512), ("dit_t2i", 512))),
+            (400.0, "multiturn_edit", (("dit_edit", 512), ("dit_edit", 512))),
+        ],
+    )
+    assert swap_sim["policy_name"] == "monolithic_kv_swap"
+    assert swap_sim["total_sessions"] == 2
 
 
 def test_cross_node_routing_check_suppresses_large_tight_mot_ship() -> None:
@@ -282,13 +334,79 @@ def test_trace_parsers_phase_shift_time_window_and_accuracy_suite(tmp_path: Path
         min_sessions=20,
         warmup_s=15.0,
         steady_s=45.0,
+        cooldown_s=0.0,
     )
     assert len(tw.sessions) >= 20
     assert effective_steady_window_s(tw) >= 45.0
 
-    ps = build_online_phase_shift_suite(pools, b_deltas, g_deltas, phase_duration_s=30.0, target_qps=0.5, seed=2026)
+    # Verify cooldown exclusion and <2% actual-vs-target QPS normalization
+    tw_cd = build_time_window_suite(
+        reloaded,
+        target_qps=0.5,
+        burstgpt_deltas=b_deltas,
+        gentd26_deltas=g_deltas,
+        arrival_duration_s=240.0,
+        min_sessions=40,
+        warmup_s=60.0,
+        steady_s=150.0,
+        cooldown_s=30.0,
+    )
+    assert abs(effective_steady_window_s(tw_cd) - 150.0) < 1e-3
+    span_cd = max(s.arrival_offset_s for s in tw_cd.sessions)
+    actual_qps = len(tw_cd.sessions) / max(1e-6, span_cd)
+    assert abs(actual_qps - 0.5) / 0.5 < 0.02
+
+    # Verify `dit_t2i` under `visual_cot_highres` routes to GenTD26 (distinct from BurstGPT AR arrivals)
+    mixed_routing = [
+        InterleavedSession(
+            session_id=f"ar_{i}",
+            quadrant="multi_image_vqa",
+            source_dataset="unit",
+            turns=[InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="q")],
+        )
+        for i in range(4)
+    ] + [
+        InterleavedSession(
+            session_id=f"t2i_{i}",
+            quadrant="visual_cot_highres",
+            source_dataset="unit",
+            turns=[InterleavedTurn(turn_idx=0, modality_plan="dit_t2i", prompt="img")],
+        )
+        for i in range(4)
+    ]
+    assign_dual_trace_arrivals(
+        mixed_routing,
+        burstgpt_deltas=[0.05, 0.05, 2.90],
+        gentd26_deltas=[1.0, 1.0, 1.0],
+        target_qps=0.5,
+        target_span_s=16.0,
+    )
+    t2i_offs = sorted(s.arrival_offset_s for s in mixed_routing if s.session_id.startswith("t2i_"))
+    ar_offs = sorted(s.arrival_offset_s for s in mixed_routing if s.session_id.startswith("ar_"))
+    # Uniform GenTD26 deltas yield evenly spaced offsets; skewed BurstGPT deltas cluster early.
+    assert abs(t2i_offs[1] - (16.0 / 3.0)) < 0.05
+    assert ar_offs[1] < 1.0
+
+    # Verify balanced Phase-Shift 360s: Phase 2 (`ar50_dit50`) AR arrival span >= 80.0s (no 6.3s collapse!)
+    ps = build_online_phase_shift_suite(
+        pools,
+        b_deltas,
+        g_deltas,
+        phase_duration_s=120.0,
+        target_qps=0.8,
+        seed=2026,
+    )
     assert [p["phase_label"] for p in ps.phase_schedule] == ["ar80_dit20", "ar20_dit80", "ar50_dit50"]
     assert all(s.phase_label in {"ar80_dit20", "ar20_dit80", "ar50_dit50"} for s in ps.sessions)
+    p2_ar_offs = [
+        float(s.arrival_offset_s)
+        for s in ps.sessions
+        if s.phase_label == "ar50_dit50"
+        and s.turns
+        and s.turns[0].modality_plan in ("ar_only", "cot_then_dit")
+    ]
+    assert len(p2_ar_offs) >= 2
+    assert (max(p2_ar_offs) - min(p2_ar_offs)) >= 80.0
 
     # Verify `build_m3_active_accuracy_suite` (moved to `interleaved_bench.py`) on self-contained mini fixtures.
     for rel_img in ("images/mse-bench/m0.png", "images/magicbrush/mb0.png", "images/mmvet/v0.png"):
@@ -359,10 +477,12 @@ def test_policy_presets_ablations_static_splits_and_internvlu_budget(tmp_path: P
     ablations = build_ablation_configs(num_gpus=8)
     assert [name for name, _ in ablations] == [
         "full_morphserve",
-        "no_m4_layer_chunk",
-        "no_m3_cow_loopback",
-        "no_m2_dual_path",
         "no_m1_tripool_vmm",
+        "no_m1_scoped_vae",
+        "no_m2_dual_path",
+        "no_m2_pacer_numa",
+        "no_m3_cow_loopback",
+        "no_m4_layer_chunk",
     ]
     splits = build_static_split_configs(num_gpus=8)
     assert [name for name, _ in splits] == [

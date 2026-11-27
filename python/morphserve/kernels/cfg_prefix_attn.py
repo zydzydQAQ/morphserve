@@ -547,6 +547,75 @@ def _get_cached_left_pad_meta(
     return meta
 
 
+def _run_unpadded_varlen_cfg(
+    q_list: list[Any],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+    k_prefix: Any | None,
+    v_prefix: Any | None,
+    shared_branch_ids: list[int],
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    sm_scale: float,
+    *,
+    cu_seqlens_cache: dict[tuple[str, tuple[int, ...]], Any] | None = None,
+) -> list[Any] | None:
+    """Single-pass unpadded varlen FA2 for multi-branch CFG below two-pass split threshold (zero left-padding)."""
+    q_len, h_q, head_dim = q_list[0].shape
+    h_kv = k_loc_list[0].shape[1]
+    backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
+    if backend[0] != "vllm_varlen":
+        return None
+    import torch
+
+    _, _, fn, _ = backend
+    num_branches = len(q_list)
+    shared_set = set(shared_branch_ids)
+    has_pre = k_prefix is not None and v_prefix is not None and int(k_prefix.shape[0]) > 0
+
+    q_all = torch.cat(q_list, dim=0).contiguous()
+    k_parts: list[Any] = []
+    v_parts: list[Any] = []
+    k_lens: list[int] = []
+    for b in range(num_branches):
+        ln = 0
+        if b in shared_set and has_pre:
+            k_parts.append(k_prefix)
+            v_parts.append(v_prefix)
+            ln += int(k_prefix.shape[0])
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and vs is not None and int(ks.shape[0]) > 0:
+            k_parts.append(ks)
+            v_parts.append(vs)
+            ln += int(ks.shape[0])
+        kl, vl = k_loc_list[b], v_loc_list[b]
+        k_parts.append(kl)
+        v_parts.append(vl)
+        ln += int(kl.shape[0])
+        k_lens.append(ln)
+
+    k_all = torch.cat(k_parts, dim=0).contiguous()
+    v_all = torch.cat(v_parts, dim=0).contiguous()
+    q_lens = [q_len] * num_branches
+    cu_q = _get_cu_seqlens(q_lens, q_all.device, cache=cu_seqlens_cache)
+    cu_k = _get_cu_seqlens(k_lens, q_all.device, cache=cu_seqlens_cache)
+    out = fn(
+        q_all,
+        k_all,
+        v_all,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=q_len,
+        max_seqlen_k=max(k_lens),
+        softmax_scale=sm_scale,
+        causal=False,
+        return_softmax_lse=False,
+    )
+    if isinstance(out, tuple):
+        out = out[0]
+    return [out[b * q_len : (b + 1) * q_len] for b in range(num_branches)]
+
+
 def _run_direct_workspace_noncausal_cfg(
     q_list: list[Any],
     k_loc_list: list[Any],
@@ -587,6 +656,7 @@ def _run_direct_workspace_noncausal_cfg(
     ws = direct_ws_cache.get(wkey) if direct_ws_cache is not None else None
     q_shape = (num_branches, q_len, h_q, head_dim)
     kv_shape = (num_branches, max_len, h_kv, head_dim)
+    allocated_fresh = False
     if (
         ws is None
         or ws["q"].shape != q_shape
@@ -596,18 +666,19 @@ def _run_direct_workspace_noncausal_cfg(
     ):
         ws = {
             "q": torch.empty(q_shape, dtype=q0.dtype, device=q0.device),
-            "k": torch.zeros(kv_shape, dtype=k_loc_list[0].dtype, device=q0.device),
-            "v": torch.zeros(kv_shape, dtype=v_loc_list[0].dtype, device=q0.device),
+            "k": torch.empty(kv_shape, dtype=k_loc_list[0].dtype, device=q0.device),
+            "v": torch.empty(kv_shape, dtype=v_loc_list[0].dtype, device=q0.device),
             "last_lens": lens,
             "last_max": max_len,
         }
+        allocated_fresh = True
         if direct_ws_cache is not None:
             direct_ws_cache[wkey] = ws
 
     q_buf = ws["q"]
     k_buf = ws["k"][:, :max_len]
     v_buf = ws["v"][:, :max_len]
-    need_zero_pad = (ws["last_lens"] != lens) or (ws["last_max"] != max_len)
+    need_zero_pad = allocated_fresh or (ws["last_lens"] != lens) or (ws["last_max"] != max_len)
     if need_zero_pad:
         ws["last_lens"] = lens
         ws["last_max"] = max_len
@@ -667,25 +738,39 @@ def shared_prefix_cfg_attention(
     l_shared = int(k_prefix.shape[0]) if k_prefix is not None else 0
 
     if q_list[0].is_cuda:
-        if backend in ("cascade_cfg", "flash_prefix") and should_use_flash_prefix_split(
-            q_len, l_shared, len(shared_branch_ids)
-        ):
-            fp_out = _run_flash_prefix_cfg(
-                q_list=q_list,
-                k_loc_list=k_loc_list,
-                v_loc_list=v_loc_list,
-                k_prefix=k_prefix,
-                v_prefix=v_prefix,
-                shared_branch_ids=shared_branch_ids,
-                k_suffix_list=k_suffix_list,
-                v_suffix_list=v_suffix_list,
-                sm_scale=sm_scale,
-                cu_seqlens_cache=cu_seqlens_cache,
-            )
-            if fp_out is not None:
-                if stats_out is not None:
-                    stats_out["cascade_split_executed"] = stats_out.get("cascade_split_executed", 0) + 1
-                return fp_out
+        if backend in ("cascade_cfg", "flash_prefix"):
+            if should_use_flash_prefix_split(q_len, l_shared, len(shared_branch_ids)):
+                fp_out = _run_flash_prefix_cfg(
+                    q_list=q_list,
+                    k_loc_list=k_loc_list,
+                    v_loc_list=v_loc_list,
+                    k_prefix=k_prefix,
+                    v_prefix=v_prefix,
+                    shared_branch_ids=shared_branch_ids,
+                    k_suffix_list=k_suffix_list,
+                    v_suffix_list=v_suffix_list,
+                    sm_scale=sm_scale,
+                    cu_seqlens_cache=cu_seqlens_cache,
+                )
+                if fp_out is not None:
+                    if stats_out is not None:
+                        stats_out["cascade_split_executed"] = stats_out.get("cascade_split_executed", 0) + 1
+                    return fp_out
+            else:
+                vp_out = _run_unpadded_varlen_cfg(
+                    q_list=q_list,
+                    k_loc_list=k_loc_list,
+                    v_loc_list=v_loc_list,
+                    k_prefix=k_prefix,
+                    v_prefix=v_prefix,
+                    shared_branch_ids=shared_branch_ids,
+                    k_suffix_list=k_suffix_list,
+                    v_suffix_list=v_suffix_list,
+                    sm_scale=sm_scale,
+                    cu_seqlens_cache=cu_seqlens_cache,
+                )
+                if vp_out is not None:
+                    return vp_out
 
         if attn_noncausal is not None and backend in ("cascade_cfg", "flash_prefix", "lossless_varlen", "unpadded_varlen"):
             return _run_direct_workspace_noncausal_cfg(

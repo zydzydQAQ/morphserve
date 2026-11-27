@@ -729,6 +729,12 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
     const double bw_h2d_gbps = topology_.effective_h2d_gbps(src_worker.gpu_id, active);
     const int num_layers = (eff_fam == "internvl_u") ? 20 : atlas_.ref_num_layers();
 
+    // On co-paged bridge_mllm_dit (e.g., InternVL-U Regime B), an alpha <= 0.01 GPU holds
+    // resident VLM weights in super_pool that must be synchronously evicted to materialize
+    // Decoder, incurring full remap/H2D serialization (never cheaper than a warm Decoder peer).
+    const bool eff_post_evict =
+        src_worker.post_evict || (req.architecture == "bridge_mllm_dit" && alpha <= 0.01);
+
     MorphStallEstimate stall_est{};
     if (cost_model_mode_ == "legacy_analytical") {
         stall_est = PerformanceAtlas::estimate_legacy_analytical(
@@ -736,7 +742,7 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
     } else if (cost_model_mode_ == "pipeline_analytical") {
         stall_est = PerformanceAtlas::estimate_pipeline_analytical(
             alpha,
-            src_worker.post_evict,
+            eff_post_evict,
             req.gen_expert_bytes,
             bw_h2d_gbps,
             req.dit_step1_ms,
@@ -749,7 +755,7 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
             eff_fam,
             req.resolution,
             alpha,
-            src_worker.post_evict,
+            eff_post_evict,
             req.gen_expert_bytes,
             bw_h2d_gbps,
             req.dit_step1_ms,

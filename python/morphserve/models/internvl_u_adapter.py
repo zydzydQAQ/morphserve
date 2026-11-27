@@ -17,7 +17,7 @@ from morphserve.vmm import (
     TriPoolVMM,
 )
 
-from .base import GpuCPTGAdapterMixin, PackedTransferState, compute_vmm_available_kv_bytes
+from .base import GpuCPTGAdapterMixin, PackedTransferState, compute_vmm_available_kv_bytes, is_oom_exception
 from .internvl_u_loader import load_internvlu_pipeline
 
 MIB = 1024**2
@@ -987,6 +987,70 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         self._update_hwm()
         return total_b
 
+    def _serve_preempted_ar_cmds(
+        self,
+        ar_cmds: list[dict[str, Any]],
+        emit_preempt_ack: Callable[[dict[str, Any]], None],
+    ) -> int:
+        """Execute mid-DiT preempted VLM AR commands with per-request OOM/error isolation."""
+        if not ar_cmds:
+            return 0
+        try:
+            batch_outs = self.decode_ar_batch(ar_cmds)
+            alpha_now = self.resident_alpha()
+            kv_free_now = self.available_kv_bytes()
+            for cmd, ar_res in zip(ar_cmds, batch_outs):
+                emit_preempt_ack(
+                    {
+                        "cmd_id": cmd.get("cmd_id"),
+                        "rank": self.rank,
+                        "status": "ok",
+                        "ctx_id": str(cmd["ctx_id"]),
+                        **ar_res,
+                        "resident_alpha": alpha_now,
+                        "kv_free_bytes": kv_free_now,
+                        "preempted_mid_dit": True,
+                    }
+                )
+            return len(ar_cmds)
+        except BaseException as exc:
+            if len(ar_cmds) > 1:
+                served = 0
+                for single in ar_cmds:
+                    served += self._serve_preempted_ar_cmds([single], emit_preempt_ack)
+                return served
+            cmd = ar_cmds[0]
+            if is_oom_exception(exc):
+                gc.collect()
+                try:
+                    import torch
+
+                    if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
+                        self._update_hwm()
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                emit_preempt_ack(
+                    {
+                        "cmd_id": cmd.get("cmd_id"),
+                        "rank": self.rank,
+                        "status": "oom",
+                        "resident_alpha": self.resident_alpha(),
+                        "kv_free_bytes": self.available_kv_bytes(),
+                        "error": str(exc)[:200],
+                    }
+                )
+            else:
+                emit_preempt_ack(
+                    {
+                        "cmd_id": cmd.get("cmd_id"),
+                        "rank": self.rank,
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            return 0
+
     def generate_dit(
         self,
         ctx_id: str,
@@ -1027,6 +1091,8 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         vmm_st0 = self.vmm.stats_dict() if (self.pager is not None and self.vmm is not None) else None
         h2d_weight_ms = 0.0
         vae_ms = 0.0
+        yield_count = 0
+        preempt_yield_ms = 0.0
         t0 = time.perf_counter()
         if self.naive_offloader is not None:
             t_sw0 = time.perf_counter()
@@ -1042,6 +1108,31 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             and self.vmm.expert_resident_count(self.pager.expert_id) == self.pager.num_layers
         )
 
+        # In unconstrained Regime A (VLM & Decoder both 100% resident in HBM), service arriving AR
+        # commands at DiT denoising step boundaries via `callback_on_step_end` (bit-exact lossless:
+        # greedy VLM decoding never touches diffusion latents or the local `torch.Generator`).
+        img_pipe_params = inspect.signature(self.pipe.image_pipeline.__call__).parameters
+        step_preempt_cb = None
+        if (
+            (not self._quota_constrained)
+            and str(getattr(self.policy, "preemption_mode", "non_preemptive")) != "non_preemptive"
+            and poll_preempt_cmds is not None
+            and emit_preempt_ack is not None
+            and "callback_on_step_end" in img_pipe_params
+        ):
+            def _on_step_end(_pipe: Any, _step_idx: int, _timestep: Any, _cb_kwargs: dict[str, Any]) -> dict[str, Any]:
+                nonlocal yield_count, preempt_yield_ms
+                polled = poll_preempt_cmds()
+                if not polled:
+                    return {}
+                t_ar0 = time.perf_counter()
+                self._serve_preempted_ar_cmds(polled, emit_preempt_ack)
+                preempt_yield_ms += (time.perf_counter() - t_ar0) * 1000.0
+                yield_count += 1
+                return {}
+
+            step_preempt_cb = _on_step_end
+
         gen = torch.Generator(device=self.device).manual_seed(seed)
         try:
             if self.vlm_pager is not None and self.vmm is not None and self.vlm_pager.expert_id >= 0:
@@ -1052,18 +1143,21 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                         # Bucket 0 holds `encoder_padding_token` and `decoder_projector`, which execute in
                         # `generation_decoder.prepare_forward_input` before `transformer_blocks[0]`'s pre-hook.
                         self.pager.wait_layer_if_needed(0, "prepare_forward_input")
-                        latents_out = self.pipe.image_pipeline(
+                        paged_kwargs: dict[str, Any] = {
                             **diff_inp,
-                            all_cfg_scale=4.5,
-                            part_cfg_scale=2.0,
-                            num_inference_steps=steps,
-                            num_images_per_prompt=1,
-                            use_resolution_binning=False,
-                            height=gh,
-                            width=gw,
-                            generator=gen,
-                            output_type="latent",
-                        ).images
+                            "all_cfg_scale": 4.5,
+                            "part_cfg_scale": 2.0,
+                            "num_inference_steps": steps,
+                            "num_images_per_prompt": 1,
+                            "use_resolution_binning": False,
+                            "height": gh,
+                            "width": gw,
+                            "generator": gen,
+                            "output_type": "latent",
+                        }
+                        if step_preempt_cb is not None:
+                            paged_kwargs["callback_on_step_end"] = step_preempt_cb
+                        latents_out = self.pipe.image_pipeline(**paged_kwargs).images
                     # Run QwenImage VAE decode outside `generation_mode` so decoder blocks remain unpinned
                     # under strict 12 GiB quotas while staying 100% resident under ample 40/80 GB `super_pool`.
                     lat_bf16 = latents_out.to(torch.bfloat16)
@@ -1087,8 +1181,10 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                         "width": gw,
                         "generator": gen,
                     }
-                    if "generator_device" in inspect.signature(self.pipe.image_pipeline.__call__).parameters:
+                    if "generator_device" in img_pipe_params:
                         call_kwargs["generator_device"] = None
+                    if step_preempt_cb is not None:
+                        call_kwargs["callback_on_step_end"] = step_preempt_cb
                     imgs_t = self.pipe.image_pipeline(**call_kwargs).images
         finally:
             if is_cuda:
@@ -1141,11 +1237,11 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             "elapsed_ms": round(elapsed_ms, 2),
             "h2d_weight_ms": round(h2d_weight_ms, 2),
             "vae_ms": round(vae_ms, 2),
-            "preempt_yield_ms": 0.0,
+            "preempt_yield_ms": round(preempt_yield_ms, 2),
             "kv_bytes": int(entry.get("bridge_bytes", 0)),
             "resident_alpha": self.resident_alpha(),
             "kv_free_bytes": self.available_kv_bytes(),
-            "yield_count": 0,
+            "yield_count": int(yield_count),
         }
 
     def reset_for_new_suite(self) -> float:

@@ -451,6 +451,28 @@ void test_router_seams() {
     router_hold.set_worker_state_fields(1, 1.0, 0.0, 0, 16 * kGiB, 1);
     const RouteDecision dec_idle = router_hold.decide(req_hold);
     MS_CHECK(dec_idle.path == "state_ship" && dec_idle.dst_gpu == 1);
+
+    // Co-paged bridge_mllm_dit Regime B: VLM-hot src (alpha=0.0, post_evict=false) MUST NOT
+    // appear cheaper to morph than a post-VAE Decoder-hot peer (alpha=0.40, post_evict=true).
+    DualPathMorphRouter router_regb(topo);
+    router_regb.init_workers(
+        2,
+        [](int) { return "hybrid"; },
+        {{0, 0.0}, {1, 1.0}},
+        {{0, 16 * kGiB}, {1, 16 * kGiB}});
+    router_regb.update_worker_telemetry(1, 0.40, 16 * kGiB, 1);  // Triggers post_evict=true on Decoder-hot rank 1
+    CPTGRequestSpec req_regb;
+    req_regb.req_id = "ivlu_regb_ship_to_warm_dec";
+    req_regb.src_gpu = 0;
+    req_regb.architecture = "bridge_mllm_dit";
+    req_regb.model_family = "internvl_u";
+    req_regb.bridge_bytes = 4 * kMiB;
+    req_regb.gen_expert_bytes = 5600LL * kMiB;
+    req_regb.dit_step1_ms = 350.0;
+    req_regb.dit_total_steps = 16;
+    const RouteDecision dec_regb = router_regb.decide(req_regb);
+    MS_CHECK(dec_regb.path == "state_ship" && dec_regb.dst_gpu == 1);
+    MS_CHECK(dec_regb.t_ship_ms < dec_regb.t_morph_ms);
 }
 
 void test_preempt_edf_controller() {

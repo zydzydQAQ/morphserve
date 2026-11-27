@@ -973,3 +973,23 @@ def test_cluster_engine_concurrent_ar_waiters_no_livelock_and_batch_before_dit(t
     assert all(o.get("status") == "ok" for o in outs)
     assert inflight_after == 0
     assert bad_overlap is False
+
+
+def test_cluster_engine_mid_dit_preemption_gate_for_internvlu_regimes() -> None:
+    """Mid-DiT preemption is active for BAGEL and InternVL-U Regime A, and disabled in quota-capped Regime B."""
+    pol_bagel = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="bagel")
+    pol_ivlu_a = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="internvl_u")
+    pol_ivlu_b_quota = EnginePolicyConfig.from_preset(
+        "morphserve", num_gpus=2, model_family="internvl_u", gpu_memory_quota_mib=12288.0
+    )
+    pol_ivlu_b_frac = EnginePolicyConfig.from_preset(
+        "morphserve", num_gpus=2, model_family="internvl_u", gpu_memory_fraction=0.30
+    )
+    pol_nonpre = EnginePolicyConfig.from_preset(
+        "morphserve", num_gpus=2, model_family="internvl_u", preemption_mode="non_preemptive"
+    )
+    assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_bagel) is True
+    assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_ivlu_a) is True
+    assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_ivlu_b_quota) is False
+    assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_ivlu_b_frac) is False
+    assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_nonpre) is False

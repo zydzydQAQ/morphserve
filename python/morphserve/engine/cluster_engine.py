@@ -700,11 +700,28 @@ class MorphServeClusterEngine:
             for g in range(self.policy.num_gpus)
         }
 
+    @staticmethod
+    def _supports_mid_dit_preemption(eff_policy: EnginePolicyConfig) -> bool:
+        """True when workers can preempt active DiT steps without thrashing co-paged VLM/Decoder banks."""
+        if eff_policy.preemption_mode == "non_preemptive":
+            return False
+        if eff_policy.cptg_architecture == "bridge_mllm_dit":
+            raw_quota = getattr(eff_policy, "gpu_memory_quota_mib", None)
+            raw_frac = getattr(eff_policy, "gpu_memory_fraction", None)
+            if (raw_quota is not None and float(raw_quota) > 0.0) or (
+                raw_frac is not None and float(raw_frac) < 0.999
+            ):
+                return False
+        return True
+
     def _pick_initial_gpu(self, eff_policy: EnginePolicyConfig, modality_plan: str) -> int:
+        eff_preempt = (
+            eff_policy.preemption_mode if self._supports_mid_dit_preemption(eff_policy) else "non_preemptive"
+        )
         return self.router.select_initial_gpu(
             num_gpus=eff_policy.num_gpus,
             routing_mode=eff_policy.routing_mode,
-            preemption_mode=eff_policy.preemption_mode,
+            preemption_mode=eff_preempt,
             static_und_ranks=eff_policy.static_und_ranks,
             modality_plan=modality_plan,
             gpu_busy=self._gpu_busy_map(),
@@ -817,7 +834,7 @@ class MorphServeClusterEngine:
     ) -> tuple[dict[str, Any], bool]:
         """Dispatch AR via mid-DiT preemption OR continuous-batched `EXEC_AR` without single-AR lock serialization."""
         can_preempt = (
-            eff_policy.preemption_mode != "non_preemptive"
+            self._supports_mid_dit_preemption(eff_policy)
             and (self._gpu_locks[resident_gpu].locked() or self._active_dit_ranks.get(resident_gpu, 0) > 0)
             and self._active_preemptions.get(resident_gpu, 0) < 4
         )

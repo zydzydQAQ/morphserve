@@ -954,3 +954,145 @@ def test_internvlu_bridge_pack_inline_metadata_and_16b_alignment() -> None:
 
     with pytest.raises(ValueError, match="truncated"):
         unpack_internvlu_bridge_state(meta, flat[:-1])
+
+
+def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) -> None:
+    """Regime A services arriving AR turns at DiT step boundaries with OOM isolation; Regime B disables mid-DiT preemption."""
+    torch = pytest.importorskip("torch")
+    from PIL import Image
+
+    class _StepPipe:
+        def __init__(self) -> None:
+            self.cb_seen: list[bool] = []
+
+        def __call__(
+            self,
+            *,
+            num_inference_steps: int = 4,
+            callback_on_step_end: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            self.cb_seen.append(callback_on_step_end is not None)
+            latents = torch.zeros((1, 4, 8, 8))
+            if callback_on_step_end is not None:
+                for step_i in range(num_inference_steps):
+                    out_cb = callback_on_step_end(self, step_i, step_i, {"latents": latents})
+                    assert isinstance(out_cb, dict)
+            return SimpleNamespace(images=[Image.new("RGB", (32, 32), color=(40, 80, 120))])
+
+    def _make_stub_pipe():
+        step_pipe = _StepPipe()
+        proc = SimpleNamespace(image_gen_processor=SimpleNamespace(merge_size=2, patch_size=8))
+        tok = SimpleNamespace(
+            pad_token_id=0,
+            eos_token_id=2,
+            unk_token_id=1,
+            convert_tokens_to_ids=lambda _s: -1,
+            decode=lambda seq, skip_special_tokens=True: "step preempt answer",
+        )
+        pipe = SimpleNamespace(
+            device=torch.device("cpu"),
+            processor=proc,
+            tokenizer=tok,
+            vlm=None,
+            generation_decoder=None,
+            image_pipeline=step_pipe,
+        )
+        return pipe, step_pipe
+
+    # 1. Regime A (unconstrained): callback_on_step_end fires, serves valid AR & isolates error without killing DiT!
+    pipe_a, step_pipe_a = _make_stub_pipe()
+    pol_a = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=1,
+        model_family="internvl_u",
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        preemption_mode="layer_chunk",
+    )
+    ad_a = InternVLUCPTGAdapter(rank=0, policy=pol_a, bench_root=tmp_path, pipeline=pipe_a, device=torch.device("cpu"))
+    try:
+        ad_a._ctx_store["dit_a"] = {
+            "prompt": "draw a cat",
+            "diff_inp": {},
+            "gh": 32,
+            "gw": 32,
+            "bridge_bytes": 64,
+        }
+        ad_a._ctx_store["ar_ok"] = {"prompt": "describe", "history": [], "images": [], "bridge_bytes": 64}
+        ad_a._ctx_store["ar_bad"] = {"prompt": "bad", "history": [], "images": [], "bridge_bytes": 64}
+
+        def _fake_decode_ar_batch(batch_cmds: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            if len(batch_cmds) > 1 or any(c.get("ctx_id") == "ar_bad" for c in batch_cmds):
+                if len(batch_cmds) > 1:
+                    raise RuntimeError("injected batch error")
+                raise MemoryError("out of memory on ar_bad")
+            return [
+                {
+                    "text": "ok reply",
+                    "tokens": 2,
+                    "ttft_ms": 12.0,
+                    "tpots_ms": [8.0],
+                    "kv_bytes": 64,
+                }
+            ]
+
+        ad_a.decode_ar_batch = _fake_decode_ar_batch  # type: ignore[method-assign]
+        queued_batches = [
+            [
+                {"cmd_id": "c_ok", "ctx_id": "ar_ok", "prompt": "describe", "max_ar_tokens": 4},
+                {"cmd_id": "c_bad", "ctx_id": "ar_bad", "prompt": "bad", "max_ar_tokens": 4},
+            ],
+            [],
+            [],
+            [],
+        ]
+        acks: list[dict[str, Any]] = []
+        res_a = ad_a.generate_dit(
+            "dit_a",
+            {"height": 32, "width": 32, "dit_steps": 4, "seed": 7},
+            poll_preempt_cmds=lambda: queued_batches.pop(0) if queued_batches else [],
+            emit_preempt_ack=acks.append,
+        )
+        assert res_a["status"] == "ok"
+        assert step_pipe_a.cb_seen == [True]
+        assert res_a["yield_count"] == 1
+        by_id = {a["cmd_id"]: a for a in acks}
+        assert by_id["c_ok"]["status"] == "ok" and by_id["c_ok"]["preempted_mid_dit"] is True
+        assert by_id["c_bad"]["status"] == "oom"
+    finally:
+        ad_a.close()
+
+    # 2. Regime B (quota-constrained): callback_on_step_end MUST NOT be passed (prevents VLM<->Decoder thrash).
+    pipe_b, step_pipe_b = _make_stub_pipe()
+    pol_b = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=1,
+        model_family="internvl_u",
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        preemption_mode="layer_chunk",
+        gpu_memory_quota_mib=12288.0,
+    )
+    ad_b = InternVLUCPTGAdapter(rank=0, policy=pol_b, bench_root=tmp_path, pipeline=pipe_b, device=torch.device("cpu"))
+    try:
+        ad_b._ctx_store["dit_b"] = {
+            "prompt": "draw a dog",
+            "diff_inp": {},
+            "gh": 32,
+            "gw": 32,
+            "bridge_bytes": 64,
+        }
+        acks_b: list[dict[str, Any]] = []
+        res_b = ad_b.generate_dit(
+            "dit_b",
+            {"height": 32, "width": 32, "dit_steps": 4, "seed": 7},
+            poll_preempt_cmds=lambda: [{"cmd_id": "c_never", "ctx_id": "x"}],
+            emit_preempt_ack=acks_b.append,
+        )
+        assert res_b["status"] == "ok"
+        assert step_pipe_b.cb_seen == [False]
+        assert res_b["yield_count"] == 0
+        assert acks_b == []
+    finally:
+        ad_b.close()

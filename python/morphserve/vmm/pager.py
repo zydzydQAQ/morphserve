@@ -575,6 +575,7 @@ class LayerExpertPager:
                                     vmm.load_expert_layers_sync(self.expert_id, 0, target_res)
                                     self._has_pending_async_prefetch = False
                                 elif policy != "none" or (self.spec.install_module_hooks and self.spec.hook_modules):
+                                    self._ensure_expert_headroom(target_res - cur_res)
                                     vmm.prefetch_expert_async(self.expert_id, 0, target_res)
                                     self._has_pending_async_prefetch = True
                                     if cur_res == 0:

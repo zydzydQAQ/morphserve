@@ -622,6 +622,8 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_router_reserve_ar_queue.restype = None
     L.ms_router_release_ar_queue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_double]
     L.ms_router_release_ar_queue.restype = None
+    L.ms_router_set_colocated_ar.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    L.ms_router_set_colocated_ar.restype = None
     L.ms_router_select_initial_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     L.ms_router_select_initial_gpu.restype = ctypes.c_int
     L.ms_router_select_static_gen_gpu.argtypes = [ctypes.c_void_p, ctypes.c_char_p]

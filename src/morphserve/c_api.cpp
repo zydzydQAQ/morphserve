@@ -1707,6 +1707,14 @@ void ms_router_release_ar_queue(ms_router_t* r, int gpu_id, double est_ar_ms) {
     MS_CAPI_CATCH_VOID()
 }
 
+void ms_router_set_colocated_ar(ms_router_t* r, int gpu_id, int count) {
+    if (!r || !r->ptr) return;
+    try {
+        r->ptr->set_colocated_ar_count(gpu_id, count);
+    }
+    MS_CAPI_CATCH_VOID()
+}
+
 int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json) {
     clear_err();
     if (!r || !r->ptr) {
@@ -1728,7 +1736,7 @@ int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json) {
             parse_bool_map(j, "gpu_busy"),
             parse_int_map(j, "active_dit_ranks"),
             parse_int_map(j, "active_preemptions"),
-            j.value("max_preemptions_per_gpu", 6),
+            j.value("max_preemptions_per_gpu", 4),
             j.value("architecture", std::string("tight_mot")));
     }
     MS_CAPI_CATCH_RETURN(-1)
@@ -1972,7 +1980,8 @@ char* ms_ctrl_plan_turn_transition_json(ms_ctrl_t* c, const char* req_json) {
             j.value("has_more_turns", false),
             j.value("has_more_edits", false),
             j.value("now_ms", 0.0),
-            parse_bool_map(j, "gpu_busy"));
+            parse_bool_map(j, "gpu_busy"),
+            j.value("src_lock_held", false));
         return dup_json_str(plan.to_json());
     }
     MS_CAPI_CATCH_RETURN(nullptr)

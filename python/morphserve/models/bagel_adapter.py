@@ -1207,7 +1207,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 4096) * MIB
+                    headroom_b = (nccl_reserve_mib + 4608) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -1235,7 +1235,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 self.pipeline,
                 mode=self.policy.preemption_mode,
                 tpot_slo_ms=self.policy.ar_tpot_slo_ms,
-                guard_ms=30.0,
+                guard_ms=26.0,
                 init_layer_ms=10.5,
                 init_ar_step_ms=66.0,
                 pager=self.pager,
@@ -1261,7 +1261,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 self._calibrated_ar_step_ms = max(5.0, min(66.0, float(tpots[-1])))
                 if self.sched is not None:
                     self.sched.ema_ar_step_ms = self._calibrated_ar_step_ms
-                    self.sched.guard_ms = 30.0
+                    self.sched.guard_ms = 26.0
                     self.sched.last_effective_chunk_layers = self.sched.compute_adaptive_chunk_layers()
             self.release_context("__warm_ar__")
 
@@ -1323,6 +1323,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         update_vit: bool = True,
         *,
         keep_naive_resident: bool = False,
+        pacer_already_held: bool = False,
         timing_out: dict[str, float] | None = None,
     ) -> None:
         """Unified PIL & GPU-uint8 image injection sharing VAE seed and running ViT prep outside autocast(bf16)."""
@@ -1370,7 +1371,22 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             new_token_ids=self.pipeline.new_token_ids,
                         )
                         vi = {k: (v.to(self.device) if torch.is_tensor(v) else v) for k, v in vi.items()}
-                    with torch.autocast(device_type=dev_type, enabled=ac_enabled, dtype=torch.bfloat16):
+                    pkv_sid = int(getattr(ctx.get("past_key_values"), "session_id", 0) or 0)
+                    excl_sids = (pkv_sid,) if pkv_sid > 0 else ()
+                    # `forward_cache_update_vae` runs `language_model(..., mode="gen")` (reading `moe_gen`
+                    # weights in Triton) right after `vae.encode`. Always enter `pager.generation_mode`
+                    # so `moe_gen` is 100% resident and pinned even when `use_scoped_vae=False`.
+                    gen_cm = (
+                        self.pager.generation_mode(
+                            prefetch_all=True,
+                            pacer=(None if pacer_already_held else self.pacer),
+                            rank=self.rank,
+                            exclude_session_ids=excl_sids,
+                        )
+                        if (self.pager is not None and self.vmm is not None)
+                        else nullcontext()
+                    )
+                    with gen_cm, torch.autocast(device_type=dev_type, enabled=ac_enabled, dtype=torch.bfloat16):
                         ctx["past_key_values"] = self.pipeline.bagel.forward_cache_update_vae(
                             self.pipeline.vae, ctx["past_key_values"], **vi
                         )
@@ -1425,6 +1441,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         *,
         can_run_vae: bool,
         prep_dit: bool,
+        pacer_already_held: bool = False,
         timing_out: dict[str, float] | None = None,
     ) -> None:
         assert session.main_ctx is not None
@@ -1441,6 +1458,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=can_run_vae,
                     update_vit=True,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=pacer_already_held,
                     timing_out=timing_out,
                 )
                 if prep_dit and not can_run_vae:
@@ -1452,6 +1470,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=can_run_vae,
                     update_vit=True,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=pacer_already_held,
                     timing_out=timing_out,
                 )
                 if prep_dit and not can_run_vae:
@@ -1465,6 +1484,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=can_run_vae,
                     update_vit=True,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=pacer_already_held,
                     timing_out=timing_out,
                 )
                 if prep_dit and not can_run_vae:
@@ -1476,6 +1496,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=can_run_vae,
                     update_vit=True,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=pacer_already_held,
                     timing_out=timing_out,
                 )
                 if prep_dit and not can_run_vae:
@@ -1489,6 +1510,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 update_vae=can_run_vae,
                 update_vit=True,
                 keep_naive_resident=keep_naive,
+                pacer_already_held=pacer_already_held,
                 timing_out=timing_out,
             )
             if prep_dit and not can_run_vae:
@@ -1514,6 +1536,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         update_vae=True,
                         update_vit=False,
                         keep_naive_resident=keep_naive,
+                        pacer_already_held=pacer_already_held,
                         timing_out=timing_out,
                     )
                 else:
@@ -1781,16 +1804,13 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         if deferral is None or deferral.is_empty:
             return
         keep_naive = self.naive_offloader is not None
-        early_pacer_cm = (
-            self.pacer.acquire_process_slot(self.rank)
-            if (
-                self.pacer is not None
-                and self.pager is not None
-                and self.vmm is not None
-                and self.vmm.expert_resident_count(self.pager.expert_id) < self.pager.num_layers
-            )
-            else nullcontext()
+        early_pacer_acquired = bool(
+            self.pacer is not None
+            and self.pager is not None
+            and self.vmm is not None
+            and self.vmm.expert_resident_count(self.pager.expert_id) < self.pager.num_layers
         )
+        early_pacer_cm = self.pacer.acquire_process_slot(self.rank) if early_pacer_acquired else nullcontext()
         with early_pacer_cm, session.atomic_kv_update():
             session.pending_deferral = None
             if deferral.turn_cmd is not None:
@@ -1799,6 +1819,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     deferral.turn_cmd,
                     can_run_vae=True,
                     prep_dit=True,
+                    pacer_already_held=early_pacer_acquired,
                     timing_out=timing_out,
                 )
             assert session.main_ctx is not None
@@ -1811,6 +1832,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=True,
                     update_vit=False,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=early_pacer_acquired,
                     timing_out=timing_out,
                 )
                 if cfg_text_ctx is not None:
@@ -1820,6 +1842,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         update_vae=True,
                         update_vit=False,
                         keep_naive_resident=keep_naive,
+                        pacer_already_held=early_pacer_acquired,
                         timing_out=timing_out,
                     )
             if deferral.vae_pil and session.last_img_pil is not None:
@@ -1829,6 +1852,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=True,
                     update_vit=False,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=early_pacer_acquired,
                     timing_out=timing_out,
                 )
                 if cfg_text_ctx is not None:
@@ -1838,6 +1862,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         update_vae=True,
                         update_vit=False,
                         keep_naive_resident=keep_naive,
+                        pacer_already_held=early_pacer_acquired,
                         timing_out=timing_out,
                     )
             for pend_img in deferral.vae_paths:
@@ -1848,6 +1873,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     update_vae=True,
                     update_vit=False,
                     keep_naive_resident=keep_naive,
+                    pacer_already_held=early_pacer_acquired,
                     timing_out=timing_out,
                 )
                 if cfg_text_ctx is not None:
@@ -1857,6 +1883,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         update_vae=True,
                         update_vit=False,
                         keep_naive_resident=keep_naive,
+                        pacer_already_held=early_pacer_acquired,
                         timing_out=timing_out,
                     )
 
@@ -1896,7 +1923,12 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
             session = self._ensure_ctx_resident(ctx_id)
             has_pending = session.has_pending_deferral
-            est_dit_vae_bytes = int(7.0 * GIB) if (height >= 1024 or width >= 1024) else int(4.5 * GIB)
+            if self.policy.use_scoped_vae:
+                # With Scoped VAE active, FLUX VAE decode activations run inside TriPoolVMM Arena-2
+                # rather than PyTorch driver memory, so keep driver headroom aligned with `max_pool_b`.
+                est_dit_vae_bytes = int(4608 * MIB) if (height >= 1024 or width >= 1024) else int(2560 * MIB)
+            else:
+                est_dit_vae_bytes = int(6144 * MIB) if (height >= 1024 or width >= 1024) else int(3584 * MIB)
             if self.pager is not None and self.vmm is not None:
                 extra_dit_kv = (256 * MIB) if has_pending else (64 * MIB)
                 # `for_dit=True` already reserves full DiT expert bytes in TriPoolVMM's accounting;
@@ -2233,7 +2265,18 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     # Drop per-turn CFG branch caches immediately after denoising completes.
                     session.drop_cfg_branches()
                     if self.vmm is not None and is_cuda and (int(img_shape[0]) >= 1024 or int(img_shape[1]) >= 1024):
-                        self._ensure_cuda_driver_headroom_for_dit(5120 * MIB, exclude_ctx_ids=(ctx_id,))
+                        if self.policy.use_scoped_vae:
+                            free_drv, _ = torch.cuda.mem_get_info(self.device)
+                            unused_pt = max(
+                                0,
+                                int(torch.cuda.memory_reserved(self.device))
+                                - int(torch.cuda.memory_allocated(self.device)),
+                            )
+                            if int(free_drv) < 1536 * MIB and unused_pt >= 512 * MIB:
+                                self._update_hwm()
+                                torch.cuda.empty_cache()
+                        else:
+                            self._ensure_cuda_driver_headroom_for_dit(5120 * MIB, exclude_ctx_ids=(ctx_id,))
 
                     # Phase 2: FLUX VAE decode outside `generation_session` (bounded OOM retry reuses `latents`!).
                     for vae_attempt in range(max_dit_oom_retries + 1):
@@ -2399,9 +2442,20 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             freed_host_b = old.close()
             if freed_host_b > 0:
                 self._kv_host_pinned_bytes = max(0, self._kv_host_pinned_bytes - freed_host_b)
-        if self.vmm is None and torch.cuda.is_available():
-            self._update_hwm()
-            torch.cuda.empty_cache()
+        if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
+            if self.vmm is None:
+                self._update_hwm()
+                torch.cuda.empty_cache()
+            else:
+                unused_pt = max(
+                    0,
+                    int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+                )
+                if unused_pt >= 1024 * MIB:
+                    free_drv, _ = torch.cuda.mem_get_info(self.device)
+                    if int(free_drv) < 4096 * MIB:
+                        self._update_hwm()
+                        torch.cuda.empty_cache()
 
     def reset_for_new_suite(self) -> float:
         self._pending_h2d_weight_ms.clear()

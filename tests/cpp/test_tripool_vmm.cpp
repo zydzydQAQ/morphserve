@@ -795,6 +795,75 @@ void test_lru_multibank_eviction_and_release_free_overflow() {
         vmm->kv_session_destroy(sid);
         MS_EXPECT(vmm->shutdown() == 0);
     }
+
+    // 3. pop_fine_handle_locked grows within max_pool_bytes BEFORE evicting unpinned experts or
+    //    thinking KV, and release_free_overflow_to_driver trims fine pages first without shrinking
+    //    super_pool_total_ below init_super_handles_.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 16;   // 2 x 8 MiB super handles (init_super_handles_ = 2)
+        cfg.fine_kv_pool_mib = 4;  // 2 x 2 MiB fine pages (base_fine_pages_ = 2)
+        cfg.super_handle_mib = 8;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = true;
+        cfg.max_pool_bytes = 28 * kMiB;  // +8 MiB headroom above 20 MiB initial pool
+        cfg.simulated = true;
+        cfg.materialize_sim_va = true;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const int eid = vmm->expert_register(2, 8, nullptr, 0);
+        MS_EXPECT(vmm->expert_load_layers_sync(eid, 0, 2) == 0);  // Consumes both super handles (free_super=0)
+        MS_EXPECT(vmm->expert_resident_count(eid) == 2);
+
+        const uint64_t sid_think = vmm->kv_session_create();
+        const int32_t rid_think = vmm->kv_region_alloc(4 * kMiB, sid_think);
+        MS_EXPECT(vmm->kv_region_ensure(rid_think, 4 * kMiB, nullptr) != 0);  // Consumes base fine pages
+        MS_EXPECT(vmm->kv_session_mark_thinking(sid_think, nullptr) == 0);
+
+        // Active KV session needs 6 MiB (3 fine pages) -> must grow within max_pool_bytes (20->26 MiB)
+        // WITHOUT evicting the unpinned expert layers or swapping the thinking KV region!
+        const uint64_t sid_act = vmm->kv_session_create();
+        const int32_t rid_act = vmm->kv_region_alloc(12 * kMiB, sid_act);
+        MS_EXPECT(vmm->kv_region_ensure(rid_act, 6 * kMiB, nullptr) != 0);
+        MS_EXPECT(vmm->expert_resident_count(eid) == 2);
+        UnifiedVmmStatsPod st_grow{};
+        vmm->get_stats(&st_grow);
+        MS_EXPECT(st_grow.overflow_creates == 3);
+        MS_EXPECT(st_grow.expert_auto_evictions_for_kv == 0);
+        MS_EXPECT(st_grow.kv_host_swap_outs == 0);
+        MS_EXPECT(st_grow.pool_total_bytes == 26 * kMiB);
+
+        // Exceeding max_pool_bytes (need +4 MiB -> 30 > 28 MiB): grows 2 MiB to cap, then evicts expert.
+        MS_EXPECT(vmm->kv_region_ensure(rid_act, 10 * kMiB, nullptr) != 0);
+        MS_EXPECT(vmm->expert_resident_count(eid) == 1);
+        UnifiedVmmStatsPod st_cap{};
+        vmm->get_stats(&st_cap);
+        MS_EXPECT(st_cap.pool_total_bytes == 28 * kMiB);
+        MS_EXPECT(st_cap.expert_auto_evictions_for_kv == 1);
+
+        // Free active KV and evict remaining expert layer -> 1 free super handle + excess fine pages.
+        // release_free_overflow_to_driver MUST release excess fine pages first and keep super_pool_total_ intact.
+        MS_EXPECT(vmm->kv_region_free(rid_act, nullptr) == 0);
+        MS_EXPECT(vmm->expert_evict_range(eid, 0, 2, nullptr) >= 1);
+        UnifiedVmmStatsPod st_pre_trim{};
+        vmm->get_stats(&st_pre_trim);
+        const uint64_t super_before_trim = st_pre_trim.super_pool_total_handles;
+        MS_EXPECT(super_before_trim <= 2);
+
+        const size_t trimmed = vmm->release_free_overflow_to_driver(8 * kMiB);
+        MS_EXPECT(trimmed == 8 * kMiB);
+        UnifiedVmmStatsPod st_post_trim{};
+        vmm->get_stats(&st_post_trim);
+        MS_EXPECT(st_post_trim.super_pool_total_handles == super_before_trim);
+        MS_EXPECT(st_post_trim.pool_total_bytes == 20 * kMiB);
+
+        MS_EXPECT(vmm->kv_region_free(rid_think, nullptr) == 0);
+        vmm->kv_session_destroy(sid_act);
+        vmm->kv_session_destroy(sid_think);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
 }
 
 }  // namespace

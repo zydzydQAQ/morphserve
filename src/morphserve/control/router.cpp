@@ -248,6 +248,7 @@ nlohmann::json CPTGRequestSpec::to_json() const {
         {"resolution", resolution},
         {"interleaved_roundtrip_gamma", interleaved_roundtrip_gamma},
         {"model_family", model_family},
+        {"src_hold_credit_ms", src_hold_credit_ms},
     };
 }
 
@@ -264,6 +265,7 @@ CPTGRequestSpec CPTGRequestSpec::from_json(const nlohmann::json& j) {
     r.resolution = j.value("resolution", 512);
     r.interleaved_roundtrip_gamma = j.value("interleaved_roundtrip_gamma", 1);
     r.model_family = j.value("model_family", "");
+    r.src_hold_credit_ms = std::max(0.0, j.value("src_hold_credit_ms", 0.0));
     return r;
 }
 
@@ -457,7 +459,6 @@ void DualPathMorphRouter::reserve_ar_queue(int gpu_id, double est_ar_ms) {
     auto it = worker_states_.find(gpu_id);
     if (it != worker_states_.end()) {
         it->second.queue_wait_ms += delta;
-        ++it->second.colocated_ar_b;
     }
 }
 
@@ -470,7 +471,14 @@ void DualPathMorphRouter::release_ar_queue(int gpu_id, double est_ar_ms) {
     auto it = worker_states_.find(gpu_id);
     if (it != worker_states_.end()) {
         it->second.queue_wait_ms = std::max(0.0, it->second.queue_wait_ms - delta);
-        it->second.colocated_ar_b = std::max(0, it->second.colocated_ar_b - 1);
+    }
+}
+
+void DualPathMorphRouter::set_colocated_ar_count(int gpu_id, int count) {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = worker_states_.find(gpu_id);
+    if (it != worker_states_.end()) {
+        it->second.colocated_ar_b = std::max(0, count);
     }
 }
 
@@ -507,7 +515,10 @@ int DualPathMorphRouter::select_initial_gpu(
     auto ar_alpha_tier = [&](int g) -> int {
         const double alpha = w_map.at(g).expert_alpha;
         if (architecture == "bridge_mllm_dit") {
-            return (alpha < 0.50) ? 0 : 1;
+            // On co-paged InternVL-U (Regime B), post-VAE Decoder-hot ranks retain `dec_alpha ~ 0.25`
+            // while VLM weights are evicted (`vlm_alpha = 0.0`); only genuine VLM-hot ranks (`alpha <= 0.01`)
+            // belong in tier 0 so `ar_only` never triggers unnecessary 6 GiB VLM<->Decoder thrashing.
+            return (alpha <= 0.01) ? 0 : 1;
         }
         // On tight_mot (BAGEL), Und is always resident on every GPU; only genuinely KV-heavy
         // GPUs (alpha <= 0.50) are specialized, while partial post-VAE dips (e.g. 0.75 vs 1.0)
@@ -611,14 +622,25 @@ int DualPathMorphRouter::select_initial_gpu(
         const auto& wb = w_map.at(b);
         double aa = 0.0;
         double ab = 0.0;
+        double eff_qa = wa.queue_wait_ms;
+        double eff_qb = wb.queue_wait_ms;
         if (routing_mode == "dual_path") {
             // For `bridge_mllm_dit` (InternVL-U), `PREP_DIT` runs VLM first and ships a compact
-            // bridge via Path A to hot Decoder GPUs: prefer low decoder alpha (VLM resident).
-            aa = (architecture == "bridge_mllm_dit") ? wa.expert_alpha : -wa.expert_alpha;
-            ab = (architecture == "bridge_mllm_dit") ? wb.expert_alpha : -wb.expert_alpha;
+            // bridge via Path A to hot Decoder GPUs: prefer VLM-hot ranks (`alpha <= 0.01`) unless
+            // their queue wait exceeds the ~1.2s VLM<->Decoder morph cost (cancels identically on
+            // unconstrained Regime A where all GPUs have `alpha = 1.0`).
+            if (architecture == "bridge_mllm_dit") {
+                aa = wa.expert_alpha;
+                ab = wb.expert_alpha;
+                if (wa.expert_alpha > 0.01) eff_qa += 1200.0;
+                if (wb.expert_alpha > 0.01) eff_qb += 1200.0;
+            } else {
+                aa = -wa.expert_alpha;
+                ab = -wb.expert_alpha;
+            }
         }
-        return std::make_tuple(wa.kv_free_bytes >= min_kv_b ? 0 : 1, wa.queue_wait_ms, is_busy(a), aa, pos_mod(a - cur, n)) <
-               std::make_tuple(wb.kv_free_bytes >= min_kv_b ? 0 : 1, wb.queue_wait_ms, is_busy(b), ab, pos_mod(b - cur, n));
+        return std::make_tuple(wa.kv_free_bytes >= min_kv_b ? 0 : 1, eff_qa, is_busy(a), aa, pos_mod(a - cur, n)) <
+               std::make_tuple(wb.kv_free_bytes >= min_kv_b ? 0 : 1, eff_qb, is_busy(b), ab, pos_mod(b - cur, n));
     });
     const int chosen = cands.front();
     rr_cursor_ = (chosen + 1) % n;
@@ -693,7 +715,8 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
     const double alpha = std::max(0.0, std::min(1.0, src_worker.expert_alpha));
     const double missing_bytes = (1.0 - alpha) * static_cast<double>(req.gen_expert_bytes);
     if (missing_bytes <= 0.0) {
-        return {round_3(eff_q_wait_ms), topology_.solo_h2d_gbps(src_worker.gpu_id)};
+        const double eff_local_ms = std::max(0.0, eff_q_wait_ms - std::max(0.0, req.src_hold_credit_ms));
+        return {round_3(eff_local_ms), topology_.solo_h2d_gbps(src_worker.gpu_id)};
     }
     const double h2d_wait_ms = pacer_ ? pacer_->predicted_wait_ms(src_worker.gpu_id, now_ms) : 0.0;
     const int active = (!pacer_ || pacer_->max_concurrent_per_half() == 1)

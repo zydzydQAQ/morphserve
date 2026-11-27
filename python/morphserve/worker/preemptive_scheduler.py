@@ -14,6 +14,20 @@ from morphserve._core import get_core_lib
 from .bagel_interceptor import BagelExecutionInterceptor, _sync_cuda_if_present
 
 
+def _record_cuda_timing_event(device: Any) -> Any | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    if device is not None and getattr(device, "type", "cuda") != "cuda":
+        return None
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record(torch.cuda.current_stream(device))
+    return ev
+
+
 @dataclass
 class ArDecodeTask:
     """One interactive autoregressive text decoding request managed by the unified scheduler."""
@@ -135,6 +149,11 @@ class UnifiedPreemptiveScheduler:
         self._last_sync_s: float = 0.0
         self._queued_gpu_ms: float = 0.0
         self._layers_since_sync: int = 0
+        self._last_sync_is_true_sync: bool = True
+        self._pace_anchor_event: Any | None = None
+        self._pace_pending_event: Any | None = None
+        self._pace_pending_layers: int = 0
+        self._pace_layers_accum: int = 0
         self._step0_h2d_streaming: bool = False
         self._layer_calibrated: bool = False
         self._ar_yield_depth: int = 0
@@ -255,6 +274,14 @@ class UnifiedPreemptiveScheduler:
         finally:
             self._ar_yield_depth = max(0, self._ar_yield_depth - 1)
 
+    def _reset_pacing(self, *, record_anchor: bool = False) -> None:
+        self._pace_anchor_event = (
+            _record_cuda_timing_event(getattr(self.pipeline, "device", None)) if record_anchor else None
+        )
+        self._pace_pending_event = None
+        self._pace_pending_layers = 0
+        self._pace_layers_accum = 0
+
     def reset_telemetry(self, *, preserve_layer_calibration: bool = False) -> None:
         self.yield_count = 0
         self.ar_steps_executed = 0
@@ -270,6 +297,8 @@ class UnifiedPreemptiveScheduler:
         self.completed_ar_tasks.clear()
         self._pending_arrivals.clear()
         self._layers_since_sync = 0
+        self._last_sync_is_true_sync = True
+        self._reset_pacing(record_anchor=False)
 
     @property
     def interceptor(self) -> BagelExecutionInterceptor:
@@ -281,6 +310,8 @@ class UnifiedPreemptiveScheduler:
         self._last_sync_s = now
         self._queued_gpu_ms = 0.0
         self._layers_since_sync = 0
+        self._last_sync_is_true_sync = True
+        self._reset_pacing(record_anchor=(self.mode == "layer_chunk"))
         streaming = False
         if self.pager is not None and getattr(self.pager, "vmm", None) is not None:
             res_alpha_fn = getattr(self.pager, "resident_alpha", None)
@@ -547,18 +578,70 @@ class UnifiedPreemptiveScheduler:
             self._last_sync_s = now_s
             self._queued_gpu_ms = 0.0
             self._layers_since_sync = 0
+            self._last_sync_is_true_sync = True
+            self._reset_pacing(record_anchor=(self.mode == "layer_chunk"))
             return
 
         cur_ema_layer_ms = self.ema_layer_ms
         eff_layer_ms = max(cur_ema_layer_ms, 24.0) if self._step0_h2d_streaming else cur_ema_layer_ms
         self._queued_gpu_ms += eff_layer_ms
         self._layers_since_sync += 1
+        self._pace_layers_accum += 1
         est_gpu_s = max(time.perf_counter(), self._last_sync_s + self._queued_gpu_ms / 1000.0)
-        if self._should_yield_now(est_gpu_s, next_unit_ms=eff_layer_ms):
+        should_yield = self._should_yield_now(est_gpu_s, next_unit_ms=eff_layer_ms)
+
+        # Bubble-free 1-chunk CUDA Event pacing in `layer_chunk` mode: keep at most 1 chunk (~38 ms)
+        # ahead in the GPU stream while waiting on the previous chunk's completion event so uncontended
+        # DiT steps never run 10+ seconds ahead of CPU arrival polling (bounds AR TTFT < 100 ms with 0 GPU bubble).
+        if not should_yield and self.mode == "layer_chunk" and not self.active_ar_tasks:
+            pace_chunk = max(1, min(4, int(round(38.0 / max(1.0, cur_ema_layer_ms)))))
+            if self._pace_layers_accum >= pace_chunk:
+                ev_cur = _record_cuda_timing_event(dev)
+                if ev_cur is not None:
+                    if self._pace_pending_event is not None:
+                        self._pace_pending_event.synchronize()
+                        if (
+                            not self._step0_h2d_streaming
+                            and self._pace_anchor_event is not None
+                            and self._pace_pending_layers > 0
+                        ):
+                            try:
+                                obs_l = float(
+                                    self._pace_anchor_event.elapsed_time(self._pace_pending_event)
+                                ) / float(self._pace_pending_layers)
+                            except Exception:
+                                obs_l = 0.0
+                            if 1.0 <= obs_l <= 250.0:
+                                self._lib.ms_edf_record_layer(
+                                    ctypes.c_void_p(self._edf_handle), ctypes.c_double(obs_l)
+                                )
+                                self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
+                        self._pace_anchor_event = self._pace_pending_event
+                        self._pace_pending_event = ev_cur
+                        self._pace_pending_layers = self._pace_layers_accum
+                        self._pace_layers_accum = 0
+                        now_p = time.perf_counter()
+                        self._last_sync_s = now_p
+                        self._queued_gpu_ms = float(self._pace_pending_layers) * eff_layer_ms
+                        self._layers_since_sync = self._pace_pending_layers
+                        self._last_sync_is_true_sync = False
+                        should_yield = self._should_yield_now(
+                            now_p + self._queued_gpu_ms / 1000.0,
+                            next_unit_ms=eff_layer_ms,
+                        )
+                    else:
+                        if self._pace_anchor_event is None:
+                            self._pace_anchor_event = ev_cur
+                        self._pace_pending_event = ev_cur
+                        self._pace_pending_layers = self._pace_layers_accum
+                        self._pace_layers_accum = 0
+
+        if should_yield:
             _sync_cuda_if_present(dev)
             real_now = time.perf_counter()
             if (
-                self._layers_since_sync > 0
+                self._last_sync_is_true_sync
+                and self._layers_since_sync > 0
                 and not self._step0_h2d_streaming
                 and self._last_sync_s > 0.0
             ):
@@ -569,12 +652,21 @@ class UnifiedPreemptiveScheduler:
             self._last_sync_s = real_now
             self._queued_gpu_ms = 0.0
             self._layers_since_sync = 0
+            self._last_sync_is_true_sync = True
+            self._reset_pacing(record_anchor=False)
             self.admit_due_arrivals(real_now)
             if self.active_ar_tasks:
                 self.service_due_ar_tasks(force_all_urgent=False)
+                # Bounded 1x immediate post-admit re-check: if a new AR arrival just finished text prefill
+                # during `service_due_ar_tasks` and tightened earliest deadline below 1 DiT layer, pack and
+                # service it once before resuming DiT (prevents 43ms prefill + 34ms layer TPOT spikes).
+                if self.active_ar_tasks and self._should_yield_now(time.perf_counter(), next_unit_ms=eff_layer_ms):
+                    self.service_due_ar_tasks(force_all_urgent=False)
                 self._last_sync_s = time.perf_counter()
                 self._queued_gpu_ms = 0.0
                 self._layers_since_sync = 0
+                self._last_sync_is_true_sync = True
+            self._reset_pacing(record_anchor=(self.mode == "layer_chunk"))
 
     def on_dit_step_complete(self, step_start_s: float, ar_compute_before_ms: float) -> None:
         """Invoked by `BagelExecutionInterceptor` after each `bagel.forward` denoising step."""
@@ -589,10 +681,12 @@ class UnifiedPreemptiveScheduler:
             )
             if not need_sync:
                 now_s = time.perf_counter()
-                self._last_sync_s = now_s
-                self._queued_gpu_ms = 0.0
-                self._layers_since_sync = 0
                 self._step0_h2d_streaming = False
+                if self.mode != "layer_chunk":
+                    self._last_sync_s = now_s
+                    self._queued_gpu_ms = 0.0
+                    self._layers_since_sync = 0
+                    self._last_sync_is_true_sync = False
                 pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
                 self.step_times_ms.append(pure_step_ms)
                 return
@@ -600,7 +694,8 @@ class UnifiedPreemptiveScheduler:
         _sync_cuda_if_present(dev)
         now_s = time.perf_counter()
         if (
-            self._layers_since_sync > 0
+            self._last_sync_is_true_sync
+            and self._layers_since_sync > 0
             and not self._step0_h2d_streaming
             and self._last_sync_s > 0.0
         ):
@@ -611,6 +706,8 @@ class UnifiedPreemptiveScheduler:
         self._last_sync_s = now_s
         self._queued_gpu_ms = 0.0
         self._layers_since_sync = 0
+        self._last_sync_is_true_sync = True
+        self._reset_pacing(record_anchor=False)
         self._step0_h2d_streaming = False
         pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
         self.step_times_ms.append(pure_step_ms)
@@ -623,11 +720,18 @@ class UnifiedPreemptiveScheduler:
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0
                     self._layers_since_sync = 0
+                    self._last_sync_is_true_sync = True
                 elif self._should_yield_now(now_s, next_unit_ms=1.6 * self.ema_layer_ms):
                     self.service_due_ar_tasks(force_all_urgent=False)
+                    if self.active_ar_tasks and self._should_yield_now(
+                        time.perf_counter(), next_unit_ms=1.6 * self.ema_layer_ms
+                    ):
+                        self.service_due_ar_tasks(force_all_urgent=False)
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0
                     self._layers_since_sync = 0
+                    self._last_sync_is_true_sync = True
+        self._reset_pacing(record_anchor=(self.mode == "layer_chunk"))
 
     @contextmanager
     def run_session(self):

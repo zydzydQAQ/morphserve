@@ -425,6 +425,15 @@ class DualPathMorphRouter:
                 ctypes.c_double(float(est_ar_ms)),
             )
 
+    def set_colocated_ar_count(self, gpu_id: int, count: int) -> None:
+        """Update active mid-DiT colocated AR count (3rd Performance Atlas axis) on `gpu_id`."""
+        with self._mu:
+            self._lib.ms_router_set_colocated_ar(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_int(int(gpu_id)),
+                ctypes.c_int(max(0, int(count))),
+            )
+
     def select_initial_gpu(
         self,
         *,
@@ -437,7 +446,7 @@ class DualPathMorphRouter:
         gpu_busy: Mapping[int, bool] | None = None,
         active_dit_ranks: Mapping[int, int] | None = None,
         active_preemptions: Mapping[int, int] | None = None,
-        max_preemptions_per_gpu: int = 6,
+        max_preemptions_per_gpu: int = 4,
         architecture: str = "tight_mot",
     ) -> int:
         with self._mu:

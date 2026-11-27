@@ -181,7 +181,8 @@ public:
         bool has_more_turns,
         bool has_more_edits,
         double now_ms,
-        const std::map<int, bool>& gpu_busy = {});
+        const std::map<int, bool>& gpu_busy = {},
+        bool src_lock_held = false);
 
     // Read-only transition plan with zero router or pacer mutation (used by `ClusterSimulator` prior to dispatch).
     TurnTransitionPlan plan_turn_transition_readonly(

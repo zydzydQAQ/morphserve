@@ -867,3 +867,90 @@ def test_naive_host_offloader_and_static_fission_dropper_lifecycle() -> None:
         assert all(p.numel() > 0 for p in und_params)
     finally:
         dropper.close()
+
+
+def test_bagel_update_image_ctx_uses_generation_mode_without_scoped_vae(tmp_path: Path) -> None:
+    """Regression test for `no_m1_scoped_vae` `err=52`: `forward_cache_update_vae` runs `mode='gen'`
+    Triton kernels and MUST enter `pager.generation_mode` even when `use_scoped_vae=False`, while
+    skipping re-entrant pacer acquisition when `pacer_already_held=True`."""
+    torch = pytest.importorskip("torch")
+    from contextlib import contextmanager
+    from PIL import Image
+
+    pipe, cache_cls = _build_bagel_stub(torch, num_layers=2, hidden=8)
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=1,
+        use_tripool_vmm=False,
+        use_expert_pager=False,
+        use_scoped_vae=False,
+        preemption_mode="non_preemptive",
+    )
+    adapter = BagelCPTGAdapter(
+        rank=0,
+        policy=pol,
+        bench_root=tmp_path,
+        pipeline=pipe,
+        cache_cls=cache_cls,
+        device=torch.device("cpu"),
+    )
+    calls: list[dict[str, Any]] = []
+
+    class _SpyPager:
+        @contextmanager
+        def generation_mode(self, **kwargs: Any):
+            calls.append(dict(kwargs))
+            yield
+
+    adapter.pager = _SpyPager()  # type: ignore[assignment]
+    adapter.vmm = object()  # type: ignore[assignment]
+    adapter.pacer = object()
+    ctx = {"past_key_values": cache_cls(2), "kv_lens": [0], "ropes": [0]}
+    img = Image.new("RGB", (16, 16), color=(10, 20, 30))
+
+    try:
+        adapter._update_image_ctx(ctx, img, update_vae=True, update_vit=False, pacer_already_held=False)
+        adapter._update_image_ctx(ctx, img, update_vae=True, update_vit=False, pacer_already_held=True)
+        assert len(calls) == 2
+        assert calls[0]["prefetch_all"] is True
+        assert calls[0]["pacer"] is adapter.pacer
+        assert calls[1]["prefetch_all"] is True
+        assert calls[1]["pacer"] is None
+    finally:
+        adapter.pager = None
+        adapter.vmm = None
+        adapter.close()
+
+
+def test_internvlu_bridge_pack_inline_metadata_and_16b_alignment() -> None:
+    """Small int64/bool grid metadata tensors serialize inline in JSON `meta` and bulk tensors stay 16B-aligned."""
+    torch = pytest.importorskip("torch")
+    from morphserve.models.internvl_u_adapter import pack_internvlu_bridge_state, unpack_internvlu_bridge_state
+
+    diff_inp = {
+        "encoder_hidden_states": [torch.randn((5, 8), dtype=torch.bfloat16)],
+        "encoder_image_token_mask": [torch.tensor([True, False, True] * 25, dtype=torch.bool)],  # 75 bytes (odd!)
+        "image_fhw_cond": [torch.zeros((0, 3), dtype=torch.int64)],
+        "image_grid_thw_gen": torch.tensor([[1, 32, 32]], dtype=torch.int64),
+        "conditional_image": [torch.randn((1, 3, 4, 4), dtype=torch.float32)],
+        "image_hidden_states": None,
+    }
+    meta, flat = pack_internvlu_bridge_state(diff_inp, device=torch.device("cpu"))
+    assert meta["tree"]["image_grid_thw_gen"]["kind"] == "inline_tensor"
+    assert meta["tree"]["image_fhw_cond"]["items"][0]["kind"] == "inline_tensor"
+    # Bulk tensor following odd-length 75-byte bool mask MUST be 16-byte aligned.
+    cond_node = meta["tree"]["conditional_image"]["items"][0]
+    assert cond_node["kind"] == "tensor"
+    assert int(cond_node["offset"]) % 16 == 0
+
+    restored = unpack_internvlu_bridge_state(meta, flat)
+    assert torch.equal(restored["image_grid_thw_gen"], diff_inp["image_grid_thw_gen"])
+    assert tuple(restored["image_fhw_cond"][0].shape) == (0, 3)
+    assert restored["image_fhw_cond"][0].dtype == torch.int64
+    assert torch.equal(restored["encoder_hidden_states"][0], diff_inp["encoder_hidden_states"][0])
+    assert torch.equal(restored["encoder_image_token_mask"][0], diff_inp["encoder_image_token_mask"][0])
+    assert torch.equal(restored["conditional_image"][0], diff_inp["conditional_image"][0])
+    assert restored["image_hidden_states"] is None
+
+    with pytest.raises(ValueError, match="truncated"):
+        unpack_internvlu_bridge_state(meta, flat[:-1])

@@ -829,8 +829,9 @@ TurnTransitionPlan MorphControlEngine::plan_turn_transition(
     bool has_more_turns,
     bool has_more_edits,
     double now_ms,
-    const std::map<int, bool>& gpu_busy) {
-    const PreparedTransition prep = prepare_transition_request(
+    const std::map<int, bool>& gpu_busy,
+    bool src_lock_held) {
+    PreparedTransition prep = prepare_transition_request(
         policy_,
         router_->operator_profile(),
         session_id,
@@ -845,6 +846,9 @@ TurnTransitionPlan MorphControlEngine::plan_turn_transition(
         std::nullopt,
         std::nullopt,
         std::nullopt);
+    if (src_lock_held) {
+        prep.req.src_hold_credit_ms = prep.est_dit_ms;
+    }
 
     auto [dec, ship_mode] = router_->plan_and_reserve_transition(
         policy_.routing_mode,

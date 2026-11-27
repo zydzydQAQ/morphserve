@@ -206,23 +206,41 @@ def _bridge_tensor_nbytes(val: Any) -> int:
 
 
 def pack_internvlu_bridge_state(diffusion_inputs: dict[str, Any], device: Any) -> tuple[dict[str, Any], Any]:
-    """Pack `InternVL-U` `diffusion_inputs` bridge tensors into a flat contiguous `uint8` CUDA tensor."""
+    """Pack `InternVL-U` `diffusion_inputs` bridge tensors into a 16B-aligned contiguous `uint8` CUDA tensor.
+
+    Small integer/bool shape-metadata tensors (`<= 64` elements, e.g. `image_grid_thw_gen`,
+    `image_fhw_cond`, `image_grid_thw_gen_cond`) are serialized inline in JSON `meta` so
+    control-plane grid dimensions are immune to byte-offset/wire corruption.
+    """
     import torch
 
     chunks: list[Any] = []
     offset = 0
+    _INLINE_DTYPES = (torch.int64, torch.int32, torch.bool)
 
     def _rec(key: str, val: Any) -> Any:
         nonlocal offset
         if val is None:
             return {"kind": "none"}
         if torch.is_tensor(val):
+            dt_name = _DTYPE_NAME_MAP[str(val.dtype)]
+            if val.dtype in _INLINE_DTYPES and int(val.numel()) <= 64:
+                return {
+                    "kind": "inline_tensor",
+                    "dtype": dt_name,
+                    "shape": list(val.shape),
+                    "values": val.detach().cpu().tolist(),
+                }
+            pad = (-offset) & 15
+            if pad > 0:
+                chunks.append(torch.zeros((pad,), dtype=torch.uint8, device=device))
+                offset += pad
             t_c = val.to(device).contiguous()
             u8 = t_c.view(torch.uint8).reshape(-1)
             nb = int(u8.numel())
             node = {
                 "kind": "tensor",
-                "dtype": _DTYPE_NAME_MAP[str(t_c.dtype)],
+                "dtype": dt_name,
                 "shape": list(t_c.shape),
                 "offset": offset,
                 "nbytes": nb,
@@ -242,8 +260,13 @@ def pack_internvlu_bridge_state(diffusion_inputs: dict[str, Any], device: Any) -
 
 
 def unpack_internvlu_bridge_state(meta: dict[str, Any], flat_u8: Any) -> dict[str, Any]:
-    """Reconstruct `InternVL-U` `diffusion_inputs` dictionary from flat `uint8` CUDA buffer."""
+    """Reconstruct `InternVL-U` `diffusion_inputs` dictionary from flat `uint8` CUDA buffer + inline metadata."""
     import torch
+
+    expected_total = int(meta.get("total_bytes", 0))
+    actual_total = int(flat_u8.numel()) if hasattr(flat_u8, "numel") else len(flat_u8)
+    if actual_total < expected_total:
+        raise ValueError(f"InternVL-U bridge payload truncated: got {actual_total} < expected {expected_total} bytes")
 
     dtype_lookup = {
         "bfloat16": torch.bfloat16,
@@ -259,6 +282,9 @@ def unpack_internvlu_bridge_state(meta: dict[str, Any], flat_u8: Any) -> dict[st
         kind = node["kind"]
         if kind == "none":
             return None
+        if kind == "inline_tensor":
+            dt = dtype_lookup[node["dtype"]]
+            return torch.tensor(node["values"], dtype=dt, device=flat_u8.device).reshape(node["shape"])
         if kind == "tensor":
             dt = dtype_lookup[node["dtype"]]
             nb = int(node["nbytes"])

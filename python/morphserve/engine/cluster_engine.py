@@ -710,7 +710,7 @@ class MorphServeClusterEngine:
             gpu_busy=self._gpu_busy_map(),
             active_dit_ranks=self._active_dit_ranks,
             active_preemptions=self._active_preemptions,
-            max_preemptions_per_gpu=6,
+            max_preemptions_per_gpu=4,
             architecture=eff_policy.cptg_architecture,
         )
 
@@ -739,6 +739,7 @@ class MorphServeClusterEngine:
         has_more_turns: bool,
         has_more_edits: bool,
         now_ms: float,
+        src_lock_held: bool = False,
     ) -> dict[str, Any]:
         req = {
             "session_id": str(session_id),
@@ -754,6 +755,7 @@ class MorphServeClusterEngine:
             "has_more_edits": bool(has_more_edits),
             "now_ms": float(now_ms),
             "gpu_busy": {str(k): bool(v) for k, v in self._gpu_busy_map().items()},
+            "src_lock_held": bool(src_lock_held),
         }
         return call_json(
             self._lib,
@@ -817,10 +819,11 @@ class MorphServeClusterEngine:
         can_preempt = (
             eff_policy.preemption_mode != "non_preemptive"
             and (self._gpu_locks[resident_gpu].locked() or self._active_dit_ranks.get(resident_gpu, 0) > 0)
-            and self._active_preemptions.get(resident_gpu, 0) < 6
+            and self._active_preemptions.get(resident_gpu, 0) < 4
         )
         if can_preempt:
             self._active_preemptions[resident_gpu] += 1
+            self.router.set_colocated_ar_count(resident_gpu, self._active_preemptions[resident_gpu])
             try:
                 ar_res = await self._rpc(
                     resident_gpu,
@@ -837,7 +840,8 @@ class MorphServeClusterEngine:
                     },
                 )
             finally:
-                self._active_preemptions[resident_gpu] -= 1
+                self._active_preemptions[resident_gpu] = max(0, self._active_preemptions[resident_gpu] - 1)
+                self.router.set_colocated_ar_count(resident_gpu, self._active_preemptions[resident_gpu])
             was_mid_dit = bool(ar_res.get("preempted_mid_dit", True)) and ar_res.get("status") == "ok"
             if ar_res.get("status") == "ok":
                 ar_res = dict(ar_res, queue_ms=round(float(ar_res.get("queue_ms", 0.0)), 2))
@@ -848,7 +852,8 @@ class MorphServeClusterEngine:
         self.router.reserve_ar_queue(resident_gpu, est_ar_ms)
         try:
             # Wait only if an exclusive DiT / NCCL operation holds `_gpu_locks`; multiple AR turns
-            # dispatch concurrently into `WorkerRuntime` so `decode_ar_batch` batches them.
+            # register atomically before releasing the direct-handoff `MemorySlackGpuLock` so waiting
+            # ARs never livelock and batch concurrently into `WorkerRuntime.decode_ar_batch`.
             ar_has_img = bool(turn.image_paths or use_prev_image)
             ar_num_img = len(turn.image_paths) + (1 if use_prev_image else 0)
             ar_dl_ms = t_enq * 1000.0 + eff_policy.ar_ttft_slo_for(
@@ -856,18 +861,23 @@ class MorphServeClusterEngine:
                 num_images=ar_num_img,
                 image_res=max(turn.height, turn.width),
             )
-            while self._gpu_locks[resident_gpu].locked():
+            if self._gpu_locks[resident_gpu].locked():
                 await self._gpu_locks[resident_gpu].acquire(
                     est_mem_bytes=0,
                     est_exec_ms=est_ar_ms,
                     slo_deadline_ms=ar_dl_ms,
                     op_priority=0,
                 )
-                self._gpu_locks[resident_gpu].release()
-            # Add coordinator-local queue wait to worker-local `ttft_ms` so multi-node `perf_counter` skew is 0.
-            coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
-            self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
-            self._ar_drained_events[resident_gpu].clear()
+                try:
+                    coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
+                    self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
+                    self._ar_drained_events[resident_gpu].clear()
+                finally:
+                    self._gpu_locks[resident_gpu].release()
+            else:
+                coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
+                self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
+                self._ar_drained_events[resident_gpu].clear()
             try:
                 ar_res = await self._rpc(
                     resident_gpu,
@@ -1660,7 +1670,7 @@ class MorphServeClusterEngine:
                                 est_mem_bytes=(512 if turn.height >= 1024 else 256) * MIB,
                                 est_exec_ms=est_prep_ms,
                                 slo_deadline_ms=prep_dl_ms,
-                                op_priority=0,
+                                op_priority=1,
                             )
                             holding_src_lock = True
                             held_src_gpu = resident_gpu
@@ -1734,6 +1744,7 @@ class MorphServeClusterEngine:
                             has_more_turns=has_more_turns,
                             has_more_edits=has_more_edits,
                             now_ms=now_rel_ms,
+                            src_lock_held=bool(holding_src_lock and held_src_gpu == resident_gpu),
                         )
                     except BaseException:
                         if holding_src_lock:
@@ -1864,11 +1875,13 @@ class MorphServeClusterEngine:
                             if dit_res.get("status") != "oom":
                                 reuse_held_lock = holding_src_lock and (held_src_gpu == dst_gpu)
                                 if reuse_held_lock:
+                                    is_expired_turn = (dit_dl_ms - (time.perf_counter() * 1000.0) - est_dit_ms) < 0.0
                                     should_yield_to_sched = (
                                         eff_policy.gpu_queue_mode == "memory_slack"
                                         and self._gpu_locks[dst_gpu].has_waiters()
                                         and (
                                             turn.height >= 1024
+                                            or is_expired_turn
                                             or est_dit_mem_b > self._free_mem_bytes_for_gpu(dst_gpu)
                                         )
                                     )

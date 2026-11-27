@@ -598,14 +598,25 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
             }
             continue;
         }
+        // When an explicit physical pool ceiling (`max_pool_bytes > 0`) is configured, grow the
+        // fine KV pool within that safe headroom BEFORE evicting resident Gen experts or
+        // synchronously swapping thinking KV regions to host RAM. (Free super handles were already
+        // carved above so idle Arena-0 handles are always consumed first.)
+        const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+        if (cfg_.allow_overflow && cfg_.max_pool_bytes > 0 && (cur_pool_b + min_gran_) <= cfg_.max_pool_bytes) {
+            free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
+            ++fine_pool_total_;
+            ++overflow_creates_;
+            break;
+        }
         if (evict_one_tail_expert_layer_locked(stream, /*for_kv=*/true)) {
             continue;
         }
         if (evict_one_thinking_kv_region_locked(stream, exclude_region_id)) {
             continue;
         }
-        const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
-        const bool over_cap = (cfg_.max_pool_bytes > 0) && ((cur_pool_b + min_gran_) > cfg_.max_pool_bytes);
+        const uint64_t post_evict_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+        const bool over_cap = (cfg_.max_pool_bytes > 0) && ((post_evict_pool_b + min_gran_) > cfg_.max_pool_bytes);
         if (!cfg_.allow_overflow || over_cap) {
             throw VmmOutOfMemoryError(
                 over_cap ? "TriPool physical pool reached max_pool_bytes cap for KV page"
@@ -1717,21 +1728,26 @@ size_t TriPoolVMM::release_free_overflow_to_driver(size_t target_bytes) {
     size_t released = 0;
     try {
         backend_->ensure_context();
-        while (released < target_bytes && excess_b >= super_bytes_ && !free_super_handles_.empty()) {
-            const uint64_t h = free_super_handles_.back();
-            free_super_handles_.pop_back();
-            backend_->release_phys_handle(h, super_bytes_);
-            if (super_pool_total_ > 0) --super_pool_total_;
-            released += super_bytes_;
-            excess_b -= super_bytes_;
-        }
-        while (released < target_bytes && excess_b >= min_gran_ && free_fine_handles_.size() > base_fine_pages_) {
+        // Return excess idle fine KV pages first so initial 64 MiB super handles reserved for
+        // Arena-0 experts and Arena-2 Scoped VAE remain intact.
+        while (released < target_bytes && excess_b >= min_gran_ && !free_fine_handles_.empty() &&
+               fine_pool_total_ > base_fine_pages_) {
             const uint64_t h = free_fine_handles_.back();
             free_fine_handles_.pop_back();
             backend_->release_phys_handle(h, min_gran_);
             if (fine_pool_total_ > 0) --fine_pool_total_;
             released += min_gran_;
             excess_b -= min_gran_;
+        }
+        // Only trim free super handles that actually grew above the initial super-pool reserve.
+        while (released < target_bytes && excess_b >= super_bytes_ && !free_super_handles_.empty() &&
+               super_pool_total_ > init_super_handles_) {
+            const uint64_t h = free_super_handles_.back();
+            free_super_handles_.pop_back();
+            backend_->release_phys_handle(h, super_bytes_);
+            if (super_pool_total_ > 0) --super_pool_total_;
+            released += super_bytes_;
+            excess_b -= super_bytes_;
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "[tripool_vmm] release_free_overflow_to_driver error: %s\n", e.what());

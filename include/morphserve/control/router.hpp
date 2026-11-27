@@ -30,6 +30,7 @@ struct CPTGRequestSpec {
     int resolution = 512;
     int interleaved_roundtrip_gamma = 1;
     std::string model_family;  // optional ("bagel" | "internvl_u"); inferred from architecture if empty
+    double src_hold_credit_ms = 0.0;  // 1-job hysteresis credit when caller already holds warm src GPU lock
 
     int64_t effective_state_bytes() const;
     nlohmann::json to_json() const;
@@ -120,6 +121,7 @@ public:
 
     void reserve_ar_queue(int gpu_id, double est_ar_ms);
     void release_ar_queue(int gpu_id, double est_ar_ms);
+    void set_colocated_ar_count(int gpu_id, int count);
 
     int select_initial_gpu(
         int num_gpus,
@@ -131,7 +133,7 @@ public:
         const std::map<int, bool>& gpu_busy = {},
         const std::map<int, int>& active_dit_ranks = {},
         const std::map<int, int>& active_preemptions = {},
-        int max_preemptions_per_gpu = 6,
+        int max_preemptions_per_gpu = 4,
         const std::string& architecture = "tight_mot");
 
     int select_static_gen_gpu(

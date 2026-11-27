@@ -394,16 +394,63 @@ void test_router_seams() {
     }
     MS_CHECK(picked_idle.size() == 4);
 
-    // Genuinely KV-heavy GPU (alpha <= 0.50) IS still preferred for ar_only, and bridge_mllm_dit prefers VLM-hot (< 0.50).
+    // Genuinely KV-heavy GPU (alpha <= 0.50) IS still preferred for ar_only, and bridge_mllm_dit prefers VLM-hot (<= 0.01).
     DualPathMorphRouter router_ivlu(topo);
     router_ivlu.init_workers(
         4,
         [](int) { return "hybrid"; },
-        {{0, 0.0}, {1, 1.0}, {2, 0.0}, {3, 1.0}},
+        {{0, 0.0}, {1, 0.25}, {2, 0.0}, {3, 1.0}},
         {{0, 16 * kGiB}, {1, 16 * kGiB}, {2, 16 * kGiB}, {3, 16 * kGiB}});
-    const int iv_a = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "bridge_mllm_dit");
-    const int iv_b = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "bridge_mllm_dit");
+    const int iv_a = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 4, "bridge_mllm_dit");
+    const int iv_b = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 4, "bridge_mllm_dit");
+    // Post-VAE Decoder-hot rank 1 (alpha=0.25) MUST NOT be misclassified as VLM-hot (tier 0).
     MS_CHECK((iv_a == 0 && iv_b == 2) || (iv_a == 2 && iv_b == 0));
+
+    // For bridge_mllm_dit dit_t2i, VLM-hot ranks (0, 2) are preferred over Decoder-hot ranks (1, 3)
+    // while VLM queue wait <= 1200 ms, and elastically spill over when VLM ranks backlog > 1200 ms.
+    router_ivlu.set_worker_state_fields(0, 0.0, 500.0, 0, 16 * kGiB, 1);
+    router_ivlu.set_worker_state_fields(2, 0.0, 800.0, 0, 16 * kGiB, 1);
+    router_ivlu.set_worker_state_fields(1, 0.25, 0.0, 0, 16 * kGiB, 1);
+    router_ivlu.set_worker_state_fields(3, 1.0, 0.0, 0, 16 * kGiB, 1);
+    const int iv_dit_warm = router_ivlu.select_initial_gpu(
+        4, "dual_path", "non_preemptive", {}, "dit_t2i", nullptr, all_idle, {}, {}, 4, "bridge_mllm_dit");
+    MS_CHECK(iv_dit_warm == 0);
+    router_ivlu.set_worker_state_fields(0, 0.0, 2000.0, 0, 16 * kGiB, 1);
+    router_ivlu.set_worker_state_fields(2, 0.0, 2000.0, 0, 16 * kGiB, 1);
+    const int iv_dit_spill = router_ivlu.select_initial_gpu(
+        4, "dual_path", "non_preemptive", {}, "dit_t2i", nullptr, all_idle, {}, {}, 4, "bridge_mllm_dit");
+    MS_CHECK(iv_dit_spill == 1 || iv_dit_spill == 3);
+
+    // reserve_ar_queue must NOT falsely inflate colocated_ar_b; set_colocated_ar_count controls it explicitly.
+    router_ivlu.reserve_ar_queue(0, 100.0);
+    MS_CHECK(router_ivlu.get_worker_state(0).colocated_ar_b == 0);
+    router_ivlu.release_ar_queue(0, 100.0);
+    router_ivlu.set_colocated_ar_count(0, 3);
+    MS_CHECK(router_ivlu.get_worker_state(0).colocated_ar_b == 3);
+    router_ivlu.set_colocated_ar_count(0, 0);
+    MS_CHECK(router_ivlu.get_worker_state(0).colocated_ar_b == 0);
+
+    // Warm src_hold_credit_ms prevents busy-to-busy double-queuing hops while still offloading to idle peers.
+    DualPathMorphRouter router_hold(topo);
+    router_hold.init_workers(
+        2,
+        [](int) { return "hybrid"; },
+        {{0, 1.0}, {1, 1.0}},
+        {{0, 16 * kGiB}, {1, 16 * kGiB}});
+    router_hold.set_worker_state_fields(0, 1.0, 10000.0, 0, 16 * kGiB, 1);
+    router_hold.set_worker_state_fields(1, 1.0, 8000.0, 0, 16 * kGiB, 1);
+    CPTGRequestSpec req_hold;
+    req_hold.req_id = "hold_busy";
+    req_hold.src_gpu = 0;
+    req_hold.architecture = "bridge_mllm_dit";
+    req_hold.bridge_bytes = 4 * kMiB;
+    req_hold.src_hold_credit_ms = 5000.0;
+    const RouteDecision dec_busy = router_hold.decide(req_hold);
+    MS_CHECK(dec_busy.path == "in_place_morph" && dec_busy.dst_gpu == 0);
+    // When peer 1 is idle, still offload to peer 1 despite holding src lock!
+    router_hold.set_worker_state_fields(1, 1.0, 0.0, 0, 16 * kGiB, 1);
+    const RouteDecision dec_idle = router_hold.decide(req_hold);
+    MS_CHECK(dec_idle.path == "state_ship" && dec_idle.dst_gpu == 1);
 }
 
 void test_preempt_edf_controller() {

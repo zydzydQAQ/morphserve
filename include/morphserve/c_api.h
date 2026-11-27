@@ -396,6 +396,7 @@ void ms_router_update_telemetry(
     int64_t telemetry_seq);
 void ms_router_reserve_ar_queue(ms_router_t* r, int gpu_id, double est_ar_ms);
 void ms_router_release_ar_queue(ms_router_t* r, int gpu_id, double est_ar_ms);
+void ms_router_set_colocated_ar(ms_router_t* r, int gpu_id, int count);
 int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json);
 int ms_router_select_static_gen_gpu(const ms_router_t* r, const char* req_json);
 int ms_router_select_oom_retry_gpu(const ms_router_t* r, const char* req_json);

@@ -519,6 +519,10 @@ class WorkerRuntime:
                 try:
                     _record_current_stream_if_cuda_tensor(raw)
                     logical_b = self.adapter.unpack_state(str(cmd["new_ctx_id"]), meta, raw)
+                    if getattr(raw, "is_cuda", False):
+                        import torch
+
+                        torch.cuda.current_stream(raw.device).synchronize()
                 finally:
                     del raw
                 return self._emit_ack(

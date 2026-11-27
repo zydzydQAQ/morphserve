@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -482,3 +483,78 @@ def test_preemption_session_per_item_oom_isolation_and_tpot_slack_deferral() -> 
         ps2.drain(stop_polling_after=True)
         assert admitted_ids == ["cmd_first", "cmd_second"]
         assert set(completed2) == {"cmd_first", "cmd_second"}
+
+
+def test_layer_chunk_non_poisoned_ema_and_bounded_post_admit_recheck() -> None:
+    """Verify skipped-sync DiT step boundaries do not corrupt `ema_layer_ms`, and a newly admitted
+    tight-deadline AR task triggers at most one immediate post-admit yield before resuming DiT."""
+    pipe = _make_pure_python_stub_pipeline(num_layers=4)
+    served_steps: list[str] = []
+
+    def _step_exec(task: ArDecodeTask) -> None:
+        served_steps.append(task.req_id)
+        task.generated_token_ids.append(1)
+        task.last_step_time_s = time.perf_counter()
+        if len(task.generated_token_ids) >= task.max_tokens:
+            task.finished = True
+
+    sched = UnifiedPreemptiveScheduler(
+        pipe,
+        mode="layer_chunk",
+        tpot_slo_ms=100.0,
+        guard_ms=26.0,
+        init_layer_ms=10.5,
+        init_ar_step_ms=50.0,
+        step_executor=_step_exec,
+    )
+    sched._layer_calibrated = True
+    t0 = sched.begin_session_clock()
+    # Populate 2 warmup step times so step 2 takes the `not need_sync` fast path.
+    sched.step_times_ms.extend([100.0, 100.0])
+    sched._last_sync_is_true_sync = False
+    sched._layers_since_sync = 2
+    sched._last_sync_s = t0 - 5.0  # Stale 5s timestamp must NOT poison EMA when `_last_sync_is_true_sync=False`!
+    ema_before = sched.ema_layer_ms
+    sched.on_dit_step_complete(t0, 0.0)
+    assert abs(sched.ema_layer_ms - ema_before) < 1e-6
+
+    # Bounded 1x post-admit immediate re-check: T1 is served during yield, and during T1's service
+    # T2 arrives already past deadline -> T2 must be served immediately once before resuming DiT!
+    t2_injected = {"done": False}
+    t_now = sched.begin_session_clock()
+    t1 = ArDecodeTask(
+        req_id="t1",
+        kv_cache=None,
+        curr_tokens=None,
+        pos_ids=None,
+        max_tokens=1,
+        end_token_id=None,
+        tpot_slo_ms=100.0,
+        arrival_time_s=t_now - 0.15,
+        last_step_time_s=t_now - 0.15,
+    )
+    sched.active_ar_tasks.append(t1)
+
+    def _poll_t2(now_s: float) -> list[ArDecodeTask]:
+        if served_steps and not t2_injected["done"]:
+            t2_injected["done"] = True
+            return [
+                ArDecodeTask(
+                    req_id="t2",
+                    kv_cache=None,
+                    curr_tokens=None,
+                    pos_ids=None,
+                    max_tokens=2,
+                    end_token_id=None,
+                    tpot_slo_ms=100.0,
+                    arrival_time_s=now_s - 0.15,
+                    last_step_time_s=now_s - 0.15,
+                )
+            ]
+        return []
+
+    sched.external_arrival_poll = _poll_t2
+    sched.on_gen_layer_complete(0, 4, t_now)
+    # T1 ran in the primary yield and T2 got exactly 1 bounded post-admit step (not infinite loop to completion).
+    assert served_steps == ["t1", "t2"]
+    assert len(sched.active_ar_tasks) == 1 and sched.active_ar_tasks[0].req_id == "t2"

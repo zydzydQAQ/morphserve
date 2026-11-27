@@ -4,6 +4,7 @@ LRU Think-Time KV Swap vs. Recompute ablation, and Mean/P99/HBM-utilization repo
 from __future__ import annotations
 
 import asyncio
+import time
 
 from morphserve._core import call_json, encode_json, get_core_lib
 from morphserve.engine.cluster_engine import ClusterRunReport, MemorySlackGpuLock
@@ -143,7 +144,7 @@ def test_memory_slack_gpu_lock_reorders_and_bounds_starvation():
         await lock.acquire()  # Hold GPU initially
 
         async def _waiter(name: str, mem_b: int, slack_ms: float) -> None:
-            now_ms = asyncio.get_running_loop().time() * 1000.0
+            now_ms = time.perf_counter() * 1000.0
             await lock.acquire(
                 est_mem_bytes=mem_b,
                 est_exec_ms=1000.0,

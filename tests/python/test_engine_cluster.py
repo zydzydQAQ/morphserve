@@ -1066,3 +1066,88 @@ def test_nccl_transfer_guard_reclaims_dst_headroom_after_probe_oom(tmp_path: Pat
     assert dst_op_names[idx_reclaim - 1] == "ALLOC_RECV_BUF"
     assert dst_op_names[idx_reclaim + 1] == "ALLOC_RECV_BUF"
     assert ops_on_dst[idx_reclaim][1] is True
+
+
+def test_nccl_dual_oom_preserves_src_ctx_and_falls_back_to_in_place_path_b(tmp_path: Path) -> None:
+    """When `nccl_dual` Path-A hits `PACK_CTX` or `ALLOC_RECV_BUF` OOM, `src_ctx` stays intact and falls back to Path B."""
+    for fail_mode in ("pack_oom", "recv_oom"):
+        pol = EnginePolicyConfig.from_preset(
+            "morphserve",
+            num_gpus=2,
+            model_family="synthetic",
+            inter_turn_think_s_range=(0.0, 0.0),
+        )
+        fleet = InProcessWorkerFleet(pol)
+        eng = MorphServeClusterEngine(
+            policy=pol,
+            fleet=fleet,
+            tmp_root=tmp_path / f"tmp_nccl_fb_{fail_mode}",
+        )
+        eng.start()
+        seen_ops: list[tuple[int, str, dict[str, Any]]] = []
+        orig_rpc = eng._rpc
+        orig_plan = eng._plan_turn_transition
+
+        def _force_nccl_dual(ctrl_handle: int, **kwargs: Any) -> dict[str, Any]:
+            res = orig_plan(ctrl_handle, **kwargs)
+            src_g = int(kwargs["src_gpu"])
+            other_g = 1 - src_g
+            res["ship_mode"] = "nccl_dual"
+            res["dst_gpu"] = other_g
+            res["reserved_kv_bytes"] = 0
+            res["release_src_on_fwd"] = True
+            res["ephemeral_gen_ctx"] = False
+            res["needs_return_ship"] = False
+            res["dit_ctx_id"] = str(kwargs["base_ctx_id"])
+            return res
+
+        async def _intercept_rpc(rank: int, payload: dict[str, Any]) -> dict[str, Any]:
+            op = str(payload.get("op", ""))
+            seen_ops.append((rank, op, dict(payload)))
+            if fail_mode == "pack_oom" and op == "PACK_CTX":
+                return {"status": "oom", "error": "injected pack_ctx oom"}
+            if fail_mode == "recv_oom" and op == "ALLOC_RECV_BUF":
+                return {"status": "oom", "probe_only": bool(payload.get("probe_only", False)), "error": "injected recv oom"}
+            return await orig_rpc(rank, payload)
+
+        eng._plan_turn_transition = _force_nccl_dual  # type: ignore[method-assign]
+        eng._rpc = _intercept_rpc  # type: ignore[method-assign]
+        try:
+            suite = WorkloadSuite(
+                name=f"fb_{fail_mode}",
+                trace_source="unit",
+                base_qps=1.0,
+                sessions=[
+                    InterleavedSession(
+                        session_id=f"s_fb_{fail_mode}",
+                        quadrant="interleaved_co_creation",
+                        source_dataset="unit",
+                        arrival_offset_s=0.0,
+                        turns=[
+                            InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="plan scene", max_ar_tokens=2),
+                            InterleavedTurn(
+                                turn_idx=1,
+                                modality_plan="dit_t2i",
+                                prompt="render scene",
+                                height=512,
+                                width=512,
+                                dit_steps=2,
+                            ),
+                        ],
+                    )
+                ],
+            )
+            rep = eng.run_suite(suite, target_qps=1.0)
+        finally:
+            eng.shutdown()
+
+        assert rep.completed_sessions == 1
+        assert rep.oom_sessions == 0
+        assert rep.error_sessions == 0
+        assert rep.path_a_ships == 0
+        assert rep.path_b_morphs == 1
+        pack_calls = [p for _, op, p in seen_ops if op == "PACK_CTX"]
+        assert pack_calls and pack_calls[0].get("release_after_pack") is False
+        if fail_mode == "recv_oom":
+            assert any(op == "DROP_PACKED_CTX" for _, op, _ in seen_ops)
+            assert any(op == "RECLAIM_HEADROOM" for _, op, _ in seen_ops)

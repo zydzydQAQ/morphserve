@@ -483,6 +483,7 @@ class MorphServeClusterEngine:
         self._started = False
         self.host_shmem_delta_gib = 0.0
         self._image_res_cache: dict[str, int] = {}
+        self._pending_bg_releases: dict[tuple[int, str], asyncio.Task[Any]] = {}
 
     def _probe_image_max_edge(self, rel_path: str, fallback: int = 512) -> int:
         key = str(rel_path)
@@ -637,6 +638,40 @@ class MorphServeClusterEngine:
                 ev = asyncio.Event()
                 ev.set()
                 self._ar_drained_events.append(ev)
+
+    def _schedule_bg_release_ctx(self, rank: int, ctx_id: str) -> None:
+        key = (int(rank), str(ctx_id))
+        prev = self._pending_bg_releases.get(key)
+
+        async def _do_release() -> None:
+            if prev is not None and not prev.done():
+                try:
+                    await prev
+                except Exception:
+                    pass
+            try:
+                await self._rpc(int(rank), {"op": "RELEASE_CTX", "ctx_id": str(ctx_id)})
+            except Exception:
+                pass
+            finally:
+                if self._pending_bg_releases.get(key) is task:
+                    self._pending_bg_releases.pop(key, None)
+
+        task = asyncio.create_task(_do_release())
+        self._pending_bg_releases[key] = task
+
+    async def _await_bg_release_ctx(self, rank: int, ctx_id: str) -> None:
+        task = self._pending_bg_releases.get((int(rank), str(ctx_id)))
+        if task is not None and not task.done():
+            try:
+                await task
+            except Exception:
+                pass
+
+    async def _drain_bg_releases(self) -> None:
+        while self._pending_bg_releases:
+            tasks = list(self._pending_bg_releases.values())
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def start(self) -> dict[str, Any]:
         if self._started:
@@ -957,6 +992,7 @@ class MorphServeClusterEngine:
         include_cfg_dup: bool,
         *,
         release_src_ctx: bool = True,
+        defer_src_release: bool = False,
         src_lock_held: bool = False,
         dst_est_mem_bytes: int = 0,
         dst_est_exec_ms: float = 0.0,
@@ -967,12 +1003,16 @@ class MorphServeClusterEngine:
 
         When `src_lock_held=True`, ownership of the caller's held `_gpu_locks[src_gpu]` transfers here and is
         guaranteed released immediately after `PACK_CTX` completes (zero extra `src_gpu` queue wait).
+        When `defer_src_release=True` (used for `nccl_dual`), `PACK_CTX` leaves `ctx_id` intact on `src_gpu`
+        until `UNPACK_CTX` succeeds on `dst_gpu`, so any staging OOM preserves `src_gpu` KV for seamless
+        in-place Path-B fallback instead of killing the session.
         When `ship["status"] == "ok"`, `_gpu_locks[dst_gpu]` remains exclusively held for the body so callers
         may run `EXEC_DIT` atomically right after `UNPACK_CTX` without releasing/reacquiring the GPU lock.
         All staging semaphores, destination locks, and temporary buffers are guaranteed released on exit.
         """
         src_queue_ms = 0.0
         t_pack0 = 0.0
+        pack_release_flag = bool(release_src_ctx and not defer_src_release)
         if src_lock_held:
             try:
                 self._ensure_async_primitives()
@@ -983,7 +1023,7 @@ class MorphServeClusterEngine:
                         "op": "PACK_CTX",
                         "ctx_id": ctx_id,
                         "include_cfg_dup": include_cfg_dup,
-                        "release_after_pack": release_src_ctx,
+                        "release_after_pack": pack_release_flag,
                     },
                 )
                 pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
@@ -1008,7 +1048,7 @@ class MorphServeClusterEngine:
                         "op": "PACK_CTX",
                         "ctx_id": ctx_id,
                         "include_cfg_dup": include_cfg_dup,
-                        "release_after_pack": release_src_ctx,
+                        "release_after_pack": pack_release_flag,
                     },
                 )
                 pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
@@ -1016,7 +1056,12 @@ class MorphServeClusterEngine:
                 self._gpu_locks[src_gpu].release()
 
         if pack_res.get("status") != "ok":
-            yield dict(pack_res, packed_ok=False)
+            yield dict(
+                pack_res,
+                packed_ok=False,
+                src_ctx_preserved=True,
+                src_ctx_released=False,
+            )
             return
 
         packed_id = str(pack_res["packed_id"])
@@ -1058,7 +1103,13 @@ class MorphServeClusterEngine:
                     {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": False},
                 )
                 if alloc_res.get("status") != "ok":
-                    yield {"status": "oom", "packed_ok": True, "error": alloc_res.get("error", "alloc_recv_oom")}
+                    yield {
+                        "status": "oom",
+                        "packed_ok": True,
+                        "src_ctx_preserved": bool(not pack_release_flag),
+                        "src_ctx_released": bool(pack_release_flag),
+                        "error": alloc_res.get("error", "alloc_recv_oom"),
+                    }
                     return
 
             recv_id = str(alloc_res["recv_id"])
@@ -1074,7 +1125,13 @@ class MorphServeClusterEngine:
             xfer_wall_ms = max(0.0, (time.perf_counter() - t_xf0) * 1000.0)
 
             if s_res.get("status") != "ok" or r_res.get("status") != "ok":
-                yield {"status": "oom", "packed_ok": True, "error": "nccl_xfer_oom"}
+                yield {
+                    "status": "oom",
+                    "packed_ok": True,
+                    "src_ctx_preserved": bool(not pack_release_flag),
+                    "src_ctx_released": bool(pack_release_flag),
+                    "error": "nccl_xfer_oom",
+                }
                 return
 
             ship_ms = max(float(s_res.get("ship_ms", 0.0)), float(r_res.get("ship_ms", 0.0)))
@@ -1090,6 +1147,7 @@ class MorphServeClusterEngine:
                 t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq1) * 1000.0)
                 holding_dst_lock = True
 
+            await self._await_bg_release_ctx(dst_gpu, new_ctx_id)
             t_unp0 = time.perf_counter()
             u_res = await self._rpc(
                 dst_gpu,
@@ -1104,15 +1162,22 @@ class MorphServeClusterEngine:
                 yield {
                     "status": "oom",
                     "packed_ok": True,
+                    "src_ctx_preserved": bool(not pack_release_flag),
+                    "src_ctx_released": bool(pack_release_flag),
                     "error": u_res.get("error", "unpack_oom"),
                     "kv_free_bytes": u_res.get("kv_free_bytes"),
                     "telemetry_seq": u_res.get("telemetry_seq"),
                 }
                 return
 
+            if release_src_ctx and defer_src_release:
+                self._schedule_bg_release_ctx(src_gpu, ctx_id)
+
             yield {
                 "status": "ok",
                 "packed_ok": True,
+                "src_ctx_preserved": False,
+                "src_ctx_released": bool(release_src_ctx),
                 "ship_ms": ship_ms,
                 "kv_transfer_ms": round(pack_ms + max(ship_ms, xfer_wall_ms) + unpack_ms, 2),
                 "queue_ms": round(src_queue_ms + t_dst_q_acc, 2),
@@ -1800,6 +1865,8 @@ class MorphServeClusterEngine:
                         owned_tmp_imgs.append(save_tmp)
 
                     dit_res: dict[str, Any] = {"status": "error", "error": "not_run"}
+                    reserved_dit_gpu = dst_gpu
+                    fallback_in_place = False
                     try:
                         if ship_mode in ("nccl_dual", "nccl_static"):
                             pass_src_lock = holding_src_lock and (held_src_gpu == resident_gpu)
@@ -1812,13 +1879,14 @@ class MorphServeClusterEngine:
                                 dit_ctx_id,
                                 include_cfg_dup=include_cfg_dup,
                                 release_src_ctx=release_src_on_fwd,
+                                defer_src_release=(ship_mode == "nccl_dual"),
                                 src_lock_held=pass_src_lock,
                                 dst_est_mem_bytes=est_dit_mem_b,
                                 dst_est_exec_ms=est_dit_ms,
                                 dst_slo_deadline_ms=dit_dl_ms,
                                 dst_op_priority=1,
                             ) as ship:
-                                if release_src_on_fwd and ship.get("packed_ok"):
+                                if release_src_on_fwd and ship.get("src_ctx_released", ship.get("packed_ok")):
                                     src_ctx_alive = False
                                 self.router.release_kv_reservation(
                                     dst_gpu,
@@ -1828,7 +1896,10 @@ class MorphServeClusterEngine:
                                 )
                                 kv_res_released = True
                                 if ship.get("status") != "ok":
-                                    dit_res = {"status": "oom", "error": ship.get("error", f"{ship_mode}_oom")}
+                                    if ship_mode == "nccl_dual" and ship.get("src_ctx_preserved"):
+                                        fallback_in_place = True
+                                    else:
+                                        dit_res = {"status": "oom", "error": ship.get("error", f"{ship_mode}_oom")}
                                 else:
                                     if ship_mode == "nccl_dual":
                                         resident_gpu = dst_gpu
@@ -1852,6 +1923,39 @@ class MorphServeClusterEngine:
                                         ephemeral_gen_ctx=ephemeral_gen_ctx,
                                         needs_return_ship=needs_return_ship,
                                     )
+                            if fallback_in_place:
+                                # Path-A NCCL staging hit OOM while `ctx_id` remained intact on `resident_gpu`:
+                                # seamlessly fall back to in-place Path-B execution (0 extra staging HBM).
+                                self.router.release_dit_reservation(reserved_dit_gpu, est_dit_ms)
+                                dst_gpu = resident_gpu
+                                reserved_dit_gpu = dst_gpu
+                                self.router.reserve_ar_queue(reserved_dit_gpu, est_dit_ms)
+                                dit_ctx_id = ctx_id
+                                ephemeral_gen_ctx = False
+                                needs_return_ship = False
+                                path_b_morphs += 1
+                                turn_morphed = True
+                                t_dq_fb = time.perf_counter()
+                                await self._acquire_exclusive_gpu(
+                                    dst_gpu,
+                                    est_mem_bytes=est_dit_mem_b,
+                                    est_exec_ms=est_dit_ms,
+                                    slo_deadline_ms=dit_dl_ms,
+                                    op_priority=1,
+                                )
+                                turn_q_ms += max(0.0, (time.perf_counter() - t_dq_fb) * 1000.0)
+                                try:
+                                    dit_res = await self._exec_dit_on_locked_gpu(
+                                        dst_gpu,
+                                        dit_ctx_id,
+                                        turn,
+                                        ti,
+                                        save_tmp=save_tmp,
+                                        ephemeral_gen_ctx=False,
+                                        needs_return_ship=False,
+                                    )
+                                finally:
+                                    self._gpu_locks[dst_gpu].release()
                         else:
                             if ship_mode == "shm_static":
                                 pass_src_lock = holding_src_lock and (held_src_gpu == resident_gpu)
@@ -1946,7 +2050,7 @@ class MorphServeClusterEngine:
                             self._gpu_locks[held_src_gpu].release()
                         if not kv_res_released:
                             self.router.release_kv_reservation(dst_gpu, reserved_kv_b)
-                        self.router.release_dit_reservation(dst_gpu, est_dit_ms)
+                        self.router.release_dit_reservation(reserved_dit_gpu, est_dit_ms)
 
                     # Return-ship updated post-DiT `main_ctx` back to `und` rank for multi-turn `tight_mot` fission.
                     if dit_res.get("status") == "ok" and needs_return_ship:
@@ -2259,6 +2363,7 @@ class MorphServeClusterEngine:
                     await ticker_task
                 except asyncio.CancelledError:
                     pass
+                await self._drain_bg_releases()
             _record_alpha_sample()
             wall_s = max(time.perf_counter() - t0, 1e-6)
 

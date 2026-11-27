@@ -1126,8 +1126,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
                         )
         # Defragment PyTorch's caching allocator when raw driver free is tight so large contiguous
-        # DiT/VAE/FlashAttn allocations (1.0-1.9 GiB) never fail with fragmented CUDACachingAllocator OOM.
-        if int(free_drv) < min(int(needed_driver_bytes), 3072 * MIB) and unused_pt >= 512 * MIB:
+        # DiT/VAE/FlashAttn/NCCL allocations (1.0-1.9 GiB) never fail with fragmented CUDACachingAllocator OOM.
+        if int(free_drv) < min(int(needed_driver_bytes), 4096 * MIB) and unused_pt >= 512 * MIB:
             self._update_hwm()
             torch.cuda.empty_cache()
         return trimmed
@@ -1239,7 +1239,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 5120) * MIB
+                    headroom_b = (nccl_reserve_mib + 6144) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,

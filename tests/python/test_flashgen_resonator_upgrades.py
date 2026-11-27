@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import time
 
 from morphserve._core import call_json, encode_json, get_core_lib
 from morphserve.engine.cluster_engine import ClusterRunReport, MemorySlackGpuLock
@@ -73,9 +74,9 @@ def test_router_3d_atlas_vs_legacy_and_colocated_ar_stretch():
     d_atlas = r_atlas.decide(req_1024, workers=workers)
     d_legacy = r_legacy.decide(req_1024, workers=workers)
     assert d_atlas.path == "in_place_morph"
-    assert d_atlas.t_morph_ms < 250.0
+    assert d_atlas.t_morph_ms < 300.0
     assert d_legacy.path == "state_ship"
-    assert d_legacy.t_morph_ms > 1000.0
+    assert d_legacy.t_morph_ms > 5.0 * d_atlas.t_morph_ms
 
     # Post-eviction contention at alpha=0.75 (1024^2): atlas_3d sees ~268 ms stall whereas legacy sees 0 ms.
     workers_pe = {

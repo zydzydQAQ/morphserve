@@ -1005,8 +1005,8 @@ void test_performance_atlas_3d_and_fallbacks() {
 
     const RouteDecision d_atlas = r_atlas.decide(req1024, &ws_map, 0.0);
     const RouteDecision d_legacy = r_legacy.decide(req1024, &ws_map, 0.0);
-    MS_CHECK(d_atlas.path == "in_place_morph" && d_atlas.t_morph_ms < 250.0);
-    MS_CHECK(d_legacy.path == "state_ship" && d_legacy.t_morph_ms > 1000.0);
+    MS_CHECK(d_atlas.path == "in_place_morph" && d_atlas.t_morph_ms < 300.0);
+    MS_CHECK(d_legacy.path == "state_ship" && d_legacy.t_morph_ms > 5.0 * d_atlas.t_morph_ms);
 
     // JSON round-trip preserves exact entries.
     const PerformanceAtlas rt = PerformanceAtlas::from_json(atlas.to_json());

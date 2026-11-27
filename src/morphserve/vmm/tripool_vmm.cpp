@@ -116,6 +116,7 @@ void TriPoolVMM::init_pools() {
             free_super_handles_.push_back(backend_->create_phys_handle(super_bytes_));
         }
         super_pool_total_ = super_n;
+        init_super_handles_ = super_n;
 
         const size_t fine_n = (cfg_.fine_kv_pool_mib * (1ULL << 20)) / min_gran_;
         free_fine_handles_.reserve(fine_n);
@@ -183,7 +184,8 @@ int TriPoolVMM::shutdown() {
             }
         }
         experts_.clear();
-        expert_mapped_handles_ = 0;
+        expert_use_clock_ = 0;
+    expert_mapped_handles_ = 0;
         expert_fine_bundles_current_ = 0;
         expert_resident_layers_ = 0;
 
@@ -322,6 +324,7 @@ void TriPoolVMM::cleanup_failed_init_locked() noexcept {
 void TriPoolVMM::reset_counters_locked() {
     super_pool_total_ = 0;
     fine_pool_total_ = 0;
+    init_super_handles_ = 0;
     base_fine_pages_ = 0;
     kv_mapped_pages_ = 0;
     kv_mapped_pages_peak_ = 0;
@@ -333,6 +336,7 @@ void TriPoolVMM::reset_counters_locked() {
     transient_alloc_calls_ = 0;
     transient_free_calls_ = 0;
     transient_scope_flushes_ = 0;
+    expert_use_clock_ = 0;
     expert_mapped_handles_ = 0;
     expert_resident_layers_ = 0;
     expert_prefetch_layers_completed_ = 0;
@@ -1429,6 +1433,7 @@ int TriPoolVMM::expert_register(
         bank.host_pinned_base = static_cast<uint8_t*>(host_pinned_base);
         bank.host_bytes = host_bytes;
         bank.pinned = false;
+        bank.last_used_seq = ++expert_use_clock_;
         bank.va_base = backend_->reserve_va(total_va, super_bytes_);
         bank.layers.resize(static_cast<size_t>(num_layers));
         for (int l = 0; l < num_layers; ++l) {
@@ -1465,7 +1470,11 @@ size_t TriPoolVMM::expert_layer_stride_bytes(int expert_id) {
 int TriPoolVMM::expert_set_pinned(int expert_id, int pinned) {
     std::lock_guard<std::mutex> lock(mu_);
     if (expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
-    experts_[static_cast<size_t>(expert_id)].pinned = (pinned != 0);
+    auto& bank = experts_[static_cast<size_t>(expert_id)];
+    bank.pinned = (pinned != 0);
+    if (bank.pinned) {
+        bank.last_used_seq = ++expert_use_clock_;
+    }
     return 0;
 }
 
@@ -1483,6 +1492,7 @@ int TriPoolVMM::expert_load_layers_sync(int expert_id, int start_layer, int end_
     std::unique_lock<std::mutex> lock(mu_);
     if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
     auto& bank = experts_[static_cast<size_t>(expert_id)];
+    bank.last_used_seq = ++expert_use_clock_;
     start_layer = std::max(0, start_layer);
     end_layer_exclusive = std::min(bank.num_layers, end_layer_exclusive);
     try {
@@ -1540,6 +1550,7 @@ int TriPoolVMM::expert_prefetch_async(int expert_id, int start_layer, int end_la
     std::unique_lock<std::mutex> lock(mu_);
     if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
     auto& bank = experts_[static_cast<size_t>(expert_id)];
+    bank.last_used_seq = ++expert_use_clock_;
     start_layer = std::max(0, start_layer);
     end_layer_exclusive = std::min(bank.num_layers, end_layer_exclusive);
 
@@ -1570,6 +1581,7 @@ int TriPoolVMM::expert_wait_layer(int expert_id, int layer_idx, void* compute_st
     if (!initialized_ || expert_id < 0 || static_cast<size_t>(expert_id) >= experts_.size()) return -1;
     auto& bank = experts_[static_cast<size_t>(expert_id)];
     if (layer_idx < 0 || layer_idx >= bank.num_layers) return -2;
+    bank.last_used_seq = ++expert_use_clock_;
     ++expert_wait_calls_;
 
     auto& lyr = bank.layers[static_cast<size_t>(layer_idx)];
@@ -1690,6 +1702,41 @@ size_t TriPoolVMM::coalesce_fine_to_super(size_t max_super) {
         std::fprintf(stderr, "[tripool_vmm] coalesce_fine_to_super error: %s\n", e.what());
         return 0;
     }
+}
+
+size_t TriPoolVMM::release_free_overflow_to_driver(size_t target_bytes) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!initialized_ || !cfg_.allow_overflow || target_bytes == 0) return 0;
+    const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+    const uint64_t init_pool_b =
+        static_cast<uint64_t>(init_super_handles_) * super_bytes_ +
+        static_cast<uint64_t>(base_fine_pages_) * min_gran_;
+    if (cur_pool_b <= init_pool_b) return 0;
+
+    size_t excess_b = static_cast<size_t>(cur_pool_b - init_pool_b);
+    size_t released = 0;
+    try {
+        backend_->ensure_context();
+        while (released < target_bytes && excess_b >= super_bytes_ && !free_super_handles_.empty()) {
+            const uint64_t h = free_super_handles_.back();
+            free_super_handles_.pop_back();
+            backend_->release_phys_handle(h, super_bytes_);
+            if (super_pool_total_ > 0) --super_pool_total_;
+            released += super_bytes_;
+            excess_b -= super_bytes_;
+        }
+        while (released < target_bytes && excess_b >= min_gran_ && free_fine_handles_.size() > base_fine_pages_) {
+            const uint64_t h = free_fine_handles_.back();
+            free_fine_handles_.pop_back();
+            backend_->release_phys_handle(h, min_gran_);
+            if (fine_pool_total_ > 0) --fine_pool_total_;
+            released += min_gran_;
+            excess_b -= min_gran_;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[tripool_vmm] release_free_overflow_to_driver error: %s\n", e.what());
+    }
+    return released;
 }
 
 int TriPoolVMM::expert_evict_layer(int expert_id, int layer_idx, void* stream) {
@@ -2267,15 +2314,30 @@ bool TriPoolVMM::evict_layer_locked(
 }
 
 bool TriPoolVMM::evict_one_tail_expert_layer_locked(void* stream, bool for_kv, int exclude_expert_id) {
+    // LRU multi-bank eviction: when multiple expert banks share super_pool (e.g. VLM + Decoder in
+    // constrained bridge_mllm_dit), always evict the least-recently-used unpinned bank first so an
+    // active bank's tail layers are not discarded while a stale inactive bank occupies physical handles.
+    ExpertBank* victim_bank = nullptr;
+    int victim_layer = -1;
     for (auto& bank : experts_) {
         if (bank.pinned || bank.id == exclude_expert_id) continue;
+        int tail_res = -1;
         for (int l = bank.num_layers - 1; l >= 0; --l) {
             if (bank.layers[static_cast<size_t>(l)].state == LayerState::RESIDENT) {
-                if (evict_layer_locked(bank, l, stream, /*is_auto=*/true, for_kv)) {
-                    return true;
-                }
+                tail_res = l;
+                break;
             }
         }
+        if (tail_res < 0) continue;
+        if (victim_bank == nullptr ||
+            bank.last_used_seq < victim_bank->last_used_seq ||
+            (bank.last_used_seq == victim_bank->last_used_seq && bank.id < victim_bank->id)) {
+            victim_bank = &bank;
+            victim_layer = tail_res;
+        }
+    }
+    if (victim_bank != nullptr && victim_layer >= 0) {
+        return evict_layer_locked(*victim_bank, victim_layer, stream, /*is_auto=*/true, for_kv);
     }
     return false;
 }

@@ -88,8 +88,8 @@ class EnginePolicyConfig:
     preemption_mode: str = "layer_chunk"  # "non_preemptive" | "step_preemptive" | "layer_chunk"
     cost_model_mode: str = "atlas_3d"  # "atlas_3d" | "pipeline_analytical" | "legacy_analytical"
     gpu_queue_mode: str = "memory_slack"  # "memory_slack" | "fcfs"
-    gpu_queue_max_aging_ms: float = 6000.0
-    gpu_queue_max_bypasses: int = 3
+    gpu_queue_max_aging_ms: float = 45000.0
+    gpu_queue_max_bypasses: int = 5
     kv_eviction_mode: str = "swap"  # "swap" | "recompute"
     static_und_ranks: tuple[int, ...] = ()
     static_gen_ranks: tuple[int, ...] = ()

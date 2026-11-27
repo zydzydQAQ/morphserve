@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 
 from morphserve._core import call_json, encode_json, get_core_lib
-from morphserve.sim.cluster_sim import (
-    ClusterPhysicsProfile,
+from morphserve.sim.cluster_simulator import (
     HardwareInterconnectSpec,
+    MeasuredPhysicsProfile,
     WorkloadScaleSpec,
     simulate_cluster_point,
 )
@@ -98,7 +98,7 @@ def _summarize(tag: str, rep: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
-    ph = ClusterPhysicsProfile()
+    ph = MeasuredPhysicsProfile()
     hw_8a100 = HardwareInterconnectSpec.presets(ph)[0]
     ws_std = WorkloadScaleSpec.bagel_7b_standard()
 
@@ -117,8 +117,8 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
             offered_qps=1.0,
             num_sessions=160,
             seed=2026,
-            ph=ph,
-            ws=ws_std,
+            physics=ph,
+            workload_scale=ws_std,
             skew_tag="main_mix",
             bench_root=bench_root,
             policy_overrides={
@@ -142,8 +142,8 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
             offered_qps=1.2,
             num_sessions=192,
             seed=2026,
-            ph=ph,
-            ws=ws_std,
+            physics=ph,
+            workload_scale=ws_std,
             skew_tag="main_mix",
             bench_root=bench_root,
             policy_overrides={
@@ -163,9 +163,9 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
         gpu_hbm_gib=36.0,
         compute_speedup_x=1.0,
         solo_h2d_gbps=hw_8a100.solo_h2d_gbps,
-        agg_h2d_gbps_4way=hw_8a100.agg_h2d_gbps_4way,
+        agg_h2d_gbps=hw_8a100.agg_h2d_gbps,
         intra_half_p2p_gbps=hw_8a100.intra_half_p2p_gbps,
-        cross_socket_p2p_gbps=hw_8a100.cross_socket_p2p_gbps,
+        inter_socket_p2p_gbps=hw_8a100.inter_socket_p2p_gbps,
         inter_node_rdma_gbps=hw_8a100.inter_node_rdma_gbps,
         gpus_per_node=8,
     )
@@ -186,8 +186,8 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
             offered_qps=1.0,
             num_sessions=160,
             seed=2026,
-            ph=ph,
-            ws=ws_long_mt,
+            physics=ph,
+            workload_scale=ws_long_mt,
             skew_tag="main_mix",
             bench_root=bench_root,
             policy_overrides={

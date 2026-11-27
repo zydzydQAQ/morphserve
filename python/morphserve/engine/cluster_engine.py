@@ -297,8 +297,8 @@ class MemorySlackGpuLock:
         gpu_id: int,
         *,
         mode: str = "memory_slack",
-        max_wait_aging_ms: float = 6000.0,
-        max_bypasses: int = 3,
+        max_wait_aging_ms: float = 45000.0,
+        max_bypasses: int = 5,
         free_mem_provider: Callable[[int], int] | None = None,
     ) -> None:
         self.gpu_id = int(gpu_id)
@@ -331,6 +331,9 @@ class MemorySlackGpuLock:
 
     def locked(self) -> bool:
         return self._locked
+
+    def has_waiters(self) -> bool:
+        return any(not f.done() for _, f in self._waiters)
 
     def stats(self) -> dict[str, int]:
         if not self._handle:
@@ -605,21 +608,25 @@ class MorphServeClusterEngine:
         except Exception:
             return 0
 
+    def _build_gpu_locks(self, eff_policy: EnginePolicyConfig) -> list[MemorySlackGpuLock]:
+        for lk in self._gpu_locks:
+            if hasattr(lk, "close"):
+                lk.close()
+        return [
+            MemorySlackGpuLock(
+                g,
+                mode=eff_policy.gpu_queue_mode,
+                max_wait_aging_ms=eff_policy.gpu_queue_max_aging_ms,
+                max_bypasses=eff_policy.gpu_queue_max_bypasses,
+                free_mem_provider=self._free_mem_bytes_for_gpu,
+            )
+            for g in range(eff_policy.num_gpus)
+        ]
+
     def _ensure_async_primitives(self) -> None:
         n_gpus = self.policy.num_gpus
         if len(self._gpu_locks) != n_gpus:
-            for lk in self._gpu_locks:
-                lk.close()
-            self._gpu_locks = [
-                MemorySlackGpuLock(
-                    g,
-                    mode=self.policy.gpu_queue_mode,
-                    max_wait_aging_ms=self.policy.gpu_queue_max_aging_ms,
-                    max_bypasses=self.policy.gpu_queue_max_bypasses,
-                    free_mem_provider=self._free_mem_bytes_for_gpu,
-                )
-                for g in range(n_gpus)
-            ]
+            self._gpu_locks = self._build_gpu_locks(self.policy)
         if len(self._xfer_locks) != n_gpus:
             self._xfer_locks = [asyncio.Lock() for _ in range(n_gpus)]
         if len(self._dst_staging_sems) != n_gpus:
@@ -703,6 +710,7 @@ class MorphServeClusterEngine:
             gpu_busy=self._gpu_busy_map(),
             active_dit_ranks=self._active_dit_ranks,
             active_preemptions=self._active_preemptions,
+            max_preemptions_per_gpu=6,
             architecture=eff_policy.cptg_architecture,
         )
 
@@ -809,7 +817,7 @@ class MorphServeClusterEngine:
         can_preempt = (
             eff_policy.preemption_mode != "non_preemptive"
             and (self._gpu_locks[resident_gpu].locked() or self._active_dit_ranks.get(resident_gpu, 0) > 0)
-            and self._active_preemptions.get(resident_gpu, 0) < 2
+            and self._active_preemptions.get(resident_gpu, 0) < 6
         )
         if can_preempt:
             self._active_preemptions[resident_gpu] += 1
@@ -841,9 +849,21 @@ class MorphServeClusterEngine:
         try:
             # Wait only if an exclusive DiT / NCCL operation holds `_gpu_locks`; multiple AR turns
             # dispatch concurrently into `WorkerRuntime` so `decode_ar_batch` batches them.
+            ar_has_img = bool(turn.image_paths or use_prev_image)
+            ar_num_img = len(turn.image_paths) + (1 if use_prev_image else 0)
+            ar_dl_ms = t_enq * 1000.0 + eff_policy.ar_ttft_slo_for(
+                has_image=ar_has_img,
+                num_images=ar_num_img,
+                image_res=max(turn.height, turn.width),
+            )
             while self._gpu_locks[resident_gpu].locked():
-                async with self._gpu_locks[resident_gpu]:
-                    pass
+                await self._gpu_locks[resident_gpu].acquire(
+                    est_mem_bytes=0,
+                    est_exec_ms=est_ar_ms,
+                    slo_deadline_ms=ar_dl_ms,
+                    op_priority=0,
+                )
+                self._gpu_locks[resident_gpu].release()
             # Add coordinator-local queue wait to worker-local `ttft_ms` so multi-node `perf_counter` skew is 0.
             coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
             self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
@@ -910,32 +930,63 @@ class MorphServeClusterEngine:
         include_cfg_dup: bool,
         *,
         release_src_ctx: bool = True,
+        src_lock_held: bool = False,
+        dst_est_mem_bytes: int = 0,
+        dst_est_exec_ms: float = 0.0,
+        dst_slo_deadline_ms: float = 0.0,
+        dst_op_priority: int = 1,
     ):
         """Async context manager executing decoupled NCCL pack->send->recv->unpack while owning lock/semaphore lifetime.
 
+        When `src_lock_held=True`, ownership of the caller's held `_gpu_locks[src_gpu]` transfers here and is
+        guaranteed released immediately after `PACK_CTX` completes (zero extra `src_gpu` queue wait).
         When `ship["status"] == "ok"`, `_gpu_locks[dst_gpu]` remains exclusively held for the body so callers
         may run `EXEC_DIT` atomically right after `UNPACK_CTX` without releasing/reacquiring the GPU lock.
         All staging semaphores, destination locks, and temporary buffers are guaranteed released on exit.
         """
-        self._ensure_async_primitives()
-
-        t_src_q0 = time.perf_counter()
-        await self._acquire_exclusive_gpu(src_gpu)
-        src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
-        t_pack0 = time.perf_counter()
-        try:
-            pack_res = await self._rpc(
+        src_queue_ms = 0.0
+        t_pack0 = 0.0
+        if src_lock_held:
+            try:
+                self._ensure_async_primitives()
+                t_pack0 = time.perf_counter()
+                pack_res = await self._rpc(
+                    src_gpu,
+                    {
+                        "op": "PACK_CTX",
+                        "ctx_id": ctx_id,
+                        "include_cfg_dup": include_cfg_dup,
+                        "release_after_pack": release_src_ctx,
+                    },
+                )
+                pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
+            finally:
+                self._gpu_locks[src_gpu].release()
+        else:
+            self._ensure_async_primitives()
+            t_src_q0 = time.perf_counter()
+            await self._acquire_exclusive_gpu(
                 src_gpu,
-                {
-                    "op": "PACK_CTX",
-                    "ctx_id": ctx_id,
-                    "include_cfg_dup": include_cfg_dup,
-                    "release_after_pack": release_src_ctx,
-                },
+                est_mem_bytes=0,
+                est_exec_ms=default_operator_profile().prep_overhead_ms,
+                slo_deadline_ms=dst_slo_deadline_ms,
+                op_priority=0,
             )
-            pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
-        finally:
-            self._gpu_locks[src_gpu].release()
+            src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
+            t_pack0 = time.perf_counter()
+            try:
+                pack_res = await self._rpc(
+                    src_gpu,
+                    {
+                        "op": "PACK_CTX",
+                        "ctx_id": ctx_id,
+                        "include_cfg_dup": include_cfg_dup,
+                        "release_after_pack": release_src_ctx,
+                    },
+                )
+                pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
+            finally:
+                self._gpu_locks[src_gpu].release()
 
         if pack_res.get("status") != "ok":
             yield dict(pack_res, packed_ok=False)
@@ -960,7 +1011,13 @@ class MorphServeClusterEngine:
             if alloc_res.get("status") != "ok":
                 if self._gpu_locks[dst_gpu].locked() or self._active_dit_ranks.get(dst_gpu, 0) > 0:
                     t_dq0 = time.perf_counter()
-                    await self._acquire_exclusive_gpu(dst_gpu)
+                    await self._acquire_exclusive_gpu(
+                        dst_gpu,
+                        est_mem_bytes=dst_est_mem_bytes,
+                        est_exec_ms=dst_est_exec_ms,
+                        slo_deadline_ms=dst_slo_deadline_ms,
+                        op_priority=dst_op_priority,
+                    )
                     t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
                     holding_dst_lock = True
                 alloc_res = await self._rpc(
@@ -990,7 +1047,13 @@ class MorphServeClusterEngine:
             ship_ms = max(float(s_res.get("ship_ms", 0.0)), float(r_res.get("ship_ms", 0.0)))
             if not holding_dst_lock:
                 t_dq1 = time.perf_counter()
-                await self._acquire_exclusive_gpu(dst_gpu)
+                await self._acquire_exclusive_gpu(
+                    dst_gpu,
+                    est_mem_bytes=dst_est_mem_bytes,
+                    est_exec_ms=dst_est_exec_ms,
+                    slo_deadline_ms=dst_slo_deadline_ms,
+                    op_priority=dst_op_priority,
+                )
                 t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq1) * 1000.0)
                 holding_dst_lock = True
 
@@ -1049,37 +1112,81 @@ class MorphServeClusterEngine:
         *,
         include_cfg_dup: bool = True,
         release_src_ctx: bool = True,
+        src_lock_held: bool = False,
+        dst_est_mem_bytes: int = 0,
+        dst_est_exec_ms: float = 0.0,
+        dst_slo_deadline_ms: float = 0.0,
+        dst_op_priority: int = 1,
     ) -> dict[str, Any]:
-        if not self.topo.same_node(src_gpu, dst_gpu):
-            raise ValueError(
-                f"SHM state shipping requires same-node GPUs, got cross-node transfer {src_gpu}->{dst_gpu} "
-                f"(node {self.topo.node_of(src_gpu)} -> node {self.topo.node_of(dst_gpu)})"
-            )
-        self._ensure_async_primitives()
-        shm_name = f"ms_shm_{os.getpid()}_{src_gpu}_{dst_gpu}_{self._next_cmd_id()}"
-        t_sq0 = time.perf_counter()
-        await self._acquire_exclusive_gpu(src_gpu)
-        src_q_ms = max(0.0, (time.perf_counter() - t_sq0) * 1000.0)
-        t_s0 = time.perf_counter()
-        try:
-            s_res = await self._rpc(
+        src_q_ms = 0.0
+        if src_lock_held:
+            try:
+                if not self.topo.same_node(src_gpu, dst_gpu):
+                    raise ValueError(
+                        f"SHM state shipping requires same-node GPUs, got cross-node transfer {src_gpu}->{dst_gpu} "
+                        f"(node {self.topo.node_of(src_gpu)} -> node {self.topo.node_of(dst_gpu)})"
+                    )
+                self._ensure_async_primitives()
+                shm_name = f"ms_shm_{os.getpid()}_{src_gpu}_{dst_gpu}_{self._next_cmd_id()}"
+                t_s0 = time.perf_counter()
+                s_res = await self._rpc(
+                    src_gpu,
+                    {
+                        "op": "SEND_SHM",
+                        "ctx_id": ctx_id,
+                        "shm_name": shm_name,
+                        "include_cfg_dup": include_cfg_dup,
+                        "release_after_send": release_src_ctx,
+                    },
+                )
+                send_ms = max(0.0, (time.perf_counter() - t_s0) * 1000.0)
+                if s_res.get("status") != "ok":
+                    return dict(s_res, sent_ok=False)
+            finally:
+                self._gpu_locks[src_gpu].release()
+        else:
+            if not self.topo.same_node(src_gpu, dst_gpu):
+                raise ValueError(
+                    f"SHM state shipping requires same-node GPUs, got cross-node transfer {src_gpu}->{dst_gpu} "
+                    f"(node {self.topo.node_of(src_gpu)} -> node {self.topo.node_of(dst_gpu)})"
+                )
+            self._ensure_async_primitives()
+            shm_name = f"ms_shm_{os.getpid()}_{src_gpu}_{dst_gpu}_{self._next_cmd_id()}"
+            t_sq0 = time.perf_counter()
+            await self._acquire_exclusive_gpu(
                 src_gpu,
-                {
-                    "op": "SEND_SHM",
-                    "ctx_id": ctx_id,
-                    "shm_name": shm_name,
-                    "include_cfg_dup": include_cfg_dup,
-                    "release_after_send": release_src_ctx,
-                },
+                est_mem_bytes=0,
+                est_exec_ms=default_operator_profile().prep_overhead_ms,
+                slo_deadline_ms=dst_slo_deadline_ms,
+                op_priority=0,
             )
-            send_ms = max(0.0, (time.perf_counter() - t_s0) * 1000.0)
-            if s_res.get("status") != "ok":
-                return dict(s_res, sent_ok=False)
-        finally:
-            self._gpu_locks[src_gpu].release()
+            src_q_ms = max(0.0, (time.perf_counter() - t_sq0) * 1000.0)
+            t_s0 = time.perf_counter()
+            try:
+                s_res = await self._rpc(
+                    src_gpu,
+                    {
+                        "op": "SEND_SHM",
+                        "ctx_id": ctx_id,
+                        "shm_name": shm_name,
+                        "include_cfg_dup": include_cfg_dup,
+                        "release_after_send": release_src_ctx,
+                    },
+                )
+                send_ms = max(0.0, (time.perf_counter() - t_s0) * 1000.0)
+                if s_res.get("status") != "ok":
+                    return dict(s_res, sent_ok=False)
+            finally:
+                self._gpu_locks[src_gpu].release()
 
         t_dq0 = time.perf_counter()
-        await self._acquire_exclusive_gpu(dst_gpu)
+        await self._acquire_exclusive_gpu(
+            dst_gpu,
+            est_mem_bytes=dst_est_mem_bytes,
+            est_exec_ms=dst_est_exec_ms,
+            slo_deadline_ms=dst_slo_deadline_ms,
+            op_priority=dst_op_priority,
+        )
         dst_q_ms = max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
         t_r0 = time.perf_counter()
         try:
@@ -1490,6 +1597,8 @@ class MorphServeClusterEngine:
                     turn_vae_ms = 0.0
                     turn_yield_ms = 0.0
 
+                    holding_src_lock = False
+                    held_src_gpu = resident_gpu
                     if plan == "cot_then_dit":
                         cot_res, did_preempt = await self._execute_ar_phase(
                             eff_policy,
@@ -1553,6 +1662,8 @@ class MorphServeClusterEngine:
                                 slo_deadline_ms=prep_dl_ms,
                                 op_priority=0,
                             )
+                            holding_src_lock = True
+                            held_src_gpu = resident_gpu
                             turn_q_ms += max(0.0, (time.perf_counter() - t_pq0) * 1000.0)
                             try:
                                 prep_res = await self._rpc(
@@ -1569,12 +1680,17 @@ class MorphServeClusterEngine:
                                         "prepare_for_dit": True,
                                     },
                                 )
-                            finally:
-                                self._gpu_locks[resident_gpu].release()
+                            except BaseException:
+                                holding_src_lock = False
+                                self._gpu_locks[held_src_gpu].release()
+                                raise
                         finally:
                             self.router.release_ar_queue(resident_gpu, est_prep_ms)
 
                         if prep_res["status"] == "oom":
+                            if holding_src_lock:
+                                holding_src_lock = False
+                                self._gpu_locks[held_src_gpu].release()
                             src_ctx_alive = False
                             should_retry, attempt, oom_retries, resident_gpu, next_cid = await self._retry_or_fail_oom(
                                 eff_policy=eff_policy,
@@ -1602,22 +1718,28 @@ class MorphServeClusterEngine:
                         turn_vae_ms += float(prep_res.get("vae_ms", 0.0))
 
                     # Plan cross-paradigm transition & atomically reserve router/pacer state in C++ `MorphControlEngine`.
-                    now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
-                    trans = self._plan_turn_transition(
-                        ctrl_handle,
-                        session_id=sess.session_id,
-                        base_ctx_id=ctx_id,
-                        turn_idx=ti,
-                        attempt=attempt,
-                        src_gpu=resident_gpu,
-                        state_bytes=kv_bytes,
-                        modality_plan=plan,
-                        height=turn.height,
-                        dit_steps=turn.dit_steps,
-                        has_more_turns=has_more_turns,
-                        has_more_edits=has_more_edits,
-                        now_ms=now_rel_ms,
-                    )
+                    try:
+                        now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
+                        trans = self._plan_turn_transition(
+                            ctrl_handle,
+                            session_id=sess.session_id,
+                            base_ctx_id=ctx_id,
+                            turn_idx=ti,
+                            attempt=attempt,
+                            src_gpu=resident_gpu,
+                            state_bytes=kv_bytes,
+                            modality_plan=plan,
+                            height=turn.height,
+                            dit_steps=turn.dit_steps,
+                            has_more_turns=has_more_turns,
+                            has_more_edits=has_more_edits,
+                            now_ms=now_rel_ms,
+                        )
+                    except BaseException:
+                        if holding_src_lock:
+                            holding_src_lock = False
+                            self._gpu_locks[held_src_gpu].release()
+                        raise
                     ship_mode = str(trans["ship_mode"])
                     dst_gpu = int(trans["dst_gpu"])
                     est_dit_ms = float(trans["est_dit_ms"])
@@ -1627,6 +1749,8 @@ class MorphServeClusterEngine:
                     release_src_on_fwd = bool(trans["release_src_on_fwd"])
                     include_cfg_dup = bool(trans["include_cfg_dup_on_wire"])
                     dit_ctx_id = str(trans["dit_ctx_id"])
+                    dit_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
+                    est_dit_mem_b = int(kv_bytes) + ((4096 if turn.height >= 1024 else 1024) * MIB)
 
                     src_gpu_before_ship = resident_gpu
                     kv_res_released = reserved_kv_b == 0
@@ -1644,6 +1768,9 @@ class MorphServeClusterEngine:
                     dit_res: dict[str, Any] = {"status": "error", "error": "not_run"}
                     try:
                         if ship_mode in ("nccl_dual", "nccl_static"):
+                            pass_src_lock = holding_src_lock and (held_src_gpu == resident_gpu)
+                            if pass_src_lock:
+                                holding_src_lock = False
                             async with self._nccl_transfer_guard(
                                 resident_gpu,
                                 dst_gpu,
@@ -1651,6 +1778,11 @@ class MorphServeClusterEngine:
                                 dit_ctx_id,
                                 include_cfg_dup=include_cfg_dup,
                                 release_src_ctx=release_src_on_fwd,
+                                src_lock_held=pass_src_lock,
+                                dst_est_mem_bytes=est_dit_mem_b,
+                                dst_est_exec_ms=est_dit_ms,
+                                dst_slo_deadline_ms=dit_dl_ms,
+                                dst_op_priority=1,
                             ) as ship:
                                 if release_src_on_fwd and ship.get("packed_ok"):
                                     src_ctx_alive = False
@@ -1688,6 +1820,9 @@ class MorphServeClusterEngine:
                                     )
                         else:
                             if ship_mode == "shm_static":
+                                pass_src_lock = holding_src_lock and (held_src_gpu == resident_gpu)
+                                if pass_src_lock:
+                                    holding_src_lock = False
                                 ship = await self._ship_shm(
                                     resident_gpu,
                                     dst_gpu,
@@ -1695,6 +1830,11 @@ class MorphServeClusterEngine:
                                     dit_ctx_id,
                                     include_cfg_dup=include_cfg_dup,
                                     release_src_ctx=release_src_on_fwd,
+                                    src_lock_held=pass_src_lock,
+                                    dst_est_mem_bytes=est_dit_mem_b,
+                                    dst_est_exec_ms=est_dit_ms,
+                                    dst_slo_deadline_ms=dit_dl_ms,
+                                    dst_op_priority=1,
                                 )
                                 if release_src_on_fwd and ship.get("sent_ok"):
                                     src_ctx_alive = False
@@ -1722,17 +1862,36 @@ class MorphServeClusterEngine:
                                 turn_morphed = True
 
                             if dit_res.get("status") != "oom":
-                                t_dq_dit = time.perf_counter()
-                                dit_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
-                                est_dit_mem_b = int(kv_bytes) + ((4096 if turn.height >= 1024 else 1024) * MIB)
-                                await self._acquire_exclusive_gpu(
-                                    dst_gpu,
-                                    est_mem_bytes=est_dit_mem_b,
-                                    est_exec_ms=est_dit_ms,
-                                    slo_deadline_ms=dit_dl_ms,
-                                    op_priority=1,
-                                )
-                                turn_q_ms += max(0.0, (time.perf_counter() - t_dq_dit) * 1000.0)
+                                reuse_held_lock = holding_src_lock and (held_src_gpu == dst_gpu)
+                                if reuse_held_lock:
+                                    should_yield_to_sched = (
+                                        eff_policy.gpu_queue_mode == "memory_slack"
+                                        and self._gpu_locks[dst_gpu].has_waiters()
+                                        and (
+                                            turn.height >= 1024
+                                            or est_dit_mem_b > self._free_mem_bytes_for_gpu(dst_gpu)
+                                        )
+                                    )
+                                    if should_yield_to_sched:
+                                        holding_src_lock = False
+                                        self._gpu_locks[held_src_gpu].release()
+                                        reuse_held_lock = False
+                                if holding_src_lock and not reuse_held_lock:
+                                    holding_src_lock = False
+                                    self._gpu_locks[held_src_gpu].release()
+
+                                if reuse_held_lock:
+                                    holding_src_lock = False
+                                else:
+                                    t_dq_dit = time.perf_counter()
+                                    await self._acquire_exclusive_gpu(
+                                        dst_gpu,
+                                        est_mem_bytes=est_dit_mem_b,
+                                        est_exec_ms=est_dit_ms,
+                                        slo_deadline_ms=dit_dl_ms,
+                                        op_priority=1,
+                                    )
+                                    turn_q_ms += max(0.0, (time.perf_counter() - t_dq_dit) * 1000.0)
                                 try:
                                     dit_res = await self._exec_dit_on_locked_gpu(
                                         dst_gpu,
@@ -1746,6 +1905,9 @@ class MorphServeClusterEngine:
                                 finally:
                                     self._gpu_locks[dst_gpu].release()
                     finally:
+                        if holding_src_lock:
+                            holding_src_lock = False
+                            self._gpu_locks[held_src_gpu].release()
                         if not kv_res_released:
                             self.router.release_kv_reservation(dst_gpu, reserved_kv_b)
                         self.router.release_dit_reservation(dst_gpu, est_dit_ms)
@@ -1962,7 +2124,7 @@ class MorphServeClusterEngine:
     ) -> ClusterRunReport:
         eff_policy = run_options.apply_to_policy(self.policy) if run_options is not None else self.policy
         n_gpus = eff_policy.num_gpus
-        self._gpu_locks = [asyncio.Lock() for _ in range(n_gpus)]
+        self._gpu_locks = self._build_gpu_locks(eff_policy)
         self._xfer_locks = [asyncio.Lock() for _ in range(n_gpus)]
         self._dst_staging_sems = [asyncio.Semaphore(1) for _ in range(n_gpus)]
         self._inflight_ar_on_gpu = {g: 0 for g in range(n_gpus)}
@@ -2187,6 +2349,10 @@ class MorphServeClusterEngine:
         )
 
     def shutdown(self) -> None:
+        for lk in self._gpu_locks:
+            if hasattr(lk, "close"):
+                lk.close()
+        self._gpu_locks = []
         if not self._started:
             return
         self.fleet.shutdown()

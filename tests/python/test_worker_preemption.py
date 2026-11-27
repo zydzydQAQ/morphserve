@@ -372,3 +372,113 @@ def test_bagel_interceptor_hooks_workspace_isolation_and_packed_ar_equivalence()
         logits_b, _ = ic_b.forward_ar_step_batch([tok0], [pos0], [cache_cls(2)], return_logits=True)
     assert tuple(logits_b.shape) == (1, 64)
     ic_b.uninstall()
+
+
+def test_preemption_session_per_item_oom_isolation_and_tpot_slack_deferral() -> None:
+    pipe = _make_pure_python_stub_pipeline(num_layers=8)
+
+    def _step_exec(task: ArDecodeTask) -> None:
+        task.generated_token_ids.append(1)
+        if len(task.generated_token_ids) >= task.max_tokens:
+            task.finished = True
+
+    sched = UnifiedPreemptiveScheduler(
+        pipe,
+        mode="layer_chunk",
+        tpot_slo_ms=100.0,
+        guard_ms=20.0,
+        init_layer_ms=10.0,
+        init_ar_step_ms=40.0,
+        step_executor=_step_exec,
+    )
+
+    # 1. Per-item OOM isolation: cmd_bad raises VmmOutOfMemoryError during admit -> cleanly aborted via
+    # `on_abort_cmd` while sibling `cmd_good` is STILL admitted & completed (zero orphaned TimeoutError!).
+    inbox = [
+        {"cmd_id": "cmd_bad", "ctx_id": "c_bad", "max_ar_tokens": 1},
+        {"cmd_id": "cmd_good", "ctx_id": "c_good", "max_ar_tokens": 1},
+    ]
+    aborted_cmds: list[tuple[str, BaseException | None]] = []
+    completed: list[str] = []
+
+    def _poll() -> list[dict[str, Any]]:
+        out = list(inbox)
+        inbox.clear()
+        return out
+
+    def _admit(cmd: dict[str, Any], now_s: float) -> tuple[ArDecodeTask, str]:
+        if cmd["cmd_id"] == "cmd_bad":
+            raise VmmOutOfMemoryError("admit OOM")
+        t = ArDecodeTask(
+            req_id=str(cmd["cmd_id"]),
+            kv_cache=None,
+            curr_tokens=None,
+            pos_ids=None,
+            max_tokens=int(cmd["max_ar_tokens"]),
+            end_token_id=None,
+            tpot_slo_ms=100.0,
+            arrival_time_s=now_s,
+            last_step_time_s=now_s,
+        )
+        return t, str(cmd["cmd_id"])
+
+    with PreemptionSession(
+        sched,
+        poll_cmds=_poll,
+        admit_cmd=_admit,
+        on_complete=lambda _t, h: completed.append(h),
+        on_abort_cmd=lambda cmd, exc: aborted_cmds.append((str(cmd["cmd_id"]), exc)),
+        on_oom_reclaim=lambda _tasks: 0,
+    ) as ps:
+        t0 = sched.begin_session_clock()
+        sched.admit_due_arrivals(t0)
+        assert len(aborted_cmds) == 1
+        assert aborted_cmds[0][0] == "cmd_bad"
+        assert isinstance(aborted_cmds[0][1], VmmOutOfMemoryError)
+        ps.drain(stop_polling_after=False)
+        assert completed == ["cmd_good"]
+
+    # 2. TPOT-protective deferral: if an active AR task has tight slack (< 60ms), a newly arriving
+    # lightweight command is deferred by 1 yield rather than stalling the active task's TPOT deadline.
+    admitted_ids: list[str] = []
+    completed2: list[str] = []
+    inbox2: list[dict[str, Any]] = []
+
+    def _poll2() -> list[dict[str, Any]]:
+        out = list(inbox2)
+        inbox2.clear()
+        return out
+
+    def _admit2(cmd: dict[str, Any], now_s: float) -> tuple[ArDecodeTask, str]:
+        admitted_ids.append(str(cmd["cmd_id"]))
+        t = ArDecodeTask(
+            req_id=str(cmd["cmd_id"]),
+            kv_cache=None,
+            curr_tokens=None,
+            pos_ids=None,
+            max_tokens=int(cmd["max_ar_tokens"]),
+            end_token_id=None,
+            tpot_slo_ms=100.0,
+            arrival_time_s=now_s,
+            last_step_time_s=now_s,
+        )
+        return t, str(cmd["cmd_id"])
+
+    with PreemptionSession(
+        sched,
+        poll_cmds=_poll2,
+        admit_cmd=_admit2,
+        on_complete=lambda _t, h: completed2.append(h),
+    ) as ps2:
+        t0 = sched.begin_session_clock()
+        inbox2.append({"cmd_id": "cmd_first", "ctx_id": "c1", "max_ar_tokens": 2})
+        sched.admit_due_arrivals(t0)
+        assert admitted_ids == ["cmd_first"]
+        # Advance 70 ms so active task has only 30 ms slack remaining -> cmd_second MUST defer!
+        inbox2.append({"cmd_id": "cmd_second", "ctx_id": "c2", "max_ar_tokens": 1})
+        sched.admit_due_arrivals(t0 + 0.070)
+        assert admitted_ids == ["cmd_first"]
+        # After servicing the yield (resetting slack), cmd_second is admitted & completed cleanly.
+        ps2.drain(stop_polling_after=True)
+        assert admitted_ids == ["cmd_first", "cmd_second"]
+        assert set(completed2) == {"cmd_first", "cmd_second"}

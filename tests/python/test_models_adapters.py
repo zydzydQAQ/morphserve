@@ -671,7 +671,7 @@ def test_internvl_u_adapter_edit_preencode_no_monkeypatch_and_hwm(tmp_path: Path
         assert adapter.pager.spec.vae_encode_restore == "none"
         assert adapter.available_kv_bytes() >= 0
 
-        # Pre-encode edit turn into bridge tensors outside generation_mode.
+        # Pre-encode edit turn into bridge tensors outside generation_mode (lazy pack: no eager flat concat).
         b_bytes = adapter.prepare_turn(
             "iv0",
             {
@@ -683,6 +683,7 @@ def test_internvl_u_adapter_edit_preencode_no_monkeypatch_and_hwm(tmp_path: Path
             },
         )
         assert b_bytes > 0
+        assert "packed_flat" not in adapter._ctx_store["iv0"]
         assert pipe.prepare_diff_calls == 1
 
         # Pack & unpack bridge state roundtrip

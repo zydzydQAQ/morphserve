@@ -196,6 +196,7 @@ public:
     int expert_wait_layer(int expert_id, int layer_idx, void* compute_stream);
     int expert_sync_h2d(int expert_id);
     size_t coalesce_fine_to_super(size_t max_super = SIZE_MAX);
+    size_t release_free_overflow_to_driver(size_t target_bytes = SIZE_MAX);
     int expert_evict_layer(int expert_id, int layer_idx, void* stream);
     int expert_evict_range(int expert_id, int start_layer, int end_layer_exclusive, void* stream);
     int expert_is_resident(int expert_id, int layer_idx);
@@ -254,6 +255,7 @@ private:
         uint8_t* host_pinned_base = nullptr;
         size_t host_bytes = 0;
         bool pinned = false;
+        uint64_t last_used_seq = 0;
         bool last_async_error = false;
         bool last_async_error_oom = false;
         std::string last_async_error_msg;
@@ -411,6 +413,7 @@ private:
     std::vector<uint64_t> free_fine_handles_;
     uint64_t super_pool_total_ = 0;
     uint64_t fine_pool_total_ = 0;
+    size_t init_super_handles_ = 0;
     size_t base_fine_pages_ = 0;
     uint64_t fine_to_super_bundles_ = 0;
     uint64_t transient_fine_bundles_current_ = 0;
@@ -453,6 +456,7 @@ private:
 
     std::deque<ExpertBank> experts_;
     std::deque<PrefetchJob> prefetch_queue_;
+    uint64_t expert_use_clock_ = 0;
     uint64_t expert_mapped_handles_ = 0;
     uint64_t expert_resident_layers_ = 0;
     uint64_t expert_prefetch_layers_completed_ = 0;

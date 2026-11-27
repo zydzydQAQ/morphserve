@@ -437,7 +437,7 @@ class DualPathMorphRouter:
         gpu_busy: Mapping[int, bool] | None = None,
         active_dit_ranks: Mapping[int, int] | None = None,
         active_preemptions: Mapping[int, int] | None = None,
-        max_preemptions_per_gpu: int = 2,
+        max_preemptions_per_gpu: int = 6,
         architecture: str = "tight_mot",
     ) -> int:
         with self._mu:

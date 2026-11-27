@@ -1014,6 +1014,17 @@ class TriPoolVMM:
             )
         )
 
+    def release_free_overflow_bytes(self, target_bytes: int = 0) -> int:
+        """Return idle overflow physical handles above the initial pool floor back to the CUDA driver."""
+        if self._closed or not self._handle:
+            return 0
+        return int(
+            self.lib.ms_vmm_release_free_overflow(
+                ctypes.c_void_p(self._handle),
+                ctypes.c_size_t(max(0, int(target_bytes))),
+            )
+        )
+
     def ensure_expert_headroom(
         self,
         expert_id: int,

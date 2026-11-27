@@ -190,6 +190,21 @@ _DTYPE_NAME_MAP = {
 }
 
 
+def _bridge_tensor_nbytes(val: Any) -> int:
+    """Compute exact byte length produced by `pack_internvlu_bridge_state` without allocating/concatenating."""
+    import torch
+
+    if val is None:
+        return 0
+    if torch.is_tensor(val):
+        return int(val.numel()) * int(val.element_size())
+    if isinstance(val, list):
+        return sum(_bridge_tensor_nbytes(x) for x in val)
+    if isinstance(val, dict):
+        return sum(_bridge_tensor_nbytes(v) for v in val.values())
+    return 0
+
+
 def pack_internvlu_bridge_state(diffusion_inputs: dict[str, Any], device: Any) -> tuple[dict[str, Any], Any]:
     """Pack `InternVL-U` `diffusion_inputs` bridge tensors into a flat contiguous `uint8` CUDA tensor."""
     import torch
@@ -497,9 +512,24 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 allow_overflow=bool(plan["allow_overflow"]),
             )
             if self.pager is not None:
+                use_elastic_split = bool(
+                    self._quota_constrained
+                    and self.vlm_pager is not None
+                    and int(self.policy.num_gpus) >= 2
+                    and str(self.policy.routing_mode) == "dual_path"
+                )
                 if not self._quota_constrained:
                     # Regime A (40 GiB unconstrained): keep Decoder 100% resident (`alpha=1.0`) alongside VLM.
                     init_alpha = 1.0
+                elif use_elastic_split:
+                    # Regime B (12 GiB constrained, >=2 GPUs): initialize even ranks VLM-hot (`alpha=0.0`)
+                    # and odd ranks Decoder-hot (`alpha=1.0`) so dual-path ships ~2-8 MiB bridges across
+                    # warm ranks while retaining full on-demand elastic morphing when demand shifts.
+                    init_alpha = 1.0 if (self.rank % 2 == 1) else 0.0
+                    if not bool(plan["allow_overflow"]):
+                        max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
+                        max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
+                        init_alpha = min(init_alpha, max_fit_alpha)
                 else:
                     init_alpha = (
                         0.0 if self.vlm_pager is not None else float(self.policy.initial_alphas.get(self.rank, 1.0))
@@ -512,7 +542,8 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 self.pager.bind_vmm(self.vmm, initial_alpha=init_alpha)
             if self.vlm_pager is not None:
                 vlm_fit_layers = int(plan["super_pool_mib"]) // max(1, self.vlm_pager.layer_stride_mib)
-                vlm_init_alpha = min(1.0, float(vlm_fit_layers) / float(max(1, self.vlm_pager.num_layers)))
+                vlm_fit_alpha = min(1.0, float(vlm_fit_layers) / float(max(1, self.vlm_pager.num_layers)))
+                vlm_init_alpha = 0.0 if float(getattr(self, "_initial_bound_alpha", 0.0)) > 0.0 else vlm_fit_alpha
                 self._initial_vlm_alpha = float(vlm_init_alpha)
                 self.vlm_pager.bind_vmm(self.vmm, initial_alpha=vlm_init_alpha)
         else:
@@ -541,6 +572,19 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             "kv_free_bytes": self.available_kv_bytes(),
             "memory_plan": dict(self._memory_plan),
         }
+
+    def _maybe_empty_cache(self, *, min_unused_mib: int = 256) -> None:
+        import torch
+
+        if not (self._quota_constrained and torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"):
+            return
+        unused_b = max(
+            0,
+            int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+        )
+        if unused_b >= int(min_unused_mib) * MIB:
+            self._update_hwm()
+            torch.cuda.empty_cache()
 
     def warmup(self) -> None:
         self.reset_peak_memory_stats()
@@ -670,9 +714,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             return est_b
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
-        if self._quota_constrained and is_cuda:
-            self._update_hwm()
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         h = int(cmd.get("height", 512))
         w = int(cmd.get("width", 512))
@@ -704,13 +746,11 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 vlm_hidden_states=v_out.hidden_states,
             )
             del inp, v_out
-            meta, flat = pack_internvlu_bridge_state(diff_inp, device=self.device)
         if is_cuda:
             torch.cuda.current_stream(self.device).synchronize()
         self._update_hwm()
-        if self._quota_constrained and is_cuda:
-            torch.cuda.empty_cache()
-        b_bytes = int(meta["total_bytes"])
+        self._maybe_empty_cache(min_unused_mib=256)
+        b_bytes = _bridge_tensor_nbytes(diff_inp)
         self._ctx_store[ctx_id] = {
             "prompt": prompt,
             "pil_img": pil_img,
@@ -719,8 +759,6 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             "diff_inp": diff_inp,
             "gh": gh,
             "gw": gw,
-            "packed_meta": meta,
-            "packed_flat": flat,
             "bridge_bytes": b_bytes,
         }
         return b_bytes
@@ -734,17 +772,14 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         eff_prompt = _format_prompt_with_history(prompt, history)
         pil_img = entry.get("pil_img")
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
-        if self._quota_constrained and is_cuda:
-            self._update_hwm()
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
         with self._vlm_execution_scope(), torch.inference_mode():
             out, t0, streamer = self._run_vlm_text_generate(eff_prompt, pil_img, int(max_tokens))
         if is_cuda:
             torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self._update_hwm()
-        if self._quota_constrained and is_cuda:
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         tok_seq = _trim_internvlu_generated_tokens(out.generate_output[0], self.pipe.tokenizer)
         n_tok = max(1, int(len(tok_seq)))
@@ -831,9 +866,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             max_toks.append(max(1, int(cmd.get("max_ar_tokens", 32))))
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
-        if self._quota_constrained and is_cuda:
-            self._update_hwm()
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         with self._vlm_execution_scope(), torch.inference_mode():
             out, t_gen0, streamer = self._run_vlm_text_generate(prompts, None, max(max_toks))
@@ -841,8 +874,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             torch.cuda.current_stream(self.device).synchronize()
         dt_ms = (time.perf_counter() - t_gen0) * 1000.0
         self._update_hwm()
-        if self._quota_constrained and is_cuda:
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         alpha_now = self.resident_alpha()
         free_kv_now = self.available_kv_bytes()
@@ -964,9 +996,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         save_tmp_path = cmd.get("save_tmp_image_path")
 
         is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
-        if self._quota_constrained and is_cuda:
-            self._update_hwm()
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         vmm_st0 = self.vmm.stats_dict() if (self.pager is not None and self.vmm is not None) else None
         h2d_weight_ms = 0.0
@@ -1012,9 +1042,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                     # under strict 12 GiB quotas while staying 100% resident under ample 40/80 GB `super_pool`.
                     lat_bf16 = latents_out.to(torch.bfloat16)
                     del latents_out
-                    if self._quota_constrained and is_cuda:
-                        self._update_hwm()
-                        torch.cuda.empty_cache()
+                    self._maybe_empty_cache(min_unused_mib=128)
                     t_vae0 = time.perf_counter()
                     imgs_t = self.pipe.image_pipeline.latents_to_pixels(lat_bf16)
                     if is_cuda:
@@ -1079,8 +1107,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 pil_img.save(save_tmp_path, format="PNG")
         del imgs_t
         self._update_hwm()
-        if self._quota_constrained and is_cuda:
-            torch.cuda.empty_cache()
+        self._maybe_empty_cache(min_unused_mib=256)
 
         return {
             "status": "ok",
@@ -1097,9 +1124,16 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
 
     def reset_for_new_suite(self) -> float:
         if self.vmm is not None and self.vlm_pager is not None:
-            if self.pager is not None:
+            init_dec = float(getattr(self, "_initial_bound_alpha", 0.0))
+            init_vlm = float(getattr(self, "_initial_vlm_alpha", 1.0))
+            if self.pager is not None and init_dec <= 0.0:
                 self.pager.set_residency_alpha(0.0)
-            self.vlm_pager.set_residency_alpha(float(getattr(self, "_initial_vlm_alpha", 1.0)))
+            if init_vlm <= 0.0:
+                self.vlm_pager.set_residency_alpha(0.0)
+            if self.pager is not None and init_dec > 0.0:
+                self.pager.set_residency_alpha(init_dec)
+            if init_vlm > 0.0:
+                self.vlm_pager.set_residency_alpha(init_vlm)
             self.reset_peak_memory_stats()
             return self.resident_alpha()
         return super().reset_for_new_suite()
@@ -1108,9 +1142,11 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         import torch
 
         self._ctx_store.pop(ctx_id, None)
-        if (self.vmm is None or self._quota_constrained) and torch.cuda.is_available():
+        if self.vmm is None and torch.cuda.is_available():
             self._update_hwm()
             torch.cuda.empty_cache()
+        elif self._quota_constrained:
+            self._maybe_empty_cache(min_unused_mib=256)
 
     def memory_and_vmm_stats(self) -> dict[str, Any]:
         stats = super().memory_and_vmm_stats()

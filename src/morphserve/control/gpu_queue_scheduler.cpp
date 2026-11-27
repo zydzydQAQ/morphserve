@@ -66,8 +66,8 @@ nlohmann::json GpuQueuePolicy::to_json() const {
 GpuQueuePolicy GpuQueuePolicy::from_json(const nlohmann::json& j) {
     GpuQueuePolicy p;
     p.mode = j.value("mode", "memory_slack");
-    p.max_wait_aging_ms = j.value("max_wait_aging_ms", 6000.0);
-    p.max_bypasses = j.value("max_bypasses", 3);
+    p.max_wait_aging_ms = j.value("max_wait_aging_ms", 45000.0);
+    p.max_bypasses = j.value("max_bypasses", 5);
     return p;
 }
 
@@ -124,7 +124,8 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
             const auto& b = waiters[best];
             const int a_fit = fits_mem(a) ? 0 : 1;
             const int b_fit = fits_mem(b) ? 0 : 1;
-            if (std::tie(a_fit, a.enqueue_ms, a.waiter_id) < std::tie(b_fit, b.enqueue_ms, b.waiter_id)) {
+            if (std::tie(a.op_priority, a_fit, a.enqueue_ms, a.waiter_id) <
+                std::tie(b.op_priority, b_fit, b.enqueue_ms, b.waiter_id)) {
                 best = idx;
             }
         }
@@ -150,14 +151,22 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
 
     size_t chosen = fifo_idx;
     if (!fitting.empty()) {
+        // Domino-free Feasible-Slack EDF + SRPT fallback:
+        // Partition fitting waiters into SLO-feasible (`slack >= 0` or unprioritized, bucket 0)
+        // vs already-expired (`slack < 0`, bucket 1). Within bucket 0 run EDF (tightest feasible
+        // slack first); within bucket 1 run SRPT (`est_exec_ms` ascending) so already-missed heavy
+        // turns cannot trigger an EDF domino cascade across feasible short turns or inflate JCT.
+        auto rank_key = [&](const GpuQueueWaiter& w) noexcept {
+            const double slack = effective_slack_ms(w, now_ms);
+            const bool feasible = (w.slo_deadline_ms <= 0.0) || (slack >= 0.0);
+            const int bucket = feasible ? 0 : 1;
+            const double primary = feasible ? slack : std::max(0.0, w.est_exec_ms);
+            const double secondary = feasible ? std::max(0.0, w.est_exec_ms) : -slack;
+            return std::make_tuple(w.op_priority, bucket, primary, secondary, w.enqueue_ms, w.waiter_id);
+        };
         chosen = fitting.front();
         for (size_t idx : fitting) {
-            const auto& a = waiters[idx];
-            const auto& b = waiters[chosen];
-            const double a_slack = effective_slack_ms(a, now_ms);
-            const double b_slack = effective_slack_ms(b, now_ms);
-            if (std::tie(a.op_priority, a_slack, a.est_exec_ms, a.enqueue_ms, a.waiter_id) <
-                std::tie(b.op_priority, b_slack, b.est_exec_ms, b.enqueue_ms, b.waiter_id)) {
+            if (rank_key(waiters[idx]) < rank_key(waiters[chosen])) {
                 chosen = idx;
             }
         }

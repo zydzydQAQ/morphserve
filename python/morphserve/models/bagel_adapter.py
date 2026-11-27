@@ -1068,6 +1068,70 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 torch.cuda.empty_cache()
         return evicted_total
 
+    def _release_vmm_overflow_to_driver(self, target_bytes: int = 0) -> int:
+        if self.vmm is None:
+            return 0
+        fn = getattr(self.vmm, "release_free_overflow_bytes", None)
+        if not callable(fn):
+            return 0
+        return int(fn(int(max(0, target_bytes))))
+
+    def _ensure_cuda_driver_headroom_for_dit(
+        self,
+        needed_driver_bytes: int,
+        *,
+        exclude_ctx_ids: Iterable[str] = (),
+    ) -> int:
+        """Ensure CUDA driver + PyTorch caching allocator has sufficient headroom before DiT/VAE spikes."""
+        import torch
+
+        if self.vmm is None or not (torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"):
+            return 0
+        free_drv, _ = torch.cuda.mem_get_info(self.device)
+        unused_pt = max(
+            0,
+            int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+        )
+        free_est = int(free_drv) + unused_pt
+        trimmed = 0
+        if free_est < int(needed_driver_bytes):
+            deficit = int(needed_driver_bytes) - free_est
+            trimmed += self._release_vmm_overflow_to_driver(deficit)
+            free_drv, _ = torch.cuda.mem_get_info(self.device)
+            unused_pt = max(
+                0,
+                int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+            )
+            free_est = int(free_drv) + unused_pt
+            if free_est < int(needed_driver_bytes) and self._auto_idle_kv_swap_enabled():
+                vmm_pool_b = int(self.vmm.stats_dict().get("pool_total_bytes", 0))
+                init_pool_b = int(round(float(getattr(self, "_vmm_initial_pool_mib", 0.0)) * MIB))
+                vmm_excess_b = max(0, vmm_pool_b - init_pool_b)
+                if vmm_excess_b > 0:
+                    rem_deficit = min(int(needed_driver_bytes) - free_est, vmm_excess_b)
+                    target_avail = self.available_kv_bytes(for_dit=True) + rem_deficit
+                    reclaimed = self.evict_idle_kv_to_host(
+                        target_avail,
+                        exclude_ctx_ids=exclude_ctx_ids,
+                        for_dit=True,
+                    )
+                    if reclaimed > 0:
+                        flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+                        if callable(flush_fn):
+                            flush_fn()
+                        trimmed += self._release_vmm_overflow_to_driver(rem_deficit)
+                        free_drv, _ = torch.cuda.mem_get_info(self.device)
+                        unused_pt = max(
+                            0,
+                            int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+                        )
+        # Defragment PyTorch's caching allocator when raw driver free is tight so large contiguous
+        # DiT/VAE/FlashAttn allocations (1.0-1.9 GiB) never fail with fragmented CUDACachingAllocator OOM.
+        if int(free_drv) < min(int(needed_driver_bytes), 3072 * MIB) and unused_pt >= 512 * MIB:
+            self._update_hwm()
+            torch.cuda.empty_cache()
+        return trimmed
+
     def _ensure_ctx_resident(self, ctx_id: str, extra_needed_bytes: int = 0) -> BagelSessionContext:
         session = self._ctx_store[ctx_id]
         allow_auto_swap = self._auto_idle_kv_swap_enabled()
@@ -1136,14 +1200,14 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 free_drv, total_drv = torch.cuda.mem_get_info(self.device)
                 if int(total_drv) > 0:
                     nccl_reserve_mib = (
-                        768
+                        (1024 + 64 * max(0, int(self.policy.num_gpus) - 8))
                         if (
                             int(self.policy.num_gpus) >= 2
                             and str(self.policy.routing_mode) in ("dual_path", "static_nccl_fission")
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 8192) * MIB
+                    headroom_b = (nccl_reserve_mib + 4096) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -1171,7 +1235,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 self.pipeline,
                 mode=self.policy.preemption_mode,
                 tpot_slo_ms=self.policy.ar_tpot_slo_ms,
-                guard_ms=24.0,
+                guard_ms=30.0,
                 init_layer_ms=10.5,
                 init_ar_step_ms=66.0,
                 pager=self.pager,
@@ -1197,7 +1261,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 self._calibrated_ar_step_ms = max(5.0, min(66.0, float(tpots[-1])))
                 if self.sched is not None:
                     self.sched.ema_ar_step_ms = self._calibrated_ar_step_ms
-                    self.sched.guard_ms = 24.0
+                    self.sched.guard_ms = 30.0
                     self.sched.last_effective_chunk_layers = self.sched.compute_adaptive_chunk_layers()
             self.release_context("__warm_ar__")
 
@@ -1832,15 +1896,18 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
             session = self._ensure_ctx_resident(ctx_id)
             has_pending = session.has_pending_deferral
+            est_dit_vae_bytes = int(7.0 * GIB) if (height >= 1024 or width >= 1024) else int(4.5 * GIB)
             if self.pager is not None and self.vmm is not None:
                 extra_dit_kv = (256 * MIB) if has_pending else (64 * MIB)
-                needed_for_dit = int(self.pager.total_mirror_bytes) + extra_dit_kv
-                if self.available_kv_bytes(for_dit=False) < needed_for_dit:
-                    self.evict_idle_kv_to_host(needed_for_dit, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                # `for_dit=True` already reserves full DiT expert bytes in TriPoolVMM's accounting;
+                # only reclaim idle KV when net DiT KV headroom is actually below `extra_dit_kv`.
+                if self.available_kv_bytes(for_dit=True) < extra_dit_kv:
+                    self.evict_idle_kv_to_host(extra_dit_kv, exclude_ctx_ids=(ctx_id,), for_dit=True)
+                self._ensure_cuda_driver_headroom_for_dit(est_dit_vae_bytes, exclude_ctx_ids=(ctx_id,))
             elif use_idle_kv_swap:
                 # Fair symmetric idle-KV protection for `monolithic_kv_swap` & `prism_tetriserve_coloc`:
                 # proactively reclaim idle KV if free HBM is below estimated DiT+VAE spike (`4.5 GiB` / `7.5 GiB`).
-                est_dit_vae_bytes = int(7.5 * GIB) if (height >= 1024 or width >= 1024) else int(4.5 * GIB)
+                est_dit_vae_bytes_base = int(7.5 * GIB) if (height >= 1024 or width >= 1024) else int(4.5 * GIB)
                 if is_cuda:
                     free_drv, _ = torch.cuda.mem_get_info(self.device)
                     unused_pt = max(
@@ -1850,10 +1917,15 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     free_hbm_est = int(free_drv) + unused_pt
                 else:
                     free_hbm_est = self.available_kv_bytes(for_dit=False)
-                if free_hbm_est < est_dit_vae_bytes:
-                    deficit = est_dit_vae_bytes - free_hbm_est
-                    target_avail = max(est_dit_vae_bytes, self.available_kv_bytes(for_dit=False) + deficit)
+                if free_hbm_est < est_dit_vae_bytes_base:
+                    deficit = est_dit_vae_bytes_base - free_hbm_est
+                    target_avail = max(est_dit_vae_bytes_base, self.available_kv_bytes(for_dit=False) + deficit)
                     reclaimed_b = self.evict_idle_kv_to_host(target_avail, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                    if self.vmm is not None and reclaimed_b > 0:
+                        flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+                        if callable(flush_fn):
+                            flush_fn()
+                        self._release_vmm_overflow_to_driver(deficit)
                     if reclaimed_b > 0 and is_cuda:
                         self._update_hwm()
                         torch.cuda.empty_cache()
@@ -1994,6 +2066,49 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         }
                     )
 
+            def _abort_preempt_cmd(d_msg: dict[str, Any], exc: BaseException | None) -> None:
+                if emit_preempt_ack is None:
+                    return
+                if exc is not None and is_oom_exception(exc):
+                    if is_cuda:
+                        self._update_hwm()
+                        torch.cuda.empty_cache()
+                    emit_preempt_ack(
+                        {
+                            "cmd_id": str(d_msg["cmd_id"]),
+                            "rank": self.rank,
+                            "status": "oom",
+                            "error": str(exc)[:200],
+                        }
+                    )
+                elif exc is not None:
+                    emit_preempt_ack(
+                        {
+                            "cmd_id": str(d_msg["cmd_id"]),
+                            "rank": self.rank,
+                            "status": "error",
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
+                else:
+                    _abort_deferred_cmd(d_msg)
+
+            def _is_heavy_preempt_cmd(ar_msg: dict[str, Any]) -> bool:
+                if ar_msg.get("image_paths") or ar_msg.get("use_prev_image"):
+                    return True
+                ar_cid = str(ar_msg.get("ctx_id", ""))
+                ar_sess = self._ctx_store.get(ar_cid)
+                return bool(ar_sess is not None and ar_sess.is_swapped)
+
+            def _reclaim_for_preempt(_tasks: list[ArDecodeTask]) -> int:
+                freed_b = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
+                if self.vmm is not None:
+                    flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+                    if callable(flush_fn):
+                        flush_fn()
+                    freed_b += self._release_vmm_overflow_to_driver()
+                return freed_b
+
             hw_key = (height, width)
             has_prior_hw = hw_key in self._calibrated_layer_ms_by_hw
 
@@ -2005,11 +2120,9 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     on_complete=_complete_preempt_task if (emit_preempt_ack is not None) else None,
                     on_abort=_abort_preempt_handle,
                     on_abort_deferred=_abort_deferred_cmd,
-                    on_oom_reclaim=(
-                        (lambda _tasks: self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)))
-                        if self._auto_idle_kv_swap_enabled()
-                        else None
-                    ),
+                    on_abort_cmd=_abort_preempt_cmd,
+                    on_oom_reclaim=_reclaim_for_preempt if self._auto_idle_kv_swap_enabled() else None,
+                    is_heavy_cmd=_is_heavy_preempt_cmd,
                     drain_context_factory=lambda: torch.autocast(
                         device_type=dev_type, enabled=is_cuda, dtype=torch.bfloat16
                     ),
@@ -2101,16 +2214,26 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         except BaseException as exc:
                             if dit_attempt < max_dit_oom_retries and is_oom_exception(exc):
                                 self._update_hwm()
+                                free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
                                 freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                vmm_trimmed = 0
+                                if self.vmm is not None:
+                                    flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+                                    if callable(flush_fn):
+                                        flush_fn()
+                                    vmm_trimmed = self._release_vmm_overflow_to_driver()
                                 if is_cuda:
                                     gc.collect()
                                     torch.cuda.empty_cache()
-                                if freed > 0:
+                                free_after = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
+                                if freed > 0 or vmm_trimmed > 0 or (free_after - free_before) >= 64 * MIB:
                                     continue
                             raise
 
                     # Drop per-turn CFG branch caches immediately after denoising completes.
                     session.drop_cfg_branches()
+                    if self.vmm is not None and is_cuda and (int(img_shape[0]) >= 1024 or int(img_shape[1]) >= 1024):
+                        self._ensure_cuda_driver_headroom_for_dit(5120 * MIB, exclude_ctx_ids=(ctx_id,))
 
                     # Phase 2: FLUX VAE decode outside `generation_session` (bounded OOM retry reuses `latents`!).
                     for vae_attempt in range(max_dit_oom_retries + 1):
@@ -2158,11 +2281,19 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         except BaseException as exc:
                             if vae_attempt < max_dit_oom_retries and is_oom_exception(exc):
                                 self._update_hwm()
+                                free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
                                 freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                vmm_trimmed = 0
+                                if self.vmm is not None:
+                                    flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+                                    if callable(flush_fn):
+                                        flush_fn()
+                                    vmm_trimmed = self._release_vmm_overflow_to_driver()
                                 if is_cuda:
                                     gc.collect()
                                     torch.cuda.empty_cache()
-                                if freed > 0:
+                                free_after = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
+                                if freed > 0 or vmm_trimmed > 0 or (free_after - free_before) >= 64 * MIB:
                                     continue
                             raise
             finally:

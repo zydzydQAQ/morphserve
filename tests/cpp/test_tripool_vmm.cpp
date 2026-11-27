@@ -713,6 +713,90 @@ void test_oom_exceptions_strict_and_capped() {
     }
 }
 
+void test_lru_multibank_eviction_and_release_free_overflow() {
+    // 1. Multi-bank LRU eviction: evict the least-recently-used unpinned expert bank first.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 32;  // 4 x 8 MiB
+        cfg.fine_kv_pool_mib = 4;
+        cfg.super_handle_mib = 8;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = false;
+        cfg.simulated = true;
+        cfg.materialize_sim_va = true;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const int bank0_dec = vmm->expert_register(2, 8, nullptr, 0);
+        const int bank1_vlm = vmm->expert_register(2, 8, nullptr, 0);
+        MS_EXPECT(bank0_dec == 0 && bank1_vlm == 1);
+
+        // Load VLM (older) first, then Decoder (newer); unpin both.
+        MS_EXPECT(vmm->expert_load_layers_sync(bank1_vlm, 0, 2) == 0);
+        MS_EXPECT(vmm->expert_load_layers_sync(bank0_dec, 0, 2) == 0);
+        MS_EXPECT(vmm->expert_resident_count(bank0_dec) == 2);
+        MS_EXPECT(vmm->expert_resident_count(bank1_vlm) == 2);
+
+        // Transient scratchpad requires 1 super handle -> must evict older VLM (bank 1), NOT Decoder (bank 0).
+        vmm->scope_begin();
+        void* p1 = vmm->transient_alloc(8 * kMiB, nullptr);
+        MS_EXPECT(p1 != nullptr);
+        MS_EXPECT(vmm->expert_resident_count(bank0_dec) == 2);
+        MS_EXPECT(vmm->expert_resident_count(bank1_vlm) == 1);
+
+        // Touch VLM layer 0 so VLM is now MORE recently used than Decoder; next transient evicts Decoder.
+        MS_EXPECT(vmm->expert_wait_layer(bank1_vlm, 0, nullptr) == 0);
+        void* p2 = vmm->transient_alloc(8 * kMiB, nullptr);
+        MS_EXPECT(p2 != nullptr);
+        MS_EXPECT(vmm->expert_resident_count(bank0_dec) == 1);
+        MS_EXPECT(vmm->expert_resident_count(bank1_vlm) == 1);
+
+        vmm->transient_free(p2, 8 * kMiB, nullptr);
+        vmm->transient_free(p1, 8 * kMiB, nullptr);
+        MS_EXPECT(vmm->scope_end(nullptr) == 0);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
+
+    // 2. release_free_overflow_to_driver shrinks idle overflow handles back to initial pool floor.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 8;   // 1 x 8 MiB
+        cfg.fine_kv_pool_mib = 4; // 2 x 2 MiB -> 12 MiB initial pool floor
+        cfg.super_handle_mib = 8;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = true;
+        cfg.max_pool_bytes = 32 * kMiB;
+        cfg.simulated = true;
+        cfg.materialize_sim_va = true;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const uint64_t sid = vmm->kv_session_create();
+        const int32_t rid = vmm->kv_region_alloc(24 * kMiB, sid);
+        MS_EXPECT(vmm->kv_region_ensure(rid, 20 * kMiB, nullptr) != 0);
+
+        UnifiedVmmStatsPod st_peak{};
+        vmm->get_stats(&st_peak);
+        MS_EXPECT(st_peak.pool_total_bytes >= 20 * kMiB);
+        MS_EXPECT(st_peak.overflow_creates > 0);
+
+        // Free KV pages -> overflow handles sit idle in free pool until released.
+        MS_EXPECT(vmm->kv_region_free(rid, nullptr) == 0);
+        const size_t trimmed = vmm->release_free_overflow_to_driver(SIZE_MAX);
+        MS_EXPECT(trimmed >= 8 * kMiB);
+
+        UnifiedVmmStatsPod st_after{};
+        vmm->get_stats(&st_after);
+        MS_EXPECT(st_after.pool_total_bytes == 12 * kMiB);
+        MS_EXPECT(vmm->release_free_overflow_to_driver(SIZE_MAX) == 0);
+
+        vmm->kv_session_destroy(sid);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -723,6 +807,7 @@ int main() {
     test_session_pinned_multi_exclude_and_ensure_expert_headroom();
     test_nested_transient_scopes();
     test_oom_exceptions_strict_and_capped();
+    test_lru_multibank_eviction_and_release_free_overflow();
 
     if (g_failures > 0) {
         std::cerr << "[FAIL] test_tripool_vmm (" << g_failures << " check(s) failed)\n";

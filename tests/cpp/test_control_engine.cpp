@@ -376,8 +376,34 @@ void test_router_seams() {
         1);
     MS_CHECK(
         router_arch.select_initial_gpu(
-            2, "dual_path", "layer_chunk", {}, "ar_only", nullptr, {{0, true}, {1, true}}, {{0, 1}, {1, 0}}, {{0, 0}, {1, 0}}, 2, "tight_mot") ==
+            2, "dual_path", "layer_chunk", {}, "ar_only", nullptr, {{0, true}, {1, true}}, {{0, 1}, {1, 0}}, {{0, 0}, {1, 0}}, 6, "tight_mot") ==
         1);
+
+    // Low-load tight_mot ar_only MUST spread uniformly across idle GPUs despite minor post-VAE alpha dip (0.75 vs 1.0).
+    DualPathMorphRouter router_spread(topo);
+    router_spread.init_workers(
+        4,
+        [](int) { return "hybrid"; },
+        {{0, 0.75}, {1, 1.0}, {2, 1.0}, {3, 1.0}},
+        {{0, 16 * kGiB}, {1, 16 * kGiB}, {2, 16 * kGiB}, {3, 16 * kGiB}});
+    std::map<int, bool> all_idle = {{0, false}, {1, false}, {2, false}, {3, false}};
+    std::set<int> picked_idle;
+    for (int i = 0; i < 4; ++i) {
+        picked_idle.insert(
+            router_spread.select_initial_gpu(4, "dual_path", "layer_chunk", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "tight_mot"));
+    }
+    MS_CHECK(picked_idle.size() == 4);
+
+    // Genuinely KV-heavy GPU (alpha <= 0.50) IS still preferred for ar_only, and bridge_mllm_dit prefers VLM-hot (< 0.50).
+    DualPathMorphRouter router_ivlu(topo);
+    router_ivlu.init_workers(
+        4,
+        [](int) { return "hybrid"; },
+        {{0, 0.0}, {1, 1.0}, {2, 0.0}, {3, 1.0}},
+        {{0, 16 * kGiB}, {1, 16 * kGiB}, {2, 16 * kGiB}, {3, 16 * kGiB}});
+    const int iv_a = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "bridge_mllm_dit");
+    const int iv_b = router_ivlu.select_initial_gpu(4, "dual_path", "non_preemptive", {}, "ar_only", nullptr, all_idle, {}, {}, 6, "bridge_mllm_dit");
+    MS_CHECK((iv_a == 0 && iv_b == 2) || (iv_a == 2 && iv_b == 0));
 }
 
 void test_preempt_edf_controller() {
@@ -985,6 +1011,21 @@ void test_gpu_wait_queue_scheduler() {
     };
     const auto sel_fb = ms_sched.select_and_pop(q_tight, 120.0, 1LL * kGiB);
     MS_CHECK(sel_fb.has_value() && sel_fb->waiter_id == 21);
+
+    // Domino-free Feasible-Slack EDF + SRPT fallback: already-expired heavy 1024^2 waiter MUST NOT
+    // preempt an SLO-feasible 512^2 waiter, and among expired waiters shorter work runs first (SRPT).
+    GpuWaitQueueScheduler dom_sched(GpuQueuePolicy{"memory_slack", 45000.0, 5});
+    std::vector<GpuQueueWaiter> q_dom = {
+        {30, 100.0, 2LL * kGiB, 24000.0, 10000.0, 1, 0},  // already expired (slack = -19000), heavy
+        {31, 110.0, 1LL * kGiB, 5000.0, 12000.0, 1, 0},   // feasible (slack = +2000)
+        {32, 120.0, 1LL * kGiB, 4000.0, 6000.0, 1, 0},    // already expired (slack = -3000), short
+    };
+    const auto d1 = dom_sched.select_and_pop(q_dom, 5000.0, 8LL * kGiB);
+    MS_CHECK(d1.has_value() && d1->waiter_id == 31);
+    const auto d2 = dom_sched.select_and_pop(q_dom, 5000.0, 8LL * kGiB);
+    MS_CHECK(d2.has_value() && d2->waiter_id == 32);
+    const auto d3 = dom_sched.select_and_pop(q_dom, 5000.0, 8LL * kGiB);
+    MS_CHECK(d3.has_value() && d3->waiter_id == 30);
 }
 
 }  // namespace

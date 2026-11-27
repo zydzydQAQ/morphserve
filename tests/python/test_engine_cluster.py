@@ -34,6 +34,7 @@ from morphserve.engine import (
     hamilton_apportion,
     run_multinode_worker_daemon,
 )
+from morphserve.engine.cluster_engine import MemorySlackGpuLock
 from morphserve.models import SyntheticCPTGAdapter
 from morphserve.router import (
     CPTGRequestSpec,
@@ -561,6 +562,7 @@ def test_cluster_engine_multiturn_continuity_run_options_and_canonical_report(tm
         assert rep.completed_sessions == len(suite.sessions)
         assert rep.oom_sessions == 0
         assert rep.error_sessions == 0
+        assert all(isinstance(lk, MemorySlackGpuLock) for lk in engine._gpu_locks)
         # Canonical report schema invariants
         assert rep.joint_slo_goodput_rps == rep.steady_joint_slo_goodput_rps
         assert rep.joint_slo_attainment_pct == rep.steady_joint_slo_attainment_pct
@@ -843,3 +845,70 @@ def test_cluster_simulator_custom_sessions_full_overrides_and_ledger_stats() -> 
     assert sim_rep["total_sessions"] == len(custom)
     assert sim_rep["joint_slo_goodput_rps"] == sim_rep["steady_joint_slo_goodput_rps"]
     assert sim_rep["joint_slo_attainment_pct"] == sim_rep["steady_joint_slo_attainment_pct"]
+
+
+def test_worker_runtime_recv_ready_event_and_normal_dit_requeues_leftover_preempt() -> None:
+    """Verify ALLOC_RECV_BUF -> RECV_NCCL passes `ready_event` and EXEC_DIT never orphans polled AR cmds."""
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=2, model_family="synthetic")
+
+    class _FakeCudaBuf:
+        is_cuda = False
+
+        def __init__(self, n: int) -> None:
+            self.n = n
+
+    seen_ready_events: list[Any] = []
+
+    class _MockMesh:
+        def alloc_recv_u8(self, nbytes: int) -> Any:
+            return bytearray(nbytes)
+
+        def recv_u8(
+            self,
+            nbytes: int,
+            src_rank: int,
+            sync_stream: bool = True,
+            *,
+            out_tensor: Any = None,
+            ready_event: Any = None,
+            cuda_stream: int | None = None,
+        ) -> tuple[Any, float]:
+            seen_ready_events.append((out_tensor, ready_event))
+            return b"x" * nbytes, 0.1
+
+    class _OrphaningAdapter(SyntheticCPTGAdapter):
+        def generate_dit(self, ctx_id: str, cmd: dict[str, Any], poll_preempt_cmds=None, emit_preempt_ack=None):
+            if poll_preempt_cmds is not None:
+                _ = poll_preempt_cmds()  # Polls cmd but intentionally returns without ACKing it!
+            return super().generate_dit(ctx_id, cmd, poll_preempt_cmds=None, emit_preempt_ack=None)
+
+    acks: list[dict[str, Any]] = []
+    adapter = _OrphaningAdapter(rank=0, policy=pol)
+    rt = WorkerRuntime(rank=0, policy=pol, adapter=adapter, peer_mesh=_MockMesh(), ack_sink=acks.append)
+    try:
+        # 1. ALLOC_RECV_BUF -> RECV_NCCL unpacks `(buf, alloc_ev)` and forwards `ready_event` into `recv_u8`.
+        a_ack = rt._dispatch_xfer_cmd({"cmd_id": "a1", "op": "ALLOC_RECV_BUF", "nbytes": 16})
+        assert a_ack is not None and a_ack["status"] == "ok"
+        r_ack = rt._dispatch_xfer_cmd(
+            {
+                "cmd_id": "r1",
+                "op": "RECV_NCCL",
+                "src_rank": 1,
+                "recv_id": a_ack["recv_id"],
+                "meta": {"total_bytes": 16, "logical_bytes": 16},
+            }
+        )
+        assert r_ack is not None and r_ack["status"] == "ok"
+        assert len(seen_ready_events) == 1
+        assert isinstance(seen_ready_events[0][0], bytearray)
+
+        # 2. If `generate_dit` polls a preempted AR command and returns normally without ACKing it,
+        # WorkerRuntime defensively re-enqueues it onto `ar_preempt_q` so coordinator never hangs 600s!
+        rt.handle_command({"cmd_id": "p0", "op": "PREP_DIT", "ctx_id": "c_dit", "prompt": "draw", "height": 512, "width": 512})
+        rt.enqueue_command({"cmd_id": "ar_orphan", "op": "EXEC_AR_PREEMPT", "ctx_id": "c_ar", "prompt": "hi", "max_ar_tokens": 2})
+        dit_ack = rt.handle_command({"cmd_id": "d0", "op": "EXEC_DIT", "ctx_id": "c_dit", "prompt": "draw", "height": 512, "width": 512, "dit_steps": 1})
+        assert dit_ack is not None and dit_ack["status"] == "ok"
+        requeued = rt._poll_preempt_cmds()
+        assert [m["cmd_id"] for m in requeued] == ["ar_orphan"]
+    finally:
+        rt.handle_command({"cmd_id": "sh", "op": "SHUTDOWN"})

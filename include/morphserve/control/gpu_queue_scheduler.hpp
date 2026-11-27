@@ -25,8 +25,8 @@ struct GpuQueueWaiter {
 
 struct GpuQueuePolicy {
     std::string mode = "memory_slack";  // "memory_slack" | "fcfs"
-    double max_wait_aging_ms = 6000.0;  // hard anti-starvation age threshold
-    int max_bypasses = 3;               // max times a waiter may be skipped before promotion
+    double max_wait_aging_ms = 45000.0; // hard anti-starvation age threshold
+    int max_bypasses = 5;               // max times a waiter may be skipped before promotion
 
     nlohmann::json to_json() const;
     static GpuQueuePolicy from_json(const nlohmann::json& j);

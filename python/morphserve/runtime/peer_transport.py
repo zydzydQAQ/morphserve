@@ -164,6 +164,7 @@ class PeerByteTransport:
         sync_stream: bool = True,
         *,
         out_tensor: Any = None,
+        ready_event: Any = None,
         cuda_stream: int | None = None,
     ) -> tuple[Any, float]:
         nb = max(0, int(nbytes))
@@ -279,6 +280,7 @@ class NcclPeerAdapter(PeerByteTransport):
         sync_stream: bool = True,
         *,
         out_tensor: Any = None,
+        ready_event: Any = None,
         cuda_stream: int | None = None,
     ) -> tuple[Any, float]:
         import torch
@@ -294,6 +296,12 @@ class NcclPeerAdapter(PeerByteTransport):
         if nb <= 0:
             return flat, 0.0
         stream_ptr = int(cuda_stream) if cuda_stream is not None else 0
+        # Ensure any prior default-stream kernel that previously owned `flat`'s recycled
+        # CUDACachingAllocator block has completed before `ncclRecv` writes on `transfer_stream_`.
+        if ready_event is not None:
+            ready_event.synchronize()
+        elif stream_ptr == 0 and getattr(flat, "is_cuda", False):
+            torch.cuda.default_stream(self.device).synchronize()
         _, elapsed_ms = self._recv_ptr(
             int(flat.data_ptr()),
             nb,

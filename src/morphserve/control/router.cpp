@@ -504,6 +504,16 @@ int DualPathMorphRouter::select_initial_gpu(
         auto it = active_preemptions.find(g);
         return (it != active_preemptions.end()) ? it->second : 0;
     };
+    auto ar_alpha_tier = [&](int g) -> int {
+        const double alpha = w_map.at(g).expert_alpha;
+        if (architecture == "bridge_mllm_dit") {
+            return (alpha < 0.50) ? 0 : 1;
+        }
+        // On tight_mot (BAGEL), Und is always resident on every GPU; only genuinely KV-heavy
+        // GPUs (alpha <= 0.50) are specialized, while partial post-VAE dips (e.g. 0.75 vs 1.0)
+        // share tier 1 so idle ar_only arrivals spread uniformly via round-robin.
+        return (alpha <= 0.50) ? 0 : 1;
+    };
 
     if ((routing_mode == "twostage_shm" || routing_mode == "static_nccl_fission") && !static_und_ranks.empty()) {
         std::vector<int> cands = static_und_ranks;
@@ -529,8 +539,8 @@ int DualPathMorphRouter::select_initial_gpu(
         }
         if (!idle.empty()) {
             std::sort(idle.begin(), idle.end(), [&](int a, int b) {
-                return std::make_tuple(w_map.at(a).expert_alpha, pos_mod(a - cur, n)) <
-                       std::make_tuple(w_map.at(b).expert_alpha, pos_mod(b - cur, n));
+                return std::make_tuple(ar_alpha_tier(a), pos_mod(a - cur, n)) <
+                       std::make_tuple(ar_alpha_tier(b), pos_mod(b - cur, n));
             });
             const int chosen = idle.front();
             rr_cursor_ = (chosen + 1) % n;
@@ -545,8 +555,8 @@ int DualPathMorphRouter::select_initial_gpu(
             }
             if (!elig.empty()) {
                 std::sort(elig.begin(), elig.end(), [&](int a, int b) {
-                    return std::make_tuple(pre_cnt(a), dit_cnt(a) > 0 ? 1 : 0, w_map.at(a).expert_alpha, pos_mod(a - cur, n)) <
-                           std::make_tuple(pre_cnt(b), dit_cnt(b) > 0 ? 1 : 0, w_map.at(b).expert_alpha, pos_mod(b - cur, n));
+                    return std::make_tuple(pre_cnt(a), dit_cnt(a) > 0 ? 1 : 0, ar_alpha_tier(a), pos_mod(a - cur, n)) <
+                           std::make_tuple(pre_cnt(b), dit_cnt(b) > 0 ? 1 : 0, ar_alpha_tier(b), pos_mod(b - cur, n));
                 });
                 const int chosen = elig.front();
                 rr_cursor_ = (chosen + 1) % n;
@@ -584,8 +594,8 @@ int DualPathMorphRouter::select_initial_gpu(
             }
             if (!elig.empty()) {
                 std::sort(elig.begin(), elig.end(), [&](int a, int b) {
-                    return std::make_tuple(pre_cnt(a), w_map.at(a).queue_wait_ms, pos_mod(a - cur, n)) <
-                           std::make_tuple(pre_cnt(b), w_map.at(b).queue_wait_ms, pos_mod(b - cur, n));
+                    return std::make_tuple(pre_cnt(a), dit_cnt(a) > 0 ? 1 : 0, w_map.at(a).queue_wait_ms, pos_mod(a - cur, n)) <
+                           std::make_tuple(pre_cnt(b), dit_cnt(b) > 0 ? 1 : 0, w_map.at(b).queue_wait_ms, pos_mod(b - cur, n));
                 });
                 const int chosen = elig.front();
                 rr_cursor_ = (chosen + 1) % n;

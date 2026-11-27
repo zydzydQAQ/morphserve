@@ -781,6 +781,18 @@ size_t ms_vmm_coalesce_fine_to_super(ms_vmm_t* h, size_t max_super) {
     MS_CAPI_CATCH_RETURN(0)
 }
 
+size_t ms_vmm_release_free_overflow(ms_vmm_t* h, size_t target_bytes) {
+    clear_err();
+    if (!h || !h->ptr) {
+        set_err_code_msg(MS_ERR_INVALID_ARG, "ms_vmm_release_free_overflow: null handle");
+        return 0;
+    }
+    try {
+        return h->ptr->release_free_overflow_to_driver(target_bytes == 0 ? SIZE_MAX : target_bytes);
+    }
+    MS_CAPI_CATCH_RETURN(0)
+}
+
 int ms_vmm_expert_evict_layer(ms_vmm_t* h, int expert_id, int layer_idx, void* stream) {
     clear_err();
     if (!h || !h->ptr) {
@@ -1716,7 +1728,7 @@ int ms_router_select_initial_gpu(ms_router_t* r, const char* req_json) {
             parse_bool_map(j, "gpu_busy"),
             parse_int_map(j, "active_dit_ranks"),
             parse_int_map(j, "active_preemptions"),
-            j.value("max_preemptions_per_gpu", 2),
+            j.value("max_preemptions_per_gpu", 6),
             j.value("architecture", std::string("tight_mot")));
     }
     MS_CAPI_CATCH_RETURN(-1)

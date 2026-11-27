@@ -134,6 +134,7 @@ class UnifiedPreemptiveScheduler:
         self._run_t0_s: float = 0.0
         self._last_sync_s: float = 0.0
         self._queued_gpu_ms: float = 0.0
+        self._layers_since_sync: int = 0
         self._step0_h2d_streaming: bool = False
         self._layer_calibrated: bool = False
         self._ar_yield_depth: int = 0
@@ -268,6 +269,7 @@ class UnifiedPreemptiveScheduler:
         self.active_ar_tasks.clear()
         self.completed_ar_tasks.clear()
         self._pending_arrivals.clear()
+        self._layers_since_sync = 0
 
     @property
     def interceptor(self) -> BagelExecutionInterceptor:
@@ -278,6 +280,7 @@ class UnifiedPreemptiveScheduler:
         self._run_t0_s = now
         self._last_sync_s = now
         self._queued_gpu_ms = 0.0
+        self._layers_since_sync = 0
         streaming = False
         if self.pager is not None and getattr(self.pager, "vmm", None) is not None:
             res_alpha_fn = getattr(self.pager, "resident_alpha", None)
@@ -543,22 +546,35 @@ class UnifiedPreemptiveScheduler:
             self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
             self._last_sync_s = now_s
             self._queued_gpu_ms = 0.0
+            self._layers_since_sync = 0
             return
 
         cur_ema_layer_ms = self.ema_layer_ms
         eff_layer_ms = max(cur_ema_layer_ms, 24.0) if self._step0_h2d_streaming else cur_ema_layer_ms
         self._queued_gpu_ms += eff_layer_ms
+        self._layers_since_sync += 1
         est_gpu_s = max(time.perf_counter(), self._last_sync_s + self._queued_gpu_ms / 1000.0)
         if self._should_yield_now(est_gpu_s, next_unit_ms=eff_layer_ms):
             _sync_cuda_if_present(dev)
             real_now = time.perf_counter()
+            if (
+                self._layers_since_sync > 0
+                and not self._step0_h2d_streaming
+                and self._last_sync_s > 0.0
+            ):
+                obs_layer_ms = (real_now - self._last_sync_s) * 1000.0 / float(self._layers_since_sync)
+                if 1.0 <= obs_layer_ms <= 250.0:
+                    self._lib.ms_edf_record_layer(ctypes.c_void_p(self._edf_handle), ctypes.c_double(obs_layer_ms))
+                    self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
             self._last_sync_s = real_now
             self._queued_gpu_ms = 0.0
+            self._layers_since_sync = 0
             self.admit_due_arrivals(real_now)
             if self.active_ar_tasks:
                 self.service_due_ar_tasks(force_all_urgent=False)
                 self._last_sync_s = time.perf_counter()
                 self._queued_gpu_ms = 0.0
+                self._layers_since_sync = 0
 
     def on_dit_step_complete(self, step_start_s: float, ar_compute_before_ms: float) -> None:
         """Invoked by `BagelExecutionInterceptor` after each `bagel.forward` denoising step."""
@@ -575,6 +591,7 @@ class UnifiedPreemptiveScheduler:
                 now_s = time.perf_counter()
                 self._last_sync_s = now_s
                 self._queued_gpu_ms = 0.0
+                self._layers_since_sync = 0
                 self._step0_h2d_streaming = False
                 pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
                 self.step_times_ms.append(pure_step_ms)
@@ -582,8 +599,18 @@ class UnifiedPreemptiveScheduler:
 
         _sync_cuda_if_present(dev)
         now_s = time.perf_counter()
+        if (
+            self._layers_since_sync > 0
+            and not self._step0_h2d_streaming
+            and self._last_sync_s > 0.0
+        ):
+            obs_layer_ms = (now_s - self._last_sync_s) * 1000.0 / float(self._layers_since_sync)
+            if 1.0 <= obs_layer_ms <= 250.0:
+                self._lib.ms_edf_record_layer(ctypes.c_void_p(self._edf_handle), ctypes.c_double(obs_layer_ms))
+                self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
         self._last_sync_s = now_s
         self._queued_gpu_ms = 0.0
+        self._layers_since_sync = 0
         self._step0_h2d_streaming = False
         pure_step_ms = (now_s - step_start_s) * 1000.0 - (self.ar_compute_total_ms - ar_compute_before_ms)
         self.step_times_ms.append(pure_step_ms)
@@ -595,10 +622,12 @@ class UnifiedPreemptiveScheduler:
                     self.service_one_step_round()
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0
+                    self._layers_since_sync = 0
                 elif self._should_yield_now(now_s, next_unit_ms=1.6 * self.ema_layer_ms):
                     self.service_due_ar_tasks(force_all_urgent=False)
                     self._last_sync_s = time.perf_counter()
                     self._queued_gpu_ms = 0.0
+                    self._layers_since_sync = 0
 
     @contextmanager
     def run_session(self):
@@ -621,6 +650,7 @@ class PreemptionSession:
         on_complete: Callable[[ArDecodeTask, Any], None] | None = None,
         on_abort: Callable[[Any, BaseException | None], None] | None = None,
         on_abort_deferred: Callable[[dict[str, Any]], None] | None = None,
+        on_abort_cmd: Callable[[dict[str, Any], BaseException | None], None] | None = None,
         on_oom_reclaim: Callable[[list[ArDecodeTask]], int] | None = None,
         is_heavy_cmd: Callable[[dict[str, Any]], bool] | None = None,
         drain_context_factory: Callable[[], Any] | None = None,
@@ -634,6 +664,7 @@ class PreemptionSession:
         self._on_complete = on_complete
         self._on_abort = on_abort
         self._on_abort_deferred = on_abort_deferred
+        self._on_abort_cmd = on_abort_cmd
         self._on_oom_reclaim = on_oom_reclaim
         self._is_heavy_cmd = is_heavy_cmd or (lambda cmd: bool(cmd.get("image_paths") or cmd.get("use_prev_image")))
         self._drain_context_factory = drain_context_factory
@@ -655,6 +686,12 @@ class PreemptionSession:
     def yield_count(self) -> int:
         return int(self.scheduler.yield_count) if self.scheduler is not None else 0
 
+    def _emit_cmd_abort(self, cmd: dict[str, Any], exc: BaseException | None) -> None:
+        if self._on_abort_cmd is not None:
+            self._on_abort_cmd(cmd, exc)
+        elif self._on_abort_deferred is not None:
+            self._on_abort_deferred(cmd)
+
     def _poll_external(self, now_s: float) -> list[ArDecodeTask]:
         if self.scheduler is None or self._admit_cmd is None:
             return []
@@ -669,16 +706,48 @@ class PreemptionSession:
         if not incoming:
             return []
 
-        has_live_ar = bool(self.scheduler.active_ar_tasks)
+        existing_active = list(self.scheduler.active_ar_tasks)
+        has_live_ar = bool(existing_active)
+        tight_active_slack = False
+        if existing_active:
+            min_dl_s = min(t.next_deadline_s() for t in existing_active)
+            earliest_slack_ms = (min_dl_s - now_s) * 1000.0
+            tight_thresh_ms = min(
+                float(self.scheduler.ema_ar_step_ms) + 20.0,
+                0.72 * float(self.scheduler.tpot_slo_ms),
+            )
+            tight_active_slack = earliest_slack_ms < tight_thresh_ms
+
         tasks: list[ArDecodeTask] = []
-        for ar_msg in incoming:
-            # Never stall an active AR stream's TPOT clock with a heavy ViT image prefill;
-            # lightweight text-only prefills immediately join the active `[B, D]` microbatch.
-            if has_live_ar and self._is_heavy_cmd(ar_msg):
+        for idx, ar_msg in enumerate(incoming):
+            # Never stall an active AR stream's TPOT clock with a heavy ViT/swap prefill or
+            # when an already-active AR task is near its next TPOT deadline (defer 1 yield so
+            # the active task hits its token deadline first and resets slack to full TPOT SLO).
+            if has_live_ar and (tight_active_slack or self._is_heavy_cmd(ar_msg)):
                 self._deferred_cmds.append(ar_msg)
                 continue
-            with self.scheduler.ar_yield_guard():
-                task, handle = self._admit_cmd(ar_msg, now_s)
+            try:
+                with self.scheduler.ar_yield_guard():
+                    task, handle = self._admit_cmd(ar_msg, now_s)
+            except BaseException as exc:
+                recovered = False
+                if self._on_oom_reclaim is not None and _is_oom_err(exc):
+                    try:
+                        reclaimed = int(self._on_oom_reclaim(list(self.scheduler.active_ar_tasks)))
+                    except Exception:
+                        reclaimed = 0
+                    if reclaimed > 0:
+                        try:
+                            with self.scheduler.ar_yield_guard():
+                                task, handle = self._admit_cmd(ar_msg, time.perf_counter())
+                            recovered = True
+                        except BaseException as retry_exc:
+                            exc = retry_exc
+                if not recovered:
+                    # Isolate admission failure strictly to this single AR command so the enclosing
+                    # DiT turn and all sibling polled commands (`incoming[idx+1:]`) are never orphaned.
+                    self._emit_cmd_abort(ar_msg, exc)
+                    continue
             self._inflight[id(task)] = handle
             tasks.append(task)
             has_live_ar = True
@@ -721,9 +790,8 @@ class PreemptionSession:
         if self._deferred_cmds:
             deferred = list(self._deferred_cmds)
             self._deferred_cmds.clear()
-            if self._on_abort_deferred is not None:
-                for cmd in deferred:
-                    self._on_abort_deferred(cmd)
+            for cmd in deferred:
+                self._emit_cmd_abort(cmd, exc)
         if self.scheduler is not None:
             self.scheduler.active_ar_tasks.clear()
             self.scheduler.completed_ar_tasks.clear()

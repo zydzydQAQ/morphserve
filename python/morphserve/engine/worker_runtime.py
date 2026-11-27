@@ -36,6 +36,14 @@ def _record_cuda_event_if_tensor(payload: Any) -> Any:
     return None
 
 
+def _record_default_stream_event_if_cuda(payload: Any) -> Any:
+    if getattr(payload, "is_cuda", False):
+        import torch
+
+        return torch.cuda.default_stream(payload.device).record_event()
+    return None
+
+
 def _record_current_stream_if_cuda_tensor(payload: Any) -> None:
     if getattr(payload, "is_cuda", False) and hasattr(payload, "record_stream"):
         import torch
@@ -285,8 +293,9 @@ class WorkerRuntime:
                 nbytes = max(0, int(cmd["nbytes"]))
                 recv_id = f"rbuf_{self.rank}_{cmd_id}"
                 buf = self.peer_mesh.alloc_recv_u8(nbytes) if hasattr(self.peer_mesh, "alloc_recv_u8") else bytearray(nbytes)
+                alloc_ev = _record_default_stream_event_if_cuda(buf)
                 with self._xfer_store_lock:
-                    self._recv_store[recv_id] = buf
+                    self._recv_store[recv_id] = (buf, alloc_ev)
                 return self._emit_ack(
                     {
                         "cmd_id": cmd_id,
@@ -341,11 +350,16 @@ class WorkerRuntime:
                 wire_bytes = int(meta["total_bytes"])
                 rid_s = str(recv_id)
                 with self._xfer_store_lock:
-                    pre_buf = self._recv_store.pop(rid_s, None)
+                    entry = self._recv_store.pop(rid_s, None)
+                if isinstance(entry, tuple) and len(entry) == 2:
+                    pre_buf, alloc_ev = entry
+                else:
+                    pre_buf, alloc_ev = entry, None
                 raw, ship_ms = self.peer_mesh.recv_u8(
                     wire_bytes,
                     src_rank=int(cmd["src_rank"]),
                     out_tensor=pre_buf,
+                    ready_event=alloc_ev,
                 )
                 with self._xfer_store_lock:
                     self._recv_store[rid_s] = raw
@@ -459,6 +473,10 @@ class WorkerRuntime:
                         )
                     pending_inflight.clear()
                     raise
+                if pending_inflight:
+                    for leftover in pending_inflight:
+                        self.ar_preempt_q.put(leftover)
+                    pending_inflight.clear()
                 if cmd.get("release_after_dit", False):
                     self.adapter.release_context(cid)
                 return self._emit_ack(

@@ -14,9 +14,9 @@ from morphserve.router import (
     DualPathMorphRouter,
     WorkerState,
 )
-from morphserve.sim.cluster_sim import (
-    ClusterPhysicsProfile,
+from morphserve.sim.cluster_simulator import (
     HardwareInterconnectSpec,
+    MeasuredPhysicsProfile,
     WorkloadScaleSpec,
     simulate_cluster_point,
 )
@@ -183,7 +183,7 @@ def test_memory_slack_gpu_lock_reorders_and_bounds_starvation():
 
 
 def test_simulator_metrics_and_cluster_report_schema_parity():
-    ph = ClusterPhysicsProfile()
+    ph = MeasuredPhysicsProfile()
     hw = HardwareInterconnectSpec.presets(ph)[0]
     ws = WorkloadScaleSpec.bagel_7b_standard()
     raw = simulate_cluster_point(
@@ -193,8 +193,8 @@ def test_simulator_metrics_and_cluster_report_schema_parity():
         offered_qps=0.6,
         num_sessions=32,
         seed=2026,
-        ph=ph,
-        ws=ws,
+        physics=ph,
+        workload_scale=ws,
         policy_overrides={"steady_window_mode": "session_trim", "steady_state_trim_frac": 0.1},
     )
     rep = ClusterRunReport.from_dict(raw)

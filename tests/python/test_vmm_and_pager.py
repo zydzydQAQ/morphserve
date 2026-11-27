@@ -464,9 +464,6 @@ def test_numa_memfd_mirror_cross_fd_shared_mapping() -> None:
 
 
 def test_expert_pager_restore_free_super_layers_async_bounded_by_free_handles() -> None:
-    from types import SimpleNamespace
-    from morphserve.vmm.pager import ExpertPager, ExpertPartitionSpec
-
     prefetch_calls: list[tuple[int, int, int]] = []
 
     class _FakeVmm:
@@ -486,15 +483,13 @@ def test_expert_pager_restore_free_super_layers_async_bounded_by_free_handles() 
             return max(0, end - start)
 
     spec = ExpertPartitionSpec(
-        model_family="bagel",
-        role="generation",
-        num_layers=28,
+        name="bagel_test",
+        plans=[LayerPackPlan(layer_idx=i, used_bytes=512 * MIB, params=[]) for i in range(28)],
         layer_stride_bytes=512 * MIB,
-        layer_params=[[] for _ in range(28)],
         hook_modules=[],
         vae_module=None,
     )
-    pager = ExpertPager(spec)
+    pager = LayerExpertPager(spec)
     pager.expert_id = 0
 
     # 1. Partial eviction (20/28 resident) with 18 free super handles (18*64MiB = 1152MiB -> 2 layers @ 512MiB).

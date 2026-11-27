@@ -153,6 +153,20 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(std::abs(p_ms.steady_window_s - 150.0) < 1e-9);
     MS_CHECK(std::abs(p_ms.cooldown_s - 30.0) < 1e-9);
 
+    // InternVL-U Regime A enables step-level preemption (VLM + Decoder both resident);
+    // quota-capped Regime B stays non-preemptive because VLM & Decoder are co-paged.
+    const PolicyConfig p_ivlu_a = PolicyConfig::from_preset("morphserve", 8, {{"model_family", "internvl_u"}});
+    const PolicyConfig p_ivlu_b_q = PolicyConfig::from_preset(
+        "morphserve", 8, {{"model_family", "internvl_u"}, {"gpu_memory_quota_mib", 12288.0}});
+    const PolicyConfig p_ivlu_b_f = PolicyConfig::from_preset(
+        "morphserve", 8, {{"model_family", "internvl_u"}, {"gpu_memory_fraction", 0.30}});
+    MS_CHECK(p_ivlu_a.preemption_mode == "step_preemptive");
+    MS_CHECK(p_ivlu_a.allow_vmm_overflow == true);
+    MS_CHECK(p_ivlu_b_q.preemption_mode == "non_preemptive");
+    MS_CHECK(p_ivlu_b_q.allow_vmm_overflow == false);
+    MS_CHECK(p_ivlu_b_f.preemption_mode == "non_preemptive");
+    MS_CHECK(p_ivlu_b_f.allow_vmm_overflow == false);
+
     // Full override coverage + JSON round-trip.
     const PolicyConfig custom = PolicyConfig::from_preset(
         "morphserve",

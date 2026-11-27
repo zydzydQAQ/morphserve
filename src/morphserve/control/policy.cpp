@@ -427,7 +427,8 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_naive_offload = false;
         cfg.kv_vmm_only = false;
         cfg.use_idle_kv_swap = true;
-        cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "layer_chunk";
+        cfg.preemption_mode =
+            (fam == "internvl_u") ? (is_ivlu_capped ? "non_preemptive" : "step_preemptive") : "layer_chunk";
         cfg.cost_model_mode = "atlas_3d";
         cfg.gpu_queue_mode = "memory_slack";
         cfg.kv_eviction_mode = "swap";

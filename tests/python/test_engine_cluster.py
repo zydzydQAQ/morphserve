@@ -993,3 +993,71 @@ def test_cluster_engine_mid_dit_preemption_gate_for_internvlu_regimes() -> None:
     assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_ivlu_b_quota) is False
     assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_ivlu_b_frac) is False
     assert MorphServeClusterEngine._supports_mid_dit_preemption(pol_nonpre) is False
+
+
+def test_nccl_transfer_guard_reclaims_dst_headroom_after_probe_oom(tmp_path: Path) -> None:
+    """When `ALLOC_RECV_BUF(probe_only=True)` OOMs, `_nccl_transfer_guard` locks dst, runs `RECLAIM_HEADROOM`, and succeeds."""
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=2)
+    eng = MorphServeClusterEngine(
+        policy=pol,
+        model_dir=tmp_path,
+        bench_root=tmp_path,
+        tmp_root=tmp_path / "tmp_nccl_reclaim",
+        fleet_factory=_make_fake_fleet,
+    )
+    ops_on_dst: list[tuple[str, bool]] = []
+    reclaimed = {"done": False}
+    orig_rpc = eng._rpc
+
+    async def _intercept_rpc(rank: int, payload: dict[str, Any]) -> dict[str, Any]:
+        op = str(payload.get("op", ""))
+        if rank == 1:
+            ops_on_dst.append((op, eng._gpu_locks[1].locked()))
+            if op == "ALLOC_RECV_BUF" and payload.get("probe_only", False) and not reclaimed["done"]:
+                return {"status": "oom", "probe_only": True, "error": "injected probe oom"}
+            if op == "RECLAIM_HEADROOM":
+                assert eng._gpu_locks[1].locked() is True
+                reclaimed["done"] = True
+        return await orig_rpc(rank, payload)
+
+    eng._rpc = _intercept_rpc  # type: ignore[method-assign]
+
+    async def _run() -> dict[str, Any]:
+        eng._ensure_async_primitives()
+        # Seed a context on rank 0 so PACK_CTX has state to ship.
+        await orig_rpc(
+            0,
+            {
+                "op": "EXEC_AR",
+                "ctx_id": "ctx_reclaim",
+                "prompt": "seed context",
+                "image_paths": [],
+                "use_prev_image": False,
+                "max_ar_tokens": 2,
+                "prepare_for_dit": False,
+            },
+        )
+        async with eng._nccl_transfer_guard(
+            0,
+            1,
+            "ctx_reclaim",
+            "ctx_reclaim_dst",
+            include_cfg_dup=False,
+            release_src_ctx=True,
+        ) as ship:
+            assert eng._gpu_locks[1].locked() is True
+            return dict(ship)
+
+    try:
+        ship_res = asyncio.run(_run())
+    finally:
+        eng.shutdown()
+
+    assert ship_res.get("status") == "ok"
+    assert reclaimed["done"] is True
+    dst_op_names = [op for op, _ in ops_on_dst]
+    assert "RECLAIM_HEADROOM" in dst_op_names
+    idx_reclaim = dst_op_names.index("RECLAIM_HEADROOM")
+    assert dst_op_names[idx_reclaim - 1] == "ALLOC_RECV_BUF"
+    assert dst_op_names[idx_reclaim + 1] == "ALLOC_RECV_BUF"
+    assert ops_on_dst[idx_reclaim][1] is True

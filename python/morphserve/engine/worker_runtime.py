@@ -488,6 +488,22 @@ class WorkerRuntime:
                     }
                 )
 
+            if op == "RECLAIM_HEADROOM":
+                needed_b = max(0, int(cmd.get("needed_bytes", 0)))
+                reclaimed_b = 0
+                reclaim_fn = getattr(self.adapter, "reclaim_driver_headroom", None)
+                if callable(reclaim_fn):
+                    reclaimed_b = int(reclaim_fn(needed_b))
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "reclaimed_bytes": reclaimed_b,
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
             if op == "PACK_CTX":
                 cid = str(cmd["ctx_id"])
                 packed = self.adapter.pack_state(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))

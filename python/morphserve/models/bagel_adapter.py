@@ -1132,6 +1132,38 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             torch.cuda.empty_cache()
         return trimmed
 
+    def reclaim_driver_headroom(
+        self,
+        needed_bytes: int,
+        exclude_ctx_ids: Iterable[str] = (),
+    ) -> int:
+        """Reclaim CUDA driver + PyTorch caching allocator headroom for large NCCL staging buffers."""
+        import torch
+
+        needed = max(0, int(needed_bytes))
+        if needed <= 0 or not (torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"):
+            return 0
+        reclaimed = 0
+        if self.vmm is not None:
+            reclaimed += self._ensure_cuda_driver_headroom_for_dit(needed, exclude_ctx_ids=exclude_ctx_ids)
+        elif self._auto_idle_kv_swap_enabled():
+            free_drv, _ = torch.cuda.mem_get_info(self.device)
+            unused_pt = max(
+                0,
+                int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+            )
+            if int(free_drv) + unused_pt < needed:
+                deficit = needed - (int(free_drv) + unused_pt)
+                target_avail = max(needed, self.available_kv_bytes(for_dit=False) + deficit)
+                reclaimed += self.evict_idle_kv_to_host(
+                    target_avail, exclude_ctx_ids=exclude_ctx_ids, for_dit=False
+                )
+        free_drv, _ = torch.cuda.mem_get_info(self.device)
+        if int(free_drv) < needed:
+            self._update_hwm()
+            torch.cuda.empty_cache()
+        return reclaimed
+
     def _ensure_ctx_resident(self, ctx_id: str, extra_needed_bytes: int = 0) -> BagelSessionContext:
         session = self._ctx_store[ctx_id]
         allow_auto_swap = self._auto_idle_kv_swap_enabled()
@@ -1207,7 +1239,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 5376) * MIB
+                    headroom_b = (nccl_reserve_mib + 5120) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -2411,7 +2443,14 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
     def pack_state(self, ctx_id: str, include_cfg_dup: bool = False) -> PackedTransferState:
         with self._pinned_ctx(ctx_id):
             session = self._ensure_ctx_resident(ctx_id)
-            return pack_bagel_multi_context(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
+            try:
+                return pack_bagel_multi_context(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
+            except BaseException as exc:
+                if is_oom_exception(exc):
+                    est_need = max(1024 * MIB, int(session.logical_bytes()) + 512 * MIB)
+                    self.reclaim_driver_headroom(est_need, exclude_ctx_ids=(ctx_id,))
+                    return pack_bagel_multi_context(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
+                raise
 
     def unpack_state(self, new_ctx_id: str, meta: dict[str, Any], raw_payload: Any) -> int:
         self.release_context(new_ctx_id)

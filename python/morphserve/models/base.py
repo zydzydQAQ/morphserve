@@ -213,6 +213,14 @@ class CPTGModelAdapter(ABC):
         """Swap unpinned idle think-time sessions' KV to Host Pinned DRAM until `available_kv_bytes >= target`."""
         return 0
 
+    def reclaim_driver_headroom(
+        self,
+        needed_bytes: int,
+        exclude_ctx_ids: Iterable[str] = (),
+    ) -> int:
+        """Reclaim CUDA driver / PyTorch allocator headroom (e.g., before large NCCL staging buffers)."""
+        return 0
+
     @abstractmethod
     def release_context(self, ctx_id: str) -> None:
         """Release all worker state and VMM KV regions associated with `ctx_id`."""

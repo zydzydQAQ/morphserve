@@ -1036,7 +1036,7 @@ class MorphServeClusterEngine:
         try:
             alloc_res = await self._rpc(dst_gpu, {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": True})
             if alloc_res.get("status") != "ok":
-                if self._gpu_locks[dst_gpu].locked() or self._active_dit_ranks.get(dst_gpu, 0) > 0:
+                if not holding_dst_lock:
                     t_dq0 = time.perf_counter()
                     await self._acquire_exclusive_gpu(
                         dst_gpu,
@@ -1047,6 +1047,12 @@ class MorphServeClusterEngine:
                     )
                     t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
                     holding_dst_lock = True
+                # Exclusively own `dst_gpu` now: reclaim idle KV + trim VMM overflow + defragment
+                # PyTorch caching allocator so the contiguous NCCL recv buffer succeeds without OOM.
+                await self._rpc(
+                    dst_gpu,
+                    {"op": "RECLAIM_HEADROOM", "needed_bytes": int(wire_bytes) + 512 * MIB},
+                )
                 alloc_res = await self._rpc(
                     dst_gpu,
                     {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": False},

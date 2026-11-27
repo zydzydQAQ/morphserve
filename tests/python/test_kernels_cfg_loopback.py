@@ -362,3 +362,84 @@ def test_gpu_loopback_bicubic_vae_norm_and_context_update_parity() -> None:
     assert updated["past_key_values"]["vit_tokens"] == expected_vit_toks
     assert updated["kv_lens"] == [10 + (expected_vae_toks + 2) + (expected_vit_toks + 2)]
     assert updated["ropes"] == [3]
+
+
+def test_lse_merge_transposed_noncontiguous_and_packed_varlen_dispatch() -> None:
+    torch = pytest.importorskip("torch")
+    from morphserve.kernels.cfg_prefix_attn import (
+        _merge_two_lse_states,
+        _run_packed_varlen_noncausal_cfg,
+        _supports_packed_varlen_attn,
+    )
+
+    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    torch.manual_seed(77)
+    m_tot, h_q, d = 32, 8, 64
+    o_a = torch.randn((m_tot, h_q, d), device=device, dtype=dtype)
+    o_b = torch.randn((m_tot, h_q, d), device=device, dtype=dtype)
+    lse_a_mh = torch.randn((m_tot, h_q), device=device, dtype=torch.float32)
+    lse_b_mh = torch.randn((m_tot, h_q), device=device, dtype=torch.float32)
+
+    # Non-contiguous sliced (H_q, M) layout matching FA2 varlen Stage-2 LSE output.
+    lse_a_hm = lse_a_mh.transpose(0, 1).contiguous()
+    lse_b_wide = torch.randn((h_q, m_tot + 16), device=device, dtype=torch.float32)
+    lse_b_wide[:, :m_tot] = lse_b_mh.transpose(0, 1)
+    lse_b_hm_slice = lse_b_wide[:, :m_tot]
+    assert not lse_b_hm_slice.is_contiguous()
+
+    ln2 = 0.6931471805599453
+    ref = _merge_two_lse_states(o_a, lse_a_mh * ln2, o_b, lse_b_mh * ln2)
+    got_out = o_b.clone()
+    got = _merge_two_lse_states(
+        o_a,
+        lse_a_hm,
+        o_b,
+        lse_b_hm_slice,
+        out=got_out,
+        lse_transposed=True,
+        lse_scale=ln2,
+    )
+    assert got.data_ptr() == got_out.data_ptr()
+    atol = 1e-2 if dtype == torch.bfloat16 else 1e-5
+    assert torch.allclose(got.float(), ref.float(), atol=atol, rtol=1e-4)
+
+    # `_supports_packed_varlen_attn` rejects plain callables and accepts vLLM-Omni-style packed impls.
+    assert _supports_packed_varlen_attn(None) is False
+    assert _supports_packed_varlen_attn(lambda *a, **kw: None) is False
+
+    seen_meta: dict[str, Any] = {}
+
+    class _FakePackedAttn:
+        def __init__(self) -> None:
+            self.attention = SimpleNamespace(_forward_varlen_packed=lambda *a, **kw: None)
+
+        def __call__(self, q: Any, k: Any, v: Any, meta: Any) -> Any:
+            seen_meta["q_shape"] = tuple(q.shape)
+            seen_meta["k_shape"] = tuple(k.shape)
+            seen_meta["extra"] = dict(meta.extra)
+            return q * 2.0
+
+    fake_attn = _FakePackedAttn()
+    assert _supports_packed_varlen_attn(fake_attn) is True
+
+    q_list = [torch.randn((4, 8, 64), device=device, dtype=dtype) for _ in range(3)]
+    k_loc = [torch.randn((4, 4, 64), device=device, dtype=dtype) for _ in range(3)]
+    v_loc = [torch.randn((4, 4, 64), device=device, dtype=dtype) for _ in range(3)]
+    k_pre = torch.randn((10, 4, 64), device=device, dtype=dtype)
+    v_pre = torch.randn((10, 4, 64), device=device, dtype=dtype)
+    k_suf = [torch.randn((2, 4, 64), device=device, dtype=dtype), None, torch.randn((3, 4, 64), device=device, dtype=dtype)]
+    v_suf = [torch.randn((2, 4, 64), device=device, dtype=dtype), None, torch.randn((3, 4, 64), device=device, dtype=dtype)]
+    outs = _run_packed_varlen_noncausal_cfg(
+        q_list, k_loc, v_loc, k_pre, v_pre, [0, 1], k_suf, v_suf, fake_attn
+    )
+    if outs is not None:
+        assert len(outs) == 3
+        assert seen_meta["q_shape"] == (1, 12, 8, 64)
+        assert seen_meta["k_shape"] == (1, (10 + 2 + 4) + (10 + 4) + (3 + 4), 4, 64)
+        assert seen_meta["extra"]["cu_seqlens_q"].tolist() == [0, 4, 8, 12]
+        assert seen_meta["extra"]["cu_seqlens_k"].tolist() == [0, 16, 30, 37]
+        assert seen_meta["extra"]["max_seqlen_q"] == 4
+        assert seen_meta["extra"]["max_seqlen_k"] == 16
+        for b in range(3):
+            assert torch.allclose(outs[b], q_list[b] * 2.0)

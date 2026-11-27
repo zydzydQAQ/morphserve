@@ -37,18 +37,27 @@ if HAS_TRITON:
         sob_d,
         sout_r,
         sout_d,
+        sla_m,
+        sla_h,
+        slb_m,
+        slb_h,
+        scale_a,
+        scale_b,
         N_ROWS,
+        H_Q: tl.constexpr,
         BLOCK_R: tl.constexpr,
         HEAD_DIM: tl.constexpr,
     ):
-        """Fused exact online-softmax LSE merge for FlashPrefix-CFG (zero autotune stall)."""
+        """Fused exact online-softmax LSE merge for FlashPrefix-CFG (zero transpose, zero autotune stall)."""
         pid_r = tl.program_id(0)
         offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
         offs_d = tl.arange(0, HEAD_DIM)
         mask_r = offs_r < N_ROWS
 
-        la = tl.load(Lse_a + offs_r, mask=mask_r, other=-1.0e20)
-        lb = tl.load(Lse_b + offs_r, mask=mask_r, other=-1.0e20)
+        offs_m = offs_r // H_Q
+        offs_h = offs_r - offs_m * H_Q
+        la = tl.load(Lse_a + offs_m * sla_m + offs_h * sla_h, mask=mask_r, other=-1.0e20).to(tl.float32) * scale_a
+        lb = tl.load(Lse_b + offs_m * slb_m + offs_h * slb_h, mask=mask_r, other=-1.0e20).to(tl.float32) * scale_b
         m = tl.maximum(tl.maximum(la, lb), -1.0e30)
         wa = tl.exp(la - m)
         wb = tl.exp(lb - m)
@@ -196,18 +205,35 @@ def get_fa2_backend_status() -> dict[str, Any]:
     }
 
 
-def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any | None = None) -> Any:
-    """Exact log-sum-exp online-softmax merge for `[M, H_q, D]` outputs and `[M, H_q]` ln-LSEs."""
+def _merge_two_lse_states(
+    o_a: Any,
+    lse_a: Any,
+    o_b: Any,
+    lse_b: Any,
+    out: Any | None = None,
+    *,
+    lse_transposed: bool = False,
+    lse_scale: float = 1.0,
+) -> Any:
+    """Exact log-sum-exp online-softmax merge for `[M, H_q, D]` outputs and `[M, H_q]` or `[H_q, M]` LSEs."""
     import torch
 
     m_tot, h_q, d = o_a.shape
     n_rows = m_tot * h_q
     oa_2d = o_a.reshape(n_rows, d).contiguous()
     ob_2d = o_b.reshape(n_rows, d).contiguous()
-    la_1d = lse_a.reshape(n_rows).contiguous()
-    lb_1d = lse_b.reshape(n_rows).contiguous()
+    if lse_a.ndim == 3 and lse_a.shape[0] == 1:
+        lse_a = lse_a.squeeze(0)
+    if lse_b.ndim == 3 and lse_b.shape[0] == 1:
+        lse_b = lse_b.squeeze(0)
 
-    if HAS_TRITON and oa_2d.is_cuda and d in (64, 128):
+    if HAS_TRITON and oa_2d.is_cuda and d in (64, 128) and lse_a.ndim == 2 and lse_b.ndim == 2:
+        if lse_transposed:
+            sla_m, sla_h = int(lse_a.stride(1)), int(lse_a.stride(0))
+            slb_m, slb_h = int(lse_b.stride(1)), int(lse_b.stride(0))
+        else:
+            sla_m, sla_h = int(lse_a.stride(0)), int(lse_a.stride(1))
+            slb_m, slb_h = int(lse_b.stride(0)), int(lse_b.stride(1))
         can_write_out_direct = (
             out is not None
             and out.shape == (m_tot, h_q, d)
@@ -220,9 +246,9 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any |
         grid = (triton.cdiv(n_rows, block_r),)
         _merge_two_lse_fwd[grid](
             oa_2d,
-            la_1d,
+            lse_a,
             ob_2d,
-            lb_1d,
+            lse_b,
             out_2d,
             oa_2d.stride(0),
             oa_2d.stride(1),
@@ -230,7 +256,14 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any |
             ob_2d.stride(1),
             out_2d.stride(0),
             out_2d.stride(1),
+            sla_m,
+            sla_h,
+            slb_m,
+            slb_h,
+            float(lse_scale),
+            float(lse_scale),
             n_rows,
+            H_Q=h_q,
             BLOCK_R=block_r,
             HEAD_DIM=d,
             num_warps=4,
@@ -241,9 +274,11 @@ def _merge_two_lse_states(o_a: Any, lse_a: Any, o_b: Any, lse_b: Any, out: Any |
             return out
         return res_3d
 
-    m = torch.clamp_min(torch.maximum(lse_a, lse_b), -1.0e30)
-    wa = torch.exp(lse_a - m)
-    wb = torch.exp(lse_b - m)
+    la_n = _normalize_lse_shape(lse_a, m_tot, h_q, lse_scale, lse_transposed=lse_transposed)
+    lb_n = _normalize_lse_shape(lse_b, m_tot, h_q, lse_scale, lse_transposed=lse_transposed)
+    m = torch.clamp_min(torch.maximum(la_n, lb_n), -1.0e30)
+    wa = torch.exp(la_n - m)
+    wb = torch.exp(lb_n - m)
     inv = 1.0 / (wa + wb)
     merged = (o_a.float() * (wa * inv).unsqueeze(-1) + o_b.float() * (wb * inv).unsqueeze(-1)).to(o_a.dtype)
     if out is not None:
@@ -297,14 +332,15 @@ def _probe_fa2_backend(device: Any, dtype: Any, h_q: int, h_kv: int, head_dim: i
     lse_ref_ln = torch.logsumexp(scores, dim=-1).transpose(0, 1).contiguous()
     out_ref = torch.einsum("hqk,khd->qhd", F.softmax(scores, dim=-1), vf).contiguous()
 
-    for mod_name in ("flash_attn", "vllm.vllm_flash_attn"):
+    for mod_name in ("vllm_omni.diffusion.attention.backends.utils.fa", "flash_attn", "vllm.vllm_flash_attn"):
         try:
             mod = __import__(mod_name, fromlist=["flash_attn_varlen_func"])
             fn = getattr(mod, "flash_attn_varlen_func", None)
             if fn is None:
                 continue
             sig = inspect.signature(fn).parameters
-            if "return_softmax_lse" not in sig:
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.values())
+            if "return_softmax_lse" not in sig and not has_var_kw:
                 _FA2_BACKEND_ERRORS.append(f"{mod_name}: no return_softmax_lse in signature {list(sig)}")
                 continue
             cu_q = torch.tensor([0, m_test], dtype=torch.int32, device=device)
@@ -373,6 +409,7 @@ def _run_varlen_fa2_with_lse(
     sm_scale: float,
     *,
     cu_seqlens_cache: dict[tuple[str, tuple[int, ...]], Any] | None = None,
+    raw_lse: bool = False,
 ) -> tuple[Any, Any]:
     import torch
 
@@ -395,10 +432,14 @@ def _run_varlen_fa2_with_lse(
             causal=False,
             return_softmax_lse=True,
         )
+        if raw_lse:
+            return out, lse
         return out, _normalize_lse_shape(lse, total_q, h_q, lse_scale, lse_transposed=lse_transposed)
 
     if len(q_lens) == 1:
         out, lse = fn(q_cat, k_cat, v_cat, causal=False, sm_scale=sm_scale, return_lse=True)
+        if raw_lse:
+            return out, lse
         return out, _normalize_lse_shape(lse, total_q, h_q, lse_scale, lse_transposed=lse_transposed)
 
     outs, lses = [], []
@@ -433,7 +474,7 @@ def _run_flash_prefix_cfg(
     *,
     cu_seqlens_cache: dict[tuple[str, tuple[int, ...]], Any] | None = None,
 ) -> list[Any] | None:
-    """FlashPrefix-CFG: Single-read FA2 on shared prefix + compact varlen tail + fused Triton LSE merge."""
+    """FlashPrefix-CFG: Single-read FA2 on shared prefix + compact varlen tail + fused zero-transpose Triton LSE merge."""
     q_len, h_q, head_dim = q_list[0].shape
     h_kv = k_loc_list[0].shape[1]
     backend = _probe_fa2_backend(q_list[0].device, q_list[0].dtype, h_q, h_kv, head_dim)
@@ -441,6 +482,8 @@ def _run_flash_prefix_cfg(
         return None
     import torch
 
+    kind, lse_scale, _, lse_transposed = backend
+    use_raw_lse = kind == "vllm_varlen"
     num_branches = len(q_list)
     b_sh = list(shared_branch_ids)
     shared_set = set(b_sh)
@@ -449,11 +492,12 @@ def _run_flash_prefix_cfg(
     n_sh_rows = len(b_sh) * q_len
 
     # Allocate packed Q once; shared-prefix pass slices a zero-copy view `q_all[:n_sh_rows]`.
-    q_all = torch.cat([q_list[b] for b in ordered_ids], dim=0).contiguous()
+    q_all = torch.cat([q_list[b] for b in ordered_ids], dim=0)
     q_shared_cat = q_all[:n_sh_rows]
 
     # Stage 1: Single HBM read of (k_prefix, v_prefix) for all shared branches packed along Q.
-    kp, vp = k_prefix.contiguous(), v_prefix.contiguous()
+    kp = k_prefix if k_prefix.is_contiguous() else k_prefix.contiguous()
+    vp = v_prefix if v_prefix.is_contiguous() else v_prefix.contiguous()
     o_pre_cat, lse_pre_cat = _run_varlen_fa2_with_lse(
         backend,
         q_shared_cat,
@@ -463,22 +507,24 @@ def _run_flash_prefix_cfg(
         [int(kp.shape[0])],
         sm_scale,
         cu_seqlens_cache=cu_seqlens_cache,
+        raw_lse=use_raw_lse,
     )
 
-    # Stage 2: Compact batched unpadded tail pass for all shared + unshared branches.
-    tail_ks, tail_vs, tail_lens = [], [], []
+    # Stage 2: Compact batched unpadded tail pass for all shared + unshared branches (flat single cat).
+    tail_k_parts, tail_v_parts, tail_lens = [], [], []
     for b in ordered_ids:
         ks, vs = k_suffix_list[b], v_suffix_list[b]
-        if ks is not None and ks.shape[0] > 0:
-            kb = torch.cat([ks, k_loc_list[b]], dim=0)
-            vb = torch.cat([vs, v_loc_list[b]], dim=0)
-        else:
-            kb, vb = k_loc_list[b], v_loc_list[b]
-        tail_ks.append(kb)
-        tail_vs.append(vb)
-        tail_lens.append(int(kb.shape[0]))
-    k_tail_cat = torch.cat(tail_ks, dim=0).contiguous()
-    v_tail_cat = torch.cat(tail_vs, dim=0).contiguous()
+        kl, vl = k_loc_list[b], v_loc_list[b]
+        ln = int(kl.shape[0])
+        if ks is not None and vs is not None and ks.shape[0] > 0:
+            tail_k_parts.append(ks)
+            tail_v_parts.append(vs)
+            ln += int(ks.shape[0])
+        tail_k_parts.append(kl)
+        tail_v_parts.append(vl)
+        tail_lens.append(ln)
+    k_tail_cat = torch.cat(tail_k_parts, dim=0)
+    v_tail_cat = torch.cat(tail_v_parts, dim=0)
     o_tail_all, lse_tail_all = _run_varlen_fa2_with_lse(
         backend,
         q_all,
@@ -488,12 +534,31 @@ def _run_flash_prefix_cfg(
         tail_lens,
         sm_scale,
         cu_seqlens_cache=cu_seqlens_cache,
+        raw_lse=use_raw_lse,
     )
 
     # Stage 3: In-place exact FP32 online-softmax LSE merge directly into `o_tail_all[:n_sh_rows]`.
     o_tail_sh = o_tail_all[:n_sh_rows]
+    if use_raw_lse and lse_transposed:
+        lse_tail_sh = lse_tail_all[..., :n_sh_rows]
+        eff_transposed = True
+        eff_scale = lse_scale
+    elif use_raw_lse:
+        lse_tail_sh = lse_tail_all[:n_sh_rows]
+        eff_transposed = False
+        eff_scale = lse_scale
+    else:
+        lse_tail_sh = lse_tail_all[:n_sh_rows]
+        eff_transposed = False
+        eff_scale = 1.0
     o_merged = _merge_two_lse_states(
-        o_pre_cat, lse_pre_cat, o_tail_sh, lse_tail_all[:n_sh_rows], out=o_tail_sh
+        o_pre_cat,
+        lse_pre_cat,
+        o_tail_sh,
+        lse_tail_sh,
+        out=o_tail_sh,
+        lse_transposed=eff_transposed,
+        lse_scale=eff_scale,
     )
     outputs: list[Any] = [None] * num_branches
     for idx_b, b in enumerate(b_sh):
@@ -545,6 +610,85 @@ def _get_cached_left_pad_meta(
     if meta is not None and cache is not None and len(cache) < 256:
         cache[key] = meta
     return meta
+
+
+def _supports_packed_varlen_attn(attn_noncausal: Any) -> bool:
+    """Return True if `attn_noncausal` exposes vLLM-Omni's packed-varlen FlashAttention path."""
+    if attn_noncausal is None:
+        return False
+    impl = getattr(attn_noncausal, "attention", None)
+    return callable(getattr(impl, "_forward_varlen_packed", None))
+
+
+def _run_packed_varlen_noncausal_cfg(
+    q_list: list[Any],
+    k_loc_list: list[Any],
+    v_loc_list: list[Any],
+    k_prefix: Any | None,
+    v_prefix: Any | None,
+    shared_branch_ids: list[int],
+    k_suffix_list: list[Any | None],
+    v_suffix_list: list[Any | None],
+    attn_noncausal: Any,
+    *,
+    cu_seqlens_cache: dict[tuple[str, tuple[int, ...]], Any] | None = None,
+) -> list[Any] | None:
+    """Zero-padding packed varlen dispatch through `attn_noncausal`'s native `_forward_varlen_packed`.
+
+    Invokes the exact same `flash_attn_varlen_func` kernel and `(cu_seqlens_q, cu_seqlens_k)`
+    as stock `_forward_varlen_masked`, preserving 100% bit-exact parity while eliminating
+    left-padding, mask allocation, and `_unpad_input`/`_index_first_axis` copies.
+    """
+    if not _supports_packed_varlen_attn(attn_noncausal):
+        return None
+    try:
+        from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata as DiffusionAttentionMetadata
+    except Exception:
+        return None
+    import torch
+
+    num_branches = len(q_list)
+    q_len = int(q_list[0].shape[0])
+    shared_set = set(shared_branch_ids)
+    has_pre = k_prefix is not None and v_prefix is not None and int(k_prefix.shape[0]) > 0
+
+    q_all = torch.cat(q_list, dim=0)
+    k_parts: list[Any] = []
+    v_parts: list[Any] = []
+    k_lens: list[int] = []
+    for b in range(num_branches):
+        ln = 0
+        if b in shared_set and has_pre:
+            k_parts.append(k_prefix)
+            v_parts.append(v_prefix)
+            ln += int(k_prefix.shape[0])
+        ks, vs = k_suffix_list[b], v_suffix_list[b]
+        if ks is not None and vs is not None and int(ks.shape[0]) > 0:
+            k_parts.append(ks)
+            v_parts.append(vs)
+            ln += int(ks.shape[0])
+        kl, vl = k_loc_list[b], v_loc_list[b]
+        k_parts.append(kl)
+        v_parts.append(vl)
+        ln += int(kl.shape[0])
+        k_lens.append(ln)
+
+    k_all = torch.cat(k_parts, dim=0)
+    v_all = torch.cat(v_parts, dim=0)
+    cu_q = _get_cu_seqlens([q_len] * num_branches, q_all.device, cache=cu_seqlens_cache)
+    cu_k = _get_cu_seqlens(k_lens, q_all.device, cache=cu_seqlens_cache)
+    meta = DiffusionAttentionMetadata(
+        extra={
+            "cu_seqlens_q": cu_q,
+            "cu_seqlens_k": cu_k,
+            "max_seqlen_q": q_len,
+            "max_seqlen_k": max(k_lens),
+        }
+    )
+    out = attn_noncausal(q_all.unsqueeze(0), k_all.unsqueeze(0), v_all.unsqueeze(0), meta)
+    if out.ndim == 4 and out.shape[0] == 1:
+        out = out.squeeze(0)
+    return [out[b * q_len : (b + 1) * q_len] for b in range(num_branches)]
 
 
 def _run_unpadded_varlen_cfg(
@@ -757,7 +901,7 @@ def shared_prefix_cfg_attention(
                         stats_out["cascade_split_executed"] = stats_out.get("cascade_split_executed", 0) + 1
                     return fp_out
             else:
-                vp_out = _run_unpadded_varlen_cfg(
+                pv_out = _run_packed_varlen_noncausal_cfg(
                     q_list=q_list,
                     k_loc_list=k_loc_list,
                     v_loc_list=v_loc_list,
@@ -766,11 +910,42 @@ def shared_prefix_cfg_attention(
                     shared_branch_ids=shared_branch_ids,
                     k_suffix_list=k_suffix_list,
                     v_suffix_list=v_suffix_list,
-                    sm_scale=sm_scale,
+                    attn_noncausal=attn_noncausal,
                     cu_seqlens_cache=cu_seqlens_cache,
                 )
-                if vp_out is not None:
-                    return vp_out
+                if pv_out is not None:
+                    return pv_out
+                if attn_noncausal is None:
+                    vp_out = _run_unpadded_varlen_cfg(
+                        q_list=q_list,
+                        k_loc_list=k_loc_list,
+                        v_loc_list=v_loc_list,
+                        k_prefix=k_prefix,
+                        v_prefix=v_prefix,
+                        shared_branch_ids=shared_branch_ids,
+                        k_suffix_list=k_suffix_list,
+                        v_suffix_list=v_suffix_list,
+                        sm_scale=sm_scale,
+                        cu_seqlens_cache=cu_seqlens_cache,
+                    )
+                    if vp_out is not None:
+                        return vp_out
+
+        if backend in ("lossless_varlen", "unpadded_varlen"):
+            pv_out = _run_packed_varlen_noncausal_cfg(
+                q_list=q_list,
+                k_loc_list=k_loc_list,
+                v_loc_list=v_loc_list,
+                k_prefix=k_prefix,
+                v_prefix=v_prefix,
+                shared_branch_ids=shared_branch_ids,
+                k_suffix_list=k_suffix_list,
+                v_suffix_list=v_suffix_list,
+                attn_noncausal=attn_noncausal,
+                cu_seqlens_cache=cu_seqlens_cache,
+            )
+            if pv_out is not None:
+                return pv_out
 
         if attn_noncausal is not None and backend in ("cascade_cfg", "flash_prefix", "lossless_varlen", "unpadded_varlen"):
             return _run_direct_workspace_noncausal_cfg(

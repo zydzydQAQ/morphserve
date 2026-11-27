@@ -915,7 +915,7 @@ def test_worker_runtime_recv_ready_event_and_normal_dit_requeues_leftover_preemp
         rt.handle_command({"cmd_id": "sh", "op": "SHUTDOWN"})
 
 
-def test_cluster_engine_concurrent_ar_waiters_no_livelock_and_batch_before_dit() -> None:
+def test_cluster_engine_concurrent_ar_waiters_no_livelock_and_batch_before_dit(tmp_path: Path) -> None:
     """Regression test for direct-handoff `MemorySlackGpuLock`: multiple queued `EXEC_AR` turns must
     wake atomically without livelocking, batch concurrently, and drain before the next exclusive DiT."""
     pol = EnginePolicyConfig.from_preset(
@@ -926,43 +926,49 @@ def test_cluster_engine_concurrent_ar_waiters_no_livelock_and_batch_before_dit()
         gpu_queue_mode="memory_slack",
     )
 
+    fleet = InProcessWorkerFleet(pol)
+    eng = MorphServeClusterEngine(policy=pol, fleet=fleet, tmp_root=tmp_path / "ar_livelock")
+    eng.start()
+
     async def _run() -> tuple[list[dict[str, Any]], int, bool]:
-        with MorphServeClusterEngine(pol) as eng:
-            eng._ensure_async_primitives()
-            # Hold GPU 0 lock exclusively as if a DiT is in progress.
-            await eng._gpu_locks[0].acquire(est_mem_bytes=0, est_exec_ms=100.0, slo_deadline_ms=0.0, op_priority=1)
-            turn = InterleavedTurn(modality_plan="ar_only", prompt="hello", max_ar_tokens=2)
+        eng._ensure_async_primitives()
+        # Hold GPU 0 lock exclusively as if a DiT is in progress.
+        await eng._gpu_locks[0].acquire(est_mem_bytes=0, est_exec_ms=100.0, slo_deadline_ms=0.0, op_priority=1)
+        turn = InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="hello", max_ar_tokens=2)
 
-            ar_tasks = [
-                asyncio.create_task(
-                    eng._execute_ar_phase(pol, 0, f"ar_ctx_{i}", turn, prepare_for_dit=False)
-                )
-                for i in range(3)
-            ]
-            # Wait until all 3 AR tasks are queued behind GPU 0 lock, then also queue an exclusive DiT waiter.
-            await asyncio.sleep(0.02)
-            assert eng._gpu_locks[0].has_waiters()
+        ar_tasks = [
+            asyncio.create_task(
+                eng._execute_ar_phase(pol, 0, f"ar_ctx_{i}", turn, prepare_for_dit=False)
+            )
+            for i in range(3)
+        ]
+        # Wait until all 3 AR tasks are queued behind GPU 0 lock, then also queue an exclusive DiT waiter.
+        await asyncio.sleep(0.02)
+        assert eng._gpu_locks[0].has_waiters()
 
-            dit_entered_while_ar_active = {"bad": False}
+        dit_entered_while_ar_active = {"bad": False}
 
-            async def _dit_waiter() -> None:
-                await eng._acquire_exclusive_gpu(0, est_mem_bytes=0, est_exec_ms=100.0, slo_deadline_ms=0.0, op_priority=1)
-                try:
-                    if eng._inflight_ar_on_gpu.get(0, 0) > 0:
-                        dit_entered_while_ar_active["bad"] = True
-                finally:
-                    eng._gpu_locks[0].release()
+        async def _dit_waiter() -> None:
+            await eng._acquire_exclusive_gpu(0, est_mem_bytes=0, est_exec_ms=100.0, slo_deadline_ms=0.0, op_priority=1)
+            try:
+                if eng._inflight_ar_on_gpu.get(0, 0) > 0:
+                    dit_entered_while_ar_active["bad"] = True
+            finally:
+                eng._gpu_locks[0].release()
 
-            dit_task = asyncio.create_task(_dit_waiter())
-            await asyncio.sleep(0.01)
+        dit_task = asyncio.create_task(_dit_waiter())
+        await asyncio.sleep(0.01)
 
-            # Release initial lock: all 3 AR tasks must complete cleanly with zero livelock!
-            eng._gpu_locks[0].release()
-            res_list = await asyncio.wait_for(asyncio.gather(*ar_tasks), timeout=5.0)
-            await asyncio.wait_for(dit_task, timeout=5.0)
-            return [r[0] for r in res_list], eng._inflight_ar_on_gpu.get(0, 0), dit_entered_while_ar_active["bad"]
+        # Release initial lock: all 3 AR tasks must complete cleanly with zero livelock!
+        eng._gpu_locks[0].release()
+        res_list = await asyncio.wait_for(asyncio.gather(*ar_tasks), timeout=5.0)
+        await asyncio.wait_for(dit_task, timeout=5.0)
+        return [r[0] for r in res_list], eng._inflight_ar_on_gpu.get(0, 0), dit_entered_while_ar_active["bad"]
 
-    outs, inflight_after, bad_overlap = asyncio.run(_run())
+    try:
+        outs, inflight_after, bad_overlap = asyncio.run(_run())
+    finally:
+        eng.shutdown()
     assert len(outs) == 3
     assert all(o.get("status") == "ok" for o in outs)
     assert inflight_after == 0

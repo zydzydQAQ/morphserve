@@ -891,7 +891,7 @@ def test_bagel_update_image_ctx_uses_generation_mode_without_scoped_vae(tmp_path
         policy=pol,
         bench_root=tmp_path,
         pipeline=pipe,
-        cache_cls=cache_cls,
+        naive_cache_cls=cache_cls,
         device=torch.device("cpu"),
     )
     calls: list[dict[str, Any]] = []

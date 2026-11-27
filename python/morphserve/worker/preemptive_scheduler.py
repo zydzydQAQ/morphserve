@@ -21,8 +21,12 @@ def _record_cuda_timing_event(device: Any) -> Any | None:
         return None
     if not torch.cuda.is_available():
         return None
-    if device is not None and getattr(device, "type", "cuda") != "cuda":
-        return None
+    if device is not None:
+        if isinstance(device, int):
+            if device < 0:
+                return None
+        elif not (str(device).startswith("cuda") or getattr(device, "type", None) == "cuda"):
+            return None
     ev = torch.cuda.Event(enable_timing=True)
     ev.record(torch.cuda.current_stream(device))
     return ev

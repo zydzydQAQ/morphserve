@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-import time
 
 from morphserve._core import call_json, encode_json, get_core_lib
 from morphserve.engine.cluster_engine import ClusterRunReport, MemorySlackGpuLock
@@ -158,14 +157,16 @@ def test_memory_slack_gpu_lock_reorders_and_bounds_starvation():
             finally:
                 lock.release()
 
-        # Enqueue heavy (8 GiB > 4 GiB free), medium-fit (2 GiB), tight-fit (1 GiB), and late-fit (1 GiB).
+        # Enqueue heavy (8 GiB > 4 GiB free), tight-fit (1 GiB), tighter-fit (1 GiB), and late loose-fit (2 GiB).
+        # Both 1 GiB waiters bypass heavy_8g (bypass_count hits max_bypasses=2), while late med_2g_loose is not
+        # starving yet, so bounded anti-starvation MUST promote heavy_8g ahead of med_2g_loose.
         t_heavy = asyncio.create_task(_waiter("heavy_8g", 8 * GIB, 50_000.0))
-        await asyncio.sleep(0.005)
-        t_med = asyncio.create_task(_waiter("med_2g_loose", 2 * GIB, 20_000.0))
         await asyncio.sleep(0.005)
         t_tight = asyncio.create_task(_waiter("tight_1g", 1 * GIB, 3_000.0))
         await asyncio.sleep(0.005)
         t_late = asyncio.create_task(_waiter("late_1g_tight", 1 * GIB, 2_000.0))
+        await asyncio.sleep(0.005)
+        t_med = asyncio.create_task(_waiter("med_2g_loose", 2 * GIB, 20_000.0))
         await asyncio.sleep(0.005)
 
         lock.release()

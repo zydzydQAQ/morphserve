@@ -984,7 +984,7 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
         ) -> Any:
             # Must NOT use upstream's buggy `callback_on_step_end` hook.
             assert callback_on_step_end is None
-            self.step_wrapped_seen.append(self.scheduler.step is not self.orig_step)
+            self.step_wrapped_seen.append(self.scheduler.step != self.orig_step)
             latents = torch.zeros((1, 4, 8, 8))
             for step_i in range(num_inference_steps):
                 latents = self.scheduler.step(latents, step_i, latents, return_dict=False)[0]

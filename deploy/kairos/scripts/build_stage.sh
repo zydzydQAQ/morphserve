@@ -40,6 +40,8 @@ CORE_SRCS=(
   "control/topology.cpp"
   "control/policy.cpp"
   "control/budget_planner.cpp"
+  "control/gpu_queue_scheduler.cpp"
+  "control/performance_atlas.cpp"
   "control/preempt_edf.cpp"
   "control/router.cpp"
   "control/morph_controller.cpp"

@@ -260,6 +260,10 @@ class _GpuNvmlPoller:
         self._peak_used_mib: float = 0.0
         self._sm_util_sum: float = 0.0
         self._sm_util_samples: int = 0
+        self._mem_util_sum: float = 0.0
+        self._mem_util_samples: int = 0
+        self._hbm_util_sum: float = 0.0
+        self._hbm_util_samples: int = 0
 
         self._init_backend()
 
@@ -337,28 +341,39 @@ class _GpuNvmlPoller:
         # 3. Fallback: CUDA driver `mem_get_info` (memory only; avoids CUDA context contention if NVML exists)
         self._backend = "cuda_mem_info"
 
-    def _query_raw(self) -> tuple[float, float | None]:
+    def _query_raw(self) -> tuple[float, float | None, float | None, float | None]:
         if self._backend == "pynvml" and self._pynvml is not None and self._nvml_handle is not None:
+            used_mib = 0.0
+            hbm_pct: float | None = None
             try:
                 mem = self._pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
                 used_mib = float(mem.used) / MIB
+                if float(mem.total) > 0.0:
+                    hbm_pct = 100.0 * float(mem.used) / float(mem.total)
             except Exception:
                 used_mib = 0.0
             sm_pct: float | None = None
+            mem_pct: float | None = None
             try:
                 util = self._pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
                 sm_pct = float(util.gpu)
+                mem_pct = float(util.memory)
             except Exception:
                 sm_pct = None
-            return used_mib, sm_pct
+                mem_pct = None
+            return used_mib, sm_pct, mem_pct, hbm_pct
 
         if self._backend == "ctypes_nvml" and self._nvml_lib is not None and self._nvml_handle is not None:
             used_mib = 0.0
+            hbm_pct = None
             sm_pct = None
+            mem_pct = None
             try:
                 mem_s = _NvmlMemoryStruct()
                 if int(self._nvml_lib.nvmlDeviceGetMemoryInfo(self._nvml_handle, ctypes.byref(mem_s))) == 0:
                     used_mib = float(mem_s.used) / MIB
+                    if float(mem_s.total) > 0.0:
+                        hbm_pct = 100.0 * float(mem_s.used) / float(mem_s.total)
             except Exception:
                 used_mib = 0.0
             try:
@@ -367,9 +382,11 @@ class _GpuNvmlPoller:
                     util_s = _NvmlUtilizationStruct()
                     if int(util_fn(self._nvml_handle, ctypes.byref(util_s))) == 0:
                         sm_pct = float(util_s.gpu)
+                        mem_pct = float(util_s.memory)
             except Exception:
                 sm_pct = None
-            return used_mib, sm_pct
+                mem_pct = None
+            return used_mib, sm_pct, mem_pct, hbm_pct
 
         try:
             import torch
@@ -377,33 +394,59 @@ class _GpuNvmlPoller:
             if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
                 free_b, total_b = torch.cuda.mem_get_info(self.device)
                 if int(total_b) > 0:
-                    return float(int(total_b) - int(free_b)) / MIB, None
+                    used_b = float(int(total_b) - int(free_b))
+                    return used_b / MIB, None, None, 100.0 * used_b / float(int(total_b))
         except Exception:
             pass
-        return 0.0, None
+        return 0.0, None, None, None
 
     def sample_once(self) -> float:
-        used_mib, sm_pct = self._query_raw()
+        used_mib, sm_pct, mem_pct, hbm_pct = self._query_raw()
         with self._lock:
             if used_mib > self._peak_used_mib:
                 self._peak_used_mib = used_mib
             if sm_pct is not None:
                 self._sm_util_sum += sm_pct
                 self._sm_util_samples += 1
+            if mem_pct is not None:
+                self._mem_util_sum += mem_pct
+                self._mem_util_samples += 1
+            if hbm_pct is not None:
+                self._hbm_util_sum += hbm_pct
+                self._hbm_util_samples += 1
         return used_mib
 
     def reset(self) -> float:
-        used_mib, _ = self._query_raw()
+        used_mib, _, _, _ = self._query_raw()
         with self._lock:
             self._peak_used_mib = used_mib
             self._sm_util_sum = 0.0
             self._sm_util_samples = 0
+            self._mem_util_sum = 0.0
+            self._mem_util_samples = 0
+            self._hbm_util_sum = 0.0
+            self._hbm_util_samples = 0
         return used_mib
 
     def snapshot(self) -> tuple[float, float, int]:
         with self._lock:
             mean_sm = (self._sm_util_sum / float(self._sm_util_samples)) if self._sm_util_samples > 0 else 0.0
             return float(self._peak_used_mib), float(mean_sm), int(self._sm_util_samples)
+
+    def snapshot_extended(self) -> dict[str, float | int]:
+        with self._lock:
+            mean_sm = (self._sm_util_sum / float(self._sm_util_samples)) if self._sm_util_samples > 0 else 0.0
+            mean_mem = (self._mem_util_sum / float(self._mem_util_samples)) if self._mem_util_samples > 0 else 0.0
+            mean_hbm = (self._hbm_util_sum / float(self._hbm_util_samples)) if self._hbm_util_samples > 0 else 0.0
+            return {
+                "peak_used_mib": float(self._peak_used_mib),
+                "sm_util_mean_pct": float(mean_sm),
+                "sm_util_samples": int(self._sm_util_samples),
+                "mem_util_mean_pct": float(mean_mem),
+                "mem_util_samples": int(self._mem_util_samples),
+                "hbm_util_mean_pct": float(mean_hbm),
+                "hbm_util_samples": int(self._hbm_util_samples),
+            }
 
     def _run_loop(self) -> None:
         while not self._stop_ev.wait(self.interval_s):
@@ -449,6 +492,10 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
     _nvml_poller: _GpuNvmlPoller | None
     _nvml_sm_util_mean_pct: float
     _nvml_sm_util_samples: int
+    _nvml_mem_util_mean_pct: float
+    _nvml_mem_util_samples: int
+    _effective_hbm_util_mean_pct: float
+    _effective_hbm_util_samples: int
 
     def _init_gpu_lifecycle_state(self) -> None:
         self.pager = None
@@ -464,6 +511,10 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         self._nvml_poller = None
         self._nvml_sm_util_mean_pct = 0.0
         self._nvml_sm_util_samples = 0
+        self._nvml_mem_util_mean_pct = 0.0
+        self._nvml_mem_util_samples = 0
+        self._effective_hbm_util_mean_pct = 0.0
+        self._effective_hbm_util_samples = 0
 
     def _ensure_nvml_poller(self) -> _GpuNvmlPoller | None:
         import torch
@@ -475,17 +526,28 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         self._nvml_poller.start()
         return self._nvml_poller
 
+    def _sync_poller_snapshot(self, poller: _GpuNvmlPoller) -> float:
+        snap = poller.snapshot_extended()
+        pk = float(snap["peak_used_mib"])
+        if int(snap["sm_util_samples"]) > 0:
+            self._nvml_sm_util_mean_pct = float(snap["sm_util_mean_pct"])
+            self._nvml_sm_util_samples = int(snap["sm_util_samples"])
+        if int(snap["mem_util_samples"]) > 0:
+            self._nvml_mem_util_mean_pct = float(snap["mem_util_mean_pct"])
+            self._nvml_mem_util_samples = int(snap["mem_util_samples"])
+        if int(snap["hbm_util_samples"]) > 0:
+            self._effective_hbm_util_mean_pct = float(snap["hbm_util_mean_pct"])
+            self._effective_hbm_util_samples = int(snap["hbm_util_samples"])
+        return pk
+
     def _stop_nvml_poller(self) -> None:
         poller = getattr(self, "_nvml_poller", None)
         if poller is None:
             return
         try:
-            pk, sm_mean, sm_n = poller.snapshot()
+            pk = self._sync_poller_snapshot(poller)
             self._max_driver_used_mib = max(self._max_driver_used_mib, pk)
             self._max_reserved_mib = max(self._max_reserved_mib, pk)
-            if sm_n > 0:
-                self._nvml_sm_util_mean_pct = sm_mean
-                self._nvml_sm_util_samples = sm_n
         finally:
             poller.stop()
             self._nvml_poller = None
@@ -541,6 +603,10 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             self._max_reserved_mib = self._max_driver_used_mib
             self._nvml_sm_util_mean_pct = 0.0
             self._nvml_sm_util_samples = 0
+            self._nvml_mem_util_mean_pct = 0.0
+            self._nvml_mem_util_samples = 0
+            self._effective_hbm_util_mean_pct = 0.0
+            self._effective_hbm_util_samples = 0
             return
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
@@ -560,6 +626,10 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         self._max_reserved_mib = base_phys
         self._nvml_sm_util_mean_pct = 0.0
         self._nvml_sm_util_samples = 0
+        self._nvml_mem_util_mean_pct = 0.0
+        self._nvml_mem_util_samples = 0
+        self._effective_hbm_util_mean_pct = 0.0
+        self._effective_hbm_util_samples = 0
 
     def _update_hwm(self) -> None:
         import torch
@@ -574,11 +644,8 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
         poller = getattr(self, "_nvml_poller", None)
         if poller is not None:
             sample_used = poller.sample_once()
-            p_pk, sm_mean, sm_n = poller.snapshot()
+            p_pk = self._sync_poller_snapshot(poller)
             poller_peak = max(p_pk, sample_used)
-            if sm_n > 0:
-                self._nvml_sm_util_mean_pct = sm_mean
-                self._nvml_sm_util_samples = sm_n
         # Sample instantaneous driver/NVML physical HBM (`cuMemGetInfo_v2` + background NVML poller)
         # so PyTorch peak at t1 and dynamic VMM pool size at t2 are never double-counted across timestamps,
         # while transient allocator spikes (`pt_peak`) are never lost.
@@ -618,6 +685,10 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             "peak_nvml_used_mib": round(nvml_peak, 2),
             "nvml_sm_util_mean_pct": round(self._nvml_sm_util_mean_pct, 2),
             "nvml_sm_util_samples": int(self._nvml_sm_util_samples),
+            "nvml_mem_util_mean_pct": round(self._nvml_mem_util_mean_pct, 2),
+            "nvml_mem_util_samples": int(self._nvml_mem_util_samples),
+            "effective_hbm_util_mean_pct": round(self._effective_hbm_util_mean_pct, 2),
+            "effective_hbm_util_samples": int(self._effective_hbm_util_samples),
             "pytorch_reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
             "vmm_stats": vmm_st,

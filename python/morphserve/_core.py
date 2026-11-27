@@ -728,6 +728,18 @@ def _bind_all_symbols(L: ctypes.CDLL) -> None:
     L.ms_sim_sweep_json.argtypes = [ctypes.c_char_p]
     L.ms_sim_sweep_json.restype = ctypes.c_void_p
 
+    # Per-GPU Memory+Slack Queue Scheduler & 3D Performance Atlas (`ms_gpu_queue_*`, `ms_atlas_*`)
+    L.ms_gpu_queue_create.argtypes = [ctypes.c_char_p]
+    L.ms_gpu_queue_create.restype = ctypes.c_void_p
+    L.ms_gpu_queue_destroy.argtypes = [ctypes.c_void_p]
+    L.ms_gpu_queue_destroy.restype = None
+    L.ms_gpu_queue_select_json.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    L.ms_gpu_queue_select_json.restype = ctypes.c_void_p
+    L.ms_gpu_queue_stats_json.argtypes = [ctypes.c_void_p]
+    L.ms_gpu_queue_stats_json.restype = ctypes.c_void_p
+    L.ms_atlas_estimate_json.argtypes = [ctypes.c_char_p]
+    L.ms_atlas_estimate_json.restype = ctypes.c_void_p
+
 
 def load_core_lib(
     so_path: Path | str | None = None,

@@ -96,6 +96,7 @@ typedef struct ms_edf_handle ms_edf_t;
 typedef struct ms_router_handle ms_router_t;
 typedef struct ms_ctrl_handle ms_ctrl_t;
 typedef struct ms_ledger_handle ms_ledger_t;
+typedef struct ms_gpu_queue_handle ms_gpu_queue_t;
 
 // Error handling & heap string release
 const char* ms_last_error(void);
@@ -461,6 +462,12 @@ char* ms_sim_point_json(const char* req_json);
 char* ms_sim_evaluate_real_json(const char* req_json);
 char* ms_sim_h100_study_json(const char* req_json);
 char* ms_sim_sweep_json(const char* req_json);
+
+ms_gpu_queue_t* ms_gpu_queue_create(const char* policy_json);
+void ms_gpu_queue_destroy(ms_gpu_queue_t* q);
+char* ms_gpu_queue_select_json(ms_gpu_queue_t* q, const char* req_json);
+char* ms_gpu_queue_stats_json(const ms_gpu_queue_t* q);
+char* ms_atlas_estimate_json(const char* req_json);
 
 #ifdef __cplusplus
 }  // extern "C"

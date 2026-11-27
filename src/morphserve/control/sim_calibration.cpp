@@ -75,7 +75,10 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
                                   "warmup_window_s",
                                   "steady_window_s",
                                   "cooldown_s",
-                                  "steady_state_trim_frac"}) {
+                                  "steady_state_trim_frac",
+                                  "cost_model_mode",
+                                  "gpu_queue_mode",
+                                  "kv_eviction_mode"}) {
             if (ref.contains(opt_k) && !ref[opt_k].is_null()) {
                 ref_ov[opt_k] = ref[opt_k];
             }

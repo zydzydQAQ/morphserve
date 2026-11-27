@@ -1,5 +1,6 @@
 #pragma once
 
+#include "morphserve/control/performance_atlas.hpp"
 #include "morphserve/control/topology.hpp"
 #include "morphserve/runtime/h2d_pacer.hpp"
 
@@ -28,6 +29,7 @@ struct CPTGRequestSpec {
     int dit_total_steps = 20;
     int resolution = 512;
     int interleaved_roundtrip_gamma = 1;
+    std::string model_family;  // optional ("bagel" | "internvl_u"); inferred from architecture if empty
 
     int64_t effective_state_bytes() const;
     nlohmann::json to_json() const;
@@ -42,6 +44,8 @@ struct WorkerState {
     int active_h2d_transfers = 0;
     int64_t kv_free_bytes = 12LL * kGiB;
     int p2p_concurrent_links = 1;
+    bool post_evict = false;   // true right after VMM expert eviction (remap contention regime)
+    int colocated_ar_b = 0;    // active colocated AR decode tasks (3rd Performance Atlas axis)
 
     nlohmann::json to_json() const;
     static WorkerState from_json(const nlohmann::json& j);
@@ -77,11 +81,17 @@ public:
         double overlap_efficiency = 0.90,
         bool allow_cross_half_state_ship = true,
         bool allow_inter_node_state_ship = true,
-        int64_t max_inter_node_state_bytes = 128LL * kMiB);
+        int64_t max_inter_node_state_bytes = 128LL * kMiB,
+        std::string cost_model_mode = "atlas_3d",
+        PerformanceAtlas performance_atlas = PerformanceAtlas::a100_default());
 
     const ClusterTopologyProfile& topology() const noexcept { return topology_; }
     std::shared_ptr<runtime::HalfNodeH2DPacer> pacer() const noexcept { return pacer_; }
     const OperatorLatencyProfile& operator_profile() const noexcept { return operator_profile_; }
+    const std::string& cost_model_mode() const noexcept { return cost_model_mode_; }
+    void set_cost_model_mode(std::string mode);
+    const PerformanceAtlas& performance_atlas() const noexcept { return atlas_; }
+    void set_performance_atlas(PerformanceAtlas atlas);
 
     std::map<int, WorkerState> init_workers(
         int num_gpus,
@@ -218,6 +228,8 @@ private:
     bool allow_cross_half_state_ship_ = true;
     bool allow_inter_node_state_ship_ = true;
     int64_t max_inter_node_state_bytes_ = 128LL * kMiB;
+    std::string cost_model_mode_ = "atlas_3d";
+    PerformanceAtlas atlas_ = PerformanceAtlas::a100_default();
 
     mutable std::mutex mu_;
     std::map<int, WorkerState> worker_states_;

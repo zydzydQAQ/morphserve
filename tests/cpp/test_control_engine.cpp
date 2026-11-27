@@ -1,6 +1,8 @@
 #include "morphserve/control/budget_planner.hpp"
+#include "morphserve/control/gpu_queue_scheduler.hpp"
 #include "morphserve/control/hash_util.hpp"
 #include "morphserve/control/morph_controller.hpp"
+#include "morphserve/control/performance_atlas.hpp"
 #include "morphserve/control/policy.hpp"
 #include "morphserve/control/preempt_edf.hpp"
 #include "morphserve/control/router.hpp"
@@ -841,6 +843,148 @@ void test_morph_control_engine_transitions_slos_and_aggregation() {
     MS_CHECK(rep_mod.at("steady_sessions_with_dit").get<int>() == 1);
     MS_CHECK(std::abs(rep_mod.at("steady_ar_slo_attainment_pct").get<double>() - 0.0) < 1e-6);
     MS_CHECK(std::abs(rep_mod.at("steady_dit_slo_attainment_pct").get<double>() - 100.0) < 1e-6);
+    // New Mean latency + P99 improper CDF + policy-mode report fields.
+    MS_CHECK(rep_mod.contains("ar_ttft_mean_ms") && std::abs(rep_mod.at("ar_ttft_mean_ms").get<double>() - 999.0) < 1e-6);
+    MS_CHECK(rep_mod.contains("dit_turn_mean_ms") && std::abs(rep_mod.at("dit_turn_mean_ms").get<double>() - 4500.0) < 1e-6);
+    MS_CHECK(rep_mod.contains("all_session_e2e_p99_ms"));
+    MS_CHECK(rep_mod.contains("all_session_dit_p99_ms"));
+    MS_CHECK(rep_mod.contains("all_session_active_jct_p99_ms"));
+    MS_CHECK(rep_mod.contains("nvml_mem_util_mean_pct"));
+    MS_CHECK(rep_mod.contains("effective_hbm_util_mean_pct"));
+    MS_CHECK(rep_mod.contains("kv_swap_hit_rate_pct"));
+}
+
+void test_performance_atlas_3d_and_fallbacks() {
+    using namespace morphserve::control;
+
+    const PerformanceAtlas atlas = PerformanceAtlas::a100_default();
+    const int64_t bagel_exp = 12446LL * kMiB;
+
+    // 1. Live A100 Stage-1 calibrated anchors: 1024^2 alpha=0.0 -> 173.97 ms (vs legacy ~1058 ms).
+    const auto a1024_0 = atlas.estimate_morph_stall("bagel", 1024, 0.0, false, bagel_exp, 12.34, 939.804, 11.71);
+    const auto leg1024_0 = PerformanceAtlas::estimate_legacy_analytical(0.0, bagel_exp, 12.34, 939.804, 11.71, 0.90);
+    MS_CHECK(a1024_0.from_atlas);
+    MS_CHECK(std::abs(a1024_0.exposed_stall_ms - 173.97) < 0.05);
+    MS_CHECK(leg1024_0.exposed_stall_ms > 1000.0);
+    MS_CHECK(leg1024_0.exposed_stall_ms > 5.0 * a1024_0.exposed_stall_ms);
+
+    // 2. Live A100 1024^2 alpha=0.5 steady (7.53 ms) and post-eviction alpha=0.75 (267.69 ms vs legacy 0 ms).
+    const auto a1024_50 = atlas.estimate_morph_stall("bagel", 1024, 0.50, false, bagel_exp, 12.34, 939.804, 11.71);
+    MS_CHECK(a1024_50.from_atlas && std::abs(a1024_50.exposed_stall_ms - 7.53) < 0.05);
+    const auto a1024_pe = atlas.estimate_morph_stall("bagel", 1024, 0.75, true, bagel_exp, 12.34, 939.804, 11.71);
+    const auto leg1024_75 = PerformanceAtlas::estimate_legacy_analytical(0.75, bagel_exp, 12.34, 939.804, 11.71, 0.90);
+    MS_CHECK(a1024_pe.from_atlas && std::abs(a1024_pe.exposed_stall_ms - 267.69) < 0.05);
+    MS_CHECK(leg1024_75.exposed_stall_ms < 1e-6);
+
+    // 3. Smooth piecewise-linear interpolation at intermediate alpha=0.25 and resolution=768.
+    const auto a1024_25 = atlas.estimate_morph_stall("bagel", 1024, 0.25, false, bagel_exp, 12.34, 939.804, 11.71);
+    MS_CHECK(a1024_25.from_atlas);
+    MS_CHECK(a1024_25.exposed_stall_ms > a1024_50.exposed_stall_ms &&
+             a1024_25.exposed_stall_ms < a1024_0.exposed_stall_ms);
+    const auto a768_50 = atlas.estimate_morph_stall("bagel", 768, 0.50, false, bagel_exp, 12.34, 600.0, 11.71);
+    const auto a512_50 = atlas.estimate_morph_stall("bagel", 512, 0.50, false, bagel_exp, 12.34, 242.735, 11.71);
+    MS_CHECK(a768_50.from_atlas);
+    MS_CHECK(a768_50.exposed_stall_ms > a1024_50.exposed_stall_ms &&
+             a768_50.exposed_stall_ms < a512_50.exposed_stall_ms);
+
+    // 4. Uncalibrated hardware (e.g. H100 Gen5 32 GB/s or custom 6 GiB expert) falls back to pipeline analytical.
+    const auto h100_fb = atlas.estimate_morph_stall("bagel", 1024, 0.0, false, bagel_exp, 32.0, 400.0, 6.0);
+    MS_CHECK(!h100_fb.from_atlas);
+    MS_CHECK(h100_fb.hidden_frac > 0.70);
+    const auto custom_fb = atlas.estimate_morph_stall("bagel", 512, 0.50, false, 6000LL * kMiB, 12.34, 200.0, 12.0);
+    MS_CHECK(!custom_fb.from_atlas);
+
+    // 5. 3rd axis (`colocated_ar_b`) sublinear stretch & router Path-A/B awareness.
+    const double s0 = atlas.dit_step_stretch_factor("bagel", 512, 0);
+    const double s1 = atlas.dit_step_stretch_factor("bagel", 512, 1);
+    const double s8 = atlas.dit_step_stretch_factor("bagel", 512, 8);
+    MS_CHECK(std::abs(s0 - 1.0) < 1e-9);
+    MS_CHECK(s1 > 1.0 && s8 > s1 && s8 < 2.0 * s1);
+
+    const auto topo = ClusterTopologyProfile::a100_pcie_8gpu_default();
+    DualPathMorphRouter r_atlas(topo, nullptr, default_operator_profile(), std::nullopt, 11.71, 0.90, true, true, 128LL * kMiB, "atlas_3d");
+    DualPathMorphRouter r_legacy(topo, nullptr, default_operator_profile(), std::nullopt, 11.71, 0.90, true, true, 128LL * kMiB, "legacy_analytical");
+
+    // 1024^2 alpha=0.0 with 1.5 GiB KV: legacy overestimates Path B (~1070 ms) and ships via Path A;
+    // atlas_3d knows in-place morph is only ~185 ms and stays in-place!
+    std::map<int, WorkerState> ws_map;
+    WorkerState w0;
+    w0.gpu_id = 0;
+    w0.expert_alpha = 0.0;
+    w0.kv_free_bytes = 16LL * kGiB;
+    WorkerState w1;
+    w1.gpu_id = 1;
+    w1.expert_alpha = 1.0;
+    w1.kv_free_bytes = 16LL * kGiB;
+    ws_map[0] = w0;
+    ws_map[1] = w1;
+
+    CPTGRequestSpec req1024;
+    req1024.req_id = "atlas_vs_legacy_1024";
+    req1024.src_gpu = 0;
+    req1024.architecture = "tight_mot";
+    req1024.model_family = "bagel";
+    req1024.kv_bytes = 1600LL * kMiB;
+    req1024.gen_expert_bytes = bagel_exp;
+    req1024.dit_step1_ms = 939.804;
+    req1024.resolution = 1024;
+    req1024.interleaved_roundtrip_gamma = 2;
+
+    const RouteDecision d_atlas = r_atlas.decide(req1024, &ws_map, 0.0);
+    const RouteDecision d_legacy = r_legacy.decide(req1024, &ws_map, 0.0);
+    MS_CHECK(d_atlas.path == "in_place_morph" && d_atlas.t_morph_ms < 250.0);
+    MS_CHECK(d_legacy.path == "state_ship" && d_legacy.t_morph_ms > 1000.0);
+
+    // JSON round-trip preserves exact entries.
+    const PerformanceAtlas rt = PerformanceAtlas::from_json(atlas.to_json());
+    const auto rt_pt = rt.estimate_morph_stall("bagel", 1024, 0.0, false, bagel_exp, 12.34, 939.804, 11.71);
+    MS_CHECK(rt_pt.from_atlas && std::abs(rt_pt.exposed_stall_ms - 173.97) < 0.05);
+}
+
+void test_gpu_wait_queue_scheduler() {
+    using namespace morphserve::control;
+
+    // 1. FCFS mode strictly follows enqueue order.
+    GpuWaitQueueScheduler fcfs_sched(GpuQueuePolicy{"fcfs", 6000.0, 3});
+    std::vector<GpuQueueWaiter> q_fcfs = {
+        {1, 100.0, 8LL * kGiB, 9000.0, 50000.0, 1, 0},
+        {2, 110.0, 1LL * kGiB, 2000.0, 5000.0, 1, 0},
+    };
+    const auto s_fcfs = fcfs_sched.select_and_pop(q_fcfs, 120.0, 4LL * kGiB);
+    MS_CHECK(s_fcfs.has_value() && s_fcfs->waiter_id == 1 && !s_fcfs->reordered);
+
+    // 2. Memory+Slack mode skips memory-exceeding FIFO head to run fitting request (0-OOM bypass).
+    GpuWaitQueueScheduler ms_sched(GpuQueuePolicy{"memory_slack", 6000.0, 2});
+    std::vector<GpuQueueWaiter> q_ms = {
+        {10, 100.0, 8LL * kGiB, 9000.0, 60000.0, 1, 0},  // does NOT fit in 4 GiB
+        {11, 110.0, 2LL * kGiB, 4000.0, 20000.0, 1, 0},  // fits, looser slack
+        {12, 120.0, 1LL * kGiB, 3000.0, 6000.0, 1, 0},   // fits, tightest slack
+    };
+    const auto sel1 = ms_sched.select_and_pop(q_ms, 200.0, 4LL * kGiB);
+    MS_CHECK(sel1.has_value() && sel1->waiter_id == 12 && sel1->reordered && sel1->memory_bypass);
+    MS_CHECK(ms_sched.stats().memory_bypasses_total == 1);
+    // Older waiters 10 & 11 had bypass_count incremented.
+    MS_CHECK(q_ms[0].waiter_id == 10 && q_ms[0].bypass_count == 1);
+    MS_CHECK(q_ms[1].waiter_id == 11 && q_ms[1].bypass_count == 1);
+
+    // Next dispatch: waiter 11 fits while 10 doesn't -> bypasses 10 a second time (bypass_count == 2 == max_bypasses).
+    const auto sel2 = ms_sched.select_and_pop(q_ms, 300.0, 4LL * kGiB);
+    MS_CHECK(sel2.has_value() && sel2->waiter_id == 11 && sel2->memory_bypass);
+    MS_CHECK(q_ms.size() == 1 && q_ms[0].waiter_id == 10 && q_ms[0].bypass_count == 2);
+
+    // Anti-starvation: add a new small waiter 13; waiter 10 hit max_bypasses=2 -> MUST be promoted!
+    q_ms.push_back({13, 310.0, 1LL * kGiB, 1000.0, 2000.0, 1, 0});
+    const auto sel3 = ms_sched.select_and_pop(q_ms, 320.0, 4LL * kGiB);
+    MS_CHECK(sel3.has_value() && sel3->waiter_id == 10 && sel3->starvation_promoted);
+    MS_CHECK(ms_sched.stats().starvation_promotions_total == 1);
+
+    // Deadlock-free fallback when NO waiter fits live_free_mem_bytes: picks smallest footprint.
+    std::vector<GpuQueueWaiter> q_tight = {
+        {20, 100.0, 10LL * kGiB, 5000.0, 20000.0, 1, 0},
+        {21, 110.0, 5LL * kGiB, 5000.0, 20000.0, 1, 0},
+    };
+    const auto sel_fb = ms_sched.select_and_pop(q_tight, 120.0, 1LL * kGiB);
+    MS_CHECK(sel_fb.has_value() && sel_fb->waiter_id == 21);
 }
 
 }  // namespace
@@ -852,6 +996,8 @@ int main() {
     test_preempt_edf_controller();
     test_worker_budget_planner();
     test_morph_control_engine_transitions_slos_and_aggregation();
+    test_performance_atlas_3d_and_fallbacks();
+    test_gpu_wait_queue_scheduler();
 
     if (g_failures > 0) {
         std::cerr << "[FAILED] test_control_engine (" << g_failures << " checks failed)\n";

@@ -247,6 +247,7 @@ nlohmann::json CPTGRequestSpec::to_json() const {
         {"dit_total_steps", dit_total_steps},
         {"resolution", resolution},
         {"interleaved_roundtrip_gamma", interleaved_roundtrip_gamma},
+        {"model_family", model_family},
     };
 }
 
@@ -262,6 +263,7 @@ CPTGRequestSpec CPTGRequestSpec::from_json(const nlohmann::json& j) {
     r.dit_total_steps = j.value("dit_total_steps", 20);
     r.resolution = j.value("resolution", 512);
     r.interleaved_roundtrip_gamma = j.value("interleaved_roundtrip_gamma", 1);
+    r.model_family = j.value("model_family", "");
     return r;
 }
 
@@ -274,6 +276,8 @@ nlohmann::json WorkerState::to_json() const {
         {"active_h2d_transfers", active_h2d_transfers},
         {"kv_free_bytes", kv_free_bytes},
         {"p2p_concurrent_links", p2p_concurrent_links},
+        {"post_evict", post_evict},
+        {"colocated_ar_b", colocated_ar_b},
     };
 }
 
@@ -286,6 +290,8 @@ WorkerState WorkerState::from_json(const nlohmann::json& j) {
     w.active_h2d_transfers = j.value("active_h2d_transfers", 0);
     w.kv_free_bytes = j.value("kv_free_bytes", 12LL * kGiB);
     w.p2p_concurrent_links = j.value("p2p_concurrent_links", 1);
+    w.post_evict = j.value("post_evict", false);
+    w.colocated_ar_b = j.value("colocated_ar_b", 0);
     return w;
 }
 
@@ -314,7 +320,9 @@ DualPathMorphRouter::DualPathMorphRouter(
     double overlap_efficiency,
     bool allow_cross_half_state_ship,
     bool allow_inter_node_state_ship,
-    int64_t max_inter_node_state_bytes)
+    int64_t max_inter_node_state_bytes,
+    std::string cost_model_mode,
+    PerformanceAtlas performance_atlas)
     : topology_(std::move(topology)),
       pacer_(pacer ? std::move(pacer)
                    : std::make_shared<runtime::HalfNodeH2DPacer>(topology_.gpu_to_group_map(), 1)),
@@ -324,7 +332,19 @@ DualPathMorphRouter::DualPathMorphRouter(
       overlap_efficiency_(overlap_efficiency),
       allow_cross_half_state_ship_(allow_cross_half_state_ship),
       allow_inter_node_state_ship_(allow_inter_node_state_ship),
-      max_inter_node_state_bytes_(max_inter_node_state_bytes) {}
+      max_inter_node_state_bytes_(max_inter_node_state_bytes),
+      cost_model_mode_(std::move(cost_model_mode)),
+      atlas_(std::move(performance_atlas)) {}
+
+void DualPathMorphRouter::set_cost_model_mode(std::string mode) {
+    std::lock_guard<std::mutex> lock(mu_);
+    cost_model_mode_ = std::move(mode);
+}
+
+void DualPathMorphRouter::set_performance_atlas(PerformanceAtlas atlas) {
+    std::lock_guard<std::mutex> lock(mu_);
+    atlas_ = std::move(atlas);
+}
 
 std::map<int, WorkerState> DualPathMorphRouter::init_workers(
     int num_gpus,
@@ -411,7 +431,14 @@ void DualPathMorphRouter::update_worker_telemetry(
         last_telemetry_seq_[gpu_id] = *telemetry_seq;
     }
     if (expert_alpha.has_value()) {
-        it->second.expert_alpha = *expert_alpha;
+        const double prev_a = it->second.expert_alpha;
+        const double new_a = *expert_alpha;
+        if (new_a < prev_a - 1e-4) {
+            it->second.post_evict = true;
+        } else if (new_a >= 0.999) {
+            it->second.post_evict = false;
+        }
+        it->second.expert_alpha = new_a;
     }
     if (kv_free_bytes.has_value()) {
         const int64_t raw_b = std::max<int64_t>(0, *kv_free_bytes);
@@ -430,6 +457,7 @@ void DualPathMorphRouter::reserve_ar_queue(int gpu_id, double est_ar_ms) {
     auto it = worker_states_.find(gpu_id);
     if (it != worker_states_.end()) {
         it->second.queue_wait_ms += delta;
+        ++it->second.colocated_ar_b;
     }
 }
 
@@ -442,6 +470,7 @@ void DualPathMorphRouter::release_ar_queue(int gpu_id, double est_ar_ms) {
     auto it = worker_states_.find(gpu_id);
     if (it != worker_states_.end()) {
         it->second.queue_wait_ms = std::max(0.0, it->second.queue_wait_ms - delta);
+        it->second.colocated_ar_b = std::max(0, it->second.colocated_ar_b - 1);
     }
 }
 
@@ -642,21 +671,56 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_b_morph_ms(
     const CPTGRequestSpec& req,
     const WorkerState& src_worker,
     double now_ms) const {
+    const std::string eff_fam = !req.model_family.empty()
+                                    ? req.model_family
+                                    : (req.architecture == "bridge_mllm_dit" ? "internvl_u" : "bagel");
+    const double coloc_stretch =
+        (cost_model_mode_ == "atlas_3d" && src_worker.colocated_ar_b > 0)
+            ? atlas_.dit_step_stretch_factor(eff_fam, req.resolution, src_worker.colocated_ar_b)
+            : 1.0;
+    const double eff_q_wait_ms = src_worker.queue_wait_ms * coloc_stretch;
+
     const double alpha = std::max(0.0, std::min(1.0, src_worker.expert_alpha));
     const double missing_bytes = (1.0 - alpha) * static_cast<double>(req.gen_expert_bytes);
     if (missing_bytes <= 0.0) {
-        return {src_worker.queue_wait_ms, topology_.solo_h2d_gbps(src_worker.gpu_id)};
+        return {round_3(eff_q_wait_ms), topology_.solo_h2d_gbps(src_worker.gpu_id)};
     }
     const double h2d_wait_ms = pacer_ ? pacer_->predicted_wait_ms(src_worker.gpu_id, now_ms) : 0.0;
     const int active = (!pacer_ || pacer_->max_concurrent_per_half() == 1)
                            ? 1
                            : std::max(1, src_worker.active_h2d_transfers + 1);
     const double bw_h2d_gbps = topology_.effective_h2d_gbps(src_worker.gpu_id, active);
-    const double h2d_xfer_ms = (missing_bytes / 1e9) / bw_h2d_gbps * 1000.0;
-    const double map_ms = map_overhead_ms_full_ * (1.0 - alpha);
-    const double resident_compute_ms = overlap_efficiency_ * alpha * req.dit_step1_ms;
-    const double exposed_stall_ms = std::max(0.0, h2d_xfer_ms - resident_compute_ms);
-    const double t_morph = src_worker.queue_wait_ms + h2d_wait_ms + map_ms + exposed_stall_ms;
+    const int num_layers = (eff_fam == "internvl_u") ? 20 : atlas_.ref_num_layers();
+
+    MorphStallEstimate stall_est{};
+    if (cost_model_mode_ == "legacy_analytical") {
+        stall_est = PerformanceAtlas::estimate_legacy_analytical(
+            alpha, req.gen_expert_bytes, bw_h2d_gbps, req.dit_step1_ms, map_overhead_ms_full_, overlap_efficiency_);
+    } else if (cost_model_mode_ == "pipeline_analytical") {
+        stall_est = PerformanceAtlas::estimate_pipeline_analytical(
+            alpha,
+            src_worker.post_evict,
+            req.gen_expert_bytes,
+            bw_h2d_gbps,
+            req.dit_step1_ms,
+            map_overhead_ms_full_,
+            overlap_efficiency_,
+            num_layers);
+    } else {
+        // Default `atlas_3d`: calibrated hardware lookup + O(1) interpolation with pipeline fallback.
+        stall_est = atlas_.estimate_morph_stall(
+            eff_fam,
+            req.resolution,
+            alpha,
+            src_worker.post_evict,
+            req.gen_expert_bytes,
+            bw_h2d_gbps,
+            req.dit_step1_ms,
+            map_overhead_ms_full_,
+            overlap_efficiency_,
+            num_layers);
+    }
+    const double t_morph = eff_q_wait_ms + h2d_wait_ms + stall_est.map_ms + stall_est.exposed_stall_ms;
     return {round_3(t_morph), round_3(bw_h2d_gbps)};
 }
 
@@ -698,13 +762,21 @@ std::pair<double, double> DualPathMorphRouter::evaluate_path_a_ship_ms(
                                : topology_.handoff_ms(src_worker.gpu_id, dst_worker.gpu_id);
     const double ship_xfer_ms = (static_cast<double>(gamma) * state_bytes / 1e9) / bw_p2p * 1000.0 + handoff;
 
+    const std::string eff_fam = !req.model_family.empty()
+                                    ? req.model_family
+                                    : (req.architecture == "bridge_mllm_dit" ? "internvl_u" : "bagel");
+    const double dst_stretch =
+        (cost_model_mode_ == "atlas_3d" && dst_worker.colocated_ar_b > 0)
+            ? atlas_.dit_step_stretch_factor(eff_fam, req.resolution, dst_worker.colocated_ar_b)
+            : 1.0;
+
     double dst_morph_ms = 0.0;
     if (dst_worker.expert_alpha < 1.0) {
         WorkerState probe = dst_worker;
         probe.queue_wait_ms = 0.0;
         dst_morph_ms = evaluate_path_b_morph_ms(req, probe, now_ms).first;
     }
-    const double t_ship = ship_xfer_ms + dst_worker.queue_wait_ms + dst_morph_ms;
+    const double t_ship = ship_xfer_ms + (dst_worker.queue_wait_ms * dst_stretch) + dst_morph_ms;
     return {round_3(t_ship), round_3(bw_p2p)};
 }
 

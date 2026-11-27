@@ -100,17 +100,45 @@ int64_t SimGpuMemoryLedger::free_kv_bytes() const noexcept {
     return static_cast<int64_t>(std::max(0.0, total_hbm_mib_ - used - 2048.0) * static_cast<double>(kMiB));
 }
 
+void SimGpuMemoryLedger::record_hbm_sample(double used_mib) noexcept {
+    if (total_hbm_mib_ <= 0.0) {
+        return;
+    }
+    const double clamped = std::clamp(used_mib, 0.0, total_hbm_mib_);
+    hbm_used_samples_sum_ += clamped;
+    ++hbm_used_samples_cnt_;
+}
+
+double SimGpuMemoryLedger::effective_hbm_util_mean_pct() const noexcept {
+    if (total_hbm_mib_ <= 0.0) {
+        return 0.0;
+    }
+    if (hbm_used_samples_cnt_ <= 0) {
+        return std::clamp(100.0 * peak_used_mib_ / total_hbm_mib_, 0.0, 100.0);
+    }
+    const double mean_used = hbm_used_samples_sum_ / static_cast<double>(hbm_used_samples_cnt_);
+    return std::clamp(100.0 * mean_used / total_hbm_mib_, 0.0, 100.0);
+}
+
 double SimGpuMemoryLedger::evict_idle_kv_to_host(
     double needed_free_mib,
     std::optional<int> exclude_sid) {
     if (!policy_.use_idle_kv_swap) {
         return 0.0;
     }
+    // LRU eviction order aligned with live `TriPoolVMM` (oldest `session_last_touch_` first).
     std::vector<int> sids;
     sids.reserve(session_kv_mib_.size());
     for (const auto& [sid, _] : session_kv_mib_) {
         sids.push_back(sid);
     }
+    std::sort(sids.begin(), sids.end(), [&](int a, int b) {
+        const uint64_t ta = session_last_touch_.count(a) ? session_last_touch_.at(a) : 0;
+        const uint64_t tb = session_last_touch_.count(b) ? session_last_touch_.at(b) : 0;
+        if (ta != tb) return ta < tb;
+        return a < b;
+    });
+    const bool drop_for_recompute = (policy_.kv_eviction_mode == "recompute");
     double freed_mib = 0.0;
     for (int cand_sid : sids) {
         if (exclude_sid.has_value() && cand_sid == *exclude_sid) {
@@ -122,8 +150,13 @@ double SimGpuMemoryLedger::evict_idle_kv_to_host(
         const double kv_before = active_kv_mib();
         const double val = session_kv_mib_.at(cand_sid);
         session_kv_mib_.erase(cand_sid);
-        swapped_session_kv_mib_[cand_sid] = val;
-        ++kv_host_swap_outs_;
+        if (drop_for_recompute) {
+            dropped_recompute_kv_mib_[cand_sid] = val;
+            ++kv_recompute_evictions_;
+        } else {
+            swapped_session_kv_mib_[cand_sid] = val;
+            ++kv_host_swap_outs_;
+        }
         const double kv_after = active_kv_mib();
         freed_mib += std::max(0.0, kv_before - kv_after);
     }
@@ -144,19 +177,42 @@ void SimGpuMemoryLedger::reclaim_empty_slabs_to_super() noexcept {
     }
 }
 
-double SimGpuMemoryLedger::ensure_session_resident(int sid) {
+SessionRestoreResult SimGpuMemoryLedger::restore_session_resident(int sid) {
+    if (auto dit = dropped_recompute_kv_mib_.find(sid); dit != dropped_recompute_kv_mib_.end()) {
+        const double recomp_val = dit->second;
+        dropped_recompute_kv_mib_.erase(dit);
+        if (!upsert_session_kv(sid, recomp_val)) {
+            dropped_recompute_kv_mib_[sid] = recomp_val;
+            return SessionRestoreResult{/*ok=*/false, 0.0, 0.0};
+        }
+        ++kv_recompute_restores_;
+        touch_session(sid);
+        return SessionRestoreResult{/*ok=*/true, 0.0, recomp_val};
+    }
     auto it = swapped_session_kv_mib_.find(sid);
     if (it == swapped_session_kv_mib_.end()) {
-        return 0.0;
+        if (session_kv_mib_.count(sid)) {
+            touch_session(sid);
+        }
+        return SessionRestoreResult{/*ok=*/true, 0.0, 0.0};
     }
     const double swapped_val = it->second;
     swapped_session_kv_mib_.erase(it);
     if (!upsert_session_kv(sid, swapped_val)) {
         swapped_session_kv_mib_[sid] = swapped_val;
-        return -1.0;
+        return SessionRestoreResult{/*ok=*/false, 0.0, 0.0};
     }
     ++kv_host_swap_ins_;
-    return swapped_val;
+    touch_session(sid);
+    return SessionRestoreResult{/*ok=*/true, swapped_val, 0.0};
+}
+
+double SimGpuMemoryLedger::ensure_session_resident(int sid) {
+    const SessionRestoreResult res = restore_session_resident(sid);
+    if (!res.ok) {
+        return -1.0;
+    }
+    return res.swapped_in_mib;
 }
 
 bool SimGpuMemoryLedger::upsert_session_kv(int sid, double logical_kv_mib) {
@@ -204,6 +260,7 @@ bool SimGpuMemoryLedger::upsert_session_kv(int sid, double logical_kv_mib) {
             }
             --resident_expert_layers_;
             ++expert_evictions_;
+            post_evict_ = true;
         }
         used = base_weights_mib() + static_cast<double>(resident_expert_layers_ * layer_stride_mib_) + kv_tot;
         if (used > total_hbm_mib_) {
@@ -239,7 +296,9 @@ bool SimGpuMemoryLedger::upsert_session_kv(int sid, double logical_kv_mib) {
         }
         return false;
     }
+    touch_session(sid);
     peak_used_mib_ = std::max(peak_used_mib_, used);
+    record_hbm_sample(used);
     return true;
 }
 
@@ -328,10 +387,14 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
             return {false, swapped_out_mib};
         }
         resident_expert_layers_ = num_expert_layers_;
+        post_evict_ = false;
 
-        if (active_sid.has_value() && post_denoise_sid_kv_mib.has_value()) {
-            session_kv_mib_[*active_sid] = *post_denoise_sid_kv_mib;
-            kv_tot = active_kv_mib();
+        if (active_sid.has_value()) {
+            touch_session(*active_sid);
+            if (post_denoise_sid_kv_mib.has_value()) {
+                session_kv_mib_[*active_sid] = *post_denoise_sid_kv_mib;
+                kv_tot = active_kv_mib();
+            }
         }
 
         const double vae_mib = policy_.use_scoped_vae ? scoped_vae_mib : unscoped_vae_mib;
@@ -344,6 +407,7 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
                (static_cast<double>(resident_expert_layers_ * layer_stride_mib_) + kv_in_super + vae_mib) > super_cap) {
             --resident_expert_layers_;
             ++expert_evictions_;
+            post_evict_ = true;
         }
 
         double vae_peak = base_weights_mib() +
@@ -359,6 +423,8 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
             return {false, swapped_out_mib};
         }
         peak_used_mib_ = std::max({peak_used_mib_, step_peak, vae_peak});
+        record_hbm_sample(step_peak);
+        record_hbm_sample(vae_peak);
         return {true, swapped_out_mib};
     }
 
@@ -441,12 +507,16 @@ std::pair<bool, double> SimGpuMemoryLedger::execute_dit_and_vae(
         retained_unscoped_vae_mib_ = std::max(retained_unscoped_vae_mib_, vae_frag_slack_mib);
     }
     peak_used_mib_ = std::max({peak_used_mib_, step_peak, vae_peak});
+    record_hbm_sample(step_peak);
+    record_hbm_sample(vae_peak);
     return {true, swapped_out_mib};
 }
 
 void SimGpuMemoryLedger::release_session(int sid) {
     session_kv_mib_.erase(sid);
     swapped_session_kv_mib_.erase(sid);
+    dropped_recompute_kv_mib_.erase(sid);
+    session_last_touch_.erase(sid);
     if (!policy_.use_tripool_vmm && session_kv_mib_.empty()) {
         retained_unscoped_vae_mib_ = 0.0;
     }
@@ -457,13 +527,17 @@ nlohmann::json SimGpuMemoryLedger::stats_json() const {
         {"gpu_id", gpu_id_},
         {"resident_expert_layers", resident_expert_layers_},
         {"expert_alpha", expert_alpha()},
+        {"post_evict", post_evict_},
         {"active_kv_mib", active_kv_mib()},
         {"free_kv_bytes", free_kv_bytes()},
         {"super_to_fine_carves", super_to_fine_carves_},
         {"expert_evictions", expert_evictions_},
         {"kv_host_swap_outs", kv_host_swap_outs_},
         {"kv_host_swap_ins", kv_host_swap_ins_},
+        {"kv_recompute_evictions", kv_recompute_evictions_},
+        {"kv_recompute_restores", kv_recompute_restores_},
         {"peak_used_mib", peak_used_mib_},
+        {"effective_hbm_util_mean_pct", round_2(effective_hbm_util_mean_pct())},
     };
 }
 

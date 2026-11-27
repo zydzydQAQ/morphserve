@@ -495,6 +495,45 @@ void test_router_and_control_engine_c_api() {
     ms_pacer_destroy(pacer);
 }
 
+void test_c_api_gpu_queue_and_atlas() {
+    // Null guards
+    MS_CHECK(ms_gpu_queue_select_json(nullptr, "{}") == nullptr);
+    MS_CHECK(ms_last_error_code() == MS_ERR_INVALID_ARG);
+    MS_CHECK(ms_gpu_queue_stats_json(nullptr) == nullptr);
+    MS_CHECK(ms_last_error_code() == MS_ERR_INVALID_ARG);
+
+    ms_gpu_queue_t* q = ms_gpu_queue_create(R"({"mode":"memory_slack","max_wait_aging_ms":5000.0,"max_bypasses":2})");
+    MS_CHECK(q != nullptr);
+    if (!q) return;
+
+    const std::string req = R"({
+        "now_ms": 200.0,
+        "live_free_mem_bytes": 4294967296,
+        "waiters": [
+            {"waiter_id": 1, "enqueue_ms": 100.0, "est_mem_bytes": 8589934592, "est_exec_ms": 8000.0, "slo_deadline_ms": 50000.0, "op_priority": 1, "bypass_count": 0},
+            {"waiter_id": 2, "enqueue_ms": 120.0, "est_mem_bytes": 1073741824, "est_exec_ms": 2000.0, "slo_deadline_ms": 6000.0, "op_priority": 1, "bypass_count": 0}
+        ]
+    })";
+    const auto resp = take_json(ms_gpu_queue_select_json(q, req.c_str()));
+    MS_CHECK(resp.at("selected").at("waiter_id").get<uint64_t>() == 2);
+    MS_CHECK(resp.at("selected").at("memory_bypass").get<bool>() == true);
+    MS_CHECK(resp.at("remaining_waiters").size() == 1);
+    MS_CHECK(resp.at("remaining_waiters")[0].at("bypass_count").get<int>() == 1);
+    const auto st = take_json(ms_gpu_queue_stats_json(q));
+    MS_CHECK(st.at("memory_bypasses_total").get<int64_t>() == 1);
+    ms_gpu_queue_destroy(q);
+
+    // 3D Performance Atlas C ABI estimate across all 3 modes.
+    const auto est_atlas = take_json(ms_atlas_estimate_json(
+        R"({"cost_model_mode":"atlas_3d","model_family":"bagel","resolution":1024,"alpha_g":0.0,"is_post_evict":false,"colocated_ar_b":2})"));
+    const auto est_legacy = take_json(ms_atlas_estimate_json(
+        R"({"cost_model_mode":"legacy_analytical","model_family":"bagel","resolution":1024,"alpha_g":0.0,"is_post_evict":false,"colocated_ar_b":2})"));
+    MS_CHECK(est_atlas.at("from_atlas").get<bool>() == true);
+    MS_CHECK(std::fabs(est_atlas.at("exposed_stall_ms").get<double>() - 173.97) < 0.1);
+    MS_CHECK(est_atlas.at("dit_step_stretch_factor").get<double>() > 1.2);
+    MS_CHECK(est_legacy.at("exposed_stall_ms").get<double>() > 1000.0);
+}
+
 }  // namespace
 
 int main() {
@@ -502,6 +541,7 @@ int main() {
     test_vmm_coalesce_oom_pinning_multi_exclude_and_headroom();
     test_policy_and_sim_override_forwarding();
     test_router_and_control_engine_c_api();
+    test_c_api_gpu_queue_and_atlas();
 
     if (g_failures != 0) {
         std::cerr << "[FAIL] test_c_api (" << g_failures << " failures)\n";

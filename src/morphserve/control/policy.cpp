@@ -76,6 +76,9 @@ void configure_static_fission_ranks(
     cfg.kv_vmm_only = false;
     cfg.use_idle_kv_swap = false;
     cfg.preemption_mode = "non_preemptive";
+    cfg.cost_model_mode = "legacy_analytical";
+    cfg.gpu_queue_mode = "fcfs";
+    cfg.kv_eviction_mode = "swap";
     for (int g = 0; g < num_gpus; ++g) {
         const bool is_und = std::find(cfg.static_und_ranks.begin(), cfg.static_und_ranks.end(), g) !=
                             cfg.static_und_ranks.end();
@@ -144,6 +147,16 @@ void apply_policy_overrides(PolicyConfig& cfg, const nlohmann::json& j) {
             if (!v.is_null()) cfg.use_idle_kv_swap = v.get<bool>();
         } else if (k == "preemption_mode") {
             if (!v.is_null()) cfg.preemption_mode = v.get<std::string>();
+        } else if (k == "cost_model_mode") {
+            if (!v.is_null()) cfg.cost_model_mode = v.get<std::string>();
+        } else if (k == "gpu_queue_mode") {
+            if (!v.is_null()) cfg.gpu_queue_mode = v.get<std::string>();
+        } else if (k == "gpu_queue_max_aging_ms") {
+            if (!v.is_null()) cfg.gpu_queue_max_aging_ms = v.get<double>();
+        } else if (k == "gpu_queue_max_bypasses") {
+            if (!v.is_null()) cfg.gpu_queue_max_bypasses = v.get<int>();
+        } else if (k == "kv_eviction_mode") {
+            if (!v.is_null()) cfg.kv_eviction_mode = v.get<std::string>();
         } else if (k == "static_und_ranks") {
             if (!v.is_null()) cfg.static_und_ranks = v.get<std::vector<int>>();
         } else if (k == "static_gen_ranks") {
@@ -297,6 +310,11 @@ nlohmann::json PolicyConfig::to_json() const {
         {"kv_vmm_only", kv_vmm_only},
         {"use_idle_kv_swap", use_idle_kv_swap},
         {"preemption_mode", preemption_mode},
+        {"cost_model_mode", cost_model_mode},
+        {"gpu_queue_mode", gpu_queue_mode},
+        {"gpu_queue_max_aging_ms", gpu_queue_max_aging_ms},
+        {"gpu_queue_max_bypasses", gpu_queue_max_bypasses},
+        {"kv_eviction_mode", kv_eviction_mode},
         {"static_und_ranks", static_und_ranks},
         {"static_gen_ranks", static_gen_ranks},
         {"initial_alphas", alphas},
@@ -410,6 +428,9 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.kv_vmm_only = false;
         cfg.use_idle_kv_swap = true;
         cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "layer_chunk";
+        cfg.cost_model_mode = "atlas_3d";
+        cfg.gpu_queue_mode = "memory_slack";
+        cfg.kv_eviction_mode = "swap";
         cfg.super_pool_mib = (fam == "internvl_u") ? ivlu_super_mib : 14336;
         cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 256;
         cfg.transient_va_gib = 16;
@@ -427,6 +448,9 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.kv_vmm_only = false;
         cfg.use_idle_kv_swap = (policy_name == "monolithic_kv_swap");
         cfg.preemption_mode = "non_preemptive";
+        cfg.cost_model_mode = "legacy_analytical";
+        cfg.gpu_queue_mode = "fcfs";
+        cfg.kv_eviction_mode = "swap";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 1.0;
         }
@@ -447,6 +471,9 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.kv_vmm_only = false;
         cfg.use_idle_kv_swap = false;
         cfg.preemption_mode = "non_preemptive";
+        cfg.cost_model_mode = "legacy_analytical";
+        cfg.gpu_queue_mode = "fcfs";
+        cfg.kv_eviction_mode = "swap";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = ((g % 2) == 0) ? 0.0 : 1.0;
         }
@@ -467,6 +494,9 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.kv_vmm_only = true;
         cfg.use_idle_kv_swap = true;
         cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "step_preemptive";
+        cfg.cost_model_mode = "legacy_analytical";
+        cfg.gpu_queue_mode = "fcfs";
+        cfg.kv_eviction_mode = "swap";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 1.0;
         }
@@ -486,6 +516,9 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.kv_vmm_only = false;
         cfg.use_idle_kv_swap = false;
         cfg.preemption_mode = "non_preemptive";
+        cfg.cost_model_mode = "legacy_analytical";
+        cfg.gpu_queue_mode = "fcfs";
+        cfg.kv_eviction_mode = "swap";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 0.0;
         }

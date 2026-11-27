@@ -482,6 +482,7 @@ PreparedTransition prepare_transition_request(
     prep.req.req_id = session_id + "_t" + std::to_string(turn_idx) + "_a" + std::to_string(attempt);
     prep.req.src_gpu = src_gpu;
     prep.req.architecture = arch;
+    prep.req.model_family = fam;
     prep.req.gen_expert_bytes = gen_expert_bytes_override.value_or(op_prof.expert_bytes(fam));
     prep.req.dit_step1_ms = dit_step1_ms_override.value_or(op_prof.step_ms(fam, height));
     prep.req.dit_total_steps = dit_steps;
@@ -701,6 +702,8 @@ WorkerStatsInput WorkerStatsInput::from_json(const nlohmann::json& st) {
     w.combined_physical_mib = comb;
     w.pytorch_reserved_mib = pt;
     w.nvml_sm_util_mean_pct = first_number_opt(st, {"nvml_sm_util_mean_pct", "sm_util_mean_pct"});
+    w.nvml_mem_util_mean_pct = first_number_opt(st, {"nvml_mem_util_mean_pct", "mem_util_mean_pct"});
+    w.effective_hbm_util_mean_pct = first_number_opt(st, {"effective_hbm_util_mean_pct", "hbm_util_mean_pct"});
 
     if (st.contains("vmm_physical_pool_mib") && st["vmm_physical_pool_mib"].is_number()) {
         w.vmm_physical_pool_mib = st["vmm_physical_pool_mib"].get<double>();
@@ -720,6 +723,8 @@ WorkerStatsInput WorkerStatsInput::from_json(const nlohmann::json& st) {
     } else if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
         w.kv_host_swap_ins = st["vmm_stats"].value("kv_swap_ins_total", 0);
     }
+    w.kv_recompute_evictions = st.value("kv_recompute_evictions", 0);
+    w.kv_recompute_restores = st.value("kv_recompute_restores", 0);
     if (st.contains("vmm_stats") && st["vmm_stats"].is_object()) {
         const auto& vs = st["vmm_stats"];
         w.overflow_creates = vs.value("overflow_creates", 0);
@@ -736,7 +741,18 @@ MorphControlEngine::MorphControlEngine(
     std::shared_ptr<DualPathMorphRouter> router)
     : policy_(std::move(policy)),
       topology_(std::move(topology)),
-      router_(router ? std::move(router) : std::make_shared<DualPathMorphRouter>(topology_)) {}
+      router_(router ? std::move(router)
+                     : std::make_shared<DualPathMorphRouter>(
+                           topology_,
+                           nullptr,
+                           default_operator_profile(),
+                           std::nullopt,
+                           12.0,
+                           0.90,
+                           true,
+                           true,
+                           128LL * kMiB,
+                           policy_.cost_model_mode)) {}
 
 PreemptEdfController MorphControlEngine::make_edf_controller(
     int num_layers,
@@ -958,11 +974,15 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     int worker_ooms = 0;
     int kv_host_swap_outs = 0;
     int kv_host_swap_ins = 0;
+    int kv_recompute_evictions = 0;
+    int kv_recompute_restores = 0;
     int overflow_creates = 0;
     int carves = 0;
     int evict_kv = 0;
     int evict_tr = 0;
     std::vector<double> sm_util_samples;
+    std::vector<double> mem_util_samples;
+    std::vector<double> eff_hbm_util_samples;
     std::vector<std::pair<double, double>> realtime_alpha_samples;
 
     auto collect_alpha_timeline = [&](const nlohmann::json& arr) {
@@ -987,12 +1007,20 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         if (ws.nvml_sm_util_mean_pct.has_value()) {
             sm_util_samples.push_back(*ws.nvml_sm_util_mean_pct);
         }
+        if (ws.nvml_mem_util_mean_pct.has_value()) {
+            mem_util_samples.push_back(*ws.nvml_mem_util_mean_pct);
+        }
+        if (ws.effective_hbm_util_mean_pct.has_value()) {
+            eff_hbm_util_samples.push_back(*ws.effective_hbm_util_mean_pct);
+        }
         if (raw_st.contains("alpha_timeline")) {
             collect_alpha_timeline(raw_st["alpha_timeline"]);
         }
         worker_ooms += ws.oom_count;
         kv_host_swap_outs += ws.kv_host_swap_outs;
         kv_host_swap_ins += ws.kv_host_swap_ins;
+        kv_recompute_evictions += ws.kv_recompute_evictions;
+        kv_recompute_restores += ws.kv_recompute_restores;
         overflow_creates += ws.overflow_creates;
         carves += ws.super_to_fine_carves;
         evict_kv += ws.expert_auto_evictions_for_kv;
@@ -1010,6 +1038,12 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         if (auto sm = first_number_opt(worker_stats_array, {"nvml_sm_util_mean_pct", "sm_util_mean_pct"}); sm.has_value()) {
             sm_util_samples.push_back(*sm);
         }
+        if (auto mu = first_number_opt(worker_stats_array, {"nvml_mem_util_mean_pct", "mem_util_mean_pct"}); mu.has_value()) {
+            mem_util_samples.push_back(*mu);
+        }
+        if (auto hu = first_number_opt(worker_stats_array, {"effective_hbm_util_mean_pct", "hbm_util_mean_pct"}); hu.has_value()) {
+            eff_hbm_util_samples.push_back(*hu);
+        }
         if (worker_stats_array.contains("workers") && worker_stats_array["workers"].is_array()) {
             for (const auto& raw_st : worker_stats_array["workers"]) {
                 ingest_worker_entry(raw_st);
@@ -1024,6 +1058,12 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         }
         if (auto sm = first_number_opt(sim_extra_fields, {"nvml_sm_util_mean_pct", "sm_util_mean_pct"}); sm.has_value()) {
             sm_util_samples.push_back(*sm);
+        }
+        if (auto mu = first_number_opt(sim_extra_fields, {"nvml_mem_util_mean_pct", "mem_util_mean_pct"}); mu.has_value()) {
+            mem_util_samples.push_back(*mu);
+        }
+        if (auto hu = first_number_opt(sim_extra_fields, {"effective_hbm_util_mean_pct", "hbm_util_mean_pct"}); hu.has_value()) {
+            eff_hbm_util_samples.push_back(*hu);
         }
     }
 
@@ -1637,6 +1677,16 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     };
     const nlohmann::json nvml_sm_util_j =
         sm_util_samples.empty() ? nlohmann::json(nullptr) : nlohmann::json(round_2(mean_raw(sm_util_samples)));
+    const nlohmann::json nvml_mem_util_j =
+        mem_util_samples.empty() ? nlohmann::json(nullptr) : nlohmann::json(round_2(mean_raw(mem_util_samples)));
+    const nlohmann::json eff_hbm_util_j =
+        eff_hbm_util_samples.empty() ? nlohmann::json(nullptr) : nlohmann::json(round_2(mean_raw(eff_hbm_util_samples)));
+
+    const int kv_total_restores = kv_host_swap_ins + kv_recompute_restores;
+    const double kv_swap_hit_rate_pct =
+        (kv_total_restores > 0)
+            ? round_1(100.0 * static_cast<double>(kv_host_swap_ins) / static_cast<double>(kv_total_restores))
+            : (policy.kv_eviction_mode == "recompute" ? 0.0 : 100.0);
 
     const nlohmann::json slo_config = {
         {"k_ar", policy.slo_scale_k},
@@ -1653,6 +1703,9 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"cot_dit_decoupled", true},
         {"primary_granularity", "turn_level"},
         {"turn_oom_accounting", "planned_turns_denominator"},
+        {"cost_model_mode", policy.cost_model_mode},
+        {"gpu_queue_mode", policy.gpu_queue_mode},
+        {"kv_eviction_mode", policy.kv_eviction_mode},
     };
 
     nlohmann::json report = {
@@ -1707,35 +1760,51 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"steady_dit_slo_attainment_pct", steady_dit_att_pct},
         {"ar_slo_attainment_pct", steady_ar_att_pct},
         {"dit_slo_attainment_pct", steady_dit_att_pct},
+        {"ar_ttft_mean_ms", round_2(mean_raw(core_ok_ttfts))},
         {"ar_ttft_p50_ms", percentile_rounded(core_ok_ttfts, 50.0)},
         {"ar_ttft_p95_ms", percentile_rounded(core_ok_ttfts, 95.0)},
         {"ar_ttft_p99_ms", percentile_rounded(core_ok_ttfts, 99.0)},
+        {"ar_tpot_mean_ms", round_2(mean_raw(core_ok_tpots))},
         {"ar_tpot_p50_ms", percentile_rounded(core_ok_tpots, 50.0)},
         {"ar_tpot_p95_ms", percentile_rounded(core_ok_tpots, 95.0)},
         {"ar_tpot_p99_ms", percentile_rounded(core_ok_tpots, 99.0)},
+        {"dit_turn_mean_ms", round_2(mean_raw(core_ok_dits))},
         {"dit_turn_p50_ms", percentile_rounded(core_ok_dits, 50.0)},
         {"dit_turn_p95_ms", percentile_rounded(core_ok_dits, 95.0)},
         {"dit_turn_p99_ms", percentile_rounded(core_ok_dits, 99.0)},
+        {"session_e2e_mean_ms", round_2(mean_raw(core_ok_e2es))},
         {"session_e2e_p50_ms", percentile_rounded(core_ok_e2es, 50.0)},
         {"session_e2e_p95_ms", percentile_rounded(core_ok_e2es, 95.0)},
         {"session_e2e_p99_ms", percentile_rounded(core_ok_e2es, 99.0)},
+        {"active_jct_mean_ms", round_2(mean_raw(core_ok_active_jcts))},
         {"active_jct_p50_ms", percentile_rounded(core_ok_active_jcts, 50.0)},
         {"active_jct_p95_ms", percentile_rounded(core_ok_active_jcts, 95.0)},
         {"active_jct_p99_ms", percentile_rounded(core_ok_active_jcts, 99.0)},
         {"all_session_active_jct_p50_ms", failure_aware_quantile(core_ok_active_jcts, steady_sessions_cnt, 50.0)},
         {"all_session_active_jct_p90_ms", failure_aware_quantile(core_ok_active_jcts, steady_sessions_cnt, 90.0)},
         {"all_session_active_jct_p95_ms", failure_aware_quantile(core_ok_active_jcts, steady_sessions_cnt, 95.0)},
+        {"all_session_active_jct_p99_ms", failure_aware_quantile(core_ok_active_jcts, steady_sessions_cnt, 99.0)},
         {"all_session_e2e_p50_ms", failure_aware_quantile(core_ok_e2es, steady_sessions_cnt, 50.0)},
         {"all_session_e2e_p90_ms", failure_aware_quantile(core_ok_e2es, steady_sessions_cnt, 90.0)},
         {"all_session_e2e_p95_ms", failure_aware_quantile(core_ok_e2es, steady_sessions_cnt, 95.0)},
+        {"all_session_e2e_p99_ms", failure_aware_quantile(core_ok_e2es, steady_sessions_cnt, 99.0)},
         {"all_session_dit_p50_ms", failure_aware_quantile(core_ok_dits, core_total_dit_units, 50.0)},
         {"all_session_dit_p90_ms", failure_aware_quantile(core_ok_dits, core_total_dit_units, 90.0)},
         {"all_session_dit_p95_ms", failure_aware_quantile(core_ok_dits, core_total_dit_units, 95.0)},
+        {"all_session_dit_p99_ms", failure_aware_quantile(core_ok_dits, core_total_dit_units, 99.0)},
         {"active_jct_cdf_points", build_improper_cdf_points(core_ok_active_jcts, steady_sessions_cnt)},
         {"e2e_cdf_points", build_improper_cdf_points(core_ok_e2es, steady_sessions_cnt)},
         {"dit_cdf_points", build_improper_cdf_points(core_ok_dits, core_total_dit_units)},
         {"latency_breakdown_ms", latency_breakdown_ms},
         {"nvml_sm_util_mean_pct", nvml_sm_util_j},
+        {"nvml_mem_util_mean_pct", nvml_mem_util_j},
+        {"effective_hbm_util_mean_pct", eff_hbm_util_j},
+        {"cost_model_mode", policy.cost_model_mode},
+        {"gpu_queue_mode", policy.gpu_queue_mode},
+        {"kv_eviction_mode", policy.kv_eviction_mode},
+        {"queue_reorders_total", 0},
+        {"queue_memory_bypasses_total", 0},
+        {"queue_starvation_promotions_total", 0},
         {"peak_gpu_reserved_mib", round_2(peak_res_mib)},
         {"peak_nvml_used_mib", round_2(peak_nvml_mib)},
         {"peak_pytorch_reserved_mib", round_2(peak_pytorch_res_mib)},
@@ -1743,6 +1812,13 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
         {"host_shmem_delta_gib", host_shmem_delta_gib},
         {"kv_host_swap_outs", kv_host_swap_outs},
         {"kv_host_swap_ins", kv_host_swap_ins},
+        {"kv_recompute_events", kv_recompute_restores},
+        {"kv_recompute_evictions", kv_recompute_evictions},
+        {"kv_swap_hit_rate_pct", kv_swap_hit_rate_pct},
+        {"kv_swap_in_mean_ms", 0.0},
+        {"kv_swap_in_p95_ms", 0.0},
+        {"kv_recompute_total_ms", 0.0},
+        {"kv_saved_recompute_ms", 0.0},
         {"vmm_overflow_creates", overflow_creates},
         {"vmm_super_to_fine_carves", carves},
         {"vmm_expert_evictions_for_kv", evict_kv},
@@ -1768,7 +1844,8 @@ nlohmann::json MorphControlEngine::aggregate_cluster_run_report(
     }
     if (sim_extra_fields.is_object()) {
         for (auto it = sim_extra_fields.begin(); it != sim_extra_fields.end(); ++it) {
-            if (it.key() == "alpha_timeline" || it.key() == "nvml_sm_util_mean_pct") {
+            if (it.key() == "alpha_timeline" || it.key() == "nvml_sm_util_mean_pct" ||
+                it.key() == "nvml_mem_util_mean_pct" || it.key() == "effective_hbm_util_mean_pct") {
                 continue;
             }
             report[it.key()] = it.value();

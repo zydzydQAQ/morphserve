@@ -26,6 +26,8 @@ add_library(morphserve_core SHARED
     src/morphserve/control/topology.cpp
     src/morphserve/control/policy.cpp
     src/morphserve/control/budget_planner.cpp
+    src/morphserve/control/gpu_queue_scheduler.cpp
+    src/morphserve/control/performance_atlas.cpp
     src/morphserve/control/preempt_edf.cpp
     src/morphserve/control/router.cpp
     src/morphserve/control/morph_controller.cpp

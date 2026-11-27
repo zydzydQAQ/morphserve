@@ -252,6 +252,29 @@ class ClusterRunReport:
     steady_sessions_with_ar: int = 0
     steady_sessions_with_dit: int = 0
     nvml_sm_util_mean_pct: float | None = None
+    nvml_mem_util_mean_pct: float | None = None
+    effective_hbm_util_mean_pct: float | None = None
+    ar_ttft_mean_ms: float = 0.0
+    ar_tpot_mean_ms: float = 0.0
+    dit_turn_mean_ms: float = 0.0
+    session_e2e_mean_ms: float = 0.0
+    active_jct_mean_ms: float = 0.0
+    all_session_active_jct_p99_ms: float | None = None
+    all_session_e2e_p99_ms: float | None = None
+    all_session_dit_p99_ms: float | None = None
+    cost_model_mode: str = "atlas_3d"
+    gpu_queue_mode: str = "memory_slack"
+    kv_eviction_mode: str = "swap"
+    queue_reorders_total: int = 0
+    queue_memory_bypasses_total: int = 0
+    queue_starvation_promotions_total: int = 0
+    kv_recompute_events: int = 0
+    kv_recompute_evictions: int = 0
+    kv_swap_hit_rate_pct: float = 100.0
+    kv_swap_in_mean_ms: float = 0.0
+    kv_swap_in_p95_ms: float = 0.0
+    kv_recompute_total_ms: float = 0.0
+    kv_saved_recompute_ms: float = 0.0
     alpha_timeline: list[dict[str, float]] = field(default_factory=list)
     latency_breakdown_ms: dict[str, Any] = field(default_factory=dict)
 
@@ -264,6 +287,149 @@ class ClusterRunReport:
         known = {f.name for f in fields(cls)}
         filtered = {k: v for k, v in data.items() if k in known}
         return cls(**filtered)
+
+
+class MemorySlackGpuLock:
+    """Async per-GPU exclusive lock delegating waiter selection to C++ `GpuWaitQueueScheduler`."""
+
+    def __init__(
+        self,
+        gpu_id: int,
+        *,
+        mode: str = "memory_slack",
+        max_wait_aging_ms: float = 6000.0,
+        max_bypasses: int = 3,
+        free_mem_provider: Callable[[int], int] | None = None,
+    ) -> None:
+        self.gpu_id = int(gpu_id)
+        self._free_mem_provider = free_mem_provider
+        self._lib = get_core_lib()
+        pol_j = {
+            "mode": str(mode),
+            "max_wait_aging_ms": float(max_wait_aging_ms),
+            "max_bypasses": int(max_bypasses),
+        }
+        h = int(self._lib.ms_gpu_queue_create(encode_json(pol_j)) or 0)
+        if h == 0:
+            raise RuntimeError(f"ms_gpu_queue_create failed: {last_error(self._lib)}")
+        self._handle = h
+        self._locked = False
+        self._seq = 0
+        self._waiters: list[tuple[dict[str, Any], asyncio.Future[None]]] = []
+
+    def __del__(self) -> None:
+        self.close()
+
+    def close(self) -> None:
+        h = getattr(self, "_handle", 0)
+        if h:
+            self._handle = 0
+            try:
+                self._lib.ms_gpu_queue_destroy(ctypes.c_void_p(h))
+            except Exception:
+                pass
+
+    def locked(self) -> bool:
+        return self._locked
+
+    def stats(self) -> dict[str, int]:
+        if not self._handle:
+            return {
+                "dispatches_total": 0,
+                "reorders_total": 0,
+                "memory_bypasses_total": 0,
+                "starvation_promotions_total": 0,
+            }
+        raw = call_json(self._lib, self._lib.ms_gpu_queue_stats_json, ctypes.c_void_p(self._handle))
+        return {k: int(v) for k, v in raw.items()}
+
+    async def acquire(
+        self,
+        *,
+        est_mem_bytes: int = 0,
+        est_exec_ms: float = 0.0,
+        slo_deadline_ms: float = 0.0,
+        op_priority: int = 1,
+    ) -> bool:
+        if not self._locked and not self._waiters:
+            self._locked = True
+            return True
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+        self._seq += 1
+        spec = {
+            "waiter_id": int(self._seq),
+            "enqueue_ms": float(time.perf_counter() * 1000.0),
+            "est_mem_bytes": int(max(0, est_mem_bytes)),
+            "est_exec_ms": float(max(0.0, est_exec_ms)),
+            "slo_deadline_ms": float(max(0.0, slo_deadline_ms)),
+            "op_priority": int(op_priority),
+            "bypass_count": 0,
+        }
+        entry = (spec, fut)
+        self._waiters.append(entry)
+        try:
+            await fut
+        except BaseException:
+            if not fut.done():
+                try:
+                    self._waiters.remove(entry)
+                except ValueError:
+                    pass
+            elif not fut.cancelled():
+                self.release()
+            raise
+        return True
+
+    def release(self) -> None:
+        if not self._locked:
+            raise RuntimeError("MemorySlackGpuLock.release() called on unlocked lock")
+        # Purge already-cancelled waiters before querying C++ selector.
+        self._waiters = [(s, f) for (s, f) in self._waiters if not f.done()]
+        if not self._waiters:
+            self._locked = False
+            return
+        live_free = 0
+        if self._free_mem_provider is not None:
+            try:
+                live_free = max(0, int(self._free_mem_provider(self.gpu_id)))
+            except Exception:
+                live_free = 0
+        req = {
+            "waiters": [s for (s, _) in self._waiters],
+            "now_ms": float(time.perf_counter() * 1000.0),
+            "live_free_mem_bytes": int(live_free),
+        }
+        resp = call_json(
+            self._lib,
+            self._lib.ms_gpu_queue_select_json,
+            ctypes.c_void_p(self._handle),
+            encode_json(req),
+        )
+        sel = resp.get("selected")
+        rem_by_id = {int(w["waiter_id"]): w for w in resp.get("remaining_waiters", [])}
+        chosen_wid = int(sel["waiter_id"]) if isinstance(sel, Mapping) else int(self._waiters[0][0]["waiter_id"])
+        chosen_fut: asyncio.Future[None] | None = None
+        next_waiters: list[tuple[dict[str, Any], asyncio.Future[None]]] = []
+        for s, f in self._waiters:
+            wid = int(s["waiter_id"])
+            if wid == chosen_wid and chosen_fut is None:
+                chosen_fut = f
+            else:
+                if wid in rem_by_id:
+                    s["bypass_count"] = int(rem_by_id[wid].get("bypass_count", s.get("bypass_count", 0)))
+                next_waiters.append((s, f))
+        self._waiters = next_waiters
+        if chosen_fut is not None and not chosen_fut.done():
+            chosen_fut.set_result(None)
+        else:
+            self._locked = False
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
 
 
 class MorphServeClusterEngine:
@@ -287,7 +453,11 @@ class MorphServeClusterEngine:
             int(policy.num_gpus), gpus_per_node=min(8, max(1, int(policy.num_gpus)))
         )
         self.pacer = HalfNodeH2DPacer(self.topo, max_concurrent_per_half=1) if policy.use_h2d_pacer else None
-        self.router = DualPathMorphRouter(self.topo, pacer=self.pacer)
+        self.router = DualPathMorphRouter(
+            self.topo,
+            pacer=self.pacer,
+            cost_model_mode=self.policy.cost_model_mode,
+        )
         self.fleet: WorkerFleet = fleet or MpSpawnGpuWorkerFleet(
             policy, self.model_dir, self.bench_root, topology=self.topo
         )
@@ -299,7 +469,7 @@ class MorphServeClusterEngine:
         self._fut_lock = threading.Lock()
         self._cmd_seq = 0
 
-        self._gpu_locks: list[asyncio.Lock] = []
+        self._gpu_locks: list[MemorySlackGpuLock] = []
         self._xfer_locks: list[asyncio.Lock] = []
         self._dst_staging_sems: list[asyncio.Semaphore] = []
         self._inflight_ar_on_gpu: dict[int, int] = {}
@@ -429,10 +599,27 @@ class MorphServeClusterEngine:
             kv_free_bytes=kv_frees,
         )
 
+    def _free_mem_bytes_for_gpu(self, gpu: int) -> int:
+        try:
+            return max(0, int(self.router.get_worker_state(gpu).kv_free_bytes))
+        except Exception:
+            return 0
+
     def _ensure_async_primitives(self) -> None:
         n_gpus = self.policy.num_gpus
         if len(self._gpu_locks) != n_gpus:
-            self._gpu_locks = [asyncio.Lock() for _ in range(n_gpus)]
+            for lk in self._gpu_locks:
+                lk.close()
+            self._gpu_locks = [
+                MemorySlackGpuLock(
+                    g,
+                    mode=self.policy.gpu_queue_mode,
+                    max_wait_aging_ms=self.policy.gpu_queue_max_aging_ms,
+                    max_bypasses=self.policy.gpu_queue_max_bypasses,
+                    free_mem_provider=self._free_mem_bytes_for_gpu,
+                )
+                for g in range(n_gpus)
+            ]
         if len(self._xfer_locks) != n_gpus:
             self._xfer_locks = [asyncio.Lock() for _ in range(n_gpus)]
         if len(self._dst_staging_sems) != n_gpus:
@@ -691,9 +878,22 @@ class MorphServeClusterEngine:
         finally:
             self.router.release_ar_queue(resident_gpu, est_ar_ms)
 
-    async def _acquire_exclusive_gpu(self, gpu: int) -> None:
-        """Acquire exclusive GPU lock after any non-preempting standalone AR batch finishes draining."""
-        await self._gpu_locks[gpu].acquire()
+    async def _acquire_exclusive_gpu(
+        self,
+        gpu: int,
+        *,
+        est_mem_bytes: int = 0,
+        est_exec_ms: float = 0.0,
+        slo_deadline_ms: float = 0.0,
+        op_priority: int = 1,
+    ) -> None:
+        """Acquire exclusive GPU lock via C++ Memory+Slack scheduler after standalone AR drains."""
+        await self._gpu_locks[gpu].acquire(
+            est_mem_bytes=est_mem_bytes,
+            est_exec_ms=est_exec_ms,
+            slo_deadline_ms=slo_deadline_ms,
+            op_priority=op_priority,
+        )
         try:
             await self._ar_drained_events[gpu].wait()
         except BaseException:
@@ -1345,7 +1545,14 @@ class MorphServeClusterEngine:
                         self.router.reserve_ar_queue(resident_gpu, est_prep_ms)
                         try:
                             t_pq0 = time.perf_counter()
-                            await self._acquire_exclusive_gpu(resident_gpu)
+                            prep_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
+                            await self._acquire_exclusive_gpu(
+                                resident_gpu,
+                                est_mem_bytes=(512 if turn.height >= 1024 else 256) * MIB,
+                                est_exec_ms=est_prep_ms,
+                                slo_deadline_ms=prep_dl_ms,
+                                op_priority=0,
+                            )
                             turn_q_ms += max(0.0, (time.perf_counter() - t_pq0) * 1000.0)
                             try:
                                 prep_res = await self._rpc(
@@ -1516,7 +1723,15 @@ class MorphServeClusterEngine:
 
                             if dit_res.get("status") != "oom":
                                 t_dq_dit = time.perf_counter()
-                                await self._acquire_exclusive_gpu(dst_gpu)
+                                dit_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
+                                est_dit_mem_b = int(kv_bytes) + ((4096 if turn.height >= 1024 else 1024) * MIB)
+                                await self._acquire_exclusive_gpu(
+                                    dst_gpu,
+                                    est_mem_bytes=est_dit_mem_b,
+                                    est_exec_ms=est_dit_ms,
+                                    slo_deadline_ms=dit_dl_ms,
+                                    op_priority=1,
+                                )
                                 turn_q_ms += max(0.0, (time.perf_counter() - t_dq_dit) * 1000.0)
                                 try:
                                     dit_res = await self._exec_dit_on_locked_gpu(
@@ -1855,6 +2070,8 @@ class MorphServeClusterEngine:
             return_exceptions=True,
         )
         sm_util_samples: list[float] = []
+        mem_util_samples: list[float] = []
+        hbm_util_samples: list[float] = []
         for item in raw_stats:
             if isinstance(item, Mapping):
                 st_d = dict(item)
@@ -1868,6 +2085,26 @@ class MorphServeClusterEngine:
                     sm_util_samples.append(sm_f)
                 else:
                     st_d.pop("nvml_sm_util_mean_pct", None)
+                mem_val = st_d.get("nvml_mem_util_mean_pct")
+                has_mem = isinstance(mem_val, (int, float)) and int(
+                    st_d.get("nvml_mem_util_samples", 1 if float(mem_val) > 0.0 else 0)
+                ) > 0
+                if has_mem:
+                    mem_f = round(float(mem_val), 2)
+                    st_d["nvml_mem_util_mean_pct"] = mem_f
+                    mem_util_samples.append(mem_f)
+                else:
+                    st_d.pop("nvml_mem_util_mean_pct", None)
+                hbm_val = st_d.get("effective_hbm_util_mean_pct")
+                has_hbm = isinstance(hbm_val, (int, float)) and int(
+                    st_d.get("effective_hbm_util_samples", 1 if float(hbm_val) > 0.0 else 0)
+                ) > 0
+                if has_hbm:
+                    hbm_f = round(float(hbm_val), 2)
+                    st_d["effective_hbm_util_mean_pct"] = hbm_f
+                    hbm_util_samples.append(hbm_f)
+                else:
+                    st_d.pop("effective_hbm_util_mean_pct", None)
                 stat_res.append(st_d)
             else:
                 stat_res.append({"oom_count": 0})
@@ -1875,12 +2112,22 @@ class MorphServeClusterEngine:
         cluster_sm_util_pct: float | None = (
             round(sum(sm_util_samples) / float(len(sm_util_samples)), 2) if sm_util_samples else None
         )
+        cluster_mem_util_pct: float | None = (
+            round(sum(mem_util_samples) / float(len(mem_util_samples)), 2) if mem_util_samples else None
+        )
+        cluster_hbm_util_pct: float | None = (
+            round(sum(hbm_util_samples) / float(len(hbm_util_samples)), 2) if hbm_util_samples else None
+        )
         if stat_res:
             stat_res[0]["alpha_timeline"] = alpha_timeline
         else:
             entry: dict[str, Any] = {"oom_count": 0, "alpha_timeline": alpha_timeline}
             if cluster_sm_util_pct is not None:
                 entry["nvml_sm_util_mean_pct"] = cluster_sm_util_pct
+            if cluster_mem_util_pct is not None:
+                entry["nvml_mem_util_mean_pct"] = cluster_mem_util_pct
+            if cluster_hbm_util_pct is not None:
+                entry["effective_hbm_util_mean_pct"] = cluster_hbm_util_pct
             stat_res.append(entry)
 
         agg = call_json(
@@ -1898,6 +2145,20 @@ class MorphServeClusterEngine:
             agg.get("nvml_sm_util_mean_pct") is None and cluster_sm_util_pct is not None
         ):
             agg["nvml_sm_util_mean_pct"] = cluster_sm_util_pct
+        if "nvml_mem_util_mean_pct" not in agg or (
+            agg.get("nvml_mem_util_mean_pct") is None and cluster_mem_util_pct is not None
+        ):
+            agg["nvml_mem_util_mean_pct"] = cluster_mem_util_pct
+        if "effective_hbm_util_mean_pct" not in agg or (
+            agg.get("effective_hbm_util_mean_pct") is None and cluster_hbm_util_pct is not None
+        ):
+            agg["effective_hbm_util_mean_pct"] = cluster_hbm_util_pct
+        q_reorders = sum(lk.stats().get("reorders_total", 0) for lk in self._gpu_locks)
+        q_bypasses = sum(lk.stats().get("memory_bypasses_total", 0) for lk in self._gpu_locks)
+        q_starv = sum(lk.stats().get("starvation_promotions_total", 0) for lk in self._gpu_locks)
+        agg["queue_reorders_total"] = int(q_reorders)
+        agg["queue_memory_bypasses_total"] = int(q_bypasses)
+        agg["queue_starvation_promotions_total"] = int(q_starv)
         if "alpha_timeline" not in agg:
             agg["alpha_timeline"] = alpha_timeline
         return ClusterRunReport.from_dict(agg)
@@ -1935,6 +2196,7 @@ class MorphServeClusterEngine:
 
 __all__ = [
     "ClusterRunReport",
+    "MemorySlackGpuLock",
     "MorphServeClusterEngine",
     "SessionOutcome",
 ]

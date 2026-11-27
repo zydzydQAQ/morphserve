@@ -377,6 +377,95 @@ void test_calibration_evaluate_against_real_runs_in_memory() {
     MS_CHECK(std::abs(cal_oom.at("per_point")[0].at("dit_p95_err_pct").get<double>() - 100.0) < 1e-6);
 }
 
+void test_lru_kv_eviction_recompute_queue_and_metrics() {
+    using namespace morphserve::control;
+
+    const ClusterPhysicsProfile ph{};
+    const PolicyConfig swap_pol = PolicyConfig::from_preset("morphserve", 8, {{"kv_eviction_mode", "swap"}});
+    const PolicyConfig recomp_pol = PolicyConfig::from_preset("morphserve", 8, {{"kv_eviction_mode", "recompute"}});
+
+    // 1. True LRU order: touch sid=0 AFTER sid=1 and sid=2 -> evicting must pick sid=1 first, keeping sid=0 resident.
+    SimGpuMemoryLedger lru_lg(0, 40960.0, swap_pol, "hybrid", 28, 28, 448, ph);
+    MS_CHECK(lru_lg.upsert_session_kv(0, 1200.0));
+    MS_CHECK(lru_lg.upsert_session_kv(1, 1200.0));
+    MS_CHECK(lru_lg.upsert_session_kv(2, 1200.0));
+    // Re-touch sid=0 so sid=1 becomes the least recently used.
+    MS_CHECK(lru_lg.upsert_session_kv(0, 1250.0));
+    const double freed_lru = lru_lg.evict_idle_kv_to_host(1200.0, /*exclude_sid=*/2);
+    MS_CHECK(freed_lru >= 1100.0);
+    // sid=0 must remain resident (0 swap-in); sid=1 must be swapped in (>0).
+    const auto r0 = lru_lg.restore_session_resident(0);
+    const auto r1 = lru_lg.restore_session_resident(1);
+    MS_CHECK(r0.ok && r0.swapped_in_mib == 0.0 && r0.recompute_kv_mib == 0.0);
+    MS_CHECK(r1.ok && r1.swapped_in_mib > 1000.0 && r1.recompute_kv_mib == 0.0);
+    MS_CHECK(lru_lg.effective_hbm_util_mean_pct() > 0.0);
+
+    // 2. Recompute eviction mode drops KV instead of host swap and flags recompute on wake-up.
+    SimGpuMemoryLedger recomp_lg(0, 40960.0, recomp_pol, "hybrid", 28, 28, 448, ph);
+    MS_CHECK(recomp_lg.upsert_session_kv(0, 1200.0));
+    MS_CHECK(recomp_lg.upsert_session_kv(1, 1200.0));
+    MS_CHECK(recomp_lg.evict_idle_kv_to_host(1200.0, /*exclude_sid=*/1) >= 1100.0);
+    MS_CHECK(recomp_lg.kv_host_swap_outs() == 0);
+    MS_CHECK(recomp_lg.kv_recompute_evictions() == 1);
+    const auto rr = recomp_lg.restore_session_resident(0);
+    MS_CHECK(rr.ok && rr.swapped_in_mib == 0.0 && rr.recompute_kv_mib > 1000.0);
+    MS_CHECK(recomp_lg.kv_recompute_restores() == 1);
+
+    // 3. End-to-end simulator check: tight 34 GiB 1-GPU multi-turn editing triggers KV swap vs recompute
+    // AND verifies Mean / P99 / HBM utilization / Memory+Slack reordering metrics.
+    const HardwareInterconnectSpec hw_tight1{
+        "unit_tight_34g_1gpu", 34.0, 1.0, 12.34, 12.34, 10.0, 10.0, 5.0, 1};
+    std::vector<SimSessionSpec> burst;
+    for (int i = 0; i < 6; ++i) {
+        const int res = (i % 2 == 0) ? 1024 : 512;
+        burst.push_back(SimSessionSpec{
+            static_cast<double>(i) * 100.0,
+            "multiturn_edit",
+            {
+                SimTurnSpec{"dit_edit", res, 16, 48, 1, false},
+                SimTurnSpec{"dit_edit", res, 16, 48, 0, false},
+                SimTurnSpec{"dit_edit", res, 16, 48, 0, false},
+            },
+            "b_" + std::to_string(i),
+            "main",
+        });
+    }
+    const nlohmann::json base_ov = {
+        {"steady_window_mode", "session_trim"},
+        {"steady_state_trim_frac", 0.0},
+        {"inter_turn_think_s_range", nlohmann::json::array({0.5, 1.5})},
+        {"think_time_median_s", 1.0},
+    };
+    nlohmann::json swap_ov = base_ov;
+    swap_ov["kv_eviction_mode"] = "swap";
+    swap_ov["gpu_queue_mode"] = "memory_slack";
+    nlohmann::json recomp_ov = base_ov;
+    recomp_ov["kv_eviction_mode"] = "recompute";
+    recomp_ov["gpu_queue_mode"] = "fcfs";
+
+    const auto rep_swap = ClusterSimulator::simulate_cluster_point(
+        "morphserve", 1, hw_tight1, 1.0, 6, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &burst, swap_ov);
+    const auto rep_recomp = ClusterSimulator::simulate_cluster_point(
+        "morphserve", 1, hw_tight1, 1.0, 6, 2026, ph, WorkloadScaleSpec::bagel_7b_standard(), "", "", "", &burst, recomp_ov);
+
+    MS_CHECK(rep_swap.at("status").get<std::string>() == "ok");
+    MS_CHECK(rep_swap.at("oom_sessions").get<int>() == 0);
+    MS_CHECK(rep_swap.at("dit_turn_mean_ms").get<double>() > 0.0);
+    MS_CHECK(rep_swap.at("session_e2e_mean_ms").get<double>() > 0.0);
+    MS_CHECK(rep_swap.at("active_jct_mean_ms").get<double>() > 0.0);
+    MS_CHECK(rep_swap.at("effective_hbm_util_mean_pct").get<double>() > 0.0);
+    MS_CHECK(rep_swap.at("queue_reorders_total").get<int64_t>() > 0);
+    MS_CHECK(rep_recomp.at("queue_reorders_total").get<int64_t>() == 0);
+    if (rep_swap.at("kv_host_swap_ins").get<int>() > 0) {
+        MS_CHECK(rep_swap.at("kv_saved_recompute_ms").get<double>() > 0.0);
+        MS_CHECK(std::abs(rep_swap.at("kv_swap_hit_rate_pct").get<double>() - 100.0) < 1e-6);
+    }
+    if (rep_recomp.at("kv_recompute_events").get<int>() > 0) {
+        MS_CHECK(rep_recomp.at("kv_recompute_total_ms").get<double>() > 0.0);
+        MS_CHECK(std::abs(rep_recomp.at("kv_swap_hit_rate_pct").get<double>() - 0.0) < 1e-6);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -387,6 +476,7 @@ int main() {
     test_canonical_schema_parity_and_internvlu_steps();
     test_oom_retry_and_hbm_conservation_under_pressure();
     test_calibration_evaluate_against_real_runs_in_memory();
+    test_lru_kv_eviction_recompute_queue_and_metrics();
 
     if (g_failures > 0) {
         std::cerr << "[FAILED] test_cluster_simulator (" << g_failures << " checks failed)\n";

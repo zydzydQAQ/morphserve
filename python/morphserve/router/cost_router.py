@@ -31,11 +31,12 @@ class CPTGRequestSpec:
     dit_total_steps: int = 20
     resolution: int = 512
     interleaved_roundtrip_gamma: int = 1
+    model_family: str = ""
 
     def __post_init__(self) -> None:
         if self.gen_expert_bytes is None or self.dit_step1_ms is None:
             prof = default_operator_profile()
-            fam = "internvl_u" if self.architecture == "bridge_mllm_dit" else "bagel"
+            fam = self.model_family or ("internvl_u" if self.architecture == "bridge_mllm_dit" else "bagel")
             if self.gen_expert_bytes is None:
                 self.gen_expert_bytes = prof.expert_bytes(fam)
             if self.dit_step1_ms is None:
@@ -60,6 +61,7 @@ class CPTGRequestSpec:
             "dit_total_steps": int(self.dit_total_steps),
             "resolution": int(self.resolution),
             "interleaved_roundtrip_gamma": int(self.interleaved_roundtrip_gamma),
+            "model_family": str(self.model_family),
         }
 
 
@@ -74,6 +76,8 @@ class WorkerState:
     active_h2d_transfers: int = 0
     kv_free_bytes: int = 12 * GIB
     p2p_concurrent_links: int = 1
+    post_evict: bool = False
+    colocated_ar_b: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +88,8 @@ class WorkerState:
             "active_h2d_transfers": int(self.active_h2d_transfers),
             "kv_free_bytes": int(self.kv_free_bytes),
             "p2p_concurrent_links": int(self.p2p_concurrent_links),
+            "post_evict": bool(self.post_evict),
+            "colocated_ar_b": int(self.colocated_ar_b),
         }
 
     @classmethod
@@ -96,6 +102,8 @@ class WorkerState:
             active_h2d_transfers=int(d["active_h2d_transfers"]),
             kv_free_bytes=int(d["kv_free_bytes"]),
             p2p_concurrent_links=int(d["p2p_concurrent_links"]),
+            post_evict=bool(d.get("post_evict", False)),
+            colocated_ar_b=int(d.get("colocated_ar_b", 0)),
         )
 
 
@@ -246,6 +254,8 @@ class DualPathMorphRouter:
         allow_cross_half_state_ship: bool = True,
         allow_inter_node_state_ship: bool = True,
         max_inter_node_state_bytes: int = 128 * MIB,
+        cost_model_mode: str = "atlas_3d",
+        performance_atlas: Mapping[str, Any] | None = None,
     ) -> None:
         self.topology = topology
         self.pacer = pacer if pacer is not None else HalfNodeH2DPacer(topology)
@@ -256,11 +266,12 @@ class DualPathMorphRouter:
         self.allow_cross_half_state_ship = bool(allow_cross_half_state_ship)
         self.allow_inter_node_state_ship = bool(allow_inter_node_state_ship)
         self.max_inter_node_state_bytes = int(max_inter_node_state_bytes)
+        self.cost_model_mode = str(cost_model_mode)
 
         self._mu = threading.RLock()
         self._lib = get_core_lib()
 
-        opts = {
+        opts: dict[str, Any] = {
             "operator_profile": self.operator_profile.to_dict(),
             "state_handoff_ms": None if state_handoff_ms is None else float(state_handoff_ms),
             "map_overhead_ms_full": self.map_overhead_ms_full,
@@ -268,7 +279,10 @@ class DualPathMorphRouter:
             "allow_cross_half_state_ship": self.allow_cross_half_state_ship,
             "allow_inter_node_state_ship": self.allow_inter_node_state_ship,
             "max_inter_node_state_bytes": self.max_inter_node_state_bytes,
+            "cost_model_mode": self.cost_model_mode,
         }
+        if performance_atlas is not None:
+            opts["performance_atlas"] = dict(performance_atlas)
         h = int(
             self._lib.ms_router_create(
                 encode_json(topology.to_dict()),

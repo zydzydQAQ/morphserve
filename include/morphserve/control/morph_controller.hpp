@@ -111,9 +111,13 @@ struct WorkerStatsInput {
     double pytorch_reserved_mib = 0.0;
     double vmm_physical_pool_mib = 0.0;
     std::optional<double> nvml_sm_util_mean_pct;
+    std::optional<double> nvml_mem_util_mean_pct;
+    std::optional<double> effective_hbm_util_mean_pct;
     int oom_count = 0;
     int kv_host_swap_outs = 0;
     int kv_host_swap_ins = 0;
+    int kv_recompute_evictions = 0;
+    int kv_recompute_restores = 0;
     int overflow_creates = 0;
     int super_to_fine_carves = 0;
     int expert_auto_evictions_for_kv = 0;

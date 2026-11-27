@@ -1,7 +1,9 @@
 #include "morphserve/c_api.h"
 
 #include "morphserve/control/budget_planner.hpp"
+#include "morphserve/control/gpu_queue_scheduler.hpp"
 #include "morphserve/control/morph_controller.hpp"
+#include "morphserve/control/performance_atlas.hpp"
 #include "morphserve/control/policy.hpp"
 #include "morphserve/control/preempt_edf.hpp"
 #include "morphserve/control/router.hpp"
@@ -63,6 +65,10 @@ struct ms_ctrl_handle {
 
 struct ms_ledger_handle {
     std::unique_ptr<morphserve::control::SimGpuMemoryLedger> ptr;
+};
+
+struct ms_gpu_queue_handle {
+    std::unique_ptr<morphserve::control::GpuWaitQueueScheduler> ptr;
 };
 
 static_assert(
@@ -1545,6 +1551,10 @@ ms_router_t* ms_router_create(const char* topology_json, ms_pacer_t* opt_pacer, 
         if (opts.contains("state_handoff_ms") && opts["state_handoff_ms"].is_number()) {
             handoff = opts["state_handoff_ms"].get<double>();
         }
+        auto atlas = morphserve::control::PerformanceAtlas::a100_default();
+        if (opts.contains("performance_atlas") && opts["performance_atlas"].is_object()) {
+            atlas = morphserve::control::PerformanceAtlas::from_json(opts["performance_atlas"]);
+        }
         auto router = std::make_shared<morphserve::control::DualPathMorphRouter>(
             topo,
             opt_pacer ? opt_pacer->ptr : nullptr,
@@ -1554,7 +1564,9 @@ ms_router_t* ms_router_create(const char* topology_json, ms_pacer_t* opt_pacer, 
             opts.value("overlap_efficiency", 0.90),
             opts.value("allow_cross_half_state_ship", true),
             opts.value("allow_inter_node_state_ship", true),
-            opts.value("max_inter_node_state_bytes", int64_t{128LL * morphserve::control::kMiB}));
+            opts.value("max_inter_node_state_bytes", int64_t{128LL * morphserve::control::kMiB}),
+            opts.value("cost_model_mode", std::string("atlas_3d")),
+            std::move(atlas));
         return new ms_router_handle{std::move(router)};
     }
     MS_CAPI_CATCH_RETURN(nullptr)
@@ -2315,6 +2327,115 @@ char* ms_sim_sweep_json(const char* req_json) {
             j.value("bench_root", std::string("")),
             j.value("sources_dir", std::string("")));
         return dup_json_str(res);
+    }
+    MS_CAPI_CATCH_RETURN(nullptr)
+}
+
+ms_gpu_queue_t* ms_gpu_queue_create(const char* policy_json) {
+    clear_err();
+    try {
+        const auto j = (policy_json && policy_json[0]) ? nlohmann::json::parse(policy_json) : nlohmann::json::object();
+        const auto pol = morphserve::control::GpuQueuePolicy::from_json(j);
+        return new ms_gpu_queue_handle{std::make_unique<morphserve::control::GpuWaitQueueScheduler>(pol)};
+    }
+    MS_CAPI_CATCH_RETURN(nullptr)
+}
+
+void ms_gpu_queue_destroy(ms_gpu_queue_t* q) { delete q; }
+
+char* ms_gpu_queue_select_json(ms_gpu_queue_t* q, const char* req_json) {
+    clear_err();
+    if (!q || !q->ptr) {
+        set_err_code_msg(MS_ERR_INVALID_ARG, "ms_gpu_queue_select_json: null handle");
+        return nullptr;
+    }
+    try {
+        const auto j = nlohmann::json::parse(req_json ? req_json : "{}");
+        std::vector<morphserve::control::GpuQueueWaiter> waiters;
+        if (j.contains("waiters") && j["waiters"].is_array()) {
+            waiters.reserve(j["waiters"].size());
+            for (const auto& item : j["waiters"]) {
+                waiters.push_back(morphserve::control::GpuQueueWaiter::from_json(item));
+            }
+        }
+        const double now_ms = j.value("now_ms", 0.0);
+        const int64_t live_free = j.value("live_free_mem_bytes", int64_t{0});
+        const auto sel = q->ptr->select_and_pop(waiters, now_ms, live_free);
+        nlohmann::json rem_j = nlohmann::json::array();
+        for (const auto& w : waiters) {
+            rem_j.push_back(w.to_json());
+        }
+        nlohmann::json sel_j = nullptr;
+        if (sel.has_value()) {
+            sel_j = {
+                {"waiter_id", sel->waiter_id},
+                {"chosen_index", sel->chosen_index},
+                {"reordered", sel->reordered},
+                {"memory_bypass", sel->memory_bypass},
+                {"starvation_promoted", sel->starvation_promoted},
+            };
+        }
+        return dup_json_str({
+            {"selected", std::move(sel_j)},
+            {"remaining_waiters", std::move(rem_j)},
+            {"stats", q->ptr->stats().to_json()},
+        });
+    }
+    MS_CAPI_CATCH_RETURN(nullptr)
+}
+
+char* ms_gpu_queue_stats_json(const ms_gpu_queue_t* q) {
+    clear_err();
+    if (!q || !q->ptr) {
+        set_err_code_msg(MS_ERR_INVALID_ARG, "ms_gpu_queue_stats_json: null handle");
+        return nullptr;
+    }
+    try {
+        return dup_json_str(q->ptr->stats().to_json());
+    }
+    MS_CAPI_CATCH_RETURN(nullptr)
+}
+
+char* ms_atlas_estimate_json(const char* req_json) {
+    clear_err();
+    try {
+        const auto j = nlohmann::json::parse(req_json ? req_json : "{}");
+        const auto atlas = (j.contains("atlas") && j["atlas"].is_object())
+                               ? morphserve::control::PerformanceAtlas::from_json(j["atlas"])
+                               : morphserve::control::PerformanceAtlas::a100_default();
+        const std::string mode = j.value("cost_model_mode", std::string("atlas_3d"));
+        const std::string fam = j.value("model_family", std::string("bagel"));
+        const int res = j.value("resolution", 512);
+        const double alpha = j.value("alpha_g", 0.5);
+        const bool post_evict = j.value("is_post_evict", false);
+        const int64_t exp_b = j.value("gen_expert_bytes", int64_t{12446LL * morphserve::control::kMiB});
+        const double bw = j.value("bw_h2d_gbps", 12.34);
+        const double step1 = j.value("dit_step1_ms", (res >= 1024) ? 939.804 : 242.735);
+        const double map_full = j.value("map_overhead_ms_full", 11.71);
+        const double ov_eff = j.value("overlap_efficiency", 0.90);
+        const int layers = j.value("num_layers", 28);
+        const int coloc_b = j.value("colocated_ar_b", 0);
+
+        morphserve::control::MorphStallEstimate est{};
+        if (mode == "legacy_analytical") {
+            est = morphserve::control::PerformanceAtlas::estimate_legacy_analytical(
+                alpha, exp_b, bw, step1, map_full, ov_eff);
+        } else if (mode == "pipeline_analytical") {
+            est = morphserve::control::PerformanceAtlas::estimate_pipeline_analytical(
+                alpha, post_evict, exp_b, bw, step1, map_full, ov_eff, layers);
+        } else {
+            est = atlas.estimate_morph_stall(
+                fam, res, alpha, post_evict, exp_b, bw, step1, map_full, ov_eff, layers);
+        }
+        const double stretch = atlas.dit_step_stretch_factor(fam, res, coloc_b);
+        return dup_json_str({
+            {"raw_h2d_ms", est.raw_h2d_ms},
+            {"exposed_stall_ms", est.exposed_stall_ms},
+            {"map_ms", est.map_ms},
+            {"hidden_frac", est.hidden_frac},
+            {"from_atlas", est.from_atlas},
+            {"dit_step_stretch_factor", stretch},
+        });
     }
     MS_CAPI_CATCH_RETURN(nullptr)
 }

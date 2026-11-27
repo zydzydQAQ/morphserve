@@ -1,7 +1,9 @@
 #include "morphserve/control/simulator.hpp"
 
+#include "morphserve/control/gpu_queue_scheduler.hpp"
 #include "morphserve/control/hash_util.hpp"
 #include "morphserve/control/morph_controller.hpp"
+#include "morphserve/control/performance_atlas.hpp"
 #include "morphserve/control/preempt_edf.hpp"
 #include "morphserve/control/router.hpp"
 #include "morphserve/runtime/h2d_pacer.hpp"
@@ -49,6 +51,7 @@ enum EvKind : int {
     EV_DIT_READY = 6,
     EV_PREP_START = 7,
     EV_TURN = 8,
+    EV_GPU_DISPATCH = 9,
 };
 
 struct EvTurn {
@@ -155,6 +158,18 @@ struct EvRetUnpack {
     double recv_gpu_ms = 0.0;
 };
 
+struct EvGpuDispatch {
+    int gpu_id = 0;
+};
+
+struct PendingGpuWork {
+    uint64_t waiter_id = 0;
+    int sid = 0;
+    bool is_prep = false;
+    EvPrepStart prep;
+    EvDitStart dit;
+};
+
 using PayloadVar = std::variant<
     std::monostate,
     EvTurn,
@@ -164,7 +179,8 @@ using PayloadVar = std::variant<
     EvDitStart,
     EvDitEnd,
     EvRetShmSend,
-    EvRetUnpack>;
+    EvRetUnpack,
+    EvGpuDispatch>;
 
 struct SimEvent {
     double ts_ms = 0.0;
@@ -176,7 +192,8 @@ struct SimEvent {
 
     int lock_prio_group() const noexcept {
         if (kind <= EV_DIT_END) return 0;
-        if (kind == EV_DIT_READY) return 1;
+        if (kind == EV_DIT_READY || kind == EV_DIT_START || kind == EV_PREP_START) return 1;
+        if (kind == EV_GPU_DISPATCH) return 2;
         if (kind == EV_TURN) {
             if (const auto* tv = std::get_if<EvTurn>(&payload)) {
                 if (tv->waiting_ar_lock) return 2;
@@ -276,6 +293,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     const double cscale = ws.compute_scale;
     const double slo_time_scale = cscale / sp;
 
+    const PerformanceAtlas gt_atlas = PerformanceAtlas::a100_default();
     auto router = std::make_shared<DualPathMorphRouter>(
         topo,
         pacer,
@@ -285,7 +303,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         0.90,
         true,
         true,
-        static_cast<int64_t>(128.0 * ws.kv_per_turn_scale * static_cast<double>(kMiB)));
+        static_cast<int64_t>(128.0 * ws.kv_per_turn_scale * static_cast<double>(kMiB)),
+        policy.cost_model_mode,
+        gt_atlas);
     MorphControlEngine ctrl(policy, topo, router);
 
     const double vmm_ar_ovh = policy.use_tripool_vmm ? ph.vmm_ar_kv_step_overhead_ms : 0.0;
@@ -379,6 +399,25 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     std::vector<double> queued_work_ms(static_cast<size_t>(num_gpus), 0.0);
     std::vector<int64_t> inflight_ship_kv_bytes(static_cast<size_t>(num_gpus), 0);
     std::vector<int> gpu_oom_counts(static_cast<size_t>(num_gpus), 0);
+
+    // Per-GPU Memory+Slack non-FCFS wait-queue schedulers (shared C++17 logic with live coordinator).
+    const GpuQueuePolicy gpu_q_policy{
+        policy.gpu_queue_mode, policy.gpu_queue_max_aging_ms, policy.gpu_queue_max_bypasses};
+    std::vector<GpuWaitQueueScheduler> gpu_schedulers;
+    gpu_schedulers.reserve(static_cast<size_t>(num_gpus));
+    for (int g = 0; g < num_gpus; ++g) {
+        gpu_schedulers.emplace_back(gpu_q_policy);
+    }
+    std::vector<std::vector<GpuQueueWaiter>> gpu_wait_specs(static_cast<size_t>(num_gpus));
+    std::vector<std::vector<PendingGpuWork>> gpu_wait_payloads(static_cast<size_t>(num_gpus));
+    std::vector<double> gpu_dispatch_armed_at(static_cast<size_t>(num_gpus), -1.0);
+    uint64_t next_waiter_id = 0;
+
+    // Think-Time KV Swap vs. Recomputation telemetry accumulators.
+    std::vector<double> sim_swap_in_latencies_ms;
+    int sim_kv_recompute_events = 0;
+    double sim_kv_recompute_total_ms = 0.0;
+    double sim_kv_saved_recompute_ms = 0.0;
 
     const int gpn = std::max(1, hw.gpus_per_node);
     const int num_nodes = std::max(1, (num_gpus + gpn - 1) / gpn);
@@ -491,6 +530,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             auto& wg = workers.at(g);
             wg.queue_wait_ms = queued_work_ms[ug] + 0.5 * rem_ar;
             wg.expert_alpha = ledgers[ug].expert_alpha();
+            wg.post_evict = ledgers[ug].is_post_evict();
             wg.kv_free_bytes = std::max<int64_t>(0, ledgers[ug].free_kv_bytes() - inflight_ship_kv_bytes[ug]);
             busy_map[g] = (rem_excl > 0.0 || rem_ar > 0.0 || queued_work_ms[ug] > 0.0);
             dit_map[g] = (now_ms >= dit_denoise_start[ug] && now_ms < dit_full_end[ug]) ? 1 : 0;
@@ -499,6 +539,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 if (pe > now_ms) ++p_cnt;
             }
             pre_map[g] = p_cnt;
+            wg.colocated_ar_b = p_cnt + ((rem_ar > 0.0) ? 1 : 0);
         }
     };
 
@@ -638,6 +679,64 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
 
     auto excl_gpu_free_at = [&](size_t ug) -> double {
         return std::max(gpu_free_at[ug], ar_slot_free_at[ug]);
+    };
+
+    auto arm_gpu_dispatch = [&](int gpu_id, double wake_ms) {
+        const size_t ug = static_cast<size_t>(gpu_id);
+        if (gpu_wait_specs[ug].empty()) {
+            return;
+        }
+        const double eff_wake = std::max(wake_ms, excl_gpu_free_at(ug));
+        if (gpu_dispatch_armed_at[ug] >= 0.0 && gpu_dispatch_armed_at[ug] <= eff_wake + 1e-6) {
+            return;
+        }
+        gpu_dispatch_armed_at[ug] = eff_wake;
+        push_ev(eff_wake, EV_GPU_DISPATCH, -1, EvGpuDispatch{gpu_id}, eff_wake);
+    };
+
+    auto enqueue_gpu_work = [&](int gpu_id, double ready_ms, GpuQueueWaiter waiter, PendingGpuWork work) {
+        const size_t ug = static_cast<size_t>(gpu_id);
+        const uint64_t wid = ++next_waiter_id;
+        waiter.waiter_id = wid;
+        waiter.enqueue_ms = ready_ms;
+        work.waiter_id = wid;
+        gpu_wait_specs[ug].push_back(waiter);
+        gpu_wait_payloads[ug].push_back(std::move(work));
+        arm_gpu_dispatch(gpu_id, ready_ms);
+    };
+
+    auto estimate_history_recompute_ms = [&](double kv_mib, bool is_1024) -> double {
+        if (kv_mib <= 0.0) return 0.0;
+        const double unit_img_kv = std::max(16.0, 268.0 * ws.kv_per_turn_scale);
+        const double n_hist_imgs = std::floor(kv_mib / unit_img_kv);
+        const double text_kv_mib = std::max(0.0, kv_mib - n_hist_imgs * unit_img_kv);
+        const double img_recomp_ms =
+            n_hist_imgs * (vit_only_img_ms + (is_1024 ? vae_encode_1024_ms : vae_encode_512_ms));
+        const double text_recomp_ms = ar_prefill_ms * std::max(1.0, text_kv_mib / std::max(1.0, 8.0 * ws.kv_per_turn_scale));
+        return img_recomp_ms + text_recomp_ms;
+    };
+
+    auto restore_kv_resident = [&](int sid_i, int gpu_id, bool is_1024) -> std::pair<bool, double> {
+        const size_t ug = static_cast<size_t>(gpu_id);
+        const SessionRestoreResult r = ledgers[ug].restore_session_resident(sid_i);
+        if (!r.ok) {
+            return {false, 0.0};
+        }
+        if (r.swapped_in_mib > 0.0) {
+            const double swap_ms =
+                ((r.swapped_in_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(gpu_id))) *
+                1000.0;
+            sim_swap_in_latencies_ms.push_back(swap_ms);
+            sim_kv_saved_recompute_ms += estimate_history_recompute_ms(r.swapped_in_mib, is_1024);
+            return {true, swap_ms};
+        }
+        if (r.recompute_kv_mib > 0.0) {
+            const double recomp_ms = estimate_history_recompute_ms(r.recompute_kv_mib, is_1024);
+            ++sim_kv_recompute_events;
+            sim_kv_recompute_total_ms += recomp_ms;
+            return {true, recomp_ms};
+        }
+        return {true, 0.0};
     };
 
     auto run_ar_phase_sim = [&](size_t usid_idx,
@@ -799,12 +898,262 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         return t_cur;
     };
 
+    auto execute_prep_start = [&](int sid_i, EvPrepStart p, double ev_ms) {
+        const size_t usid = static_cast<size_t>(sid_i);
+        const size_t ug = static_cast<size_t>(p.cur_gpu);
+        queued_work_ms[ug] = std::max(0.0, queued_work_ms[ug] - p.est_prep_q);
+        p.est_prep_q = 0.0;
+
+        const auto& sess_spec = built_sessions[usid];
+        const auto& turn = sess_spec.turns[static_cast<size_t>(p.ti)];
+        const std::string& quad = sess_spec.quadrant;
+        const std::string& plan = turn.modality_plan;
+        const int height = turn.height;
+        const bool is_1024 = height >= 1024;
+        const int n_turns = static_cast<int>(sess_spec.turns.size());
+
+        const auto [restore_ok, swap_in_ms] = restore_kv_resident(sid_i, p.cur_gpu, is_1024);
+        if (!restore_ok) {
+            ledgers[ug].release_session(sid_i);
+            ++gpu_oom_counts[ug];
+            record_oom(usid, p.ti, ev_ms);
+            return;
+        }
+
+        const bool has_img_input = (turn.num_images > 0) || (plan == "dit_edit" && p.ti > 0);
+        const bool prev_was_ar_after_dit =
+            (p.ti >= 2 &&
+             sess_spec.turns[static_cast<size_t>(p.ti - 1)].modality_plan == "ar_only" &&
+             sess_spec.turns[static_cast<size_t>(p.ti - 2)].modality_plan != "ar_only");
+        double base_delta_kv = 28.0;
+        if (quad == "multiturn_edit" || has_img_input) {
+            const double full_edit_delta = ph.turn_edit_512_kv_delta_mib * (is_1024 ? kEdit1024KvRatio : 1.0);
+            if (quad == "interleaved_co_creation" && prev_was_ar_after_dit && turn.num_images == 0) {
+                base_delta_kv = std::max(28.0, full_edit_delta - 268.0);
+            } else {
+                base_delta_kv = full_edit_delta;
+            }
+        }
+        const double cand_main_kv = sess_main_kv_mib[usid] + base_delta_kv * ws.kv_per_turn_scale;
+        const bool has_hist_for_cfg = has_img_input || (p.ti > 0);
+        const double dit_phys_kv =
+            (!policy.use_module3_cow_loopback && has_hist_for_cfg)
+                ? (cand_main_kv * ph.non_cow_kv_mult)
+                : cand_main_kv;
+
+        const bool is_fission_und =
+            ((policy.routing_mode == "static_nccl_fission" || policy.routing_mode == "twostage_shm") &&
+             policy.role_of(p.cur_gpu) == "und");
+        const bool pager_partial = policy.use_expert_pager && (ledgers[ug].expert_alpha() < 0.999);
+        const bool defer_full_turn = has_img_input && pager_partial && !is_fission_und;
+        const double src_prep_kv =
+            defer_full_turn ? std::max(4.0, sess_main_kv_mib[usid]) : (is_fission_und ? cand_main_kv : dit_phys_kv);
+
+        bool prep_mem_ok = ledgers[ug].upsert_session_kv(sid_i, src_prep_kv);
+        if (prep_mem_ok && has_img_input && !defer_full_turn && !is_fission_und) {
+            const double sc_vae = (is_1024 ? ph.scoped_vae_1024_spike_mib : ph.scoped_vae_512_spike_mib) * ws.vae_spike_scale;
+            const double un_vae = (is_1024 ? ph.unscoped_vae_1024_reserved_mib : ph.unscoped_vae_512_reserved_mib) * ws.vae_spike_scale;
+            const double vae_enc_spike = policy.use_scoped_vae ? sc_vae : un_vae;
+            prep_mem_ok = ledgers[ug].check_transient_spike(
+                vae_enc_spike, sid_i, /*contiguous_alloc=*/false, std::max(0.0, un_vae - sc_vae));
+        }
+        if (!prep_mem_ok) {
+            handle_oom_or_retry(usid, p.ti, p.attempt, p.cur_gpu, -1, ev_ms, /*push_retry_event=*/true);
+            return;
+        }
+
+        const double img_vae_ms = is_1024 ? vae_encode_1024_ms : vae_encode_512_ms;
+        const double full_loop_ms =
+            (policy.use_module3_cow_loopback ? ms_img_loop_512_ms : stock_img_loop_512_ms) +
+            (is_1024 ? (vae_encode_1024_ms - vae_encode_512_ms) : 0.0);
+
+        double prep_gpu_ms = swap_in_ms + ar_prefill_ms;
+        double deferred_dit_prep_ms = 0.0;
+        if (has_img_input) {
+            if (defer_full_turn) {
+                prep_gpu_ms = swap_in_ms + (5.0 / sp);
+                deferred_dit_prep_ms = full_loop_ms;
+            } else if (is_fission_und) {
+                prep_gpu_ms = swap_in_ms + vit_only_img_ms;
+                deferred_dit_prep_ms = img_vae_ms;
+            } else {
+                const double naive_vae_swap =
+                    policy.use_naive_offload ? (1.08 * compute_naive_swap_ms(p.cur_gpu, ev_ms + swap_in_ms)) : 0.0;
+                prep_gpu_ms = swap_in_ms + naive_vae_swap + full_loop_ms;
+            }
+        }
+
+        const int main_seq_tokens = static_cast<int>(std::round(
+            (cand_main_kv / std::max(0.01, ws.weight_scale)) / std::max(1e-4, ph.kv_mib_per_token)));
+        const bool has_shared_prefix = policy.use_module3_cow_loopback && has_hist_for_cfg;
+        const double dit_core_ms =
+            compute_dit_core_ms(p.cur_gpu, is_1024, has_img_input, has_shared_prefix, main_seq_tokens, turn.dit_steps);
+        const double step_base = is_1024 ? dit1024_step_ms : dit512_step_ms;
+        const double vae_dec_ms = is_1024 ? vae1024_ms : vae512_ms;
+
+        const double dit_ready_ms = ev_ms + prep_gpu_ms;
+        gpu_free_at[ug] = std::max(gpu_free_at[ug], dit_ready_ms);
+        push_ev(
+            dit_ready_ms,
+            EV_DIT_READY,
+            sid_i,
+            EvDitReady{
+                p.ti,
+                p.attempt,
+                p.cur_gpu,
+                p.t_turn0,
+                quad,
+                plan,
+                height,
+                turn.dit_steps,
+                n_turns,
+                cand_main_kv,
+                dit_phys_kv,
+                step_base,
+                dit_core_ms,
+                vae_dec_ms,
+                deferred_dit_prep_ms,
+                defer_full_turn});
+    };
+
+    auto execute_dit_start = [&](int sid_i, EvDitStart p, double ev_ms) {
+        const size_t usid = static_cast<size_t>(sid_i);
+        const size_t udst = static_cast<size_t>(p.dst_gpu);
+        inflight_ship_kv_bytes[udst] = std::max<int64_t>(0, inflight_ship_kv_bytes[udst] - p.inflight_kv_b);
+        p.inflight_kv_b = 0;
+
+        const double start_dit = ev_ms;
+        if (!ledgers[udst].upsert_session_kv(sid_i, p.dit_phys_kv)) {
+            queued_work_ms[udst] = std::max(0.0, queued_work_ms[udst] - p.reserved_est_ms);
+            handle_oom_or_retry(usid, p.ti, p.attempt, p.dst_gpu, p.cur_gpu, start_dit, /*push_retry_event=*/true);
+            return;
+        }
+
+        if (p.ship_mode == "nccl_dual" || p.ship_mode == "nccl_static" || p.ship_mode == "shm_static") {
+            ++sess_ships[usid];
+            if (!topo.same_node(p.cur_gpu, p.dst_gpu)) {
+                ++sess_xnode_ships[usid];
+            }
+            if (p.ship_mode == "nccl_dual") {
+                sess_gpu[usid] = p.dst_gpu;
+            }
+        }
+
+        double naive_dit_swap_ms = 0.0;
+        if (policy.use_naive_offload) {
+            naive_dit_swap_ms = 1.08 * compute_naive_swap_ms(p.dst_gpu, start_dit + p.pre_denoise_gpu_ms);
+        }
+
+        const auto [dit_ok_mem, swap_out_mib] = ledgers[udst].execute_dit_and_vae(
+            p.height, sid_i, p.cand_main_kv, p.unpack_staging_mib, p.run_pre_denoise_vae);
+        if (!dit_ok_mem) {
+            queued_work_ms[udst] = std::max(0.0, queued_work_ms[udst] - p.reserved_est_ms);
+            const double fail_frac = ledgers[udst].last_fail_dit_frac();
+            const double vae_wasted_ms = (fail_frac >= 0.99) ? (0.5 * p.vae_dec_ms + (350.0 / sp)) : 0.0;
+            const double abort_end =
+                start_dit + p.pre_denoise_gpu_ms + naive_dit_swap_ms + p.dit_core_ms * fail_frac + vae_wasted_ms;
+            gpu_free_at[udst] = std::max(gpu_free_at[udst], abort_end);
+            handle_oom_or_retry(usid, p.ti, p.attempt, p.dst_gpu, p.cur_gpu, abort_end, /*push_retry_event=*/true);
+            return;
+        }
+
+        const double swap_out_ms =
+            (swap_out_mib > 0.0 && policy.kv_eviction_mode != "recompute")
+                ? (((swap_out_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(p.dst_gpu))) *
+                   1000.0)
+                : 0.0;
+        const double denoise_start = start_dit + p.pre_denoise_gpu_ms + naive_dit_swap_ms + swap_out_ms;
+        const double denoise_end = denoise_start + p.dit_core_ms;
+        const double end_dit = denoise_end + p.vae_dec_ms;
+
+        const int tot_steps = std::max(1, p.dit_steps);
+        const double avg_step_ms = p.dit_core_ms / static_cast<double>(tot_steps);
+        const int uncond_steps = static_cast<int>(std::floor(0.4 * static_cast<double>(tot_steps)));
+        const int cfg_steps = std::max(0, tot_steps - uncond_steps);
+        const double cfg_branches = (p.cand_main_kv > 220.0 * ws.kv_per_turn_scale) ? 3.0 : 2.0;
+        const double tot_branch_passes =
+            static_cast<double>(uncond_steps) * 1.0 + static_cast<double>(cfg_steps) * cfg_branches;
+        const double one_branch_ms = p.dit_core_ms / std::max(1.0, tot_branch_passes);
+
+        dit_denoise_start[udst] = denoise_start;
+        dit_denoise_cfg_start[udst] = denoise_start + static_cast<double>(uncond_steps) * one_branch_ms;
+        dit_denoise_end[udst] = denoise_end;
+        dit_full_end[udst] = end_dit;
+        dit_active_uncond_step_ms[udst] = (p.height >= 1024) ? one_branch_ms : avg_step_ms;
+        dit_active_cfg_step_ms[udst] = (p.height >= 1024) ? (cfg_branches * one_branch_ms) : avg_step_ms;
+        dit_active_sid[udst] = sid_i;
+        dit_active_is1024[udst] = (p.height >= 1024);
+        sess_dit_actual_end[usid] = end_dit;
+        gpu_free_at[udst] = std::max(gpu_free_at[udst], end_dit);
+        workers.at(p.dst_gpu).expert_alpha = ledgers[udst].expert_alpha();
+        workers.at(p.dst_gpu).post_evict = ledgers[udst].is_post_evict();
+
+        push_ev(
+            end_dit,
+            EV_DIT_END,
+            sid_i,
+            EvDitEnd{
+                p.ti,
+                p.attempt,
+                p.cur_gpu,
+                p.dst_gpu,
+                p.ship_mode,
+                p.t_turn0,
+                p.height,
+                p.dit_steps,
+                p.n_turns,
+                p.cand_main_kv,
+                p.reserved_est_ms,
+                p.ephemeral_gen_ctx,
+                p.needs_return_ship});
+    };
+
     while (!pq.empty()) {
         SimEvent cur_ev = std::move(const_cast<SimEvent&>(pq.top()));
         pq.pop();
         const double ev_ms = cur_ev.ts_ms;
         const int sid = cur_ev.sid;
-        const size_t usid = static_cast<size_t>(sid);
+        const size_t usid = static_cast<size_t>(std::max(0, sid));
+
+        if (cur_ev.kind == EV_GPU_DISPATCH) {
+            const auto gd = std::get<EvGpuDispatch>(cur_ev.payload);
+            const size_t ug = static_cast<size_t>(gd.gpu_id);
+            gpu_dispatch_armed_at[ug] = -1.0;
+            if (gpu_wait_specs[ug].empty()) {
+                continue;
+            }
+            if (excl_gpu_free_at(ug) > ev_ms + 1e-6) {
+                arm_gpu_dispatch(gd.gpu_id, excl_gpu_free_at(ug));
+                continue;
+            }
+            const auto sel = gpu_schedulers[ug].select_and_pop(
+                gpu_wait_specs[ug], ev_ms, ledgers[ug].free_kv_bytes());
+            if (!sel.has_value()) {
+                continue;
+            }
+            PendingGpuWork chosen_work;
+            bool found = false;
+            auto& payloads = gpu_wait_payloads[ug];
+            for (size_t i = 0; i < payloads.size(); ++i) {
+                if (payloads[i].waiter_id == sel->waiter_id) {
+                    chosen_work = std::move(payloads[i]);
+                    payloads.erase(payloads.begin() + static_cast<std::ptrdiff_t>(i));
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                if (chosen_work.is_prep) {
+                    execute_prep_start(chosen_work.sid, chosen_work.prep, ev_ms);
+                } else {
+                    execute_dit_start(chosen_work.sid, chosen_work.dit, ev_ms);
+                }
+            }
+            if (!gpu_wait_specs[ug].empty()) {
+                arm_gpu_dispatch(gd.gpu_id, std::max(ev_ms, excl_gpu_free_at(ug)));
+            }
+            continue;
+        }
 
         if (cur_ev.kind == EV_RELEASE) {
             const int old_g = sess_gpu[usid];
@@ -815,130 +1164,20 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         }
 
         if (cur_ev.kind == EV_PREP_START) {
-            auto p = std::get<EvPrepStart>(cur_ev.payload);
-            const size_t ug = static_cast<size_t>(p.cur_gpu);
-            if (excl_gpu_free_at(ug) > ev_ms + 1e-6) {
-                push_ev(excl_gpu_free_at(ug), EV_PREP_START, sid, p, cur_ev.fifo_enq_ms, cur_ev.fifo_seq);
-                continue;
-            }
-            queued_work_ms[ug] = std::max(0.0, queued_work_ms[ug] - p.est_prep_q);
-            p.est_prep_q = 0.0;
-
-            const auto& sess_spec = built_sessions[usid];
-            const auto& turn = sess_spec.turns[static_cast<size_t>(p.ti)];
-            const std::string& quad = sess_spec.quadrant;
-            const std::string& plan = turn.modality_plan;
-            const int height = turn.height;
-            const bool is_1024 = height >= 1024;
-            const int n_turns = static_cast<int>(sess_spec.turns.size());
-
-            const double swap_in_mib = ledgers[ug].ensure_session_resident(sid);
-            if (swap_in_mib < 0.0) {
-                ledgers[ug].release_session(sid);
-                ++gpu_oom_counts[ug];
-                record_oom(usid, p.ti, ev_ms);
-                continue;
-            }
-            const double swap_in_ms =
-                (swap_in_mib > 0.0)
-                    ? (((swap_in_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(p.cur_gpu))) *
-                       1000.0)
-                    : 0.0;
-
-            const bool has_img_input = (turn.num_images > 0) || (plan == "dit_edit" && p.ti > 0);
-            const bool prev_was_ar_after_dit =
-                (p.ti >= 2 &&
-                 sess_spec.turns[static_cast<size_t>(p.ti - 1)].modality_plan == "ar_only" &&
-                 sess_spec.turns[static_cast<size_t>(p.ti - 2)].modality_plan != "ar_only");
-            double base_delta_kv = 28.0;
-            if (quad == "multiturn_edit" || has_img_input) {
-                const double full_edit_delta = ph.turn_edit_512_kv_delta_mib * (is_1024 ? kEdit1024KvRatio : 1.0);
-                if (quad == "interleaved_co_creation" && prev_was_ar_after_dit && turn.num_images == 0) {
-                    base_delta_kv = std::max(28.0, full_edit_delta - 268.0);
-                } else {
-                    base_delta_kv = full_edit_delta;
-                }
-            }
-            const double cand_main_kv = sess_main_kv_mib[usid] + base_delta_kv * ws.kv_per_turn_scale;
-            const bool has_hist_for_cfg = has_img_input || (p.ti > 0);
-            const double dit_phys_kv =
-                (!policy.use_module3_cow_loopback && has_hist_for_cfg)
-                    ? (cand_main_kv * ph.non_cow_kv_mult)
-                    : cand_main_kv;
-
-            const bool is_fission_und =
-                ((policy.routing_mode == "static_nccl_fission" || policy.routing_mode == "twostage_shm") &&
-                 policy.role_of(p.cur_gpu) == "und");
-            const bool pager_partial = policy.use_expert_pager && (ledgers[ug].expert_alpha() < 0.999);
-            const bool defer_full_turn = has_img_input && pager_partial && !is_fission_und;
-            const double src_prep_kv =
-                defer_full_turn ? std::max(4.0, sess_main_kv_mib[usid]) : (is_fission_und ? cand_main_kv : dit_phys_kv);
-
-            bool prep_mem_ok = ledgers[ug].upsert_session_kv(sid, src_prep_kv);
-            if (prep_mem_ok && has_img_input && !defer_full_turn && !is_fission_und) {
-                const double sc_vae = (is_1024 ? ph.scoped_vae_1024_spike_mib : ph.scoped_vae_512_spike_mib) * ws.vae_spike_scale;
-                const double un_vae = (is_1024 ? ph.unscoped_vae_1024_reserved_mib : ph.unscoped_vae_512_reserved_mib) * ws.vae_spike_scale;
-                const double vae_enc_spike = policy.use_scoped_vae ? sc_vae : un_vae;
-                prep_mem_ok = ledgers[ug].check_transient_spike(
-                    vae_enc_spike, sid, /*contiguous_alloc=*/false, std::max(0.0, un_vae - sc_vae));
-            }
-            if (!prep_mem_ok) {
-                handle_oom_or_retry(usid, p.ti, p.attempt, p.cur_gpu, -1, ev_ms, /*push_retry_event=*/true);
-                continue;
-            }
-
-            const double img_vae_ms = is_1024 ? vae_encode_1024_ms : vae_encode_512_ms;
-            const double full_loop_ms =
-                (policy.use_module3_cow_loopback ? ms_img_loop_512_ms : stock_img_loop_512_ms) +
-                (is_1024 ? (vae_encode_1024_ms - vae_encode_512_ms) : 0.0);
-
-            double prep_gpu_ms = swap_in_ms + ar_prefill_ms;
-            double deferred_dit_prep_ms = 0.0;
-            if (has_img_input) {
-                if (defer_full_turn) {
-                    prep_gpu_ms = swap_in_ms + (5.0 / sp);
-                    deferred_dit_prep_ms = full_loop_ms;
-                } else if (is_fission_und) {
-                    prep_gpu_ms = swap_in_ms + vit_only_img_ms;
-                    deferred_dit_prep_ms = img_vae_ms;
-                } else {
-                    const double naive_vae_swap =
-                        policy.use_naive_offload ? (1.08 * compute_naive_swap_ms(p.cur_gpu, ev_ms + swap_in_ms)) : 0.0;
-                    prep_gpu_ms = swap_in_ms + naive_vae_swap + full_loop_ms;
-                }
-            }
-
-            const int main_seq_tokens = static_cast<int>(std::round(
-                (cand_main_kv / std::max(0.01, ws.weight_scale)) / std::max(1e-4, ph.kv_mib_per_token)));
-            const bool has_shared_prefix = policy.use_module3_cow_loopback && has_hist_for_cfg;
-            const double dit_core_ms =
-                compute_dit_core_ms(p.cur_gpu, is_1024, has_img_input, has_shared_prefix, main_seq_tokens, turn.dit_steps);
-            const double step_base = is_1024 ? dit1024_step_ms : dit512_step_ms;
-            const double vae_dec_ms = is_1024 ? vae1024_ms : vae512_ms;
-
-            const double dit_ready_ms = ev_ms + prep_gpu_ms;
-            gpu_free_at[ug] = std::max(gpu_free_at[ug], dit_ready_ms);
-            push_ev(
-                dit_ready_ms,
-                EV_DIT_READY,
-                sid,
-                EvDitReady{
-                    p.ti,
-                    p.attempt,
-                    p.cur_gpu,
-                    p.t_turn0,
-                    quad,
-                    plan,
-                    height,
-                    turn.dit_steps,
-                    n_turns,
-                    cand_main_kv,
-                    dit_phys_kv,
-                    step_base,
-                    dit_core_ms,
-                    vae_dec_ms,
-                    deferred_dit_prep_ms,
-                    defer_full_turn});
+            const auto p = std::get<EvPrepStart>(cur_ev.payload);
+            const auto& turn = built_sessions[usid].turns[static_cast<size_t>(p.ti)];
+            const bool is_1024 = turn.height >= 1024;
+            const double est_kv_mib = sess_main_kv_mib[usid] + (is_1024 ? 512.0 : 256.0);
+            GpuQueueWaiter w;
+            w.est_mem_bytes = static_cast<int64_t>(est_kv_mib * static_cast<double>(kMiB));
+            w.est_exec_ms = p.est_prep_q;
+            w.slo_deadline_ms = p.t_turn0 + policy.dit_turn_slo_for(turn.height, turn.dit_steps) * slo_time_scale;
+            w.op_priority = 0;
+            PendingGpuWork work;
+            work.sid = sid;
+            work.is_prep = true;
+            work.prep = p;
+            enqueue_gpu_work(p.cur_gpu, ev_ms, w, std::move(work));
             continue;
         }
 
@@ -1051,19 +1290,32 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 inflight_b = tplan.reserved_kv_bytes;
                 inflight_ship_kv_bytes[static_cast<size_t>(dst_gpu)] += inflight_b;
             } else {
-                // Commit H2D pacer reservation strictly at in-place morph dispatch.
+                // Commit H2D pacer reservation strictly at in-place morph dispatch and evaluate
+                // ground-truth hardware stall from the calibrated `gt_atlas` physics oracle so
+                // miscalibrated routing cost models pay real hardware stall rather than their own estimate.
+                double pacer_wait_ms = 0.0;
+                const auto& dst_w = workers.at(dst_gpu);
+                const double alpha = dst_w.expert_alpha;
+                const double missing = (1.0 - alpha) * static_cast<double>(expert_bytes_scaled);
+                const double bw_gt = std::max(1.0, dec.selected_bw_gbps);
                 if (policy.routing_mode == "dual_path" && dec.path == "in_place_morph" &&
-                    policy.use_h2d_pacer && pacer) {
-                    const double alpha = workers.at(dst_gpu).expert_alpha;
-                    const double missing = (1.0 - alpha) * static_cast<double>(expert_bytes_scaled);
-                    if (missing > 0.0) {
-                        const double bw = std::max(1.0, dec.selected_bw_gbps);
-                        const double dma_ms = (missing / 1e9) / bw * 1000.0;
-                        pacer->reserve_slot(dst_gpu, dma_ms, dit_ready_ms + workers.at(dst_gpu).queue_wait_ms);
-                    }
+                    policy.use_h2d_pacer && pacer && missing > 0.0) {
+                    const double dma_ms = (missing / 1e9) / bw_gt * 1000.0;
+                    pacer_wait_ms = pacer->reserve_slot(dst_gpu, dma_ms, dit_ready_ms + dst_w.queue_wait_ms);
                 }
                 if (!policy.use_naive_offload) {
-                    const double morph_ovh = std::max(0.0, dec.t_morph_ms - workers.at(p.cur_gpu).queue_wait_ms);
+                    const MorphStallEstimate gt_est = gt_atlas.estimate_morph_stall(
+                        fam,
+                        p.height,
+                        alpha,
+                        dst_w.post_evict,
+                        expert_bytes_scaled,
+                        bw_gt,
+                        p.step_base,
+                        (ph.vmm_full_expert_map_ms * ws.weight_scale) / sp,
+                        0.90,
+                        ph.num_expert_layers);
+                    const double morph_ovh = std::max(0.0, pacer_wait_ms + gt_est.map_ms + gt_est.exposed_stall_ms);
                     pre_denoise_gpu_ms += morph_ovh;
                     if (policy.routing_mode == "dual_path") {
                         ++sess_morphs[usid];
@@ -1073,7 +1325,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
 
             queued_work_ms[static_cast<size_t>(dst_gpu)] += tplan.est_dit_ms;
             push_ev(
-                std::max(wire_ready_ms, excl_gpu_free_at(static_cast<size_t>(dst_gpu))),
+                wire_ready_ms,
                 EV_DIT_START,
                 sid,
                 EvDitStart{
@@ -1124,7 +1376,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 ledgers[usrc].upsert_session_kv(sid, s.r.cand_main_kv);
             }
             push_ev(
-                std::max(end_send, excl_gpu_free_at(static_cast<size_t>(s.dst_gpu))),
+                end_send,
                 EV_DIT_START,
                 sid,
                 EvDitStart{
@@ -1153,98 +1405,25 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         }
 
         if (cur_ev.kind == EV_DIT_START) {
-            auto p = std::get<EvDitStart>(cur_ev.payload);
-            const size_t udst = static_cast<size_t>(p.dst_gpu);
-            if (excl_gpu_free_at(udst) > ev_ms + 1e-6) {
-                push_ev(excl_gpu_free_at(udst), EV_DIT_START, sid, p, cur_ev.fifo_enq_ms, cur_ev.fifo_seq);
-                continue;
-            }
-            inflight_ship_kv_bytes[udst] = std::max<int64_t>(0, inflight_ship_kv_bytes[udst] - p.inflight_kv_b);
-            p.inflight_kv_b = 0;
-
-            const double start_dit = ev_ms;
-            if (!ledgers[udst].upsert_session_kv(sid, p.dit_phys_kv)) {
-                queued_work_ms[udst] = std::max(0.0, queued_work_ms[udst] - p.reserved_est_ms);
-                handle_oom_or_retry(usid, p.ti, p.attempt, p.dst_gpu, p.cur_gpu, start_dit, /*push_retry_event=*/true);
-                continue;
-            }
-
-            if (p.ship_mode == "nccl_dual" || p.ship_mode == "nccl_static" || p.ship_mode == "shm_static") {
-                ++sess_ships[usid];
-                if (!topo.same_node(p.cur_gpu, p.dst_gpu)) {
-                    ++sess_xnode_ships[usid];
-                }
-                if (p.ship_mode == "nccl_dual") {
-                    sess_gpu[usid] = p.dst_gpu;
-                }
-            }
-
-            double naive_dit_swap_ms = 0.0;
-            if (policy.use_naive_offload) {
-                naive_dit_swap_ms = 1.08 * compute_naive_swap_ms(p.dst_gpu, start_dit + p.pre_denoise_gpu_ms);
-            }
-
-            const auto [dit_ok_mem, swap_out_mib] = ledgers[udst].execute_dit_and_vae(
-                p.height, sid, p.cand_main_kv, p.unpack_staging_mib, p.run_pre_denoise_vae);
-            if (!dit_ok_mem) {
-                queued_work_ms[udst] = std::max(0.0, queued_work_ms[udst] - p.reserved_est_ms);
-                const double fail_frac = ledgers[udst].last_fail_dit_frac();
-                const double vae_wasted_ms = (fail_frac >= 0.99) ? (0.5 * p.vae_dec_ms + (350.0 / sp)) : 0.0;
-                const double abort_end =
-                    start_dit + p.pre_denoise_gpu_ms + naive_dit_swap_ms + p.dit_core_ms * fail_frac + vae_wasted_ms;
-                gpu_free_at[udst] = std::max(gpu_free_at[udst], abort_end);
-                handle_oom_or_retry(usid, p.ti, p.attempt, p.dst_gpu, p.cur_gpu, abort_end, /*push_retry_event=*/true);
-                continue;
-            }
-
-            const double swap_out_ms =
-                (swap_out_mib > 0.0)
-                    ? (((swap_out_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(p.dst_gpu))) *
-                       1000.0)
-                    : 0.0;
-            const double denoise_start = start_dit + p.pre_denoise_gpu_ms + naive_dit_swap_ms + swap_out_ms;
-            const double denoise_end = denoise_start + p.dit_core_ms;
-            const double end_dit = denoise_end + p.vae_dec_ms;
-
-            const int tot_steps = std::max(1, p.dit_steps);
-            const double avg_step_ms = p.dit_core_ms / static_cast<double>(tot_steps);
-            const int uncond_steps = static_cast<int>(std::floor(0.4 * static_cast<double>(tot_steps)));
-            const int cfg_steps = std::max(0, tot_steps - uncond_steps);
-            const double cfg_branches = (p.cand_main_kv > 220.0 * ws.kv_per_turn_scale) ? 3.0 : 2.0;
-            const double tot_branch_passes =
-                static_cast<double>(uncond_steps) * 1.0 + static_cast<double>(cfg_steps) * cfg_branches;
-            const double one_branch_ms = p.dit_core_ms / std::max(1.0, tot_branch_passes);
-
-            dit_denoise_start[udst] = denoise_start;
-            dit_denoise_cfg_start[udst] = denoise_start + static_cast<double>(uncond_steps) * one_branch_ms;
-            dit_denoise_end[udst] = denoise_end;
-            dit_full_end[udst] = end_dit;
-            dit_active_uncond_step_ms[udst] = (p.height >= 1024) ? one_branch_ms : avg_step_ms;
-            dit_active_cfg_step_ms[udst] = (p.height >= 1024) ? (cfg_branches * one_branch_ms) : avg_step_ms;
-            dit_active_sid[udst] = sid;
-            dit_active_is1024[udst] = (p.height >= 1024);
-            sess_dit_actual_end[usid] = end_dit;
-            gpu_free_at[udst] = std::max(gpu_free_at[udst], end_dit);
-            workers.at(p.dst_gpu).expert_alpha = ledgers[udst].expert_alpha();
-
-            push_ev(
-                end_dit,
-                EV_DIT_END,
-                sid,
-                EvDitEnd{
-                    p.ti,
-                    p.attempt,
-                    p.cur_gpu,
-                    p.dst_gpu,
-                    p.ship_mode,
-                    p.t_turn0,
-                    p.height,
-                    p.dit_steps,
-                    p.n_turns,
-                    p.cand_main_kv,
-                    p.reserved_est_ms,
-                    p.ephemeral_gen_ctx,
-                    p.needs_return_ship});
+            const auto p = std::get<EvDitStart>(cur_ev.payload);
+            const bool is_1024 = p.height >= 1024;
+            const double dit_act_mib =
+                (is_1024 ? (4.0 * ph.dit_512_transient_mib) : ph.dit_512_transient_mib) * std::sqrt(ws.weight_scale);
+            const double vae_mib =
+                (policy.use_scoped_vae ? (is_1024 ? ph.scoped_vae_1024_spike_mib : ph.scoped_vae_512_spike_mib)
+                                       : (is_1024 ? ph.unscoped_vae_1024_reserved_mib : ph.unscoped_vae_512_reserved_mib)) *
+                ws.vae_spike_scale;
+            const double est_mem_mib = p.dit_phys_kv + std::max(dit_act_mib, vae_mib);
+            GpuQueueWaiter w;
+            w.est_mem_bytes = static_cast<int64_t>(est_mem_mib * static_cast<double>(kMiB));
+            w.est_exec_ms = p.reserved_est_ms;
+            w.slo_deadline_ms = p.t_turn0 + policy.dit_turn_slo_for(p.height, p.dit_steps) * slo_time_scale;
+            w.op_priority = 1;
+            PendingGpuWork work;
+            work.sid = sid;
+            work.is_prep = false;
+            work.dit = p;
+            enqueue_gpu_work(p.dst_gpu, ev_ms, w, std::move(work));
             continue;
         }
 
@@ -1443,18 +1622,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         turn_ev.waiting_ar_lock ? cur_ev.fifo_seq : 0);
                     break;
                 }
-                const double swap_in_mib = ledgers[ucur].ensure_session_resident(sid);
-                if (swap_in_mib < 0.0) {
+                const auto [ar_restore_ok, swap_in_ms] = restore_kv_resident(sid, cur_gpu, is_1024);
+                if (!ar_restore_ok) {
                     ledgers[ucur].release_session(sid);
                     ++gpu_oom_counts[ucur];
                     record_oom(usid, ti, ev_ms);
                     break;
                 }
-                const double swap_in_ms =
-                    (swap_in_mib > 0.0)
-                        ? (((swap_in_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(cur_gpu))) *
-                           1000.0)
-                        : 0.0;
                 const bool prev_was_dit =
                     (ti > 0 && sess_spec.turns[static_cast<size_t>(ti - 1)].modality_plan != "ar_only");
                 const bool loopback_prev_dit_img =
@@ -1532,18 +1706,14 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                         turn_ev.waiting_ar_lock ? cur_ev.fifo_seq : 0);
                     break;
                 }
-                const double swap_in_mib = ledgers[ucur].ensure_session_resident(sid);
-                if (swap_in_mib < 0.0) {
+                const auto [cot_restore_ok, cot_restore_ms] = restore_kv_resident(sid, cur_gpu, is_1024);
+                if (!cot_restore_ok) {
                     ledgers[ucur].release_session(sid);
                     ++gpu_oom_counts[ucur];
                     record_oom(usid, ti, ev_ms);
                     break;
                 }
-                double swap_in_ms =
-                    (swap_in_mib > 0.0)
-                        ? (((swap_in_mib * static_cast<double>(kMiB) / 1e9) / std::max(0.5, topo.solo_h2d_gbps(cur_gpu))) *
-                           1000.0)
-                        : 0.0;
+                double swap_in_ms = cot_restore_ms;
                 const double base_delta_kv =
                     (turn.num_images > 0)
                         ? (ph.turn_edit_512_kv_delta_mib * (is_1024 ? kEdit1024KvRatio : 1.0) + 4.0)
@@ -1641,11 +1811,11 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 break;
             }
 
-            // `dit_edit` or `dit_t2i`: acquire exclusive GPU lock on `cur_gpu` causally (`EV_PREP_START`).
+            // `dit_edit` or `dit_t2i`: enqueue onto per-GPU Memory+Slack wait queue causally (`EV_PREP_START`).
             const double est_prep_q = (240.0 * cscale) / sp;
             queued_work_ms[static_cast<size_t>(cur_gpu)] += est_prep_q;
             push_ev(
-                std::max(ev_ms, excl_gpu_free_at(static_cast<size_t>(cur_gpu))),
+                ev_ms,
                 EV_PREP_START,
                 sid,
                 EvPrepStart{ti, attempt, cur_gpu, ev_ms, est_prep_q},
@@ -1770,6 +1940,14 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     int evict_tot = 0;
     int swap_out_tot = 0;
     int swap_in_tot = 0;
+    int64_t q_reorders_tot = 0;
+    int64_t q_mem_bypasses_tot = 0;
+    int64_t q_starv_promos_tot = 0;
+    for (const auto& qs : gpu_schedulers) {
+        q_reorders_tot += qs.stats().reorders_total;
+        q_mem_bypasses_tot += qs.stats().memory_bypasses_total;
+        q_starv_promos_tot += qs.stats().starvation_promotions_total;
+    }
     nlohmann::json worker_stats_array = nlohmann::json::array();
     const double vmm_pool_mib =
         policy.use_tripool_vmm ? static_cast<double>(policy.super_pool_mib + policy.fine_kv_pool_mib) : 0.0;
@@ -1786,9 +1964,12 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             {"combined_physical_mib", l.peak_used_mib()},
             {"pytorch_reserved_mib", std::max(0.0, l.peak_used_mib() - vmm_pool_mib)},
             {"vmm_physical_pool_mib", vmm_pool_mib},
+            {"effective_hbm_util_mean_pct", round_2(l.effective_hbm_util_mean_pct())},
             {"oom_count", gpu_oom_counts[g]},
             {"kv_host_swap_outs", l.kv_host_swap_outs()},
             {"kv_host_swap_ins", l.kv_host_swap_ins()},
+            {"kv_recompute_evictions", l.kv_recompute_evictions()},
+            {"kv_recompute_restores", l.kv_recompute_restores()},
             {"vmm_stats",
              {
                  {"overflow_creates", 0},
@@ -1816,6 +1997,14 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         {"vmm_expert_evictions", evict_tot},
         {"vmm_kv_host_swap_outs", swap_out_tot},
         {"vmm_kv_host_swap_ins", swap_in_tot},
+        {"queue_reorders_total", q_reorders_tot},
+        {"queue_memory_bypasses_total", q_mem_bypasses_tot},
+        {"queue_starvation_promotions_total", q_starv_promos_tot},
+        {"kv_swap_in_mean_ms", round_2(mean_raw(sim_swap_in_latencies_ms))},
+        {"kv_swap_in_p95_ms", percentile_rounded(sim_swap_in_latencies_ms, 95.0)},
+        {"kv_recompute_events", sim_kv_recompute_events},
+        {"kv_recompute_total_ms", round_2(sim_kv_recompute_total_ms)},
+        {"kv_saved_recompute_ms", round_2(sim_kv_saved_recompute_ms)},
     };
 
     const double wall_seconds = std::max(1e-3, max_end_ms / 1000.0);

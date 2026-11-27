@@ -86,6 +86,11 @@ class EnginePolicyConfig:
     use_idle_kv_swap: bool = False
     kv_vmm_only: bool = False
     preemption_mode: str = "layer_chunk"  # "non_preemptive" | "step_preemptive" | "layer_chunk"
+    cost_model_mode: str = "atlas_3d"  # "atlas_3d" | "pipeline_analytical" | "legacy_analytical"
+    gpu_queue_mode: str = "memory_slack"  # "memory_slack" | "fcfs"
+    gpu_queue_max_aging_ms: float = 6000.0
+    gpu_queue_max_bypasses: int = 3
+    kv_eviction_mode: str = "swap"  # "swap" | "recompute"
     static_und_ranks: tuple[int, ...] = ()
     static_gen_ranks: tuple[int, ...] = ()
     initial_alphas: dict[int, float] = field(default_factory=dict)
@@ -219,7 +224,14 @@ class EnginePolicyConfig:
                     d.pop(bool_key)
                 else:
                     d[bool_key] = bool(d[bool_key])
-        for str_key in ("think_time_dist", "ar_tpot_slo_mode", "steady_window_mode"):
+        for str_key in (
+            "think_time_dist",
+            "ar_tpot_slo_mode",
+            "steady_window_mode",
+            "cost_model_mode",
+            "gpu_queue_mode",
+            "kv_eviction_mode",
+        ):
             if str_key in d:
                 if d[str_key] is None:
                     d.pop(str_key)
@@ -232,12 +244,18 @@ class EnginePolicyConfig:
             "warmup_window_s",
             "steady_window_s",
             "cooldown_s",
+            "gpu_queue_max_aging_ms",
         ):
             if flt_key in d:
                 if d[flt_key] is None:
                     d.pop(flt_key)
                 else:
                     d[flt_key] = float(d[flt_key])
+        if "gpu_queue_max_bypasses" in d:
+            if d["gpu_queue_max_bypasses"] is None:
+                d.pop("gpu_queue_max_bypasses")
+            else:
+                d["gpu_queue_max_bypasses"] = int(d["gpu_queue_max_bypasses"])
         return cls(**d)
 
     @classmethod

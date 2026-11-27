@@ -808,12 +808,12 @@ def run_validation(
     }
 
     # ==================== Test 4: Visual-CoT (`L_shared > 0`) & Downstream Scorers (`CLIP` / `OWLv2` / `MMVet`) ====================
-    cot_prompt = "a photo of a blue fire hydrant"
+    cot_prompt = "a photo of a red fire hydrant"
     cot_plan_prompt = (
-        "Think step by step to plan the exact object count, vivid blue color, centered foreground placement, "
+        "Think step by step to plan the exact object count, vivid red color, centered foreground placement, "
         f"and clean outdoor street background before generating the image: {cot_prompt}"
     )
-    cot_meta = {"tag": "colors", "include": [{"class": "fire hydrant", "count": 1, "color": "blue"}], "prompt": cot_prompt}
+    cot_meta = {"tag": "colors", "include": [{"class": "fire hydrant", "count": 1, "color": "red"}], "prompt": cot_prompt}
 
     def _run_visual_cot_once(use_ms: bool):
         ctx_m = {"kv_lens": [0], "ropes": [0], "past_key_values": NaiveCache(num_layers)}
@@ -870,8 +870,8 @@ def run_validation(
                 clip_turn_deltas.append(float(mr["clip_t_pct"]) - float(sr["clip_t_pct"]))
     owl_ref = owlv2_scorer.score_image(cot_stock_img, cot_meta)
     owl_ms = owlv2_scorer.score_image(cot_ms_img, cot_meta)
-    mmvet_ref_score = score_mmvet_answer(cot_vqa_stock, "blue")
-    mmvet_ms_score = score_mmvet_answer(cot_vqa_ms, "blue")
+    mmvet_ref_score = score_mmvet_answer(cot_vqa_stock, "red")
+    mmvet_ms_score = score_mmvet_answer(cot_vqa_ms, "red")
     # Extract whole words (never mid-word character slices) for deterministic CoT rubric parity check
     mmvet_cot_parity = score_mmvet_answer(cot_think_ms, _extract_cot_rubric_clause(cot_think_stock))
     cot_think_exact_match = cot_think_stock == cot_think_ms

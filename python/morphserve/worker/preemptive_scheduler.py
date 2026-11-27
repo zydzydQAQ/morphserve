@@ -101,7 +101,12 @@ def _is_oom_err(exc: BaseException) -> bool:
     if isinstance(exc, MemoryError) or type(exc).__name__ == "OutOfMemoryError":
         return True
     low = str(exc).lower()
-    return "out of memory" in low or "out of vmm memory" in low
+    return (
+        "out of memory" in low
+        or "out of vmm memory" in low
+        or "cudaerrormemoryallocation" in low
+        or ("torch_call_dispatcher" in low and "aten::new_empty" in low)
+    )
 
 
 class UnifiedPreemptiveScheduler:

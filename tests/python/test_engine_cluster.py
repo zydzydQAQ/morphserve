@@ -997,14 +997,19 @@ def test_cluster_engine_mid_dit_preemption_gate_for_internvlu_regimes() -> None:
 
 def test_nccl_transfer_guard_reclaims_dst_headroom_after_probe_oom(tmp_path: Path) -> None:
     """When `ALLOC_RECV_BUF(probe_only=True)` OOMs, `_nccl_transfer_guard` locks dst, runs `RECLAIM_HEADROOM`, and succeeds."""
-    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=2)
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=2,
+        model_family="synthetic",
+        inter_turn_think_s_range=(0.0, 0.0),
+    )
+    fleet = InProcessWorkerFleet(pol)
     eng = MorphServeClusterEngine(
         policy=pol,
-        model_dir=tmp_path,
-        bench_root=tmp_path,
+        fleet=fleet,
         tmp_root=tmp_path / "tmp_nccl_reclaim",
-        fleet_factory=_make_fake_fleet,
     )
+    eng.start()
     ops_on_dst: list[tuple[str, bool]] = []
     reclaimed = {"done": False}
     orig_rpc = eng._rpc

@@ -32,6 +32,14 @@ def test_is_oom_exception_recognizes_typed_errors() -> None:
     assert is_oom_exception(VmmOutOfMemoryError("pool exhausted")) is True
     assert is_oom_exception(SyntheticOutOfMemoryError("injected")) is True
     assert is_oom_exception(MemoryError("out of memory")) is True
+    assert (
+        is_oom_exception(
+            RuntimeError(
+                'torch_call_dispatcher( "aten::new_empty", "", stack.data(), TORCH_ABI_VERSION) API call failed'
+            )
+        )
+        is True
+    )
     assert is_oom_exception(ValueError("bad argument")) is False
     assert is_oom_exception(RuntimeError("unrelated transport failure")) is False
 

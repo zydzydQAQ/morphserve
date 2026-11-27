@@ -52,6 +52,7 @@ def is_oom_exception(exc: BaseException) -> bool:
         or "cudaerrormemoryallocation" in low
         or "cublas_status_alloc_failed" in low
         or "cudnn_status_alloc_failed" in low
+        or ("torch_call_dispatcher" in low and "aten::new_empty" in low)
     )
 
 

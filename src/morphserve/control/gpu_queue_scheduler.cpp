@@ -155,28 +155,87 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
 
     size_t chosen = fifo_idx;
     if (!fitting.empty()) {
-        // Session-SLO-aware Domino-free Feasible-Slack EDF + SRPT fallback (Autellix/Parrot pattern):
+        // Session-SLO-aware Moore-Hodgson Session-SRPT + EDF-Feasible-Pair Interchange (Autellix/Parrot):
         // Partition fitting waiters into 3 buckets:
-        //   0: SLO-feasible (`slack >= 0` or unprioritized) AND `session_slo_intact` (preserves BOTH Turn & Joint SLO;
-        //      ordered by tightest slack EDF first for Liu-Layland deadline optimality, tie-breaking by fewest
-        //      remaining turns so nearly-complete sessions finish before longer ones of equal urgency)
-        //   1: SLO-feasible (`slack >= 0`) with prior turn SLO missed (`!session_slo_intact`; maximizes Turn SLO without
-        //      starving healthy Bucket-0 sessions, ordered by tightest slack EDF)
-        //   2: Already-expired (`slack < 0`), ordered by SRPT (`est_exec_ms` ascending) so heavy expired turns
-        //      cannot trigger an EDF domino cascade or inflate tail JCT.
-        auto rank_key = [&](const GpuQueueWaiter& w) noexcept {
+        //   0: SLO-feasible (`slack >= 0` or unprioritized) AND `session_slo_intact` (preserves BOTH Turn & Joint SLO)
+        //      - Primary winner `best_srpt`: minimizes remaining session work `rem_turns * max(1, est_exec_ms)`
+        //        so overload banks maximum completed multi-turn sessions per GPU-second (preventing EDF
+        //        processor-sharing collapse across half-finished sessions and protecting short 512px turns
+        //        from heavy 1024px turns).
+        //      - EDF-Feasible-Pair Interchange: a tighter-slack Bucket-0 waiter `u` may run before `best_srpt`
+        //        IFF `best_srpt` remains comfortably feasible after `u` executes (`slack(best_srpt) >= safety * u.exec`),
+        //        preserving Liu-Layland EDF optimality under non-overloaded load so BOTH finish within SLO!
+        //   1: SLO-feasible (`slack >= 0`) with prior turn SLO missed (`!session_slo_intact`; tightest slack EDF)
+        //   2: Already-expired (`slack < 0`), ordered by SRPT (`est_exec_ms` ascending).
+        auto waiter_bucket = [&](const GpuQueueWaiter& w) noexcept {
             const double slack = effective_slack_ms(w, now_ms);
             const bool feasible = (w.slo_deadline_ms <= 0.0) || (slack >= 0.0);
-            const int bucket = feasible ? (w.session_slo_intact ? 0 : 1) : 2;
-            const int rem_turns = (bucket == 0) ? std::max(1, w.remaining_turns) : 0;
-            const double primary = feasible ? slack : std::max(0.0, w.est_exec_ms);
-            const double secondary = feasible ? std::max(0.0, w.est_exec_ms) : -slack;
-            return std::make_tuple(w.op_priority, bucket, primary, rem_turns, secondary, w.enqueue_ms, w.waiter_id);
+            return feasible ? (w.session_slo_intact ? 0 : 1) : 2;
         };
-        chosen = fitting.front();
+
+        int best_prio = std::numeric_limits<int>::max();
+        int best_bucket = 3;
         for (size_t idx : fitting) {
-            if (rank_key(waiters[idx]) < rank_key(waiters[chosen])) {
-                chosen = idx;
+            const auto& w = waiters[idx];
+            const int b = waiter_bucket(w);
+            if (std::tie(w.op_priority, b) < std::tie(best_prio, best_bucket)) {
+                best_prio = w.op_priority;
+                best_bucket = b;
+            }
+        }
+
+        std::vector<size_t> top_group;
+        top_group.reserve(fitting.size());
+        for (size_t idx : fitting) {
+            const auto& w = waiters[idx];
+            if (w.op_priority == best_prio && waiter_bucket(w) == best_bucket) {
+                top_group.push_back(idx);
+            }
+        }
+
+        if (best_bucket == 0) {
+            auto srpt_key = [&](const GpuQueueWaiter& w) noexcept {
+                const int rem = std::max(1, w.remaining_turns);
+                const double exec_ms = std::max(1.0, w.est_exec_ms);
+                const double rem_work = static_cast<double>(rem) * exec_ms;
+                const double slack = effective_slack_ms(w, now_ms);
+                return std::make_tuple(rem_work, rem, slack, exec_ms, w.enqueue_ms, w.waiter_id);
+            };
+            size_t best_srpt = top_group.front();
+            for (size_t idx : top_group) {
+                if (srpt_key(waiters[idx]) < srpt_key(waiters[best_srpt])) {
+                    best_srpt = idx;
+                }
+            }
+            chosen = best_srpt;
+            const double best_slack = effective_slack_ms(waiters[best_srpt], now_ms);
+            const double safety = (top_group.size() <= 2) ? 1.0 : 1.5;
+            size_t best_edf = best_srpt;
+            double best_edf_slack = best_slack;
+            for (size_t idx : top_group) {
+                if (idx == best_srpt) continue;
+                const auto& u = waiters[idx];
+                const double u_slack = effective_slack_ms(u, now_ms);
+                const double u_exec = std::max(0.0, u.est_exec_ms);
+                if (u_slack < best_edf_slack && best_slack >= safety * u_exec) {
+                    best_edf = idx;
+                    best_edf_slack = u_slack;
+                }
+            }
+            chosen = best_edf;
+        } else {
+            auto fallback_key = [&](const GpuQueueWaiter& w) noexcept {
+                const double slack = effective_slack_ms(w, now_ms);
+                const bool feasible = (best_bucket == 1);
+                const double primary = feasible ? slack : std::max(0.0, w.est_exec_ms);
+                const double secondary = feasible ? std::max(0.0, w.est_exec_ms) : -slack;
+                return std::make_tuple(primary, secondary, w.enqueue_ms, w.waiter_id);
+            };
+            chosen = top_group.front();
+            for (size_t idx : top_group) {
+                if (fallback_key(waiters[idx]) < fallback_key(waiters[chosen])) {
+                    chosen = idx;
+                }
             }
         }
     } else {

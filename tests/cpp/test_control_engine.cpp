@@ -1150,27 +1150,29 @@ void test_gpu_wait_queue_scheduler() {
     const auto d3 = dom_sched.select_and_pop(q_dom, 5000.0, 8LL * kGiB);
     MS_CHECK(d3.has_value() && d3->waiter_id == 30);
 
-    // Session-SLO-aware 3-bucket priority (Autellix/Parrot + EDF optimality):
-    // Bucket 0 (feasible + session_slo_intact, tightest slack EDF first, rem_turns tie-break)
-    // > Bucket 1 (feasible + prior turn missed, tightest slack EDF)
-    // > Bucket 2 (already expired, SRPT).
+    // Session-SLO-aware Moore-Hodgson Session-SRPT + EDF-Feasible-Pair Interchange:
+    // 1. Under overload (running tighter-slack multi-turn job would break best_srpt's deadline):
+    //    best_srpt (minimum remaining session work `rem_turns * est_exec_ms`) runs FIRST!
+    // 2. Under non-overload (best_srpt stays comfortably feasible after tighter-slack job runs):
+    //    EDF interchange runs tighter-slack job first so BOTH finish on time!
+    // 3. Bucket 0 (intact) > Bucket 1 (prior turn missed, EDF) > Bucket 2 (expired, SRPT).
     GpuWaitQueueScheduler sess_sched(GpuQueuePolicy{"memory_slack", 120000.0, 16});
-    std::vector<GpuQueueWaiter> q_sess = {
+    std::vector<GpuQueueWaiter> q_overload = {
         {40, 100.0, 1LL * kGiB, 5000.0, 11000.0, 1, 0, false, 1}, // Bucket 1: feasible slack=+1000, prior missed
-        {41, 110.0, 1LL * kGiB, 5000.0, 15000.0, 1, 0, true, 3},  // Bucket 0: feasible slack=+5000, intact, 3 rem
-        {44, 115.0, 1LL * kGiB, 5000.0, 15000.0, 1, 0, true, 1},  // Bucket 0: feasible slack=+5000, intact, 1 rem (tie-break wins!)
-        {42, 120.0, 1LL * kGiB, 5000.0, 18000.0, 1, 0, true, 1},  // Bucket 0: feasible slack=+8000, intact, 1 rem (looser slack)
+        {41, 110.0, 1LL * kGiB, 5000.0, 11000.0, 1, 0, true, 3},  // Bucket 0: slack=+1000, work=15000 (would kill 44!)
+        {44, 115.0, 1LL * kGiB, 5000.0, 12000.0, 1, 0, true, 1},  // Bucket 0: slack=+2000, work=5000 (best_srpt!)
+        {42, 120.0, 1LL * kGiB, 7100.0, 24000.0, 1, 0, true, 1},  // Bucket 0: heavy 1024px work=7100, slack=+11900
         {43, 130.0, 1LL * kGiB, 3000.0, 6000.0, 1, 0, true, 1},   // Bucket 2: expired slack=-2000
     };
-    const auto s0 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
-    MS_CHECK(s0.has_value() && s0->waiter_id == 44);
-    const auto s1 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
-    MS_CHECK(s1.has_value() && s1->waiter_id == 41);
-    const auto s2 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    const auto s0 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
+    MS_CHECK(s0.has_value() && s0->waiter_id == 44);  // 44.slack(2000) < 41.exec(5000) -> 44 banks Joint SLO!
+    const auto s1 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
+    MS_CHECK(s1.has_value() && s1->waiter_id == 41);  // Now best_srpt=42 (slack=11900 >= 1.0*5000) -> 41 EDF-interchanges cleanly!
+    const auto s2 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
     MS_CHECK(s2.has_value() && s2->waiter_id == 42);
-    const auto s3 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    const auto s3 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
     MS_CHECK(s3.has_value() && s3->waiter_id == 40);
-    const auto s4 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    const auto s4 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
     MS_CHECK(s4.has_value() && s4->waiter_id == 43);
 
     // JSON roundtrip & backward-compatible defaults for session_slo_intact / remaining_turns.

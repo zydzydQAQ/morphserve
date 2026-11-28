@@ -1532,7 +1532,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 4096) * MIB
+                    headroom_b = (nccl_reserve_mib + 3072) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -2244,11 +2244,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             has_pending = session.has_pending_deferral
             if self.policy.use_scoped_vae:
                 # With Scoped VAE active, FLUX VAE decode activations run inside TriPoolVMM Arena-2
-                # rather than PyTorch driver memory; reserve 5.0/3.0 GiB so 1024px DiT + concurrent
-                # preempted AR never fragment CUDACachingAllocator on 40 GiB A100.
-                est_dit_vae_bytes = int(5120 * MIB) if (height >= 1024 or width >= 1024) else int(3072 * MIB)
+                # and chunked NCCL streaming caps staging at 64 MiB; reserve 3.0/2.0 GiB PyTorch driver
+                # headroom (matching `max_pool_b`) so warm Arena-1 KV is never spuriously evicted pre-DiT.
+                est_dit_vae_bytes = int(3072 * MIB) if (height >= 1024 or width >= 1024) else int(2048 * MIB)
             else:
-                est_dit_vae_bytes = int(6144 * MIB) if (height >= 1024 or width >= 1024) else int(3584 * MIB)
+                est_dit_vae_bytes = int(5120 * MIB) if (height >= 1024 or width >= 1024) else int(3072 * MIB)
             if self.pager is not None and self.vmm is not None:
                 extra_dit_kv = (256 * MIB) if has_pending else (64 * MIB)
                 # `for_dit=True` already reserves full DiT expert bytes in TriPoolVMM's accounting;
@@ -2450,7 +2450,13 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     return True
                 ar_cid = str(ar_msg.get("ctx_id", ""))
                 ar_sess = self._ctx_store.get(ar_cid)
-                return bool(ar_sess is not None and ar_sess.is_swapped)
+                # Only classify large swapped KV contexts (>256 MiB, >20ms H2D swap-in) as heavy;
+                # small text-only swapped VMM contexts swap in within ~2-15ms without stalling TPOT.
+                return bool(
+                    ar_sess is not None
+                    and ar_sess.is_swapped
+                    and int(ar_sess.logical_bytes()) > 256 * MIB
+                )
 
             def _reclaim_for_preempt(_tasks: list[ArDecodeTask]) -> int:
                 # Reclaim ~2 GiB first so a single transient activation spike doesn't dump every warm session.

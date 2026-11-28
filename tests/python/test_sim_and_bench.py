@@ -483,6 +483,7 @@ def test_policy_presets_ablations_static_splits_and_internvlu_budget(tmp_path: P
         "no_m2_pacer_numa",
         "no_m3_cow_loopback",
         "no_m4_layer_chunk",
+        "no_queue_sched",
     ]
     splits = build_static_split_configs(num_gpus=8)
     assert [name for name, _ in splits] == [
@@ -583,10 +584,13 @@ def test_exactness_tier1_sha256_and_tier2_ssim_psnr_mae_against_reference(tmp_pa
     assert m_same["sha256_equal"] is True and m_same["ssim"] == 1.0
     assert pil_sha256(img_base) != pil_sha256(img_lsb)
 
-    # Verify MMVet rubric, OWLv2 GenEval clause matching, CLIP similarity, and single-pass `geneval_pairs`.
+    # Verify MMVet rubric (including negative numbers, fractions, and multi-word content-token recall).
     assert score_mmvet_answer("The sky is clearly blue and bright", "blue<AND>bright") == 1.0
     assert score_mmvet_answer("only blue", "blue<AND>bright") == 0.5
     assert score_mmvet_answer("two apples", "2<OR>two") == 1.0
+    assert score_mmvet_answer("The solutions are -1 and -5.", "-1<AND>-5") == 1.0
+    assert score_mmvet_answer("The simplified ratio is 5/4.", "5/4") == 1.0
+    assert score_mmvet_answer("The image shows a red double-decker bus on a street.", "a red double decker bus") == 1.0
 
     owl = OwlV2GenEvalScorer(
         detector_fn=lambda _im, qs: [

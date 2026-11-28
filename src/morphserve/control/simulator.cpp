@@ -348,7 +348,6 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     const double chunk_q_1024_ms = static_cast<double>(chunk_layers_1024) * layer1024_ms;
 
     constexpr double kEdit1024KvRatio = (4096.0 + 4900.0) / (1024.0 + 4900.0);
-    constexpr double kPageableOffloadBwRatio = 0.66;
 
     const int64_t expert_bytes_scaled =
         static_cast<int64_t>(ph.packed_expert_data_mib * ws.weight_scale * static_cast<double>(kMiB));
@@ -438,6 +437,8 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
     std::vector<double> sess_think_ms(n_sess, 0.0);
     std::vector<double> sess_end_ms(n_sess, 0.0);
     std::vector<bool> sess_oom(n_sess, false);
+    std::vector<bool> sess_slo_intact(n_sess, true);
+    std::vector<bool> sess_naive_gen_held(n_sess, false);
     std::vector<int> sess_retries(n_sess, 0);
     std::vector<int> sess_ships(n_sess, 0);
     std::vector<int> sess_morphs(n_sess, 0);
@@ -568,6 +569,7 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         if (secondary_release_gpu >= 0 && secondary_release_gpu < num_gpus && secondary_release_gpu != failed_gpu) {
             ledgers[static_cast<size_t>(secondary_release_gpu)].release_session(sid_i);
         }
+        sess_naive_gen_held[usid_idx] = false;
         if (attempt_idx < policy.max_oom_retries && turn_idx == 0) {
             ++sess_retries[usid_idx];
             sess_gpu[usid_idx] = pick_oom_retry_gpu(failed_gpu, oom_time_ms);
@@ -594,6 +596,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
         sess_kv_mib[usid_idx] = cand_main_kv;
         sess_main_kv_mib[usid_idx] = cand_main_kv;
         const double turn_lat = turn_end_ms - t_turn0;
+        if (turn_lat > policy.dit_turn_slo_for(height, dit_steps) * slo_time_scale) {
+            sess_slo_intact[usid_idx] = false;
+        }
         sess_dit_records[usid_idx].push_back(SimDitRec{turn_lat, height, dit_steps});
 
         SimTurnRec rec;
@@ -638,7 +643,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 ++active_same_half;
             }
         }
-        const double eff_h2d = std::max(0.5, topo.effective_h2d_gbps(gpu_id, active_same_half) * kPageableOffloadBwRatio);
+        // Real `NaiveHostOffloader` stages expert weights in pinned host DRAM (`pin_memory=True`),
+        // achieving full PCIe H2D bandwidth without pageable-memory throttling.
+        const double eff_h2d = std::max(0.5, topo.effective_h2d_gbps(gpu_id, active_same_half));
         const double swap_ms = ((static_cast<double>(expert_bytes_scaled) / 1e9) / eff_h2d) * 1000.0;
         if (policy.use_h2d_pacer) {
             const double p_wait = pacer->reserve_slot(gpu_id, swap_ms, at_ms);
@@ -977,8 +984,11 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 prep_gpu_ms = swap_in_ms + vit_only_img_ms;
                 deferred_dit_prep_ms = img_vae_ms;
             } else {
-                const double naive_vae_swap =
-                    policy.use_naive_offload ? (1.08 * compute_naive_swap_ms(p.cur_gpu, ev_ms + swap_in_ms)) : 0.0;
+                double naive_vae_swap = 0.0;
+                if (policy.use_naive_offload && !sess_naive_gen_held[usid]) {
+                    naive_vae_swap = compute_naive_swap_ms(p.cur_gpu, ev_ms + swap_in_ms);
+                    sess_naive_gen_held[usid] = true;
+                }
                 prep_gpu_ms = swap_in_ms + naive_vae_swap + full_loop_ms;
             }
         }
@@ -1041,7 +1051,13 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
 
         double naive_dit_swap_ms = 0.0;
         if (policy.use_naive_offload) {
-            naive_dit_swap_ms = 1.08 * compute_naive_swap_ms(p.dst_gpu, start_dit + p.pre_denoise_gpu_ms);
+            if (sess_naive_gen_held[usid] && p.dst_gpu == p.cur_gpu) {
+                // `prepare_turn` already swapped `moe_gen` in and held it resident for this DiT turn.
+                naive_dit_swap_ms = 0.0;
+            } else {
+                naive_dit_swap_ms = compute_naive_swap_ms(p.dst_gpu, start_dit + p.pre_denoise_gpu_ms);
+            }
+            sess_naive_gen_held[usid] = false;
         }
 
         const auto [dit_ok_mem, swap_out_mib] = ledgers[udst].execute_dit_and_vae(
@@ -1173,6 +1189,8 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             w.est_exec_ms = p.est_prep_q;
             w.slo_deadline_ms = p.t_turn0 + policy.dit_turn_slo_for(turn.height, turn.dit_steps) * slo_time_scale;
             w.op_priority = 1;
+            w.session_slo_intact = sess_slo_intact[usid];
+            w.remaining_turns = std::max(1, static_cast<int>(built_sessions[usid].turns.size()) - p.ti);
             PendingGpuWork work;
             work.sid = sid;
             work.is_prep = true;
@@ -1419,6 +1437,8 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
             w.est_exec_ms = p.reserved_est_ms;
             w.slo_deadline_ms = p.t_turn0 + policy.dit_turn_slo_for(p.height, p.dit_steps) * slo_time_scale;
             w.op_priority = 1;
+            w.session_slo_intact = sess_slo_intact[usid];
+            w.remaining_turns = std::max(1, p.n_turns - p.ti);
             PendingGpuWork work;
             work.sid = sid;
             work.is_prep = false;
@@ -1665,6 +1685,18 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     &ar_turn_tp);
                 const bool ar_has_img = (eff_ar_images > 0);
                 const int ar_img_res = (height > 0) ? height : 512;
+                {
+                    const double ttft_lim = policy.ar_ttft_slo_for(ar_has_img, eff_ar_images, ar_img_res) * slo_time_scale;
+                    const double tpot_lim = policy.ar_tpot_slo_ms * slo_time_scale;
+                    const double tpot_stat = ar_turn_tp.empty()
+                                                 ? 0.0
+                                                 : ((policy.ar_tpot_slo_mode == "turn_mean")
+                                                        ? mean_raw(ar_turn_tp)
+                                                        : percentile_raw(ar_turn_tp, 95.0));
+                    if (ar_ttft_val > ttft_lim || (!ar_turn_tp.empty() && tpot_stat > tpot_lim)) {
+                        sess_slo_intact[usid] = false;
+                    }
+                }
                 sess_ar_has_image[usid].push_back(ar_has_img ? 1 : 0);
                 sess_ar_num_images[usid].push_back(eff_ar_images);
                 sess_ar_image_res[usid].push_back(ar_img_res);
@@ -1747,8 +1779,9 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                     }
                     break;
                 }
-                if (policy.use_naive_offload && can_vae_here) {
-                    swap_in_ms += 1.08 * compute_naive_swap_ms(cur_gpu, ev_ms + swap_in_ms);
+                if (policy.use_naive_offload && can_vae_here && !sess_naive_gen_held[usid]) {
+                    swap_in_ms += compute_naive_swap_ms(cur_gpu, ev_ms + swap_in_ms);
+                    sess_naive_gen_held[usid] = true;
                 }
 
                 const double lock_w = std::max(0.0, ev_ms - ar_enq);
@@ -1768,6 +1801,18 @@ nlohmann::json ClusterSimulator::simulate_cluster_point(
                 const bool cot_has_img = (turn.num_images > 0) || turn.use_prev_image;
                 const int cot_n_img = (turn.num_images > 0) ? turn.num_images : (turn.use_prev_image ? 1 : 0);
                 const int cot_img_res = (height > 0) ? height : 512;
+                {
+                    const double ttft_lim = policy.ar_ttft_slo_for(cot_has_img, cot_n_img, cot_img_res) * slo_time_scale;
+                    const double tpot_lim = policy.ar_tpot_slo_ms * slo_time_scale;
+                    const double tpot_stat = cot_turn_tp.empty()
+                                                 ? 0.0
+                                                 : ((policy.ar_tpot_slo_mode == "turn_mean")
+                                                        ? mean_raw(cot_turn_tp)
+                                                        : percentile_raw(cot_turn_tp, 95.0));
+                    if (cot_ttft_val > ttft_lim || (!cot_turn_tp.empty() && tpot_stat > tpot_lim)) {
+                        sess_slo_intact[usid] = false;
+                    }
+                }
                 sess_ar_has_image[usid].push_back(cot_has_img ? 1 : 0);
                 sess_ar_num_images[usid].push_back(cot_n_img);
                 sess_ar_image_res[usid].push_back(cot_img_res);

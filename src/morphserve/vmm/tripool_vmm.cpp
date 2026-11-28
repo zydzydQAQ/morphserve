@@ -800,7 +800,7 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
         backend_->ensure_context();
         const size_t wm_target = compute_watermark_reclaim_target_locked(/*for_dit=*/false, needed_restore_bytes);
         if (wm_target > 0) {
-            reclaim_thinking_kv_locked(wm_target, /*sync=*/true, &session_id, 1, stream, lock);
+            reclaim_thinking_kv_locked(wm_target, /*sync=*/false, &session_id, 1, stream, lock);
         }
 
         std::sort(swapped_rids.begin(), swapped_rids.end());

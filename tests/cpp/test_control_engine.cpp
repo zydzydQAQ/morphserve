@@ -142,10 +142,17 @@ void test_policy_presets_and_overrides() {
     const PolicyConfig p_shm = PolicyConfig::from_preset("twostage_shm", 8);
     const PolicyConfig p_naive = PolicyConfig::from_preset("naive_host_offload", 8);
     MS_CHECK(p_ms.use_idle_kv_swap == true);
+    MS_CHECK(p_ms.cost_model_mode == "pipeline_analytical");
+    MS_CHECK(std::abs(p_ms.gpu_queue_max_aging_ms - 45000.0) < 1e-9);
+    MS_CHECK(p_ms.gpu_queue_max_bypasses == 5);
     MS_CHECK(p_mono.use_idle_kv_swap == false);
     MS_CHECK(p_mono_swap.use_idle_kv_swap == true);
     MS_CHECK(p_mono_swap.routing_mode == p_mono.routing_mode && !p_mono_swap.use_tripool_vmm && !p_mono_swap.use_scoped_vae);
     MS_CHECK(p_prism.use_idle_kv_swap == true);
+    MS_CHECK(p_prism.gpu_queue_mode == "memory_slack");
+    MS_CHECK(std::abs(p_prism.gpu_queue_max_aging_ms - 45000.0) < 1e-9);
+    MS_CHECK(p_prism.gpu_queue_max_bypasses == 5);
+    MS_CHECK(p_prism.super_pool_mib == 0 && p_prism.fine_kv_pool_mib == 64);
     MS_CHECK(p_shm.use_idle_kv_swap == false);
     MS_CHECK(p_naive.use_idle_kv_swap == false);
     MS_CHECK(p44.use_idle_kv_swap == false);
@@ -153,7 +160,7 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(std::abs(p_ms.steady_window_s - 150.0) < 1e-9);
     MS_CHECK(std::abs(p_ms.cooldown_s - 30.0) < 1e-9);
 
-    // InternVL-U Regime A enables step-level preemption (VLM + Decoder both resident);
+    // InternVL-U Regime A enables step-level preemption (VLM + Decoder both resident, tight 2.5 GiB VMM super pool);
     // quota-capped Regime B stays non-preemptive because VLM & Decoder are co-paged.
     const PolicyConfig p_ivlu_a = PolicyConfig::from_preset("morphserve", 8, {{"model_family", "internvl_u"}});
     const PolicyConfig p_ivlu_b_q = PolicyConfig::from_preset(
@@ -162,6 +169,7 @@ void test_policy_presets_and_overrides() {
         "morphserve", 8, {{"model_family", "internvl_u"}, {"gpu_memory_fraction", 0.30}});
     MS_CHECK(p_ivlu_a.preemption_mode == "step_preemptive");
     MS_CHECK(p_ivlu_a.allow_vmm_overflow == true);
+    MS_CHECK(p_ivlu_a.super_pool_mib == 2560 && p_ivlu_a.fine_kv_pool_mib == 128);
     MS_CHECK(p_ivlu_b_q.preemption_mode == "non_preemptive");
     MS_CHECK(p_ivlu_b_q.allow_vmm_overflow == false);
     MS_CHECK(p_ivlu_b_f.preemption_mode == "non_preemptive");
@@ -201,9 +209,9 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(std::abs(rt.steady_state_trim_frac - 0.2) < 1e-9);
     MS_CHECK(rt.gpu_memory_quota_mib.has_value() && std::abs(*rt.gpu_memory_quota_mib - 12288.0) < 1e-9);
 
-    // Decoupled 6-mechanism Leave-One-Out M1-M4 ablation suite & static split suite propagate overrides.
+    // Decoupled 7-mechanism Leave-One-Out M1-M4 + Queue ablation suite & static split suite propagate overrides.
     const auto abl = build_ablation_configs(8, {{"dit_slo_scale_k", 3.5}});
-    MS_CHECK(abl.size() == 7);
+    MS_CHECK(abl.size() == 8);
     MS_CHECK(abl[0].first == "full_morphserve" && abl[0].second.use_tripool_vmm && abl[0].second.preemption_mode == "layer_chunk");
     MS_CHECK(abl[1].first == "no_m1_tripool_vmm" && !abl[1].second.use_tripool_vmm && !abl[1].second.use_expert_pager &&
              abl[1].second.use_scoped_vae && abl[1].second.use_h2d_pacer && abl[1].second.use_shared_numa_mirror);
@@ -216,6 +224,8 @@ void test_policy_presets_and_overrides() {
     MS_CHECK(abl[5].first == "no_m3_cow_loopback" && !abl[5].second.use_module3_cow_loopback && abl[5].second.use_tripool_vmm);
     MS_CHECK(abl[6].first == "no_m4_layer_chunk" && abl[6].second.preemption_mode == "non_preemptive" &&
              abl[6].second.use_tripool_vmm);
+    MS_CHECK(abl[7].first == "no_queue_sched" && abl[7].second.gpu_queue_mode == "fcfs" &&
+             abl[7].second.use_tripool_vmm && abl[7].second.preemption_mode == "layer_chunk");
     for (const auto& [_, cfg] : abl) {
         MS_CHECK(std::abs(cfg.dit_slo_scale_k - 3.5) < 1e-9);
     }
@@ -554,12 +564,17 @@ void test_preempt_edf_controller() {
 void test_worker_budget_planner() {
     using namespace morphserve::control;
 
-    // Unconstrained 40 GiB Regime A plan.
+    // Unconstrained 40 GiB Regime A plan (explicit large policy_super_pool_mib vs tight default 2560 MiB without +5632 MiB bloat).
     const auto unconstrained = WorkerBudgetPlanner::compute_internvlu_memory_plan(
         40960.0, 34000.0, 260.0, 4864LL * kMiB, 12288, 512, 64, true, std::nullopt, std::nullopt);
     MS_CHECK(!unconstrained.at("quota_constrained").get<bool>());
     MS_CHECK(unconstrained.at("allow_overflow").get<bool>());
     MS_CHECK(unconstrained.at("vmm_physical_pool_mib").get<int>() > 6688);
+
+    const auto regime_a_tight = WorkerBudgetPlanner::compute_internvlu_memory_plan(
+        40960.0, 26000.0, 12000.0, 2496LL * kMiB, 2560, 128, 64, true, std::nullopt, std::nullopt);
+    MS_CHECK(!regime_a_tight.at("quota_constrained").get<bool>());
+    MS_CHECK(regime_a_tight.at("vmm_physical_pool_mib").get<int>() <= 2816);
 
     // 12 GiB Regime B quota plan & verification using canonical `peak_pytorch_reserved_mib` + `vmm_physical_pool_mib`.
     const auto q_pair = WorkerBudgetPlanner::compute_internvlu_quota_overrides(

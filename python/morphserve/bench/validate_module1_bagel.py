@@ -204,8 +204,8 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     }
 
     alpha_results = []
-    # Measure Step-1 overlap across alpha = 1.0, 0.75, 0.50, 0.25, 0.0 (512x512, 20 steps)
-    for alpha in (1.0, 0.75, 0.50, 0.25, 0.0):
+    # Measure Step-1 overlap across anchor + unseen intermediate alpha points (512x512, 20 steps)
+    for alpha in (1.0, 0.75, 0.625, 0.50, 0.375, 0.25, 0.0):
         res_before = pager.set_residency_alpha(alpha)
         st_before = vmm.stats_dict()
 
@@ -267,7 +267,7 @@ def run_validation(model_dir: Path, output_dir: Path, steps: int = 20) -> dict:
     del _h_warm
     hires_results = []
     hires_ref_sha = None
-    for alpha in (1.0, 0.75, 0.50, 0.0):
+    for alpha in (1.0, 0.75, 0.625, 0.50, 0.25, 0.0):
         res_before = pager.set_residency_alpha(alpha)
         st_before = vmm.stats_dict()
         torch.cuda.synchronize()

@@ -74,6 +74,7 @@ int select_static_gen_gpu_unlocked(
             const auto& wg = w_map.at(g);
             const double tot_wait = round_3(t_ship + wg.queue_wait_ms);
             return std::make_tuple(
+                topo.same_node(src_und_gpu, g) ? 0 : 1,
                 wg.kv_free_bytes >= need_b ? 0 : 1,
                 tot_wait,
                 tier_rank(g),

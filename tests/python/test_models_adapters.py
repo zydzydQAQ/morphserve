@@ -1117,3 +1117,60 @@ def test_internvlu_step_preemption_regime_a_vs_regime_b_guard(tmp_path: Path) ->
         assert acks_b == []
     finally:
         ad_b.close()
+
+
+def test_bagel_static_fission_gen_rank_drops_unused_ar_vit_and_uniform_oom_retry(tmp_path: Path) -> None:
+    """Verify static-fission `gen` ranks drop unused `vit_model`/`connector`/untied `lm_head` while preserving
+    `embed_tokens` + understanding layers, and verify uniform worker OOM retry gates `evict_idle_kv_to_host`."""
+    torch = pytest.importorskip("torch")
+
+    pipe, cache_cls = _build_bagel_stub(torch, num_layers=2, hidden=8)
+    pipe.bagel.vit_model = torch.nn.Linear(8, 8, bias=False)
+    pipe.bagel.connector = torch.nn.Linear(8, 8, bias=False)
+    pipe.bagel.language_model.model.embed_tokens = torch.nn.Embedding(32, 8)
+    assert pipe.bagel.vit_model.weight.numel() == 64
+    assert pipe.bagel.connector.weight.numel() == 64
+    assert pipe.bagel.language_model.lm_head.weight.numel() == 256
+
+    pol_fis = EnginePolicyConfig.from_preset("static_nccl_fission", num_gpus=8)
+    gen_rank = pol_fis.static_gen_ranks[0]
+    ad_gen = BagelCPTGAdapter(
+        rank=gen_rank,
+        policy=pol_fis,
+        bench_root=tmp_path,
+        pipeline=pipe,
+        naive_cache_cls=cache_cls,
+        device=torch.device("cpu"),
+    )
+    try:
+        assert ad_gen.role == "gen"
+        assert pipe.bagel.vit_model.weight.numel() == 0
+        assert pipe.bagel.connector.weight.numel() == 0
+        assert pipe.bagel.language_model.lm_head.weight.numel() == 0
+        # `embed_tokens` and understanding MoT layers MUST remain intact for tight-MoT `mode="gen"`.
+        assert pipe.bagel.language_model.model.embed_tokens.weight.numel() == 256
+        assert pipe.bagel.language_model.model.layers[0].mlp_und.weight.numel() == 64
+    finally:
+        ad_gen.close()
+
+    # Verify uniform `max_dit_oom_retries = 2` on `monolithic_dp` never calls `evict_idle_kv_to_host`.
+    pipe_mono, cache_cls_m = _build_bagel_stub(torch, num_layers=2, hidden=8)
+    pol_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=1)
+    ad_mono = BagelCPTGAdapter(
+        rank=0,
+        policy=pol_mono,
+        bench_root=tmp_path,
+        pipeline=pipe_mono,
+        naive_cache_cls=cache_cls_m,
+        device=torch.device("cpu"),
+    )
+    evict_calls: list[int] = []
+    ad_mono.evict_idle_kv_to_host = lambda *a, **kw: (evict_calls.append(1) or 0)  # type: ignore[method-assign]
+    pipe_mono.bagel.generate_image = lambda **kw: (_ for _ in ()).throw(MemoryError("injected dit oom"))
+    try:
+        ad_mono.prepare_turn("mono_s0", {"prompt": "draw a tree", "prepare_for_dit": True, "height": 512, "width": 512})
+        with pytest.raises(MemoryError, match="injected dit oom"):
+            ad_mono.generate_dit("mono_s0", {"height": 512, "width": 512, "dit_steps": 2, "prompt": "draw a tree"})
+        assert evict_calls == []
+    finally:
+        ad_mono.close()

@@ -1577,7 +1577,7 @@ ms_router_t* ms_router_create(const char* topology_json, ms_pacer_t* opt_pacer, 
             opts.value("allow_cross_half_state_ship", true),
             opts.value("allow_inter_node_state_ship", true),
             opts.value("max_inter_node_state_bytes", int64_t{128LL * morphserve::control::kMiB}),
-            opts.value("cost_model_mode", std::string("atlas_3d")),
+            opts.value("cost_model_mode", std::string("pipeline_analytical")),
             std::move(atlas));
         return new ms_router_handle{std::move(router)};
     }
@@ -2424,7 +2424,7 @@ char* ms_atlas_estimate_json(const char* req_json) {
         const auto atlas = (j.contains("atlas") && j["atlas"].is_object())
                                ? morphserve::control::PerformanceAtlas::from_json(j["atlas"])
                                : morphserve::control::PerformanceAtlas::a100_default();
-        const std::string mode = j.value("cost_model_mode", std::string("atlas_3d"));
+        const std::string mode = j.value("cost_model_mode", std::string("pipeline_analytical"));
         const std::string fam = j.value("model_family", std::string("bagel"));
         const int res = j.value("resolution", 512);
         const double alpha = j.value("alpha_g", 0.5);

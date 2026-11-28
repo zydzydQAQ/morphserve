@@ -133,7 +133,7 @@ nlohmann::json WorkerBudgetPlanner::compute_internvlu_memory_plan(
     const int fine_mib = std::max(0, (policy_fine_kv_pool_mib / 2) * 2);
     const int desired_super = std::max(
         policy_super_pool_mib,
-        (aligned_mirror_mib > 0) ? (aligned_mirror_mib + 5632) : policy_super_pool_mib);
+        (aligned_mirror_mib > 0) ? (aligned_mirror_mib + handle_mib) : policy_super_pool_mib);
     int super_mib = desired_super;
     if (free_dev_mib > 0.0) {
         const int safe_ceiling = std::max(

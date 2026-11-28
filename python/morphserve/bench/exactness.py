@@ -101,18 +101,68 @@ def image_pair_metrics(path_a: Path, path_b: Path) -> dict[str, Any]:
     }
 
 
+_MMVET_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "in",
+        "on",
+        "at",
+        "to",
+        "of",
+        "for",
+        "by",
+        "with",
+        "from",
+        "and",
+        "or",
+        "it",
+        "its",
+        "this",
+        "that",
+    }
+)
+
+
 def _normalize_mmvet_token(text: str) -> str:
     cleaned = re.sub(r"(?<=\d),(?=\d)", "", text.lower())
     cleaned = re.sub(r"(?<!\d)\.|\.(?!\d)", " ", cleaned)
-    cleaned = re.sub(r"[^\w\s.]", " ", cleaned)
+    # Preserve numeric minus signs (`-1`, `-5`) and numeric fractions (`5/4`) while separating punctuation.
+    cleaned = re.sub(r"(?<![\s(^])-(?=\d)", " -", cleaned)
+    cleaned = re.sub(r"-(?!\d)", " ", cleaned)
+    cleaned = re.sub(r"(?<!\d)/|/(?!\d)", " ", cleaned)
+    cleaned = re.sub(r"[^\w\s.\-/]", " ", cleaned)
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
+def _mmvet_term_score(pred_norm: str, pred_tokens: set[str], term: str) -> float:
+    if f" {term} " in pred_norm:
+        return 1.0
+    toks = term.split()
+    if len(toks) < 2:
+        return 0.0
+    content = [t for t in toks if t not in _MMVET_STOPWORDS] or toks
+    matched = sum(1 for t in content if t in pred_tokens)
+    return matched / float(len(content))
+
+
 def score_mmvet_answer(prediction: str, expected_answer: str) -> float:
-    """Evaluate MMVet VQA answer against `<AND>` / `<OR>` structured ground-truth rubric (`[0.0, 1.0]`)."""
+    """Evaluate MMVet VQA answer against `<AND>` / `<OR>` structured ground-truth rubric (`[0.0, 1.0]`).
+
+    Uses exact word-boundary matching for short/numeric terms (preserving negative signs & fractions)
+    and normalized content-token recall for multi-word reference phrases.
+    """
     if not expected_answer.strip():
         return 1.0 if prediction.strip() else 0.0
-    pred_norm = f" {_normalize_mmvet_token(prediction)} "
+    pred_clean = _normalize_mmvet_token(prediction)
+    pred_norm = f" {pred_clean} "
+    pred_tokens = set(pred_clean.split())
     or_groups = [g.strip() for g in expected_answer.split("<OR>") if g.strip()]
     if not or_groups:
         return 0.0
@@ -121,10 +171,10 @@ def score_mmvet_answer(prediction: str, expected_answer: str) -> float:
         and_terms = [_normalize_mmvet_token(t) for t in grp.split("<AND>") if _normalize_mmvet_token(t)]
         if not and_terms:
             continue
-        hits = sum(1 for term in and_terms if f" {term} " in pred_norm)
-        if hits == len(and_terms):
+        score = sum(_mmvet_term_score(pred_norm, pred_tokens, term) for term in and_terms) / float(len(and_terms))
+        if score >= 1.0 - 1e-9:
             return 1.0
-        best = max(best, hits / float(len(and_terms)))
+        best = max(best, score)
     return round(best, 4)
 
 

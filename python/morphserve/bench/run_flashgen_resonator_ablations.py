@@ -20,20 +20,42 @@ from morphserve.sim.cluster_simulator import (
 MIB = 1024**2
 
 
-def run_atlas_prediction_accuracy_table() -> dict[str, Any]:
-    """Compare exposed H2D stall predictions against live Stage-1 A100 ground truth (`tab:eval_microbench`)."""
+def run_atlas_prediction_accuracy_table(module1_report_path: str = "") -> dict[str, Any]:
+    """Compare exposed H2D stall predictions against live Stage-1 A100 measurements (including unseen OOS alpha points)."""
     L = get_core_lib()
-    # Ground-truth live A100 Stage-1 measurements from `06-evaluation.tex` Table `tab:eval_microbench`.
-    benchmarks = [
-        {"label": "1024^2 steady (alpha=0.00)", "res": 1024, "alpha": 0.00, "post_evict": False, "actual_ms": 173.97},
-        {"label": "1024^2 steady (alpha=0.50)", "res": 1024, "alpha": 0.50, "post_evict": False, "actual_ms": 7.53},
-        {"label": "1024^2 post-evict (alpha=0.75)", "res": 1024, "alpha": 0.75, "post_evict": True, "actual_ms": 267.69},
-        {"label": "512^2 steady (alpha=0.75)", "res": 512, "alpha": 0.75, "post_evict": False, "actual_ms": 41.02},
-        {"label": "512^2 steady (alpha=0.50)", "res": 512, "alpha": 0.50, "post_evict": False, "actual_ms": 312.26},
-        {"label": "512^2 steady (alpha=0.00)", "res": 512, "alpha": 0.00, "post_evict": False, "actual_ms": 998.17},
-    ]
+    benchmarks: list[dict[str, Any]] = []
+    anchor_alphas = {(512, 0.75), (512, 0.50), (512, 0.00), (1024, 0.50), (1024, 0.00)}
+    if module1_report_path and Path(module1_report_path).is_file():
+        m1 = json.loads(Path(module1_report_path).read_text(encoding="utf-8"))
+        for key, res in (("test1_alpha_sweep", 512), ("test1b_1024_overlap_sweep", 1024)):
+            for pt in m1.get(key) or []:
+                alpha = float(pt.get("alpha", 1.0))
+                if alpha >= 0.999:
+                    continue
+                actual = max(0.0, float(pt.get("morph_stall_vs_alpha1_ms", 0.0)))
+                is_oos = (res, round(alpha, 3)) not in anchor_alphas
+                benchmarks.append(
+                    {
+                        "label": f"{res}^2 steady (alpha={alpha:.3g})",
+                        "res": res,
+                        "alpha": alpha,
+                        "post_evict": False,
+                        "is_oos": is_oos,
+                        "actual_ms": round(actual, 2),
+                    }
+                )
+    if not benchmarks:
+        benchmarks = [
+            {"label": "1024^2 steady (alpha=0.00)", "res": 1024, "alpha": 0.00, "post_evict": False, "is_oos": False, "actual_ms": 173.97},
+            {"label": "1024^2 steady (alpha=0.50)", "res": 1024, "alpha": 0.50, "post_evict": False, "is_oos": False, "actual_ms": 7.53},
+            {"label": "1024^2 post-evict (alpha=0.75)", "res": 1024, "alpha": 0.75, "post_evict": True, "is_oos": False, "actual_ms": 267.69},
+            {"label": "512^2 steady (alpha=0.75)", "res": 512, "alpha": 0.75, "post_evict": False, "is_oos": False, "actual_ms": 41.02},
+            {"label": "512^2 steady (alpha=0.50)", "res": 512, "alpha": 0.50, "post_evict": False, "is_oos": False, "actual_ms": 312.26},
+            {"label": "512^2 steady (alpha=0.00)", "res": 512, "alpha": 0.00, "post_evict": False, "is_oos": False, "actual_ms": 998.17},
+        ]
     rows: list[dict[str, Any]] = []
     mae_by_mode: dict[str, list[float]] = {"legacy_analytical": [], "pipeline_analytical": [], "atlas_3d": []}
+    oos_mae_by_mode: dict[str, list[float]] = {"legacy_analytical": [], "pipeline_analytical": [], "atlas_3d": []}
     for b in benchmarks:
         row: dict[str, Any] = dict(b)
         for mode in ("legacy_analytical", "pipeline_analytical", "atlas_3d"):
@@ -55,10 +77,15 @@ def run_atlas_prediction_accuracy_table() -> dict[str, Any]:
             row[f"{mode}_ms"] = pred
             row[f"{mode}_abs_err_ms"] = err
             mae_by_mode[mode].append(err)
+            if b.get("is_oos"):
+                oos_mae_by_mode[mode].append(err)
         rows.append(row)
 
     summary = {m: round(sum(v) / max(1, len(v)), 2) for m, v in mae_by_mode.items()}
-    return {"points": rows, "mae_ms": summary}
+    oos_summary = {
+        m: (round(sum(v) / len(v), 2) if v else None) for m, v in oos_mae_by_mode.items()
+    }
+    return {"points": rows, "mae_ms": summary, "oos_mae_ms": oos_summary}
 
 
 def _summarize(tag: str, rep: dict[str, Any]) -> dict[str, Any]:
@@ -97,13 +124,13 @@ def _summarize(tag: str, rep: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
+def run_all_ablations(bench_root: str = "", module1_report_path: str = "") -> dict[str, Any]:
     ph = MeasuredPhysicsProfile()
     hw_8a100 = HardwareInterconnectSpec.presets(ph)[0]
     ws_std = WorkloadScaleSpec.bagel_7b_standard()
 
-    # 1. Stage-1 Stall Prediction Accuracy (Resonator Performance Atlas vs. Analytical Formula)
-    atlas_acc = run_atlas_prediction_accuracy_table()
+    # 1. Stage-1 Stall Prediction Accuracy (L-layer pipeline_analytical vs legacy_analytical & atlas_3d)
+    atlas_acc = run_atlas_prediction_accuracy_table(module1_report_path=module1_report_path)
 
     # 2. Ablation A: Cost Model Routing (legacy_analytical vs pipeline_analytical vs atlas_3d)
     # 8xA100-40GB with constrained 14 GiB expert super-pool (matching Stage-1 `tab:eval_microbench` VAE eviction cap)
@@ -150,7 +177,7 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
                 skew_tag="main_mix",
                 bench_root=bench_root,
                 policy_overrides={
-                    "cost_model_mode": "atlas_3d",
+                    "cost_model_mode": "pipeline_analytical",
                     "gpu_queue_mode": q_mode,
                     "kv_eviction_mode": "swap",
                     "steady_window_mode": "session_trim",
@@ -185,7 +212,7 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
             skew_tag="main_mix",
             bench_root=bench_root,
             policy_overrides={
-                "cost_model_mode": "atlas_3d",
+                "cost_model_mode": "pipeline_analytical",
                 "gpu_queue_mode": "memory_slack",
                 "kv_eviction_mode": kv_mode,
                 "steady_window_mode": "session_trim",
@@ -206,10 +233,11 @@ def run_all_ablations(bench_root: str = "") -> dict[str, Any]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench-root", default="")
+    ap.add_argument("--module1-report", default="")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
 
-    res = run_all_ablations(bench_root=args.bench_root)
+    res = run_all_ablations(bench_root=args.bench_root, module1_report_path=args.module1_report)
     if args.out:
         out_p = Path(args.out)
         out_p.parent.mkdir(parents=True, exist_ok=True)

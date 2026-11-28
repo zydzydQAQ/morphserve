@@ -29,11 +29,18 @@ GIB = 1024**3
 def test_policy_preset_defaults_and_roundtrip_new_modes():
     ms = EnginePolicyConfig.from_preset("morphserve", num_gpus=8)
     mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=8)
-    assert ms.cost_model_mode == "atlas_3d"
+    prism = EnginePolicyConfig.from_preset("prism_tetriserve_coloc", num_gpus=8)
+    assert ms.cost_model_mode == "pipeline_analytical"
     assert ms.gpu_queue_mode == "memory_slack"
+    assert ms.gpu_queue_max_aging_ms == 45000.0
+    assert ms.gpu_queue_max_bypasses == 5
     assert ms.kv_eviction_mode == "swap"
     assert mono.cost_model_mode == "legacy_analytical"
     assert mono.gpu_queue_mode == "fcfs"
+    assert prism.gpu_queue_mode == "memory_slack"
+    assert prism.gpu_queue_max_aging_ms == 45000.0
+    assert prism.gpu_queue_max_bypasses == 5
+    assert prism.super_pool_mib == 0 and prism.fine_kv_pool_mib == 64
 
     ov = EnginePolicyConfig.from_preset(
         "morphserve",
@@ -201,7 +208,7 @@ def test_simulator_metrics_and_cluster_report_schema_parity():
         policy_overrides={"steady_window_mode": "session_trim", "steady_state_trim_frac": 0.1},
     )
     rep = ClusterRunReport.from_dict(raw)
-    assert rep.cost_model_mode == "atlas_3d"
+    assert rep.cost_model_mode == "pipeline_analytical"
     assert rep.gpu_queue_mode == "memory_slack"
     assert rep.kv_eviction_mode == "swap"
     assert rep.ar_ttft_mean_ms > 0.0

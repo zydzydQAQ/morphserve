@@ -209,10 +209,10 @@ void test_policy_and_sim_override_forwarding() {
     MS_CHECK(mono_swap.at("use_idle_kv_swap").get<bool>() == true);
     MS_CHECK(std::fabs(mono_swap.at("cooldown_s").get<double>() - 30.0) < 1e-6);
 
-    // 2. `ms_policy_build_ablation_configs_json` (full + 6 decoupled single-mechanism LOO ablations)
+    // 2. `ms_policy_build_ablation_configs_json` (full + 7 decoupled single-mechanism LOO ablations)
     const auto ablations = take_json(ms_policy_build_ablation_configs_json(8, "{\"slo_scale_k\":2.5}"));
-    MS_CHECK(ablations.is_array() && ablations.size() == 7);
-    if (ablations.size() == 7) {
+    MS_CHECK(ablations.is_array() && ablations.size() == 8);
+    if (ablations.size() == 8) {
         MS_CHECK(ablations[0].at("label").get<std::string>() == "full_morphserve");
         MS_CHECK(ablations[1].at("label").get<std::string>() == "no_m1_tripool_vmm");
         MS_CHECK(ablations[2].at("label").get<std::string>() == "no_m1_scoped_vae");
@@ -220,6 +220,7 @@ void test_policy_and_sim_override_forwarding() {
         MS_CHECK(ablations[4].at("label").get<std::string>() == "no_m2_pacer_numa");
         MS_CHECK(ablations[5].at("label").get<std::string>() == "no_m3_cow_loopback");
         MS_CHECK(ablations[6].at("label").get<std::string>() == "no_m4_layer_chunk");
+        MS_CHECK(ablations[7].at("label").get<std::string>() == "no_queue_sched");
         MS_CHECK(std::fabs(ablations[0].at("config").at("slo_scale_k").get<double>() - 2.5) < 1e-6);
         MS_CHECK(ablations[1].at("config").at("use_tripool_vmm").get<bool>() == false);
         MS_CHECK(ablations[1].at("config").at("use_scoped_vae").get<bool>() == true);
@@ -230,6 +231,7 @@ void test_policy_and_sim_override_forwarding() {
         MS_CHECK(ablations[4].at("config").at("use_shared_numa_mirror").get<bool>() == false);
         MS_CHECK(ablations[5].at("config").at("use_module3_cow_loopback").get<bool>() == false);
         MS_CHECK(ablations[6].at("config").at("preemption_mode").get<std::string>() == "non_preemptive");
+        MS_CHECK(ablations[7].at("config").at("gpu_queue_mode").get<std::string>() == "fcfs");
     }
 
     // 3. `ms_policy_build_static_split_configs_json`

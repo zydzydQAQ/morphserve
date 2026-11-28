@@ -60,8 +60,16 @@ double SimGpuMemoryLedger::base_weights_mib() const noexcept {
     if (policy_.use_expert_pager || policy_.use_naive_offload) {
         return offloaded_base_mib();
     }
-    if ((policy_.routing_mode == "static_nccl_fission" || policy_.routing_mode == "twostage_shm") && role_ == "und") {
-        return offloaded_base_mib();
+    if (policy_.routing_mode == "static_nccl_fission" || policy_.routing_mode == "twostage_shm") {
+        if (role_ == "und") {
+            return offloaded_base_mib();
+        }
+        if (role_ == "gen") {
+            // Static-fission `gen` ranks drop unused `vit_model` (~816 MiB), `connector` (~50 MiB),
+            // and untied `lm_head` (~1,040 MiB), while retaining the understanding tower required by
+            // tight-MoT `mode="gen"` for `<start_of_image>`/`<end_of_image>` delimiter routing.
+            return std::max(offloaded_base_mib(), monolithic_weights_mib() - 1906.0 * weight_scale_);
+        }
     }
     return monolithic_weights_mib();
 }

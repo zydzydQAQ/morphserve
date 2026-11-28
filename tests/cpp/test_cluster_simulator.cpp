@@ -76,7 +76,11 @@ void test_sim_memory_ledger() {
     const PolicyConfig mono_swap_pol = PolicyConfig::from_preset("monolithic_kv_swap", 8);
     SimGpuMemoryLedger shm_und(0, 40960.0, shm_pol, "und", 0, 28, 448, ph);
     SimGpuMemoryLedger fis_und(0, 40960.0, fis_pol, "und", 0, 28, 448, ph);
+    SimGpuMemoryLedger fis_gen(2, 40960.0, fis_pol, "gen", 28, 28, 448, ph);
     MS_CHECK(std::abs(shm_und.base_weights_mib() - fis_und.base_weights_mib()) < 1e-6);
+    // Static-fission `gen` rank drops ~1.9 GiB ViT/connector/lm_head vs monolithic weights.
+    MS_CHECK(fis_gen.base_weights_mib() < fis_gen.monolithic_weights_mib() - 1800.0);
+    MS_CHECK(fis_gen.base_weights_mib() > fis_und.base_weights_mib());
 
     SimGpuMemoryLedger swap_ledger(0, 40960.0, mono_swap_pol, "hybrid", 28, 28, 448, ph);
     for (int sid = 0; sid < 4; ++sid) {
@@ -351,6 +355,8 @@ void test_calibration_evaluate_against_real_runs_in_memory() {
     MS_CHECK(cal.at("goodput_mape_pct").get<double>() < 1e-6);
     MS_CHECK(cal.at("within_5pct_gate").get<bool>());
     MS_CHECK(cal.at("within_8pct_oos_gate").get<bool>());
+    MS_CHECK(cal.contains("by_num_gpus") && cal.at("by_num_gpus").contains("8"));
+    MS_CHECK(cal.at("by_num_gpus").at("8").at("points_checked").get<int>() == 2);
 
     // 3. Empty calibration input MUST fail OOS gate (`points_checked == 0 -> within_8pct_oos_gate == false`).
     const auto cal_empty = ClusterSimulator::evaluate_against_real_runs(nlohmann::json::array(), ph, "", "");

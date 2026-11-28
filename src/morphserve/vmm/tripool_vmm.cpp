@@ -2398,21 +2398,10 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
             free_super_handles_.pop_back();
             return SuperSlot{h, {}};
         }
-        // Reuse excess carved fine pages as zero-allocation fine-to-super bundles by default.
-        // Never coalesce fine->super for short-lived Arena-2 transient allocations (Scoped VAE),
-        // because `scope_end` returns those slots 150ms later and KV immediately carves them back
-        // (eliminating carve<->coalesce driver ioctl thrashing). For long-lived Arena-0 expert loads,
-        // coalesce only under a high 4*sub_pages_ hysteresis margin above base_fine_pages_.
+        // Reuse excess fine pages as zero-syscall fine-to-super bundles (never auto-coalesce inside
+        // slot acquisition, eliminating carve<->coalesce driver ioctl thrashing while explicit
+        // `coalesce_fine_to_super()` remains available for callers that want super-handle compaction).
         if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
-            if (!for_transient &&
-                cfg_.allow_overflow &&
-                free_fine_handles_.size() >= base_fine_pages_ + 4 * sub_pages_ &&
-                try_coalesce_fine_to_super_locked(1) > 0 &&
-                !free_super_handles_.empty()) {
-                const uint64_t h = free_super_handles_.back();
-                free_super_handles_.pop_back();
-                return SuperSlot{h, {}};
-            }
             return pop_fine_bundle_locked();
         }
         if (drain_one_queued_swap_out_locked()) {

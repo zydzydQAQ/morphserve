@@ -1327,6 +1327,51 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         )
         return max(0, int(free_drv) + unused_cached - 1024 * MIB)
 
+    def reported_kv_free_bytes(self) -> int:
+        """Return true DiT-usable HBM headroom for `DualPathMorphRouter` and `MemorySlackGpuLock`.
+
+        On tight-MoT VMM adapters with pageable generation experts, `available_kv_bytes(for_dit=False)`
+        includes unpinned Arena-0 expert handles (~14 GiB) as reclaimable for AR-only KV, which would
+        mask real DiT memory pressure (`est_dit_mem_b ≈ 4.5 GiB` at 1024px) from queue memory-fit
+        bypass and cross-GPU routing. Compute the exact physical HBM conservation law excluding full
+        DiT expert weights, live Arena-1 KV, and Arena-2 transient scratchpad, matching non-VMM
+        `available_kv_bytes()`.
+        """
+        import torch
+
+        if (
+            self.vmm is not None
+            and self.pager is not None
+            and getattr(self.policy, "gpu_memory_fraction", None) is None
+            and getattr(self.policy, "gpu_memory_quota_mib", None) is None
+        ):
+            is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+            if not is_cuda:
+                return self.available_kv_bytes(for_dit=True)
+            vmm_st = self.vmm.stats_dict()
+            min_gran = int(vmm_st.get("min_granularity_bytes", 2 * MIB))
+            super_b = int(vmm_st.get("super_handle_bytes", 64 * MIB))
+            pool_total = int(vmm_st.get("pool_total_bytes", 0))
+            kv_mapped = int(vmm_st.get("kv_mapped_pages_current", 0)) * min_gran
+            transient_b = int(vmm_st.get("transient_mapped_handles_current", 0)) * super_b
+            dit_expert_full = int(getattr(self.pager, "total_mirror_bytes", 0))
+            if dit_expert_full <= 0:
+                dit_expert_full = int(getattr(self.pager, "num_layers", 0)) * int(
+                    getattr(self.pager, "layer_stride_bytes", 0)
+                )
+            free_drv, _ = torch.cuda.mem_get_info(self.device)
+            unused_cached = max(
+                0, int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device))
+            )
+            return max(
+                0,
+                (pool_total - kv_mapped - transient_b - dit_expert_full)
+                + int(free_drv)
+                + unused_cached
+                - 1024 * MIB,
+            )
+        return self.available_kv_bytes()
+
     def _auto_idle_kv_swap_enabled(self) -> bool:
         val = getattr(self.policy, "use_idle_kv_swap", None)
         if val is not None:
@@ -1633,7 +1678,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             "reserved_mib": round(self._max_pytorch_reserved_mib, 2),
             "combined_physical_mib": round(self._max_reserved_mib, 2),
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
-            "kv_free_bytes": self.available_kv_bytes(),
+            "kv_free_bytes": self.reported_kv_free_bytes(),
         }
 
     def warmup(self) -> None:
@@ -2145,7 +2190,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
 
             self._update_hwm()
             alpha_now = self.resident_alpha()
-            free_kv_now = self.available_kv_bytes()
+            free_kv_now = self.reported_kv_free_bytes()
             outputs: list[dict[str, Any]] = []
             for st in states:
                 ctx = st["ctx"]
@@ -2441,7 +2486,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             "tpots_ms": [round(x, 2) for x in task.inter_token_latencies_ms()],
                             "kv_bytes": ar_session.logical_bytes(),
                             "resident_alpha": self.resident_alpha(),
-                            "kv_free_bytes": self.available_kv_bytes(),
+                            "kv_free_bytes": self.reported_kv_free_bytes(),
                             "preempted_mid_dit": True,
                         }
                     )
@@ -2803,7 +2848,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 "preempt_yield_ms": round(preempt_yield_ms, 2),
                 "kv_bytes": session.logical_bytes(),
                 "resident_alpha": eff_alpha,
-                "kv_free_bytes": self.available_kv_bytes(),
+                "kv_free_bytes": self.reported_kv_free_bytes(),
                 "yield_count": total_yield_count,
             }
 

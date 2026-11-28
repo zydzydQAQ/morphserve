@@ -259,7 +259,7 @@ def run_worker_process(
                 "op": "WORKER_READY",
                 "rank": rank,
                 "resident_alpha": adapter.resident_alpha(),
-                "kv_free_bytes": max(0, int(adapter.available_kv_bytes())),
+                "kv_free_bytes": max(0, int(getattr(adapter, "reported_kv_free_bytes", adapter.available_kv_bytes)())),
                 "reserved_mib": st.get("peak_reserved_mib", bind_info.get("reserved_mib", 0.0)),
                 "mirror_inode": shared_mirror.inode if shared_mirror is not None else None,
             }
@@ -525,7 +525,7 @@ class LocalNodeWorkerHost:
             self._ready_by_rank[gr] = {
                 "rank": gr,
                 "resident_alpha": info.get("resident_alpha", self.policy.initial_alphas.get(gr, 1.0)),
-                "kv_free_bytes": max(0, int(adapter.available_kv_bytes())),
+                "kv_free_bytes": max(0, int(getattr(adapter, "reported_kv_free_bytes", adapter.available_kv_bytes)())),
                 "reserved_mib": info.get("reserved_mib", 0.0),
                 "mirror_inode": mirror_inode,
             }

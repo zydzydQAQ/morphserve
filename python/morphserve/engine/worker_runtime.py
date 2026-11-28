@@ -108,7 +108,8 @@ class WorkerRuntime:
         self.oom_count = 0
 
     def _current_kv_free_bytes(self) -> int:
-        return max(0, int(self.adapter.available_kv_bytes()))
+        fn = getattr(self.adapter, "reported_kv_free_bytes", self.adapter.available_kv_bytes)
+        return max(0, int(fn()))
 
     def _telemetry_snapshot(self, *, resident_alpha: float | None = None) -> dict[str, Any]:
         with self._telemetry_lock:

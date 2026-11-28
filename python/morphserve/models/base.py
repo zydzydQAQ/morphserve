@@ -153,7 +153,7 @@ class CPTGModelAdapter(ABC):
             out = dict(out)
             out["ttft_ms"] = round(q_wait_ms + float(out.get("ttft_ms", 0.0)), 2)
             out["resident_alpha"] = self.resident_alpha()
-            out["kv_free_bytes"] = self.available_kv_bytes()
+            out["kv_free_bytes"] = self.reported_kv_free_bytes()
             results.append(out)
         return results
 
@@ -203,6 +203,14 @@ class CPTGModelAdapter(ABC):
     @abstractmethod
     def available_kv_bytes(self, *, for_dit: bool = False) -> int:
         """Return current free + drop-clean reclaimable GPU KV capacity in bytes on this worker."""
+
+    def reported_kv_free_bytes(self) -> int:
+        """Return scheduler/router-facing GPU memory headroom in bytes.
+
+        Defaults to `available_kv_bytes()`; tight-MoT VMM adapters override this to report true
+        DiT-usable HBM headroom without inflating free capacity by unpinned Arena-0 expert handles.
+        """
+        return self.available_kv_bytes()
 
     def evict_idle_kv_to_host(
         self,
@@ -702,7 +710,7 @@ class GpuCPTGAdapterMixin(CPTGModelAdapter):
             "vmm_physical_pool_mib": round(self._vmm_physical_pool_mib(), 2),
             "vmm_stats": vmm_st,
             "active_contexts": len(self._ctx_store),
-            "kv_free_bytes": self.available_kv_bytes(),
+            "kv_free_bytes": self.reported_kv_free_bytes(),
             "swapped_kv_contexts": 0,
             "kv_host_swap_outs": int(vmm_st.get("kv_swap_outs_total", 0)),
             "kv_host_swap_ins": int(vmm_st.get("kv_swap_ins_total", 0)),

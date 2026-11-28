@@ -1184,3 +1184,79 @@ def test_bagel_static_fission_gen_rank_drops_unused_ar_vit_and_uniform_oom_retry
                 assert evict_calls == []
         finally:
             ad_c.close()
+
+
+def test_bagel_reported_kv_free_bytes_excludes_unpinned_experts_for_dit_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`reported_kv_free_bytes()` must exclude unpinned Arena-0 Gen experts on tight-MoT VMM adapters
+    so `MemorySlackGpuLock` and `DualPathMorphRouter` observe true DiT HBM headroom rather than +14 GiB
+    of unpinned expert weights."""
+    torch = pytest.importorskip("torch")
+    from morphserve.engine.worker_runtime import WorkerRuntime
+
+    MIB = 1024 * 1024
+    GIB = 1024 * MIB
+
+    pipe, cache_cls = _build_bagel_stub(torch, num_layers=2, hidden=8)
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, use_tripool_vmm=False)
+    ad = BagelCPTGAdapter(
+        rank=0,
+        policy=pol,
+        bench_root=tmp_path,
+        pipeline=pipe,
+        naive_cache_cls=cache_cls,
+        device=torch.device("cpu"),
+    )
+
+    class _MockVmm:
+        def __init__(self, kv_pages: int = 1280) -> None:
+            self.kv_pages = kv_pages
+
+        def kv_free_bytes(self, *, for_dit: bool = False) -> int:
+            return (4 * GIB) if for_dit else (18 * GIB)
+
+        def stats_dict(self) -> dict[str, int]:
+            return {
+                "min_granularity_bytes": 2 * MIB,
+                "super_handle_bytes": 64 * MIB,
+                "pool_total_bytes": 17920 * MIB,
+                "kv_mapped_pages_current": self.kv_pages,
+                "transient_mapped_handles_current": 0,
+                "kv_free_bytes": 18 * GIB,
+                "kv_dit_headroom_bytes": 4 * GIB,
+            }
+
+    class _MockPager:
+        num_layers = 28
+        layer_stride_bytes = 512 * MIB
+        total_mirror_bytes = 28 * 512 * MIB  # 14336 MiB
+
+    try:
+        # Without VMM, reported == available.
+        assert ad.reported_kv_free_bytes() == ad.available_kv_bytes()
+
+        ad.vmm = _MockVmm(kv_pages=1280)  # 2560 MiB live KV
+        ad.pager = _MockPager()  # type: ignore[assignment]
+
+        # Non-CUDA fallback uses `for_dit=True` (4 GiB, not 18 GiB phantom expert space).
+        assert ad.available_kv_bytes(for_dit=False) == 18 * GIB
+        assert ad.reported_kv_free_bytes() == 4 * GIB
+
+        # CUDA conservation law:
+        # (pool_total 17920 - kv 2560 - transient 0 - experts 14336) + free_drv 4096 + unused 512 - 1024 = 4608 MiB.
+        ad.device = SimpleNamespace(type="cuda")  # type: ignore[assignment]
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _dev: (4096 * MIB, 40960 * MIB))
+        monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _dev: 2048 * MIB)
+        monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _dev: 1536 * MIB)
+        assert ad.reported_kv_free_bytes() == 4608 * MIB
+
+        # WorkerRuntime telemetry delegates to `reported_kv_free_bytes()`.
+        rt = WorkerRuntime(rank=0, policy=pol, adapter=ad, peer_mesh=None, ack_sink=lambda _m: None)
+        assert rt._current_kv_free_bytes() == 4608 * MIB
+    finally:
+        ad.vmm = None
+        ad.pager = None
+        ad.device = torch.device("cpu")
+        ad.close()

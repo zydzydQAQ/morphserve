@@ -435,7 +435,7 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.gpu_queue_max_bypasses = 16;
         cfg.kv_eviction_mode = "swap";
         cfg.super_pool_mib = (fam == "internvl_u") ? ivlu_super_mib : 14336;
-        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 3584;
+        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 256;
         cfg.transient_va_gib = 16;
         cfg.kv_va_gib = (fam == "internvl_u") ? 8 : 16;
         cfg.allow_vmm_overflow = !is_ivlu_capped;

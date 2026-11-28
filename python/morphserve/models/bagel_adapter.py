@@ -1536,7 +1536,12 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         int(self.policy.super_pool_mib) + 256,
                         int(max(0, int(free_drv) - headroom_b) // MIB),
                     )
-                    eff_fine_mib = min(eff_fine_mib, max(256, safe_pool_mib - int(self.policy.super_pool_mib)))
+                    # Pre-warm up to 3.5 GiB of 2 MiB fine KV pages inside the safe VMM budget on
+                    # live GPUs with pageable experts so Arena-1 KV and Arena-2 Scoped VAE reuse
+                    # warm handles via zero-syscall fine-to-super bundling (zero carve/overflow thrash)
+                    # while keeping `PolicyConfig.fine_kv_pool_mib` defaults intact for offline sims.
+                    target_fine_mib = max(eff_fine_mib, 3584) if (self.pager is not None) else eff_fine_mib
+                    eff_fine_mib = min(target_fine_mib, max(256, safe_pool_mib - int(self.policy.super_pool_mib)))
                     init_pool_mib = int(self.policy.super_pool_mib) + eff_fine_mib
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
                 else:

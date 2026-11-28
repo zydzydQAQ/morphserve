@@ -22,6 +22,8 @@ _XFER_OPS = frozenset(
         "RECV_NCCL",
         "DROP_PACKED_CTX",
         "DROP_RECV_BUF",
+        "PIN_STREAM_CTX",
+        "UNPIN_STREAM_CTX",
         "STREAM_SEND_NCCL",
         "STREAM_RECV_NCCL",
     }
@@ -390,6 +392,64 @@ class WorkerRuntime:
                     }
                 )
 
+            if op == "PIN_STREAM_CTX":
+                cid = str(cmd["ctx_id"])
+                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
+                prep_fn = getattr(self.adapter, "prepare_stream_send", None)
+                if not callable(prep_fn):
+                    return self._emit_ack(
+                        {"cmd_id": cmd_id, "rank": self.rank, "status": "unsupported", "error": "stream_send_unsupported"}
+                    )
+                meta, views = prep_fn(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))
+                total_bytes = int(meta["total_bytes"])
+                if total_bytes > 0 and views and getattr(views[0], "is_cuda", False):
+                    import torch
+
+                    torch.cuda.set_device(views[0].device)
+                    need_cap = min(chunk_bytes, total_bytes)
+                    if self._xfer_send_buf is None or int(self._xfer_send_buf.numel()) < need_cap:
+                        try:
+                            self._xfer_send_buf = torch.empty((need_cap,), dtype=torch.uint8, device=views[0].device)
+                        except BaseException:
+                            fin_fn = getattr(self.adapter, "finish_stream_send", None)
+                            if callable(fin_fn):
+                                fin_fn(cid, release_ctx=False)
+                            raise
+                ready_ev = _record_default_stream_event_if_cuda(views[0]) if views else None
+                stream_id = f"st_{cid}__{cmd_id}"
+                with self._xfer_store_lock:
+                    self._stream_send_store[stream_id] = (cid, views, ready_ev, total_bytes)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "stream_id": stream_id,
+                        "meta": meta,
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
+            if op == "UNPIN_STREAM_CTX":
+                cid = str(cmd["ctx_id"])
+                stream_id = cmd.get("stream_id")
+                if stream_id is not None:
+                    with self._xfer_store_lock:
+                        self._stream_send_store.pop(str(stream_id), None)
+                fin_fn = getattr(self.adapter, "finish_stream_send", None)
+                if callable(fin_fn):
+                    fin_fn(cid, release_ctx=bool(cmd.get("release_ctx", False)))
+                elif bool(cmd.get("release_ctx", False)):
+                    self.adapter.release_context(cid)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
             if op == "STREAM_SEND_NCCL":
                 assert self.peer_mesh is not None
                 from morphserve.models.bagel_adapter import copy_views_to_chunk
@@ -538,11 +598,14 @@ class WorkerRuntime:
             )
         except BaseException as exc:
             if is_oom_exception(exc):
-                probe_only = bool(op == "ALLOC_RECV_BUF" and cmd.get("probe_only", False))
+                probe_only = bool(
+                    (op == "ALLOC_RECV_BUF" and cmd.get("probe_only", False))
+                    or op == "PIN_STREAM_CTX"
+                )
                 if not probe_only:
                     self.oom_count += 1
-                gc.collect()
-                _clear_cuda_cache_if_present()
+                    gc.collect()
+                    _clear_cuda_cache_if_present()
                 return self._emit_ack(
                     {
                         "cmd_id": cmd_id,
@@ -659,63 +722,6 @@ class WorkerRuntime:
                         "rank": self.rank,
                         "status": "ok",
                         "reclaimed_bytes": reclaimed_b,
-                        **self._telemetry_snapshot(),
-                    }
-                )
-
-            if op == "PIN_STREAM_CTX":
-                cid = str(cmd["ctx_id"])
-                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
-                prep_fn = getattr(self.adapter, "prepare_stream_send", None)
-                if not callable(prep_fn):
-                    return self._emit_ack(
-                        {"cmd_id": cmd_id, "rank": self.rank, "status": "unsupported", "error": "stream_send_unsupported"}
-                    )
-                meta, views = prep_fn(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))
-                total_bytes = int(meta["total_bytes"])
-                if total_bytes > 0 and views and getattr(views[0], "is_cuda", False):
-                    import torch
-
-                    need_cap = min(chunk_bytes, total_bytes)
-                    if self._xfer_send_buf is None or int(self._xfer_send_buf.numel()) < need_cap:
-                        try:
-                            self._xfer_send_buf = torch.empty((need_cap,), dtype=torch.uint8, device=views[0].device)
-                        except BaseException:
-                            fin_fn = getattr(self.adapter, "finish_stream_send", None)
-                            if callable(fin_fn):
-                                fin_fn(cid, release_ctx=False)
-                            raise
-                ready_ev = _record_cuda_event_if_tensor(views[0]) if views else None
-                stream_id = f"st_{cid}__{cmd_id}"
-                with self._xfer_store_lock:
-                    self._stream_send_store[stream_id] = (cid, views, ready_ev, total_bytes)
-                return self._emit_ack(
-                    {
-                        "cmd_id": cmd_id,
-                        "rank": self.rank,
-                        "status": "ok",
-                        "stream_id": stream_id,
-                        "meta": meta,
-                        **self._telemetry_snapshot(),
-                    }
-                )
-
-            if op == "UNPIN_STREAM_CTX":
-                cid = str(cmd["ctx_id"])
-                stream_id = cmd.get("stream_id")
-                if stream_id is not None:
-                    with self._xfer_store_lock:
-                        self._stream_send_store.pop(str(stream_id), None)
-                fin_fn = getattr(self.adapter, "finish_stream_send", None)
-                if callable(fin_fn):
-                    fin_fn(cid, release_ctx=bool(cmd.get("release_ctx", False)))
-                elif bool(cmd.get("release_ctx", False)):
-                    self.adapter.release_context(cid)
-                return self._emit_ack(
-                    {
-                        "cmd_id": cmd_id,
-                        "rank": self.rank,
-                        "status": "ok",
                         **self._telemetry_snapshot(),
                     }
                 )

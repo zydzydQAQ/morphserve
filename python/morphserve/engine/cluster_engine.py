@@ -1071,51 +1071,48 @@ class MorphServeClusterEngine:
             chunk_b = int(self._nccl_stream_chunk_bytes)
             if src_lock_held:
                 src_lock_held = False
-                try:
-                    self._ensure_async_primitives()
-                    t_pack0 = time.perf_counter()
-                    pin_res = await self._rpc(
-                        src_gpu,
-                        {
-                            "op": "PIN_STREAM_CTX",
-                            "ctx_id": ctx_id,
-                            "include_cfg_dup": include_cfg_dup,
-                            "chunk_bytes": chunk_b,
-                        },
-                    )
-                    pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
-                finally:
-                    self._gpu_locks[src_gpu].release()
-            else:
-                self._ensure_async_primitives()
-                t_src_q0 = time.perf_counter()
+                self._gpu_locks[src_gpu].release()
+            self._ensure_async_primitives()
+            holding_dst_lock = False
+            stream_id: str | None = None
+            recv_id: str | None = None
+            stream_consumed = False
+            stream_unpinned = False
+            fallback_to_pack = False
+            try:
+                # 1. Acquire `_gpu_locks[dst_gpu]` FIRST with zero pinned KV on `src_gpu` and zero
+                #    allocated buffers on `dst_gpu` so waiting in `dst_gpu`'s queue never stacks
+                #    un-evictable KV on `src_gpu` (`pin_lifetime ~150 ms` instead of `60,000 ms`).
+                t_dq0 = time.perf_counter()
                 await self._acquire_exclusive_gpu(
-                    src_gpu,
-                    est_mem_bytes=0,
-                    est_exec_ms=default_operator_profile().prep_overhead_ms,
+                    dst_gpu,
+                    est_mem_bytes=dst_est_mem_bytes,
+                    est_exec_ms=dst_est_exec_ms,
                     slo_deadline_ms=dst_slo_deadline_ms,
-                    op_priority=0,
+                    op_priority=dst_op_priority,
                     session_slo_intact=dst_session_slo_intact,
                     remaining_turns=dst_remaining_turns,
                 )
-                src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
-                t_pack0 = time.perf_counter()
-                try:
-                    pin_res = await self._rpc(
-                        src_gpu,
-                        {
-                            "op": "PIN_STREAM_CTX",
-                            "ctx_id": ctx_id,
-                            "include_cfg_dup": include_cfg_dup,
-                            "chunk_bytes": chunk_b,
-                        },
-                    )
-                    pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
-                finally:
-                    self._gpu_locks[src_gpu].release()
+                t_dst_q_acc = max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
+                holding_dst_lock = True
+                await self._await_bg_release_ctx(dst_gpu, new_ctx_id)
 
-            if pin_res.get("status") != "unsupported" and pin_res.get("error") != "stream_send_unsupported":
-                if pin_res.get("status") != "ok":
+                # 2. Pin `src_gpu` context strictly for the active streaming window via `xfer_cmd_q`
+                #    (never blocks or waits on `src_gpu`'s main compute loop; provably deadlock-free).
+                t_pack0 = time.perf_counter()
+                pin_res = await self._rpc(
+                    src_gpu,
+                    {
+                        "op": "PIN_STREAM_CTX",
+                        "ctx_id": ctx_id,
+                        "include_cfg_dup": include_cfg_dup,
+                        "chunk_bytes": chunk_b,
+                    },
+                )
+                pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
+                if pin_res.get("status") == "unsupported" or pin_res.get("error") == "stream_send_unsupported":
+                    fallback_to_pack = True
+                elif pin_res.get("status") != "ok":
                     yield dict(
                         pin_res,
                         packed_ok=False,
@@ -1123,29 +1120,11 @@ class MorphServeClusterEngine:
                         src_ctx_released=False,
                     )
                     return
-
-                stream_id = str(pin_res["stream_id"])
-                meta = pin_res["meta"]
-                wire_bytes = int(meta["total_bytes"])
-                logical_bytes = int(meta.get("logical_bytes", wire_bytes))
-                holding_dst_lock = False
-                recv_id: str | None = None
-                stream_consumed = False
-                stream_unpinned = False
-                try:
-                    t_dq0 = time.perf_counter()
-                    await self._acquire_exclusive_gpu(
-                        dst_gpu,
-                        est_mem_bytes=dst_est_mem_bytes,
-                        est_exec_ms=dst_est_exec_ms,
-                        slo_deadline_ms=dst_slo_deadline_ms,
-                        op_priority=dst_op_priority,
-                        session_slo_intact=dst_session_slo_intact,
-                        remaining_turns=dst_remaining_turns,
-                    )
-                    t_dst_q_acc = max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
-                    holding_dst_lock = True
-                    await self._await_bg_release_ctx(dst_gpu, new_ctx_id)
+                else:
+                    stream_id = str(pin_res["stream_id"])
+                    meta = pin_res["meta"]
+                    wire_bytes = int(meta["total_bytes"])
+                    logical_bytes = int(meta.get("logical_bytes", wire_bytes))
 
                     t_prep0 = time.perf_counter()
                     prep_res = await self._rpc(
@@ -1259,27 +1238,29 @@ class MorphServeClusterEngine:
                         "telemetry_seq": c_res.get("telemetry_seq"),
                     }
                     return
-                finally:
-                    if recv_id is not None:
-                        try:
-                            await self._rpc(dst_gpu, {"op": "DROP_STREAM_RECV", "recv_id": recv_id})
-                        except Exception:
-                            pass
-                    if not stream_unpinned:
-                        try:
-                            await self._rpc(
-                                src_gpu,
-                                {
-                                    "op": "UNPIN_STREAM_CTX",
-                                    "ctx_id": ctx_id,
-                                    "stream_id": (None if stream_consumed else stream_id),
-                                    "release_ctx": False,
-                                },
-                            )
-                        except Exception:
-                            pass
-                    if holding_dst_lock:
-                        self._gpu_locks[dst_gpu].release()
+            finally:
+                if recv_id is not None:
+                    try:
+                        await self._rpc(dst_gpu, {"op": "DROP_STREAM_RECV", "recv_id": recv_id})
+                    except Exception:
+                        pass
+                if stream_id is not None and not stream_unpinned:
+                    try:
+                        await self._rpc(
+                            src_gpu,
+                            {
+                                "op": "UNPIN_STREAM_CTX",
+                                "ctx_id": ctx_id,
+                                "stream_id": (None if stream_consumed else stream_id),
+                                "release_ctx": False,
+                            },
+                        )
+                    except Exception:
+                        pass
+                if holding_dst_lock:
+                    self._gpu_locks[dst_gpu].release()
+            if not fallback_to_pack:
+                return
 
         pack_release_flag = bool(release_src_ctx and not defer_src_release)
         if src_lock_held:
@@ -2084,10 +2065,10 @@ class MorphServeClusterEngine:
                             prep_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
                             await self._acquire_exclusive_gpu(
                                 resident_gpu,
-                                est_mem_bytes=(512 if turn.height >= 1024 else 256) * MIB,
+                                est_mem_bytes=(512 if turn.height >= 1024 else 256) * MIB if is_tight_mot else 0,
                                 est_exec_ms=est_prep_ms,
                                 slo_deadline_ms=prep_dl_ms,
-                                op_priority=1,
+                                op_priority=0 if ((not is_tight_mot) and is_quota_constrained) else 1,
                                 session_slo_intact=session_slo_intact,
                                 remaining_turns=rem_turns,
                             )
@@ -2149,6 +2130,17 @@ class MorphServeClusterEngine:
                     # Plan cross-paradigm transition & atomically reserve router/pacer state in C++ `MorphControlEngine`.
                     try:
                         now_rel_ms = (time.perf_counter() - suite_t0) * 1000.0
+                        eff_src_lock_held = bool(holding_src_lock and held_src_gpu == resident_gpu)
+                        if (
+                            eff_src_lock_held
+                            and (not is_tight_mot)
+                            and is_quota_constrained
+                            and self.router.get_worker_state(resident_gpu).expert_alpha <= 0.01
+                        ):
+                            # On quota-constrained `bridge_mllm_dit`, never grant `src_hold_credit_ms`
+                            # to hijack a VLM-hot rank (`alpha <= 0.01`) into a Decoder rank during
+                            # `PREP_DIT`; ship the compact ~4 MiB bridge via Path A to Decoder-hot ranks.
+                            eff_src_lock_held = False
                         trans = self._plan_turn_transition(
                             ctrl_handle,
                             session_id=sess.session_id,
@@ -2163,7 +2155,7 @@ class MorphServeClusterEngine:
                             has_more_turns=has_more_turns,
                             has_more_edits=has_more_edits,
                             now_ms=now_rel_ms,
-                            src_lock_held=bool(holding_src_lock and held_src_gpu == resident_gpu),
+                            src_lock_held=eff_src_lock_held,
                         )
                     except BaseException:
                         if holding_src_lock:
@@ -2180,7 +2172,11 @@ class MorphServeClusterEngine:
                     include_cfg_dup = bool(trans["include_cfg_dup_on_wire"])
                     dit_ctx_id = str(trans["dit_ctx_id"])
                     dit_dl_ms = t_dit0 * 1000.0 + eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps)
-                    est_dit_mem_b = int(kv_bytes) + ((4096 if turn.height >= 1024 else 1024) * MIB)
+                    est_dit_mem_b = (
+                        int(kv_bytes) + ((4096 if turn.height >= 1024 else 1024) * MIB)
+                        if is_tight_mot
+                        else int(kv_bytes)
+                    )
 
                     src_gpu_before_ship = resident_gpu
                     kv_res_released = reserved_kv_b == 0

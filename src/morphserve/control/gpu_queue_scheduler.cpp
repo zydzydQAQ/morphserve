@@ -158,7 +158,8 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
         // Session-SLO-aware Domino-free Feasible-Slack EDF + SRPT fallback (Autellix/Parrot pattern):
         // Partition fitting waiters into 3 buckets:
         //   0: SLO-feasible (`slack >= 0` or unprioritized) AND `session_slo_intact` (preserves BOTH Turn & Joint SLO;
-        //      prioritizes fewest remaining turns to complete already-invested healthy sessions, then tightest slack EDF)
+        //      ordered by tightest slack EDF first for Liu-Layland deadline optimality, tie-breaking by fewest
+        //      remaining turns so nearly-complete sessions finish before longer ones of equal urgency)
         //   1: SLO-feasible (`slack >= 0`) with prior turn SLO missed (`!session_slo_intact`; maximizes Turn SLO without
         //      starving healthy Bucket-0 sessions, ordered by tightest slack EDF)
         //   2: Already-expired (`slack < 0`), ordered by SRPT (`est_exec_ms` ascending) so heavy expired turns
@@ -170,7 +171,7 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
             const int rem_turns = (bucket == 0) ? std::max(1, w.remaining_turns) : 0;
             const double primary = feasible ? slack : std::max(0.0, w.est_exec_ms);
             const double secondary = feasible ? std::max(0.0, w.est_exec_ms) : -slack;
-            return std::make_tuple(w.op_priority, bucket, rem_turns, primary, secondary, w.enqueue_ms, w.waiter_id);
+            return std::make_tuple(w.op_priority, bucket, primary, rem_turns, secondary, w.enqueue_ms, w.waiter_id);
         };
         chosen = fitting.front();
         for (size_t idx : fitting) {

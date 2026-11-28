@@ -1297,3 +1297,73 @@ def test_bridge_mllm_dit_quota_constrained_decouples_vlm_from_decoder_ranks(tmp_
     assert all(rank == 0 for rank, _, _ in vlm_ops)
     # Turn 2 (`EXEC_AR` after Turn 1 shipped to rank 1) MUST carry Turn 0's exact `vlm_history`!
     assert vlm_ops[2][2] is not None and len(vlm_ops[2][2]) == 1 and vlm_ops[2][2][0][0] == "describe apple"
+
+
+def test_chunked_nccl_stream_acquires_dst_lock_before_pinning_src_ctx(tmp_path: Path) -> None:
+    """Chunked NCCL streaming must acquire `_gpu_locks[dst]` BEFORE sending `PIN_STREAM_CTX` to `src`."""
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=2,
+        model_family="synthetic",
+        inter_turn_think_s_range=(0.0, 0.0),
+    )
+    eng = MorphServeClusterEngine(
+        pol,
+        tmp_root=tmp_path / "chunked_dst_before_pin",
+        fleet=InProcessWorkerFleet(pol),
+    )
+    eng._force_chunked_stream_for_test = True  # type: ignore[attr-defined]
+    eng.start()
+    pin_seen_with_dst_locked: list[bool] = []
+    orig_rpc = eng._rpc
+
+    async def _intercept_rpc(rank: int, payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("op") == "PIN_STREAM_CTX":
+            pin_seen_with_dst_locked.append(bool(eng._gpu_locks[1].locked()))
+        return await orig_rpc(rank, payload)
+
+    eng._rpc = _intercept_rpc  # type: ignore[method-assign]
+
+    async def _run() -> dict[str, Any]:
+        eng._ensure_async_primitives()
+        await orig_rpc(
+            0,
+            {
+                "op": "EXEC_AR",
+                "ctx_id": "ctx_pin_order",
+                "prompt": "seed",
+                "image_paths": [],
+                "use_prev_image": False,
+                "max_ar_tokens": 2,
+                "prepare_for_dit": False,
+            },
+        )
+        # Hold dst lock briefly so `_nccl_transfer_guard` must queue on dst BEFORE pinning src.
+        await eng._gpu_locks[1].acquire(est_mem_bytes=0, est_exec_ms=10.0, slo_deadline_ms=0.0, op_priority=1)
+
+        async def _release_soon() -> None:
+            await asyncio.sleep(0.03)
+            # While dst lock is held by another DiT turn, src MUST NOT have received PIN_STREAM_CTX yet!
+            assert pin_seen_with_dst_locked == []
+            eng._gpu_locks[1].release()
+
+        rel_task = asyncio.create_task(_release_soon())
+        async with eng._nccl_transfer_guard(
+            0,
+            1,
+            "ctx_pin_order",
+            "ctx_pin_order_dst",
+            include_cfg_dup=False,
+            est_state_bytes=128 * 1024 * 1024,
+        ) as ship:
+            out = dict(ship)
+        await rel_task
+        return out
+
+    try:
+        res = asyncio.run(_run())
+    finally:
+        eng.shutdown()
+
+    assert res.get("status") == "ok"
+    assert pin_seen_with_dst_locked == [True]

@@ -9,6 +9,7 @@ import gc
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
@@ -1152,6 +1153,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         self.sched: UnifiedPreemptiveScheduler | None = None
 
         self._img_cache: dict[str, Any] = {}
+        self._ctx_lock = threading.RLock()
         self._ctx_store: dict[str, BagelSessionContext] = {}
         self._active_ctx_pins: dict[str, int] = {}
         self._ctx_last_used_s: dict[str, float] = {}
@@ -1203,7 +1205,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         return {"kv_lens": [0], "ropes": [0], "past_key_values": self._aux_cache_factory()(self.num_expert_layers)}
 
     def _sync_ctx_vmm_activity(self, cid: str, *, active: bool) -> None:
-        session = self._ctx_store.get(cid)
+        with self._ctx_lock:
+            session = self._ctx_store.get(cid)
         if session is None:
             return
         if active:
@@ -1212,18 +1215,20 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             session.mark_thinking(trigger_watermark_check=False)
 
     def _pin_ctx_id(self, cid: str) -> None:
-        self._active_ctx_pins[cid] = self._active_ctx_pins.get(cid, 0) + 1
-        self._sync_ctx_vmm_activity(cid, active=True)
+        with self._ctx_lock:
+            self._active_ctx_pins[cid] = self._active_ctx_pins.get(cid, 0) + 1
+            self._sync_ctx_vmm_activity(cid, active=True)
 
     def _unpin_ctx_id(self, cid: str) -> None:
-        rem = self._active_ctx_pins.get(cid, 1) - 1
-        if rem <= 0:
-            self._active_ctx_pins.pop(cid, None)
-            self._sync_ctx_vmm_activity(cid, active=False)
-        else:
-            self._active_ctx_pins[cid] = rem
-        if cid in self._ctx_store:
-            self._ctx_last_used_s[cid] = time.perf_counter()
+        with self._ctx_lock:
+            rem = self._active_ctx_pins.get(cid, 1) - 1
+            if rem <= 0:
+                self._active_ctx_pins.pop(cid, None)
+                self._sync_ctx_vmm_activity(cid, active=False)
+            else:
+                self._active_ctx_pins[cid] = rem
+            if cid in self._ctx_store:
+                self._ctx_last_used_s[cid] = time.perf_counter()
 
     @contextmanager
     def _pinned_ctx(self, *ctx_ids: str):
@@ -1300,28 +1305,31 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         for_dit: bool = False,
     ) -> int:
         """Evict LRU unpinned think-time sessions' KV to Host Pinned DRAM until `available_kv_bytes >= target`."""
-        excluded = set(exclude_ctx_ids) | {cid for cid, cnt in self._active_ctx_pins.items() if cnt > 0}
-        candidates: list[tuple[float, str, BagelSessionContext]] = []
-        for cid, session in self._ctx_store.items():
-            if cid in excluded or cid.startswith("__warm_"):
-                continue
-            if not session.has_live_main_kv():
-                continue
-            candidates.append((self._ctx_last_used_s.get(cid, 0.0), cid, session))
+        with self._ctx_lock:
+            excluded = set(exclude_ctx_ids) | {cid for cid, cnt in self._active_ctx_pins.items() if cnt > 0}
+            candidates: list[tuple[float, str, BagelSessionContext]] = []
+            for cid, session in self._ctx_store.items():
+                if cid in excluded or cid.startswith("__warm_"):
+                    continue
+                if not session.has_live_main_kv():
+                    continue
+                candidates.append((self._ctx_last_used_s.get(cid, 0.0), cid, session))
 
-        candidates.sort(key=lambda item: item[0])
-        evicted_total = 0
-        for _, _, session in candidates:
-            if self.available_kv_bytes(for_dit=for_dit) >= int(target_free_bytes):
-                break
-            reclaimed, used_bundle = session.swap_out(
-                vmm=self.vmm,
-                use_cow=self.policy.use_module3_cow_loopback,
-            )
-            evicted_total += reclaimed
-            if used_bundle:
-                self._kv_host_swap_outs += 1
-                self._kv_host_pinned_bytes += reclaimed
+            candidates.sort(key=lambda item: item[0])
+            evicted_total = 0
+            for _, cid, session in candidates:
+                if self.available_kv_bytes(for_dit=for_dit) >= int(target_free_bytes):
+                    break
+                if self._active_ctx_pins.get(cid, 0) > 0 or self._ctx_store.get(cid) is not session:
+                    continue
+                reclaimed, used_bundle = session.swap_out(
+                    vmm=self.vmm,
+                    use_cow=self.policy.use_module3_cow_loopback,
+                )
+                evicted_total += reclaimed
+                if used_bundle:
+                    self._kv_host_swap_outs += 1
+                    self._kv_host_pinned_bytes += reclaimed
         if evicted_total > 0 and self.vmm is None:
             import torch
 
@@ -1488,6 +1496,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             watermark_b = int(extra_needed_bytes) + 512 * MIB
             if self.available_kv_bytes() < watermark_b:
                 self.evict_idle_kv_to_host(watermark_b, exclude_ctx_ids=(ctx_id,))
+            elif self.vmm is not None and self.pager is not None and self.available_kv_bytes(for_dit=True) < watermark_b:
+                self.evict_idle_kv_to_host(watermark_b, exclude_ctx_ids=(ctx_id,), for_dit=True)
         return session
 
     def bind_runtime_resources(self, pacer: Any | None = None) -> dict[str, Any]:
@@ -2727,19 +2737,37 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         include_cfg_dup: bool = False,
     ) -> tuple[dict[str, Any], list[Any]]:
         """Pin `ctx_id` in VMM and return zero-copy flat uint8 views & metadata for bounded-chunk NCCL streaming."""
-        self._pin_ctx_id(ctx_id)
-        try:
-            session = self._ensure_ctx_resident(ctx_id)
-            return collect_bagel_stream_views(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
-        except BaseException:
-            self._unpin_ctx_id(ctx_id)
-            raise
+        import torch
+
+        if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
+            torch.cuda.set_device(self.device)
+        with self._ctx_lock:
+            self._pin_ctx_id(ctx_id)
+            try:
+                session = self._ensure_ctx_resident(ctx_id)
+                return collect_bagel_stream_views(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
+            except BaseException:
+                self._unpin_ctx_id(ctx_id)
+                raise
 
     def finish_stream_send(self, ctx_id: str, *, release_ctx: bool = False) -> None:
-        """Unpin (and optionally release) `ctx_id` after chunked NCCL send completes or aborts."""
-        self._unpin_ctx_id(ctx_id)
-        if release_ctx:
-            self.release_context(ctx_id)
+        """Unpin (and optionally release) `ctx_id` after chunked NCCL send completes or aborts (safe from xfer thread)."""
+        old: BagelSessionContext | None = None
+        with self._ctx_lock:
+            self._unpin_ctx_id(ctx_id)
+            if release_ctx:
+                self._active_ctx_pins.pop(ctx_id, None)
+                self._ctx_last_used_s.pop(ctx_id, None)
+                self._pending_h2d_weight_ms.pop(ctx_id, None)
+                self._pending_vae_encode_ms.pop(ctx_id, None)
+                if ctx_id in self._naive_offload_held_ctx_ids:
+                    self._release_naive_hold(ctx_id)
+                old = self._ctx_store.pop(ctx_id, None)
+        if old is not None:
+            freed_host_b = old.close()
+            if freed_host_b > 0:
+                with self._ctx_lock:
+                    self._kv_host_pinned_bytes = max(0, self._kv_host_pinned_bytes - freed_host_b)
 
     def prepare_stream_recv(
         self,
@@ -2843,17 +2871,19 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
     def release_context(self, ctx_id: str) -> None:
         import torch
 
-        self._active_ctx_pins.pop(ctx_id, None)
-        self._ctx_last_used_s.pop(ctx_id, None)
-        self._pending_h2d_weight_ms.pop(ctx_id, None)
-        self._pending_vae_encode_ms.pop(ctx_id, None)
-        if ctx_id in self._naive_offload_held_ctx_ids:
-            self._release_naive_hold(ctx_id)
-        old = self._ctx_store.pop(ctx_id, None)
+        with self._ctx_lock:
+            self._active_ctx_pins.pop(ctx_id, None)
+            self._ctx_last_used_s.pop(ctx_id, None)
+            self._pending_h2d_weight_ms.pop(ctx_id, None)
+            self._pending_vae_encode_ms.pop(ctx_id, None)
+            if ctx_id in self._naive_offload_held_ctx_ids:
+                self._release_naive_hold(ctx_id)
+            old = self._ctx_store.pop(ctx_id, None)
         if old is not None:
             freed_host_b = old.close()
             if freed_host_b > 0:
-                self._kv_host_pinned_bytes = max(0, self._kv_host_pinned_bytes - freed_host_b)
+                with self._ctx_lock:
+                    self._kv_host_pinned_bytes = max(0, self._kv_host_pinned_bytes - freed_host_b)
         if torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
             if self.vmm is None:
                 self._update_hwm()

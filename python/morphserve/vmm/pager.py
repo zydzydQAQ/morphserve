@@ -626,7 +626,11 @@ class LayerExpertPager:
     ) -> int:
         if self.vmm is None or missing_layers <= 0:
             return 0
-        needed_bytes = int(missing_layers) * self.layer_stride_bytes
+        # Reserve an extra layer-sized KV-growth margin on full-scale models (>=256 MiB/layer)
+        # so Step-0 generated image KV tokens / preempted AR KV cannot starve the background
+        # expert streamer before tail layers finish mapping.
+        kv_growth_margin = min(512 * MIB, self.layer_stride_bytes) if self.layer_stride_bytes >= 256 * MIB else 0
+        needed_bytes = int(missing_layers) * self.layer_stride_bytes + kv_growth_margin
         s_ptr = _current_cuda_stream_ptr(self.vmm.device)
         return int(
             self.vmm.ensure_expert_headroom(

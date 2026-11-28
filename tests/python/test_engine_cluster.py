@@ -1374,7 +1374,14 @@ def test_worker_collect_ar_batch_session_srpt_and_barrier_isolation() -> None:
     from morphserve.engine.worker_runtime import WorkerRuntime
 
     pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic")
-    rt = WorkerRuntime(rank=0, adapter=SyntheticCPTGAdapter(rank=0, policy=pol), ack_sink=lambda _a: None, max_ar_batch_size=4)
+    rt = WorkerRuntime(
+        rank=0,
+        policy=pol,
+        adapter=SyntheticCPTGAdapter(rank=0, policy=pol),
+        peer_mesh=None,
+        ack_sink=lambda _a: None,
+        max_ar_batch_size=4,
+    )
     now_s = time.perf_counter()
 
     # Enqueue: dead 4-turn text -> intact 3-turn image -> intact 1-turn text -> intact 1-turn text -> EXEC_DIT barrier -> post-barrier AR.

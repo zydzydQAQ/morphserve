@@ -643,7 +643,7 @@ class WorkerRuntime:
                         "cmd_id": cmd_id,
                         "rank": self.rank,
                         **dit_res,
-                        **self._telemetry_snapshot(),
+                        **self._telemetry_snapshot(resident_alpha=dit_res.get("resident_alpha")),
                     }
                 )
 
@@ -669,7 +669,7 @@ class WorkerRuntime:
                 prep_fn = getattr(self.adapter, "prepare_stream_send", None)
                 if not callable(prep_fn):
                     return self._emit_ack(
-                        {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": "stream_send_unsupported"}
+                        {"cmd_id": cmd_id, "rank": self.rank, "status": "unsupported", "error": "stream_send_unsupported"}
                     )
                 meta, views = prep_fn(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))
                 total_bytes = int(meta["total_bytes"])
@@ -727,7 +727,7 @@ class WorkerRuntime:
                 prep_recv_fn = getattr(self.adapter, "prepare_stream_recv", None)
                 if not callable(prep_recv_fn):
                     return self._emit_ack(
-                        {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": "stream_recv_unsupported"}
+                        {"cmd_id": cmd_id, "rank": self.rank, "status": "unsupported", "error": "stream_recv_unsupported"}
                     )
                 partial, views = prep_recv_fn(new_cid, meta)
                 alloc_ev = None

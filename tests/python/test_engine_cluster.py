@@ -1243,17 +1243,21 @@ def test_bridge_mllm_dit_quota_constrained_decouples_vlm_from_decoder_ranks(tmp_
 
     vlm_ops: list[tuple[int, str, Any]] = []
     orig_rpc = eng._rpc
+    orig_sync = eng._sync_worker_telemetry
+
+    def _pinned_sync(rank: int, ack: dict[str, Any]) -> None:
+        patched = dict(ack)
+        if "resident_alpha" in patched:
+            patched["resident_alpha"] = 0.0 if int(rank) == 0 else 1.0
+        orig_sync(rank, patched)
 
     async def _intercept_rpc(rank: int, payload: dict[str, Any]) -> dict[str, Any]:
         op = str(payload.get("op", ""))
         if op in ("EXEC_AR", "PREP_DIT"):
             vlm_ops.append((int(rank), op, payload.get("vlm_history")))
-        res = await orig_rpc(rank, payload)
-        # Keep simulated rank 0 VLM-hot (`alpha=0.0`) and rank 1 Decoder-hot (`alpha=1.0`).
-        if isinstance(res, dict) and "resident_alpha" in res:
-            res = dict(res, resident_alpha=(0.0 if rank == 0 else 1.0))
-        return res
+        return await orig_rpc(rank, payload)
 
+    eng._sync_worker_telemetry = _pinned_sync  # type: ignore[method-assign]
     eng._rpc = _intercept_rpc  # type: ignore[method-assign]
     try:
         suite = WorkloadSuite(

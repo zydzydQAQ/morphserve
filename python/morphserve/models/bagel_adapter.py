@@ -932,6 +932,9 @@ def prealloc_bagel_stream_recv(
     all_views: list[Any] = []
     try:
         main_ctx, m_views = _prealloc_kv_context_views(sections["main"]["meta"], main_cache_factory, target_dev)
+        main_pkv = main_ctx.get("past_key_values")
+        if main_pkv is not None and callable(getattr(main_pkv, "mark_active", None)):
+            main_pkv.mark_active()
         all_views.extend(m_views)
         if "cfg_text" in sections:
             cfg_text_ctx, ct_views = _prealloc_kv_context_views(sections["cfg_text"]["meta"], aux_cache_factory, target_dev)

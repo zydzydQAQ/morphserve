@@ -562,7 +562,7 @@ def test_layer_chunk_non_poisoned_ema_and_bounded_post_admit_recheck() -> None:
 
 def test_preemption_session_single_light_admit_and_heavy_starvation_barrier() -> None:
     """Verify at most 1 light AR admits per yield when active, and aged heavy AR blocks new light bypasses."""
-    pipe = _make_stub_pipeline(num_layers=4)
+    pipe = _make_pure_python_stub_pipeline(num_layers=4)
     sched = UnifiedPreemptiveScheduler(
         pipe,
         mode="layer_chunk",

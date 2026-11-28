@@ -1065,6 +1065,7 @@ class MorphServeClusterEngine:
         use_chunked_stream = bool(
             int(est_state_bytes) > int(self._nccl_stream_threshold_bytes)
             and self.policy.cptg_architecture == "tight_mot"
+            and (self.policy.model_family == "bagel" or bool(getattr(self, "_force_chunked_stream_for_test", False)))
         )
         if use_chunked_stream:
             chunk_b = int(self._nccl_stream_chunk_bytes)
@@ -1113,7 +1114,7 @@ class MorphServeClusterEngine:
                 finally:
                     self._gpu_locks[src_gpu].release()
 
-            if pin_res.get("error") != "stream_send_unsupported":
+            if pin_res.get("status") != "unsupported" and pin_res.get("error") != "stream_send_unsupported":
                 if pin_res.get("status") != "ok":
                     yield dict(
                         pin_res,

@@ -1896,7 +1896,7 @@ class MorphServeClusterEngine:
                     eff_prev_img = (
                         (None if (is_tight_mot and src_ctx_alive) else prev_tmp_img) if turn_use_prev_image else None
                     )
-                    eff_vlm_hist = bridge_history if ((not is_tight_mot) and bridge_history) else None
+                    eff_vlm_hist = list(bridge_history) if ((not is_tight_mot) and bridge_history) else None
 
                     # ---- Branch 1: Pure AR turn (VQA) ----
                     if plan == "ar_only":

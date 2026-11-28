@@ -839,6 +839,14 @@ class PreemptionSession:
             self._is_heavy_cmd(m) and ((now_s - self._deferred_since_s.get(id(m), now_s)) >= 0.40)
             for m in incoming
         )
+        if heavy_waiting_aged and not has_live_ar:
+            aged_heavy = [
+                m
+                for m in incoming
+                if self._is_heavy_cmd(m) and ((now_s - self._deferred_since_s.get(id(m), now_s)) >= 0.40)
+            ]
+            aged_ids = {id(m) for m in aged_heavy}
+            incoming = aged_heavy + [m for m in incoming if id(m) not in aged_ids]
 
         tasks: list[ArDecodeTask] = []
         admitted_while_active = 0

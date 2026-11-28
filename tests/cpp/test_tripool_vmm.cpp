@@ -867,6 +867,96 @@ void test_lru_multibank_eviction_and_release_free_overflow() {
     }
 }
 
+void test_transient_bundles_before_expert_evict_and_expert_super_reserve() {
+    // 1. Short-lived Arena-2 transient allocation borrows idle fine KV pages via zero-syscall
+    //    fine-to-super bundling BEFORE evicting resident Arena-0 expert layers, and NEVER triggers
+    //    fine->super coalescing thrashing.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 128;   // 2 x 64 MiB (exact fit for 2 expert layers)
+        cfg.fine_kv_pool_mib = 128; // 64 x 2 MiB (base_fine_pages_ = 64)
+        cfg.super_handle_mib = 64;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = true;
+        cfg.max_pool_bytes = 256 * kMiB;  // At cap once init pools exist
+        cfg.simulated = true;
+        cfg.materialize_sim_va = false;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const int eid = vmm->expert_register(2, 64 * kMiB, nullptr, 0);
+        MS_EXPECT(eid >= 0);
+        MS_EXPECT(vmm->expert_load_layers_sync(eid, 0, 2) == 0);
+        MS_EXPECT(vmm->expert_resident_count(eid) == 2);
+
+        // Allocate 128 MiB transient scratchpad (2 super slots): MUST bundle the 64 idle fine pages
+        // instead of evicting unpinned Arena-0 expert layers, and return them cleanly on scope_end!
+        vmm->scope_begin();
+        void* tr = vmm->transient_alloc(128 * kMiB, nullptr);
+        MS_EXPECT(tr != nullptr);
+        MS_EXPECT(vmm->expert_resident_count(eid) == 2);
+        UnifiedVmmStatsPod st{};
+        vmm->get_stats(&st);
+        MS_EXPECT(st.expert_auto_evictions_for_transient == 0);
+        MS_EXPECT(st.fine_to_super_bundles == 2);
+        MS_EXPECT(st.super_to_fine_carves == 0);
+        MS_EXPECT(st.super_pool_total_handles == 2);
+
+        vmm->transient_free(tr, 128 * kMiB, nullptr);
+        MS_EXPECT(vmm->scope_end(nullptr) == 0);
+        vmm->get_stats(&st);
+        MS_EXPECT(st.fine_pool_free_pages == 64);
+        MS_EXPECT(st.super_pool_total_handles == 2);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
+
+    // 2. pop_fine_handle_locked protects free_super_handles_ reserved for evicted Arena-0 expert
+    //    layers by growing fine overflow within max_pool_bytes (0 super-handle carves!), while
+    //    still carving once max_pool_bytes cap is hit so KV never spuriously OOMs.
+    {
+        TriPoolVMMConfig cfg;
+        cfg.device = 0;
+        cfg.super_pool_mib = 128;   // 2 x 64 MiB
+        cfg.fine_kv_pool_mib = 4;   // 2 x 2 MiB
+        cfg.super_handle_mib = 64;
+        cfg.transient_va_gib = 1;
+        cfg.kv_va_gib = 1;
+        cfg.allow_overflow = true;
+        cfg.max_pool_bytes = 140 * kMiB;  // 8 MiB fine overflow headroom
+        cfg.simulated = true;
+        cfg.materialize_sim_va = false;
+
+        auto vmm = TriPoolVMM::create(cfg);
+        const int eid = vmm->expert_register(2, 64 * kMiB, nullptr, 0);
+        MS_EXPECT(eid >= 0);
+        MS_EXPECT(vmm->expert_load_layers_sync(eid, 0, 2) == 0);
+        // Evict layer 1 -> 1 free super handle, 1 missing expert layer (reserved_super == 1).
+        MS_EXPECT(vmm->expert_evict_range(eid, 1, 2, nullptr) == 1);
+
+        const uint64_t sid = vmm->kv_session_create();
+        const int32_t rid = vmm->kv_region_alloc(80 * kMiB, sid);
+        // Grow KV to 12 MiB (base 4 MiB + 8 MiB overflow): MUST NOT carve the reserved super handle!
+        MS_EXPECT(vmm->kv_region_ensure(rid, 12 * kMiB, nullptr) != 0);
+        UnifiedVmmStatsPod st{};
+        vmm->get_stats(&st);
+        MS_EXPECT(st.super_to_fine_carves == 0);
+        MS_EXPECT(st.super_pool_free_handles == 1);
+        MS_EXPECT(st.overflow_creates == 4);
+        MS_EXPECT(st.pool_total_bytes == 140 * kMiB);
+
+        // Once max_pool_bytes is reached, growing KV to 14 MiB falls back to carving the free super handle cleanly.
+        MS_EXPECT(vmm->kv_region_ensure(rid, 14 * kMiB, nullptr) != 0);
+        vmm->get_stats(&st);
+        MS_EXPECT(st.super_to_fine_carves == 1);
+        MS_EXPECT(st.pool_total_bytes == 140 * kMiB);
+
+        MS_EXPECT(vmm->kv_region_free(rid, nullptr) == 0);
+        vmm->kv_session_destroy(sid);
+        MS_EXPECT(vmm->shutdown() == 0);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -878,6 +968,7 @@ int main() {
     test_nested_transient_scopes();
     test_oom_exceptions_strict_and_capped();
     test_lru_multibank_eviction_and_release_free_overflow();
+    test_transient_bundles_before_expert_evict_and_expert_super_reserve();
 
     if (g_failures > 0) {
         std::cerr << "[FAIL] test_tripool_vmm (" << g_failures << " check(s) failed)\n";

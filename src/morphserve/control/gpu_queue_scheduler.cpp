@@ -40,6 +40,8 @@ nlohmann::json GpuQueueWaiter::to_json() const {
         {"slo_deadline_ms", slo_deadline_ms},
         {"op_priority", op_priority},
         {"bypass_count", bypass_count},
+        {"session_slo_intact", session_slo_intact},
+        {"remaining_turns", remaining_turns},
     };
 }
 
@@ -52,6 +54,8 @@ GpuQueueWaiter GpuQueueWaiter::from_json(const nlohmann::json& j) {
     w.slo_deadline_ms = j.value("slo_deadline_ms", 0.0);
     w.op_priority = j.value("op_priority", 1);
     w.bypass_count = j.value("bypass_count", 0);
+    w.session_slo_intact = j.value("session_slo_intact", true);
+    w.remaining_turns = std::max(1, j.value("remaining_turns", 1));
     return w;
 }
 
@@ -151,18 +155,22 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
 
     size_t chosen = fifo_idx;
     if (!fitting.empty()) {
-        // Domino-free Feasible-Slack EDF + SRPT fallback:
-        // Partition fitting waiters into SLO-feasible (`slack >= 0` or unprioritized, bucket 0)
-        // vs already-expired (`slack < 0`, bucket 1). Within bucket 0 run EDF (tightest feasible
-        // slack first); within bucket 1 run SRPT (`est_exec_ms` ascending) so already-missed heavy
-        // turns cannot trigger an EDF domino cascade across feasible short turns or inflate JCT.
+        // Session-SLO-aware Domino-free Feasible-Slack EDF + SRPT fallback (Autellix/Parrot pattern):
+        // Partition fitting waiters into 3 buckets:
+        //   0: SLO-feasible (`slack >= 0` or unprioritized) AND `session_slo_intact` (preserves BOTH Turn & Joint SLO;
+        //      prioritizes fewest remaining turns to complete already-invested healthy sessions, then tightest slack EDF)
+        //   1: SLO-feasible (`slack >= 0`) with prior turn SLO missed (`!session_slo_intact`; maximizes Turn SLO without
+        //      starving healthy Bucket-0 sessions, ordered by tightest slack EDF)
+        //   2: Already-expired (`slack < 0`), ordered by SRPT (`est_exec_ms` ascending) so heavy expired turns
+        //      cannot trigger an EDF domino cascade or inflate tail JCT.
         auto rank_key = [&](const GpuQueueWaiter& w) noexcept {
             const double slack = effective_slack_ms(w, now_ms);
             const bool feasible = (w.slo_deadline_ms <= 0.0) || (slack >= 0.0);
-            const int bucket = feasible ? 0 : 1;
+            const int bucket = feasible ? (w.session_slo_intact ? 0 : 1) : 2;
+            const int rem_turns = (bucket == 0) ? std::max(1, w.remaining_turns) : 0;
             const double primary = feasible ? slack : std::max(0.0, w.est_exec_ms);
             const double secondary = feasible ? std::max(0.0, w.est_exec_ms) : -slack;
-            return std::make_tuple(w.op_priority, bucket, primary, secondary, w.enqueue_ms, w.waiter_id);
+            return std::make_tuple(w.op_priority, bucket, rem_turns, primary, secondary, w.enqueue_ms, w.waiter_id);
         };
         chosen = fitting.front();
         for (size_t idx : fitting) {

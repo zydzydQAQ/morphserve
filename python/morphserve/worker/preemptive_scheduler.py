@@ -325,9 +325,13 @@ class UnifiedPreemptiveScheduler:
         if self.pager is not None and getattr(self.pager, "vmm", None) is not None:
             res_alpha_fn = getattr(self.pager, "resident_alpha", None)
             if callable(res_alpha_fn):
-                streaming = float(res_alpha_fn()) < 0.999
+                # Minor tail evictions (alpha >= 0.70, e.g. 1-8 layers restoring asynchronously after
+                # Scoped VAE) are completely hidden behind Step 0's resident prefix layers; only
+                # enable conservative 24 ms H2D pacing when a deep cold prefix (< 70% resident) exists.
+                streaming = float(res_alpha_fn()) < 0.70
             elif callable(getattr(self.pager.vmm, "expert_resident_count", None)):
-                streaming = int(self.pager.vmm.expert_resident_count(self.pager.expert_id)) < int(self.pager.num_layers)
+                n_lyrs = max(1, int(self.pager.num_layers))
+                streaming = (int(self.pager.vmm.expert_resident_count(self.pager.expert_id)) / float(n_lyrs)) < 0.70
         self._step0_h2d_streaming = streaming
         self.last_effective_chunk_layers = self.compute_adaptive_chunk_layers()
         return now
@@ -787,6 +791,7 @@ class PreemptionSession:
 
         self._inflight: dict[int, Any] = {}
         self._deferred_cmds: list[dict[str, Any]] = []
+        self._deferred_since_s: dict[int, float] = {}
         self._prev_oom_reclaim: Any = None
 
     @property
@@ -821,27 +826,47 @@ class PreemptionSession:
 
         existing_active = list(self.scheduler.active_ar_tasks)
         has_live_ar = bool(existing_active)
-        tight_active_slack = False
-        if existing_active:
-            min_dl_s = min(t.next_deadline_s() for t in existing_active)
-            earliest_slack_ms = (min_dl_s - now_s) * 1000.0
-            tight_thresh_ms = min(
-                float(self.scheduler.ema_ar_step_ms) + 20.0,
-                0.72 * float(self.scheduler.tpot_slo_ms),
-            )
-            tight_active_slack = earliest_slack_ms < tight_thresh_ms
+        min_dl_s = min((t.next_deadline_s() for t in existing_active), default=0.0)
+        tight_thresh_ms = min(
+            float(self.scheduler.ema_ar_step_ms) + 24.0,
+            0.72 * float(self.scheduler.tpot_slo_ms),
+        )
+        # Writer-starvation-free barrier for heavy AR turns (image VQA / swapped KV): if a deferred
+        # heavy command has waited >= 400 ms while light AR turns keep arriving, stop letting new
+        # light ARs bypass it so the current active batch finishes cleanly (preserving 100% TPOT)
+        # and the waiting heavy AR enters immediately instead of starving until DiT drain().
+        heavy_waiting_aged = any(
+            self._is_heavy_cmd(m) and ((now_s - self._deferred_since_s.get(id(m), now_s)) >= 0.40)
+            for m in incoming
+        )
 
         tasks: list[ArDecodeTask] = []
+        admitted_while_active = 0
         for idx, ar_msg in enumerate(incoming):
-            # Never stall an active AR stream's TPOT clock with a heavy ViT/swap prefill or
-            # when an already-active AR task is near its next TPOT deadline (defer 1 yield so
-            # the active task hits its token deadline first and resets slack to full TPOT SLO).
-            if has_live_ar and (tight_active_slack or self._is_heavy_cmd(ar_msg)):
-                self._deferred_cmds.append(ar_msg)
-                continue
+            is_heavy = bool(self._is_heavy_cmd(ar_msg))
+            cur_now = time.perf_counter() if admitted_while_active > 0 else now_s
+            if has_live_ar:
+                if existing_active:
+                    earliest_slack_ms = (min_dl_s - cur_now) * 1000.0
+                    tight_active_slack = earliest_slack_ms < tight_thresh_ms
+                else:
+                    tight_active_slack = False
+                # Never stall an active AR stream's TPOT clock with a heavy ViT/swap prefill,
+                # >1 light prefill per yield boundary, a tight active deadline, or by bypassing
+                # an aged waiting heavy AR turn.
+                if (
+                    is_heavy
+                    or tight_active_slack
+                    or admitted_while_active >= 1
+                    or (heavy_waiting_aged and (not is_heavy))
+                ):
+                    self._deferred_since_s.setdefault(id(ar_msg), cur_now)
+                    self._deferred_cmds.append(ar_msg)
+                    continue
+            self._deferred_since_s.pop(id(ar_msg), None)
             try:
                 with self.scheduler.ar_yield_guard():
-                    task, handle = self._admit_cmd(ar_msg, now_s)
+                    task, handle = self._admit_cmd(ar_msg, cur_now)
             except BaseException as exc:
                 recovered = False
                 if self._on_oom_reclaim is not None and _is_oom_err(exc):
@@ -863,6 +888,8 @@ class PreemptionSession:
                     continue
             self._inflight[id(task)] = handle
             tasks.append(task)
+            if has_live_ar:
+                admitted_while_active += 1
             has_live_ar = True
         return tasks
 
@@ -903,8 +930,11 @@ class PreemptionSession:
         if self._deferred_cmds:
             deferred = list(self._deferred_cmds)
             self._deferred_cmds.clear()
+            self._deferred_since_s.clear()
             for cmd in deferred:
                 self._emit_cmd_abort(cmd, exc)
+        else:
+            self._deferred_since_s.clear()
         if self.scheduler is not None:
             self.scheduler.active_ar_tasks.clear()
             self.scheduler.completed_ar_tasks.clear()

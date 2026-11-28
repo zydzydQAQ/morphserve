@@ -15,7 +15,17 @@ from morphserve.models.base import CPTGModelAdapter, is_oom_exception
 from morphserve.router.topology import ClusterTopologyProfile, default_topology_for
 from morphserve.runtime.peer_transport import InMemoryByteBus, InMemoryPeerMesh
 
-_XFER_OPS = frozenset({"ALLOC_RECV_BUF", "SEND_NCCL", "RECV_NCCL", "DROP_PACKED_CTX", "DROP_RECV_BUF"})
+_XFER_OPS = frozenset(
+    {
+        "ALLOC_RECV_BUF",
+        "SEND_NCCL",
+        "RECV_NCCL",
+        "DROP_PACKED_CTX",
+        "DROP_RECV_BUF",
+        "STREAM_SEND_NCCL",
+        "STREAM_RECV_NCCL",
+    }
+)
 
 
 def _clear_cuda_cache_if_present() -> None:
@@ -85,6 +95,12 @@ class WorkerRuntime:
         self._telemetry_seq = 0
         self._packed_store: dict[str, tuple[Any, Any]] = {}
         self._recv_store: dict[str, Any] = {}
+        self._stream_send_store: dict[str, tuple[str, list[Any], Any, int]] = {}
+        self._stream_recv_store: dict[str, tuple[str, dict[str, Any], list[Any], dict[str, Any], Any]] = {}
+        self._xfer_send_buf: Any = None
+        self._xfer_recv_buf: Any = None
+        self._xfer_send_stream: Any = None
+        self._xfer_recv_stream: Any = None
         self._shutdown_requested = False
         self._xfer_thread_running = False
         self.oom_count = 0
@@ -374,6 +390,149 @@ class WorkerRuntime:
                     }
                 )
 
+            if op == "STREAM_SEND_NCCL":
+                assert self.peer_mesh is not None
+                from morphserve.models.bagel_adapter import copy_views_to_chunk
+
+                stream_id = str(cmd["stream_id"])
+                dst_rank = int(cmd["dst_rank"])
+                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
+                with self._xfer_store_lock:
+                    entry = self._stream_send_store.pop(stream_id)
+                _cid, views, ready_ev, total_bytes = entry
+                ship_ms = 0.0
+                if total_bytes > 0:
+                    import torch
+
+                    is_cuda = bool(views and getattr(views[0], "is_cuda", False))
+                    use_tensor_wire = hasattr(self.peer_mesh, "alloc_recv_u8")
+                    need_cap = min(chunk_bytes, total_bytes)
+                    if is_cuda:
+                        dev = views[0].device
+                        torch.cuda.set_device(dev)
+                        if self._xfer_send_stream is None:
+                            self._xfer_send_stream = torch.cuda.Stream(device=dev)
+                        if self._xfer_send_buf is None or int(self._xfer_send_buf.numel()) < need_cap:
+                            self._xfer_send_buf = torch.empty((need_cap,), dtype=torch.uint8, device=dev)
+                        cstream = self._xfer_send_stream
+                        if ready_ev is not None:
+                            cstream.wait_event(ready_ev)
+                        off = 0
+                        while off < total_bytes:
+                            n = min(chunk_bytes, total_bytes - off)
+                            buf_slice = self._xfer_send_buf[:n]
+                            with torch.cuda.stream(cstream):
+                                copy_views_to_chunk(views, off, buf_slice)
+                            ev = cstream.record_event()
+                            if use_tensor_wire:
+                                ship_ms += float(
+                                    self.peer_mesh.send_u8(buf_slice, dst_rank=dst_rank, ready_event=ev)
+                                )
+                            else:
+                                ev.synchronize()
+                                raw_b = buf_slice.detach().cpu().numpy().tobytes()
+                                ship_ms += float(self.peer_mesh.send_u8(raw_b, dst_rank=dst_rank))
+                            off += n
+                        cstream.synchronize()
+                    else:
+                        if self._xfer_send_buf is None or int(self._xfer_send_buf.numel()) < need_cap:
+                            self._xfer_send_buf = torch.empty((need_cap,), dtype=torch.uint8, device="cpu")
+                        off = 0
+                        while off < total_bytes:
+                            n = min(chunk_bytes, total_bytes - off)
+                            buf_slice = self._xfer_send_buf[:n]
+                            copy_views_to_chunk(views, off, buf_slice)
+                            payload = buf_slice if use_tensor_wire else buf_slice.numpy().tobytes()
+                            ship_ms += float(self.peer_mesh.send_u8(payload, dst_rank=dst_rank))
+                            off += n
+                del views
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "ship_ms": ship_ms,
+                        "bytes": total_bytes,
+                    }
+                )
+
+            if op == "STREAM_RECV_NCCL":
+                assert self.peer_mesh is not None
+                from morphserve.models.bagel_adapter import copy_chunk_to_views
+
+                recv_id = str(cmd["recv_id"])
+                src_rank = int(cmd["src_rank"])
+                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
+                with self._xfer_store_lock:
+                    _new_cid, _partial, views, meta, alloc_ev = self._stream_recv_store[recv_id]
+                total_bytes = int(meta["total_bytes"])
+                ship_ms = 0.0
+                if total_bytes > 0:
+                    import torch
+
+                    is_cuda = bool(views and getattr(views[0], "is_cuda", False))
+                    use_tensor_wire = hasattr(self.peer_mesh, "alloc_recv_u8")
+                    need_cap = min(chunk_bytes, total_bytes)
+                    if is_cuda:
+                        dev = views[0].device
+                        torch.cuda.set_device(dev)
+                        if self._xfer_recv_stream is None:
+                            self._xfer_recv_stream = torch.cuda.Stream(device=dev)
+                        if self._xfer_recv_buf is None or int(self._xfer_recv_buf.numel()) < need_cap:
+                            self._xfer_recv_buf = (
+                                self.peer_mesh.alloc_recv_u8(need_cap)
+                                if use_tensor_wire
+                                else torch.empty((need_cap,), dtype=torch.uint8, device=dev)
+                            )
+                            alloc_ev = _record_default_stream_event_if_cuda(self._xfer_recv_buf)
+                        rstream = self._xfer_recv_stream
+                        prev_ev = alloc_ev
+                        off = 0
+                        while off < total_bytes:
+                            n = min(chunk_bytes, total_bytes - off)
+                            buf_slice = self._xfer_recv_buf[:n]
+                            if use_tensor_wire:
+                                got, cms = self.peer_mesh.recv_u8(
+                                    n,
+                                    src_rank=src_rank,
+                                    out_tensor=buf_slice,
+                                    ready_event=prev_ev,
+                                )
+                                ship_ms += float(cms)
+                                src_t = got[:n]
+                            else:
+                                raw_b, cms = self.peer_mesh.recv_u8(n, src_rank=src_rank)
+                                ship_ms += float(cms)
+                                src_t = torch.frombuffer(bytearray(raw_b), dtype=torch.uint8).to(dev)
+                            with torch.cuda.stream(rstream):
+                                copy_chunk_to_views(views, off, src_t)
+                            prev_ev = rstream.record_event()
+                            off += n
+                        rstream.synchronize()
+                    else:
+                        off = 0
+                        while off < total_bytes:
+                            n = min(chunk_bytes, total_bytes - off)
+                            raw_b, cms = self.peer_mesh.recv_u8(n, src_rank=src_rank)
+                            ship_ms += float(cms)
+                            src_t = (
+                                raw_b[:n]
+                                if torch.is_tensor(raw_b)
+                                else torch.frombuffer(bytearray(raw_b), dtype=torch.uint8)
+                            )
+                            copy_chunk_to_views(views, off, src_t)
+                            off += n
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "recv_id": recv_id,
+                        "ship_ms": ship_ms,
+                        "bytes": int(meta.get("logical_bytes", total_bytes)),
+                    }
+                )
+
             return self._emit_ack(
                 {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": f"unknown xfer op: {op}"}
             )
@@ -504,6 +663,140 @@ class WorkerRuntime:
                     }
                 )
 
+            if op == "PIN_STREAM_CTX":
+                cid = str(cmd["ctx_id"])
+                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
+                prep_fn = getattr(self.adapter, "prepare_stream_send", None)
+                if not callable(prep_fn):
+                    return self._emit_ack(
+                        {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": "stream_send_unsupported"}
+                    )
+                meta, views = prep_fn(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))
+                total_bytes = int(meta["total_bytes"])
+                if total_bytes > 0 and views and getattr(views[0], "is_cuda", False):
+                    import torch
+
+                    need_cap = min(chunk_bytes, total_bytes)
+                    if self._xfer_send_buf is None or int(self._xfer_send_buf.numel()) < need_cap:
+                        try:
+                            self._xfer_send_buf = torch.empty((need_cap,), dtype=torch.uint8, device=views[0].device)
+                        except BaseException:
+                            fin_fn = getattr(self.adapter, "finish_stream_send", None)
+                            if callable(fin_fn):
+                                fin_fn(cid, release_ctx=False)
+                            raise
+                ready_ev = _record_cuda_event_if_tensor(views[0]) if views else None
+                stream_id = f"st_{cid}__{cmd_id}"
+                with self._xfer_store_lock:
+                    self._stream_send_store[stream_id] = (cid, views, ready_ev, total_bytes)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "stream_id": stream_id,
+                        "meta": meta,
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
+            if op == "UNPIN_STREAM_CTX":
+                cid = str(cmd["ctx_id"])
+                stream_id = cmd.get("stream_id")
+                if stream_id is not None:
+                    with self._xfer_store_lock:
+                        self._stream_send_store.pop(str(stream_id), None)
+                fin_fn = getattr(self.adapter, "finish_stream_send", None)
+                if callable(fin_fn):
+                    fin_fn(cid, release_ctx=bool(cmd.get("release_ctx", False)))
+                elif bool(cmd.get("release_ctx", False)):
+                    self.adapter.release_context(cid)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
+            if op == "PREP_STREAM_RECV":
+                new_cid = str(cmd["new_ctx_id"])
+                meta = cmd["meta"]
+                chunk_bytes = max(1024, int(cmd.get("chunk_bytes", 64 * 1024 * 1024)))
+                prep_recv_fn = getattr(self.adapter, "prepare_stream_recv", None)
+                if not callable(prep_recv_fn):
+                    return self._emit_ack(
+                        {"cmd_id": cmd_id, "rank": self.rank, "status": "error", "error": "stream_recv_unsupported"}
+                    )
+                partial, views = prep_recv_fn(new_cid, meta)
+                alloc_ev = None
+                total_bytes = int(meta["total_bytes"])
+                if total_bytes > 0 and views and getattr(views[0], "is_cuda", False):
+                    need_cap = min(chunk_bytes, total_bytes)
+                    if self._xfer_recv_buf is None or int(self._xfer_recv_buf.numel()) < need_cap:
+                        try:
+                            if self.peer_mesh is not None and hasattr(self.peer_mesh, "alloc_recv_u8"):
+                                self._xfer_recv_buf = self.peer_mesh.alloc_recv_u8(need_cap)
+                            else:
+                                import torch
+
+                                self._xfer_recv_buf = torch.empty(
+                                    (need_cap,), dtype=torch.uint8, device=views[0].device
+                                )
+                        except BaseException:
+                            abort_fn = getattr(self.adapter, "abort_stream_recv", None)
+                            if callable(abort_fn):
+                                abort_fn(new_cid, partial)
+                            raise
+                    alloc_ev = _record_default_stream_event_if_cuda(self._xfer_recv_buf)
+                recv_id = f"srecv_{self.rank}_{cmd_id}"
+                with self._xfer_store_lock:
+                    self._stream_recv_store[recv_id] = (new_cid, partial, views, meta, alloc_ev)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "recv_id": recv_id,
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
+            if op == "DROP_STREAM_RECV":
+                recv_id = str(cmd["recv_id"])
+                with self._xfer_store_lock:
+                    entry = self._stream_recv_store.pop(recv_id, None)
+                if entry is not None:
+                    new_cid, partial, _views, _meta, _ev = entry
+                    abort_fn = getattr(self.adapter, "abort_stream_recv", None)
+                    if callable(abort_fn):
+                        abort_fn(new_cid, partial)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
+            if op == "COMMIT_STREAM_RECV":
+                recv_id = str(cmd["recv_id"])
+                with self._xfer_store_lock:
+                    new_cid, partial, views, meta, _ev = self._stream_recv_store.pop(recv_id)
+                del views
+                logical_b = self.adapter.commit_stream_recv(new_cid, partial, meta)
+                return self._emit_ack(
+                    {
+                        "cmd_id": cmd_id,
+                        "rank": self.rank,
+                        "status": "ok",
+                        "bytes": int(meta.get("logical_bytes", logical_b)),
+                        **self._telemetry_snapshot(),
+                    }
+                )
+
             if op == "PACK_CTX":
                 cid = str(cmd["ctx_id"])
                 packed = self.adapter.pack_state(cid, include_cfg_dup=bool(cmd.get("include_cfg_dup", False)))
@@ -602,6 +895,11 @@ class WorkerRuntime:
 
             if op == "RESET_SUITE":
                 self.oom_count = 0
+                with self._xfer_store_lock:
+                    self._stream_send_store.clear()
+                    self._stream_recv_store.clear()
+                self._xfer_send_buf = None
+                self._xfer_recv_buf = None
                 gc.collect()
                 _clear_cuda_cache_if_present()
                 if bool(cmd.get("reset_alpha", True)):

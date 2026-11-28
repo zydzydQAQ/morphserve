@@ -548,10 +548,14 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                     # Regime A (40 GiB unconstrained): keep Decoder 100% resident (`alpha=1.0`) alongside VLM.
                     init_alpha = 1.0
                 elif use_elastic_split:
-                    # Regime B (12 GiB constrained, >=2 GPUs): initialize even ranks VLM-hot (`alpha=0.0`)
-                    # and odd ranks Decoder-hot (`alpha=1.0`) so dual-path ships ~2-8 MiB bridges across
-                    # warm ranks while retaining full on-demand elastic morphing when demand shifts.
-                    init_alpha = 1.0 if (self.rank % 2 == 1) else 0.0
+                    # Regime B (12 GiB constrained, >=2 GPUs): match the ~1:3 VLM:Decoder compute demand
+                    # ratio on >=4 GPUs (1 VLM-hot rank per 4-GPU PCIe half-node: ranks 0, 4, ... at
+                    # alpha=0.0; remaining 75% ranks Decoder-hot at alpha=1.0) so dual-path ships compact
+                    # ~2-8 MiB bridges across intra-half warm ranks while retaining full elastic morphing.
+                    if int(self.policy.num_gpus) >= 4:
+                        init_alpha = 0.0 if (self.rank % 4 == 0) else 1.0
+                    else:
+                        init_alpha = 1.0 if (self.rank % 2 == 1) else 0.0
                     if not bool(plan["allow_overflow"]):
                         max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
                         max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))
@@ -707,7 +711,16 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
         prompt = str(cmd["prompt"])
         prep_dit = bool(cmd.get("prepare_for_dit", False))
         prev_ent = self._ctx_store.get(ctx_id)
-        history: list[tuple[str, str]] = list(prev_ent.get("history") or []) if prev_ent is not None else []
+        if prev_ent is not None:
+            history: list[tuple[str, str]] = list(prev_ent.get("history") or [])
+        elif cmd.get("vlm_history"):
+            history = [
+                (str(pair[0]), str(pair[1]))
+                for pair in cmd["vlm_history"]
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2
+            ]
+        else:
+            history = []
         images: list[Any] = list(prev_ent.get("images") or []) if prev_ent is not None else []
 
         use_prev = cmd.get("use_prev_image")
@@ -1230,8 +1243,17 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                 Path(save_tmp_path).parent.mkdir(parents=True, exist_ok=True)
                 pil_img.save(save_tmp_path, format="PNG")
         del imgs_t
+        queued_restore = 0
+        if self.pager is not None and self.vmm is not None and self.policy.use_scoped_vae:
+            restore_fn = getattr(self.pager, "restore_free_super_layers_async", None)
+            if callable(restore_fn):
+                queued_restore = int(restore_fn())
         self._update_hwm()
         self._maybe_empty_cache(min_unused_mib=256)
+
+        eff_alpha = self.resident_alpha()
+        if queued_restore > 0 and self.pager is not None and self.pager.num_layers > 0:
+            eff_alpha = min(1.0, eff_alpha + float(queued_restore) / float(self.pager.num_layers))
 
         return {
             "status": "ok",
@@ -1241,7 +1263,7 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
             "vae_ms": round(vae_ms, 2),
             "preempt_yield_ms": round(preempt_yield_ms, 2),
             "kv_bytes": int(entry.get("bridge_bytes", 0)),
-            "resident_alpha": self.resident_alpha(),
+            "resident_alpha": eff_alpha,
             "kv_free_bytes": self.available_kv_bytes(),
             "yield_count": int(yield_count),
         }

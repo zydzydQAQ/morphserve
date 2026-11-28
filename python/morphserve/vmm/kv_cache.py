@@ -1052,6 +1052,40 @@ class VmmNaiveCache:
         self._row_bytes[key] = max(1, int(row_bytes))
         return rid
 
+    def prealloc_layer_tensor(
+        self,
+        kind: str,
+        layer_idx: int,
+        shape: tuple[int, ...],
+        dtype: Any,
+    ) -> Any:
+        """Pre-map VMM Arena-1 backing pages for `(kind, layer_idx)` and return the writable layer view."""
+        assert _TORCH is not None
+        lidx = int(layer_idx)
+        key = (kind, lidx)
+        seq_l = int(shape[0]) if shape else 0
+        trailing = tuple(int(d) for d in shape[1:])
+        elem_sz = int(_TORCH.empty((), dtype=dtype).element_size())
+        row_elems = 1
+        for d in trailing:
+            row_elems *= int(d)
+        row_b = max(1, row_elems * elem_sz)
+        mp = self.key_cache if kind == "k" else self.value_cache
+        if self.vmm is None:
+            dev = f"cuda:{_TORCH.cuda.current_device()}" if _TORCH.cuda.is_available() else "cpu"
+            t = _TORCH.empty(shape, dtype=dtype, device=dev)
+            dict.__setitem__(mp, lidx, t)
+            self._lengths[key] = seq_l
+            return t
+        sample = _TORCH.empty((0,), dtype=dtype, device="cpu")
+        dev = f"cuda:{getattr(self.vmm, 'device', 0)}" if not getattr(self.vmm, "is_simulated", False) else "cpu"
+        stream_ptr = _stream_ptr_for_device(dev)
+        cap_view = self._get_or_grow_capacity_view(kind, lidx, max(1, seq_l), row_b, trailing, sample, stream_ptr)
+        view = self._tag_owner(cap_view[:seq_l])
+        dict.__setitem__(mp, lidx, view)
+        self._lengths[key] = seq_l
+        return view
+
     def _build_capacity_view(
         self,
         key: tuple[str, int],

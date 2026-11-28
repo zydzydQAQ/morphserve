@@ -1151,3 +1151,145 @@ def test_nccl_dual_oom_preserves_src_ctx_and_falls_back_to_in_place_path_b(tmp_p
         if fail_mode == "recv_oom":
             assert any(op == "DROP_PACKED_CTX" for _, op, _ in seen_ops)
             assert any(op == "RECLAIM_HEADROOM" for _, op, _ in seen_ops)
+
+
+def test_bagel_chunked_stream_views_bit_exact_across_odd_chunk_boundaries() -> None:
+    """Verify zero-OOM chunked BAGEL KV view scatter/gather matches pack/unpack bit-exactly across small odd chunks."""
+    torch = pytest.importorskip("torch")
+    from morphserve.models.bagel_adapter import (
+        BagelSessionContext,
+        collect_bagel_stream_views,
+        copy_chunk_to_views,
+        copy_views_to_chunk,
+        finalize_bagel_stream_recv,
+        prealloc_bagel_stream_recv,
+    )
+
+    class _SimpleCache:
+        def __init__(self, n_layers: int) -> None:
+            self.num_layers = n_layers
+            self.key_cache: dict[int, Any] = {i: None for i in range(n_layers)}
+            self.value_cache: dict[int, Any] = {i: None for i in range(n_layers)}
+
+    torch.manual_seed(42)
+    n_layers = 4
+    main_pkv = _SimpleCache(n_layers)
+    cfg_img_pkv = _SimpleCache(n_layers)
+    for lidx in range(n_layers):
+        main_pkv.key_cache[lidx] = torch.randn((19, 4, 32), dtype=torch.bfloat16)
+        main_pkv.value_cache[lidx] = torch.randn((19, 4, 32), dtype=torch.bfloat16)
+        cfg_img_pkv.key_cache[lidx] = torch.randn((7, 4, 32), dtype=torch.bfloat16)
+        cfg_img_pkv.value_cache[lidx] = torch.randn((7, 4, 32), dtype=torch.bfloat16)
+
+    last_u8 = torch.randint(0, 256, (3, 17, 23), dtype=torch.uint8)
+    sess = BagelSessionContext(
+        main_ctx={"kv_lens": [19], "ropes": [19], "past_key_values": main_pkv},
+        cfg_img_ctx={"kv_lens": [7], "ropes": [7], "past_key_values": cfg_img_pkv},
+        cfg_text_prefix_len=11,
+        last_img_u8=last_u8,
+    )
+    sess.cfg_text_ctx = {
+        "kv_lens": [11],
+        "ropes": [11],
+        "past_key_values": _SimpleCache(n_layers),
+    }
+    for lidx in range(n_layers):
+        sess.cfg_text_ctx["past_key_values"].key_cache[lidx] = main_pkv.key_cache[lidx][:11]
+        sess.cfg_text_ctx["past_key_values"].value_cache[lidx] = main_pkv.value_cache[lidx][:11]
+
+    meta, src_views = collect_bagel_stream_views(sess, include_cfg_text_dup=False, device=torch.device("cpu"))
+    total_b = int(meta["total_bytes"])
+    assert total_b > 4096
+
+    partial, dst_views = prealloc_bagel_stream_recv(meta, _SimpleCache, _SimpleCache, device=torch.device("cpu"))
+    chunk_b = 1537  # Intentionally odd non-aligned chunk size straddling multiple K/V tensors!
+    stage = torch.empty((chunk_b,), dtype=torch.uint8)
+    off = 0
+    while off < total_b:
+        n = min(chunk_b, total_b - off)
+        assert copy_views_to_chunk(src_views, off, stage[:n]) == n
+        assert copy_chunk_to_views(dst_views, off, stage[:n]) == n
+        off += n
+
+    restored = finalize_bagel_stream_recv(partial, meta, _SimpleCache, use_cow_rebind=True)
+    assert restored.main_ctx is not None and restored.cfg_img_ctx is not None and restored.cfg_text_ctx is not None
+    assert restored.last_img_u8 is not None and torch.equal(restored.last_img_u8, last_u8)
+    for lidx in range(n_layers):
+        assert torch.equal(restored.main_ctx["past_key_values"].key_cache[lidx], main_pkv.key_cache[lidx])
+        assert torch.equal(restored.main_ctx["past_key_values"].value_cache[lidx], main_pkv.value_cache[lidx])
+        assert torch.equal(restored.cfg_img_ctx["past_key_values"].key_cache[lidx], cfg_img_pkv.key_cache[lidx])
+        assert torch.equal(restored.cfg_img_ctx["past_key_values"].value_cache[lidx], cfg_img_pkv.value_cache[lidx])
+        assert torch.equal(restored.cfg_text_ctx["past_key_values"].key_cache[lidx], main_pkv.key_cache[lidx][:11])
+
+
+def test_bridge_mllm_dit_quota_constrained_decouples_vlm_from_decoder_ranks(tmp_path: Path) -> None:
+    """Under quota-constrained `bridge_mllm_dit`, Turn > 0 VLM turns re-route to VLM-hot ranks with exact `vlm_history`."""
+    pol = EnginePolicyConfig.from_preset(
+        "morphserve",
+        num_gpus=2,
+        model_family="synthetic",
+        cptg_arch_override="bridge_mllm_dit",
+        gpu_memory_quota_mib=12288.0,
+        inter_turn_think_s_range=(0.0, 0.0),
+    )
+    eng = MorphServeClusterEngine(
+        pol,
+        tmp_root=tmp_path / "bridge_decouple",
+        fleet=InProcessWorkerFleet(pol),
+    )
+    eng.start()
+    eng.router.set_worker_state_fields(0, expert_alpha=0.0, kv_free_bytes=8 * 1024**3)
+    eng.router.set_worker_state_fields(1, expert_alpha=1.0, kv_free_bytes=8 * 1024**3)
+
+    vlm_ops: list[tuple[int, str, Any]] = []
+    orig_rpc = eng._rpc
+
+    async def _intercept_rpc(rank: int, payload: dict[str, Any]) -> dict[str, Any]:
+        op = str(payload.get("op", ""))
+        if op in ("EXEC_AR", "PREP_DIT"):
+            vlm_ops.append((int(rank), op, payload.get("vlm_history")))
+        res = await orig_rpc(rank, payload)
+        # Keep simulated rank 0 VLM-hot (`alpha=0.0`) and rank 1 Decoder-hot (`alpha=1.0`).
+        if isinstance(res, dict) and "resident_alpha" in res:
+            res = dict(res, resident_alpha=(0.0 if rank == 0 else 1.0))
+        return res
+
+    eng._rpc = _intercept_rpc  # type: ignore[method-assign]
+    try:
+        suite = WorkloadSuite(
+            name="bridge_decouple_2turn",
+            trace_source="unit",
+            base_qps=1.0,
+            sessions=[
+                InterleavedSession(
+                    session_id="s_bridge_decouple",
+                    quadrant="interleaved_co_creation",
+                    source_dataset="unit",
+                    arrival_offset_s=0.0,
+                    turns=[
+                        InterleavedTurn(turn_idx=0, modality_plan="ar_only", prompt="describe apple", max_ar_tokens=2),
+                        InterleavedTurn(
+                            turn_idx=1,
+                            modality_plan="dit_t2i",
+                            prompt="draw red apple",
+                            height=512,
+                            width=512,
+                            dit_steps=2,
+                        ),
+                        InterleavedTurn(turn_idx=2, modality_plan="ar_only", prompt="review image", max_ar_tokens=2),
+                    ],
+                )
+            ],
+        )
+        rep = eng.run_suite(suite, target_qps=1.0)
+    finally:
+        eng.shutdown()
+
+    assert rep.completed_sessions == 1
+    assert rep.oom_sessions == 0
+    assert rep.error_sessions == 0
+    # Every VLM op (`EXEC_AR`, `PREP_DIT`) MUST execute on VLM-hot rank 0 (never thrash Decoder-hot rank 1)!
+    assert len(vlm_ops) == 3
+    assert all(rank == 0 for rank, _, _ in vlm_ops)
+    # Turn 2 (`EXEC_AR` after Turn 1 shipped to rank 1) MUST carry Turn 0's exact `vlm_history`!
+    assert vlm_ops[2][2] is not None and len(vlm_ops[2][2]) == 1 and vlm_ops[2][2][0][0] == "describe apple"

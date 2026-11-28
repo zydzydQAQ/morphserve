@@ -571,12 +571,35 @@ void TriPoolVMM::transient_free(void* ptr, ssize_t /*req_size*/, void* stream) {
 
 // ==================== Arena 1: KV Pages, Regions & Session Watermark Governance ====================
 
+size_t TriPoolVMM::missing_expert_handles_locked() const noexcept {
+    size_t missing = 0;
+    for (const auto& bank : experts_) {
+        for (const auto& lyr : bank.layers) {
+            if (lyr.state != LayerState::RESIDENT) {
+                missing += bank.handles_per_layer;
+            }
+        }
+    }
+    return missing;
+}
+
 uint64_t TriPoolVMM::pop_fine_handle_locked(
     void* stream,
     std::unique_lock<std::mutex>* opt_lock,
     int32_t exclude_region_id) {
     while (free_fine_handles_.empty()) {
-        if (!free_super_handles_.empty()) {
+        // Reclaim finished async swap-out fine pages first (zero CUDA driver ioctls, zero carving).
+        if (drain_one_queued_swap_out_locked()) {
+            continue;
+        }
+        const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
+        const bool can_grow_fine =
+            cfg_.allow_overflow && cfg_.max_pool_bytes > 0 && (cur_pool_b + min_gran_) <= cfg_.max_pool_bytes;
+        // Protect free 64 MiB super handles needed to restore evicted Arena-0 expert layers when safe
+        // fine-pool overflow headroom is available, avoiding Arena-0 super-handle theft & carve thrashing
+        // (while still carving genuinely idle super handles first when no expert layers are missing).
+        const size_t reserved_super = missing_expert_handles_locked();
+        if (!free_super_handles_.empty() && (free_super_handles_.size() > reserved_super || !can_grow_fine)) {
             const uint64_t super_h = free_super_handles_.back();
             free_super_handles_.pop_back();
             backend_->release_phys_handle(super_h, super_bytes_);
@@ -588,9 +611,6 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
             ++super_to_fine_carves_;
             break;
         }
-        if (drain_one_queued_swap_out_locked()) {
-            continue;
-        }
         if (opt_lock && has_finishing_swap_locked()) {
             cv_ready_.wait(*opt_lock, [&] { return !has_finishing_swap_locked() || stop_streamer_; });
             if (stop_streamer_) {
@@ -598,12 +618,9 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
             }
             continue;
         }
-        // When an explicit physical pool ceiling (`max_pool_bytes > 0`) is configured, grow the
-        // fine KV pool within that safe headroom BEFORE evicting resident Gen experts or
-        // synchronously swapping thinking KV regions to host RAM. (Free super handles were already
-        // carved above so idle Arena-0 handles are always consumed first.)
-        const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
-        if (cfg_.allow_overflow && cfg_.max_pool_bytes > 0 && (cur_pool_b + min_gran_) <= cfg_.max_pool_bytes) {
+        // Grow fine KV pool within safe max_pool_bytes headroom BEFORE evicting resident Gen experts or
+        // synchronously swapping thinking KV regions to host RAM.
+        if (can_grow_fine) {
             free_fine_handles_.push_back(backend_->create_phys_handle(min_gran_));
             ++fine_pool_total_;
             ++overflow_creates_;
@@ -2373,20 +2390,23 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
     void* stream,
     bool for_kv,
     int exclude_expert_id,
-    std::unique_lock<std::mutex>* opt_lock) {
+    std::unique_lock<std::mutex>* opt_lock,
+    bool for_transient) {
     while (true) {
         if (!free_super_handles_.empty()) {
             const uint64_t h = free_super_handles_.back();
             free_super_handles_.pop_back();
             return SuperSlot{h, {}};
         }
-        // Reuse excess carved fine pages as zero-allocation fine-to-super bundles by default;
-        // lazily coalesce back to a 64 MiB super handle only when overflow is enabled and free
-        // fine pages exceed a 2*sub_pages_ hysteresis margin above base_fine_pages_ (preventing
-        // carve<->coalesce thrashing and preserving strict-cap fine-to-super bundling).
+        // Reuse excess carved fine pages as zero-allocation fine-to-super bundles by default.
+        // Never coalesce fine->super for short-lived Arena-2 transient allocations (Scoped VAE),
+        // because `scope_end` returns those slots 150ms later and KV immediately carves them back
+        // (eliminating carve<->coalesce driver ioctl thrashing). For long-lived Arena-0 expert loads,
+        // coalesce only under a high 4*sub_pages_ hysteresis margin above base_fine_pages_.
         if (free_fine_handles_.size() >= base_fine_pages_ + sub_pages_) {
-            if (cfg_.allow_overflow &&
-                free_fine_handles_.size() >= base_fine_pages_ + 2 * sub_pages_ &&
+            if (!for_transient &&
+                cfg_.allow_overflow &&
+                free_fine_handles_.size() >= base_fine_pages_ + 4 * sub_pages_ &&
                 try_coalesce_fine_to_super_locked(1) > 0 &&
                 !free_super_handles_.empty()) {
                 const uint64_t h = free_super_handles_.back();
@@ -2413,6 +2433,13 @@ TriPoolVMM::SuperSlot TriPoolVMM::acquire_super_slot_locked(
                 ++overflow_creates_;
                 return SuperSlot{h, {}};
             }
+        }
+        // For short-lived Arena-2 transient allocations (Scoped VAE), borrow idle fine KV pages
+        // via zero-syscall fine-to-super bundling BEFORE evicting resident Arena-0 expert layers,
+        // since `scope_end` immediately returns every fine page to `free_fine_handles_` without
+        // causing `alpha < 1.0`, `post_evict` router penalties, or H2D pacer stalls.
+        if (for_transient && free_fine_handles_.size() >= sub_pages_) {
+            return pop_fine_bundle_locked();
         }
         if (evict_one_tail_expert_layer_locked(stream, for_kv, exclude_expert_id)) {
             continue;
@@ -2550,7 +2577,8 @@ void TriPoolVMM::extend_transient_mapped_locked(
     size_t mapped_now = 0;
     try {
         for (size_t i = 0; i < add_handles; ++i) {
-            acquired.push_back(acquire_super_slot_locked(stream, /*for_kv=*/false, /*exclude_expert_id=*/-1, opt_lock));
+            acquired.push_back(acquire_super_slot_locked(
+                stream, /*for_kv=*/false, /*exclude_expert_id=*/-1, opt_lock, /*for_transient=*/true));
         }
 
         const auto t0 = std::chrono::steady_clock::now();

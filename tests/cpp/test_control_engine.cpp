@@ -1149,6 +1149,33 @@ void test_gpu_wait_queue_scheduler() {
     MS_CHECK(d2.has_value() && d2->waiter_id == 32);
     const auto d3 = dom_sched.select_and_pop(q_dom, 5000.0, 8LL * kGiB);
     MS_CHECK(d3.has_value() && d3->waiter_id == 30);
+
+    // Session-SLO-aware 3-bucket priority (Autellix/Parrot):
+    // Bucket 0 (feasible + session_slo_intact, fewest remaining turns first)
+    // > Bucket 1 (feasible + prior turn missed, tightest slack EDF)
+    // > Bucket 2 (already expired, SRPT).
+    GpuWaitQueueScheduler sess_sched(GpuQueuePolicy{"memory_slack", 120000.0, 16});
+    std::vector<GpuQueueWaiter> q_sess = {
+        {40, 100.0, 1LL * kGiB, 5000.0, 11000.0, 1, 0, false, 1}, // Bucket 1: feasible slack=+1000, prior missed
+        {41, 110.0, 1LL * kGiB, 5000.0, 15000.0, 1, 0, true, 3},  // Bucket 0: feasible slack=+5000, intact, 3 rem
+        {42, 120.0, 1LL * kGiB, 5000.0, 18000.0, 1, 0, true, 1},  // Bucket 0: feasible slack=+8000, intact, 1 rem
+        {43, 130.0, 1LL * kGiB, 3000.0, 6000.0, 1, 0, true, 1},   // Bucket 2: expired slack=-2000
+    };
+    const auto s1 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    MS_CHECK(s1.has_value() && s1->waiter_id == 42);
+    const auto s2 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    MS_CHECK(s2.has_value() && s2->waiter_id == 41);
+    const auto s3 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    MS_CHECK(s3.has_value() && s3->waiter_id == 40);
+    const auto s4 = sess_sched.select_and_pop(q_sess, 5000.0, 8LL * kGiB);
+    MS_CHECK(s4.has_value() && s4->waiter_id == 43);
+
+    // JSON roundtrip & backward-compatible defaults for session_slo_intact / remaining_turns.
+    const GpuQueueWaiter w_rt = GpuQueueWaiter::from_json(
+        GpuQueueWaiter{99, 10.0, 2LL * kGiB, 100.0, 500.0, 1, 0, false, 3}.to_json());
+    MS_CHECK(w_rt.session_slo_intact == false && w_rt.remaining_turns == 3);
+    const GpuQueueWaiter w_legacy = GpuQueueWaiter::from_json(nlohmann::json{{"waiter_id", 7}});
+    MS_CHECK(w_legacy.session_slo_intact == true && w_legacy.remaining_turns == 1);
 }
 
 }  // namespace

@@ -353,6 +353,8 @@ class MemorySlackGpuLock:
         est_exec_ms: float = 0.0,
         slo_deadline_ms: float = 0.0,
         op_priority: int = 1,
+        session_slo_intact: bool = True,
+        remaining_turns: int = 1,
     ) -> bool:
         if not self._locked and not self._waiters:
             self._locked = True
@@ -368,6 +370,8 @@ class MemorySlackGpuLock:
             "slo_deadline_ms": float(max(0.0, slo_deadline_ms)),
             "op_priority": int(op_priority),
             "bypass_count": 0,
+            "session_slo_intact": bool(session_slo_intact),
+            "remaining_turns": int(max(1, remaining_turns)),
         }
         entry = (spec, fut)
         self._waiters.append(entry)
@@ -484,6 +488,8 @@ class MorphServeClusterEngine:
         self.host_shmem_delta_gib = 0.0
         self._image_res_cache: dict[str, int] = {}
         self._pending_bg_releases: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._nccl_stream_threshold_bytes: int = 64 * MIB
+        self._nccl_stream_chunk_bytes: int = 64 * MIB
 
     def _probe_image_max_edge(self, rel_path: str, fallback: int = 512) -> int:
         key = str(rel_path)
@@ -658,6 +664,41 @@ class MorphServeClusterEngine:
                     self._pending_bg_releases.pop(key, None)
 
         task = asyncio.create_task(_do_release())
+        self._pending_bg_releases[key] = task
+
+    def _schedule_bg_unpin_stream_ctx(
+        self,
+        rank: int,
+        ctx_id: str,
+        *,
+        stream_id: str | None = None,
+        release_ctx: bool = False,
+    ) -> None:
+        key = (int(rank), str(ctx_id))
+        prev = self._pending_bg_releases.get(key)
+
+        async def _do_unpin() -> None:
+            if prev is not None and not prev.done():
+                try:
+                    await prev
+                except Exception:
+                    pass
+            try:
+                payload: dict[str, Any] = {
+                    "op": "UNPIN_STREAM_CTX",
+                    "ctx_id": str(ctx_id),
+                    "release_ctx": bool(release_ctx),
+                }
+                if stream_id is not None:
+                    payload["stream_id"] = str(stream_id)
+                await self._rpc(int(rank), payload)
+            except Exception:
+                pass
+            finally:
+                if self._pending_bg_releases.get(key) is task:
+                    self._pending_bg_releases.pop(key, None)
+
+        task = asyncio.create_task(_do_unpin())
         self._pending_bg_releases[key] = task
 
     async def _await_bg_release_ctx(self, rank: int, ctx_id: str) -> None:
@@ -866,6 +907,10 @@ class MorphServeClusterEngine:
         prepare_for_dit: bool,
         use_prev_image: bool = False,
         prev_image_path: str | None = None,
+        *,
+        vlm_history: list[list[str]] | None = None,
+        session_slo_intact: bool = True,
+        remaining_turns: int = 1,
     ) -> tuple[dict[str, Any], bool]:
         """Dispatch AR via mid-DiT preemption OR continuous-batched `EXEC_AR` without single-AR lock serialization."""
         can_preempt = (
@@ -877,20 +922,20 @@ class MorphServeClusterEngine:
             self._active_preemptions[resident_gpu] += 1
             self.router.set_colocated_ar_count(resident_gpu, self._active_preemptions[resident_gpu])
             try:
-                ar_res = await self._rpc(
-                    resident_gpu,
-                    {
-                        "op": "EXEC_AR_PREEMPT",
-                        "ctx_id": ctx_id,
-                        "prompt": turn.prompt,
-                        "image_paths": turn.image_paths,
-                        "use_prev_image": bool(use_prev_image),
-                        "prev_image_path": prev_image_path,
-                        "max_ar_tokens": turn.max_ar_tokens,
-                        "tpot_slo_ms": eff_policy.ar_tpot_slo_ms,
-                        "prepare_for_dit": prepare_for_dit,
-                    },
-                )
+                preempt_cmd: dict[str, Any] = {
+                    "op": "EXEC_AR_PREEMPT",
+                    "ctx_id": ctx_id,
+                    "prompt": turn.prompt,
+                    "image_paths": turn.image_paths,
+                    "use_prev_image": bool(use_prev_image),
+                    "prev_image_path": prev_image_path,
+                    "max_ar_tokens": turn.max_ar_tokens,
+                    "tpot_slo_ms": eff_policy.ar_tpot_slo_ms,
+                    "prepare_for_dit": prepare_for_dit,
+                }
+                if vlm_history:
+                    preempt_cmd["vlm_history"] = vlm_history
+                ar_res = await self._rpc(resident_gpu, preempt_cmd)
             finally:
                 self._active_preemptions[resident_gpu] = max(0, self._active_preemptions[resident_gpu] - 1)
                 self.router.set_colocated_ar_count(resident_gpu, self._active_preemptions[resident_gpu])
@@ -919,6 +964,8 @@ class MorphServeClusterEngine:
                     est_exec_ms=est_ar_ms,
                     slo_deadline_ms=ar_dl_ms,
                     op_priority=0,
+                    session_slo_intact=session_slo_intact,
+                    remaining_turns=remaining_turns,
                 )
                 try:
                     coord_queue_wait_ms = max(0.0, (time.perf_counter() - t_enq) * 1000.0)
@@ -931,19 +978,19 @@ class MorphServeClusterEngine:
                 self._inflight_ar_on_gpu[resident_gpu] = self._inflight_ar_on_gpu.get(resident_gpu, 0) + 1
                 self._ar_drained_events[resident_gpu].clear()
             try:
-                ar_res = await self._rpc(
-                    resident_gpu,
-                    {
-                        "op": "EXEC_AR",
-                        "ctx_id": ctx_id,
-                        "prompt": turn.prompt,
-                        "image_paths": turn.image_paths,
-                        "use_prev_image": bool(use_prev_image),
-                        "prev_image_path": prev_image_path,
-                        "max_ar_tokens": turn.max_ar_tokens,
-                        "prepare_for_dit": prepare_for_dit,
-                    },
-                )
+                ar_cmd: dict[str, Any] = {
+                    "op": "EXEC_AR",
+                    "ctx_id": ctx_id,
+                    "prompt": turn.prompt,
+                    "image_paths": turn.image_paths,
+                    "use_prev_image": bool(use_prev_image),
+                    "prev_image_path": prev_image_path,
+                    "max_ar_tokens": turn.max_ar_tokens,
+                    "prepare_for_dit": prepare_for_dit,
+                }
+                if vlm_history:
+                    ar_cmd["vlm_history"] = vlm_history
+                ar_res = await self._rpc(resident_gpu, ar_cmd)
             finally:
                 rem = max(0, self._inflight_ar_on_gpu.get(resident_gpu, 1) - 1)
                 self._inflight_ar_on_gpu[resident_gpu] = rem
@@ -968,6 +1015,8 @@ class MorphServeClusterEngine:
         est_exec_ms: float = 0.0,
         slo_deadline_ms: float = 0.0,
         op_priority: int = 1,
+        session_slo_intact: bool = True,
+        remaining_turns: int = 1,
     ) -> None:
         """Acquire exclusive GPU lock via C++ Memory+Slack scheduler after standalone AR drains."""
         await self._gpu_locks[gpu].acquire(
@@ -975,6 +1024,8 @@ class MorphServeClusterEngine:
             est_exec_ms=est_exec_ms,
             slo_deadline_ms=slo_deadline_ms,
             op_priority=op_priority,
+            session_slo_intact=session_slo_intact,
+            remaining_turns=remaining_turns,
         )
         try:
             await self._ar_drained_events[gpu].wait()
@@ -994,24 +1045,241 @@ class MorphServeClusterEngine:
         release_src_ctx: bool = True,
         defer_src_release: bool = False,
         src_lock_held: bool = False,
+        est_state_bytes: int = 0,
         dst_est_mem_bytes: int = 0,
         dst_est_exec_ms: float = 0.0,
         dst_slo_deadline_ms: float = 0.0,
         dst_op_priority: int = 1,
+        dst_session_slo_intact: bool = True,
+        dst_remaining_turns: int = 1,
     ):
-        """Async context manager executing decoupled NCCL pack->send->recv->unpack while owning lock/semaphore lifetime.
+        """Async context manager executing decoupled NCCL transfer while owning lock/semaphore lifetime.
 
-        When `src_lock_held=True`, ownership of the caller's held `_gpu_locks[src_gpu]` transfers here and is
-        guaranteed released immediately after `PACK_CTX` completes (zero extra `src_gpu` queue wait).
-        When `defer_src_release=True` (used for `nccl_dual`), `PACK_CTX` leaves `ctx_id` intact on `src_gpu`
-        until `UNPACK_CTX` succeeds on `dst_gpu`, so any staging OOM preserves `src_gpu` KV for seamless
-        in-place Path-B fallback instead of killing the session.
-        When `ship["status"] == "ok"`, `_gpu_locks[dst_gpu]` remains exclusively held for the body so callers
-        may run `EXEC_DIT` atomically right after `UNPACK_CTX` without releasing/reacquiring the GPU lock.
-        All staging semaphores, destination locks, and temporary buffers are guaranteed released on exit.
+        For large tight_mot KV contexts (`est_state_bytes > self._nccl_stream_threshold_bytes`), uses
+        zero-OOM bounded-chunk streaming (`<= 64 MiB` peak staging VRAM on both src and dst) and acquires
+        `_gpu_locks[dst_gpu]` before destination allocation so giant recv buffers never collide with active DiT/VAE.
+        For compact bridges / small payloads (`<= 64 MiB`), retains the pipelined single-shot path.
         """
         src_queue_ms = 0.0
         t_pack0 = 0.0
+        use_chunked_stream = bool(
+            int(est_state_bytes) > int(self._nccl_stream_threshold_bytes)
+            and self.policy.cptg_architecture == "tight_mot"
+        )
+        if use_chunked_stream:
+            chunk_b = int(self._nccl_stream_chunk_bytes)
+            if src_lock_held:
+                src_lock_held = False
+                try:
+                    self._ensure_async_primitives()
+                    t_pack0 = time.perf_counter()
+                    pin_res = await self._rpc(
+                        src_gpu,
+                        {
+                            "op": "PIN_STREAM_CTX",
+                            "ctx_id": ctx_id,
+                            "include_cfg_dup": include_cfg_dup,
+                            "chunk_bytes": chunk_b,
+                        },
+                    )
+                    pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
+                finally:
+                    self._gpu_locks[src_gpu].release()
+            else:
+                self._ensure_async_primitives()
+                t_src_q0 = time.perf_counter()
+                await self._acquire_exclusive_gpu(
+                    src_gpu,
+                    est_mem_bytes=0,
+                    est_exec_ms=default_operator_profile().prep_overhead_ms,
+                    slo_deadline_ms=dst_slo_deadline_ms,
+                    op_priority=0,
+                    session_slo_intact=dst_session_slo_intact,
+                    remaining_turns=dst_remaining_turns,
+                )
+                src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
+                t_pack0 = time.perf_counter()
+                try:
+                    pin_res = await self._rpc(
+                        src_gpu,
+                        {
+                            "op": "PIN_STREAM_CTX",
+                            "ctx_id": ctx_id,
+                            "include_cfg_dup": include_cfg_dup,
+                            "chunk_bytes": chunk_b,
+                        },
+                    )
+                    pack_ms = max(0.0, (time.perf_counter() - t_pack0) * 1000.0)
+                finally:
+                    self._gpu_locks[src_gpu].release()
+
+            if pin_res.get("error") != "stream_send_unsupported":
+                if pin_res.get("status") != "ok":
+                    yield dict(
+                        pin_res,
+                        packed_ok=False,
+                        src_ctx_preserved=True,
+                        src_ctx_released=False,
+                    )
+                    return
+
+                stream_id = str(pin_res["stream_id"])
+                meta = pin_res["meta"]
+                wire_bytes = int(meta["total_bytes"])
+                logical_bytes = int(meta.get("logical_bytes", wire_bytes))
+                holding_dst_lock = False
+                recv_id: str | None = None
+                stream_consumed = False
+                stream_unpinned = False
+                try:
+                    t_dq0 = time.perf_counter()
+                    await self._acquire_exclusive_gpu(
+                        dst_gpu,
+                        est_mem_bytes=dst_est_mem_bytes,
+                        est_exec_ms=dst_est_exec_ms,
+                        slo_deadline_ms=dst_slo_deadline_ms,
+                        op_priority=dst_op_priority,
+                        session_slo_intact=dst_session_slo_intact,
+                        remaining_turns=dst_remaining_turns,
+                    )
+                    t_dst_q_acc = max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
+                    holding_dst_lock = True
+                    await self._await_bg_release_ctx(dst_gpu, new_ctx_id)
+
+                    t_prep0 = time.perf_counter()
+                    prep_res = await self._rpc(
+                        dst_gpu,
+                        {
+                            "op": "PREP_STREAM_RECV",
+                            "new_ctx_id": new_ctx_id,
+                            "meta": meta,
+                            "chunk_bytes": chunk_b,
+                        },
+                    )
+                    if prep_res.get("status") == "oom":
+                        await self._rpc(
+                            dst_gpu,
+                            {"op": "RECLAIM_HEADROOM", "needed_bytes": int(logical_bytes) + 512 * MIB},
+                        )
+                        prep_res = await self._rpc(
+                            dst_gpu,
+                            {
+                                "op": "PREP_STREAM_RECV",
+                                "new_ctx_id": new_ctx_id,
+                                "meta": meta,
+                                "chunk_bytes": chunk_b,
+                            },
+                        )
+                    if prep_res.get("status") != "ok":
+                        yield {
+                            "status": "oom",
+                            "packed_ok": False,
+                            "src_ctx_preserved": True,
+                            "src_ctx_released": False,
+                            "error": prep_res.get("error", "prep_stream_recv_oom"),
+                            "kv_free_bytes": prep_res.get("kv_free_bytes"),
+                            "telemetry_seq": prep_res.get("telemetry_seq"),
+                        }
+                        return
+
+                    recv_id = str(prep_res["recv_id"])
+                    lo, hi = (src_gpu, dst_gpu) if src_gpu < dst_gpu else (dst_gpu, src_gpu)
+                    t_xf0 = time.perf_counter()
+                    async with self._xfer_locks[lo]:
+                        async with self._xfer_locks[hi]:
+                            s_res, r_res = await asyncio.gather(
+                                self._rpc(
+                                    src_gpu,
+                                    {
+                                        "op": "STREAM_SEND_NCCL",
+                                        "stream_id": stream_id,
+                                        "dst_rank": dst_gpu,
+                                        "chunk_bytes": chunk_b,
+                                    },
+                                ),
+                                self._rpc(
+                                    dst_gpu,
+                                    {
+                                        "op": "STREAM_RECV_NCCL",
+                                        "src_rank": src_gpu,
+                                        "recv_id": recv_id,
+                                        "chunk_bytes": chunk_b,
+                                    },
+                                ),
+                            )
+                            stream_consumed = True
+                    xfer_wall_ms = max(0.0, (time.perf_counter() - t_xf0) * 1000.0)
+                    if s_res.get("status") != "ok" or r_res.get("status") != "ok":
+                        yield {
+                            "status": "oom",
+                            "packed_ok": True,
+                            "src_ctx_preserved": True,
+                            "src_ctx_released": False,
+                            "error": "nccl_stream_xfer_oom",
+                        }
+                        return
+
+                    ship_ms = max(float(s_res.get("ship_ms", 0.0)), float(r_res.get("ship_ms", 0.0)))
+                    t_com0 = time.perf_counter()
+                    c_res = await self._rpc(dst_gpu, {"op": "COMMIT_STREAM_RECV", "recv_id": recv_id})
+                    commit_ms = max(0.0, (time.perf_counter() - t_com0) * 1000.0) + max(
+                        0.0, (t_xf0 - t_prep0) * 1000.0
+                    )
+                    recv_id = None
+                    if c_res.get("status") != "ok":
+                        yield {
+                            "status": "oom",
+                            "packed_ok": True,
+                            "src_ctx_preserved": True,
+                            "src_ctx_released": False,
+                            "error": c_res.get("error", "commit_stream_recv_oom"),
+                            "kv_free_bytes": c_res.get("kv_free_bytes"),
+                            "telemetry_seq": c_res.get("telemetry_seq"),
+                        }
+                        return
+
+                    self._schedule_bg_unpin_stream_ctx(
+                        src_gpu,
+                        ctx_id,
+                        stream_id=None,
+                        release_ctx=bool(release_src_ctx),
+                    )
+                    stream_unpinned = True
+                    yield {
+                        "status": "ok",
+                        "packed_ok": True,
+                        "src_ctx_preserved": False,
+                        "src_ctx_released": bool(release_src_ctx),
+                        "ship_ms": ship_ms,
+                        "kv_transfer_ms": round(pack_ms + max(ship_ms, xfer_wall_ms) + commit_ms, 2),
+                        "queue_ms": round(src_queue_ms + t_dst_q_acc, 2),
+                        "bytes": logical_bytes,
+                        "kv_free_bytes": c_res.get("kv_free_bytes"),
+                        "telemetry_seq": c_res.get("telemetry_seq"),
+                    }
+                    return
+                finally:
+                    if recv_id is not None:
+                        try:
+                            await self._rpc(dst_gpu, {"op": "DROP_STREAM_RECV", "recv_id": recv_id})
+                        except Exception:
+                            pass
+                    if not stream_unpinned:
+                        try:
+                            await self._rpc(
+                                src_gpu,
+                                {
+                                    "op": "UNPIN_STREAM_CTX",
+                                    "ctx_id": ctx_id,
+                                    "stream_id": (None if stream_consumed else stream_id),
+                                    "release_ctx": False,
+                                },
+                            )
+                        except Exception:
+                            pass
+                    if holding_dst_lock:
+                        self._gpu_locks[dst_gpu].release()
+
         pack_release_flag = bool(release_src_ctx and not defer_src_release)
         if src_lock_held:
             try:
@@ -1038,6 +1306,8 @@ class MorphServeClusterEngine:
                 est_exec_ms=default_operator_profile().prep_overhead_ms,
                 slo_deadline_ms=dst_slo_deadline_ms,
                 op_priority=0,
+                session_slo_intact=dst_session_slo_intact,
+                remaining_turns=dst_remaining_turns,
             )
             src_queue_ms = max(0.0, (time.perf_counter() - t_src_q0) * 1000.0)
             t_pack0 = time.perf_counter()
@@ -1076,7 +1346,7 @@ class MorphServeClusterEngine:
         t_dst_q_acc += max(0.0, (time.perf_counter() - t_sem0) * 1000.0)
         holding_sem = True
         holding_dst_lock = False
-        recv_id: str | None = None
+        recv_id = None
         packed_consumed = False
         try:
             alloc_res = await self._rpc(dst_gpu, {"op": "ALLOC_RECV_BUF", "nbytes": wire_bytes, "probe_only": True})
@@ -1089,6 +1359,8 @@ class MorphServeClusterEngine:
                         est_exec_ms=dst_est_exec_ms,
                         slo_deadline_ms=dst_slo_deadline_ms,
                         op_priority=dst_op_priority,
+                        session_slo_intact=dst_session_slo_intact,
+                        remaining_turns=dst_remaining_turns,
                     )
                     t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq0) * 1000.0)
                     holding_dst_lock = True
@@ -1143,6 +1415,8 @@ class MorphServeClusterEngine:
                     est_exec_ms=dst_est_exec_ms,
                     slo_deadline_ms=dst_slo_deadline_ms,
                     op_priority=dst_op_priority,
+                    session_slo_intact=dst_session_slo_intact,
+                    remaining_turns=dst_remaining_turns,
                 )
                 t_dst_q_acc += max(0.0, (time.perf_counter() - t_dq1) * 1000.0)
                 holding_dst_lock = True
@@ -1458,6 +1732,15 @@ class MorphServeClusterEngine:
         sess_vae_ms = 0.0
         sess_preempt_yield_ms = 0.0
         is_tight_mot = eff_policy.cptg_architecture == "tight_mot"
+        is_quota_constrained = bool(
+            (getattr(eff_policy, "gpu_memory_quota_mib", None) or 0.0) > 0.0
+            or (
+                getattr(eff_policy, "gpu_memory_fraction", None) is not None
+                and float(getattr(eff_policy, "gpu_memory_fraction")) < 0.999
+            )
+        )
+        session_slo_intact = True
+        bridge_history: list[list[str]] = []
         cur_turn_idx = 0
         cur_turn_plan = ""
         cur_turn_height = 0
@@ -1587,14 +1870,32 @@ class MorphServeClusterEngine:
                 has_future_prev_image = any(
                     bool(t.use_prev_image) or (t.modality_plan == "dit_edit") for t in sess.turns[ti + 1 :]
                 )
+                rem_turns = max(1, planned_turns - ti)
 
                 attempt = 0
                 while True:
+                    # On quota-constrained `bridge_mllm_dit` (InternVL-U Regime B) where VLM and Decoder
+                    # share `super_pool` mutually exclusively, never run Turn > 0 VLM (`ar_only` / `PREP_DIT`)
+                    # on a Decoder-hot rank (which would evict all 20 Decoder layers and thrash both stages).
+                    # Re-route to a VLM-hot rank while preserving exact text `bridge_history` + `prev_tmp_img`.
+                    if (
+                        (not is_tight_mot)
+                        and is_quota_constrained
+                        and eff_policy.routing_mode == "dual_path"
+                        and resident_gpu is not None
+                        and self.router.get_worker_state(resident_gpu).expert_alpha > 0.01
+                    ):
+                        if src_ctx_alive:
+                            self._schedule_bg_release_ctx(resident_gpu, ctx_id)
+                            src_ctx_alive = False
+                        resident_gpu = self._pick_initial_gpu(eff_policy, plan)
                     if resident_gpu is None:
                         resident_gpu = self._pick_initial_gpu(eff_policy, plan)
+                    await self._await_bg_release_ctx(resident_gpu, ctx_id)
                     eff_prev_img = (
                         (None if (is_tight_mot and src_ctx_alive) else prev_tmp_img) if turn_use_prev_image else None
                     )
+                    eff_vlm_hist = bridge_history if ((not is_tight_mot) and bridge_history) else None
 
                     # ---- Branch 1: Pure AR turn (VQA) ----
                     if plan == "ar_only":
@@ -1606,6 +1907,9 @@ class MorphServeClusterEngine:
                             prepare_for_dit=False,
                             use_prev_image=turn_use_prev_image,
                             prev_image_path=eff_prev_img,
+                            vlm_history=eff_vlm_hist,
+                            session_slo_intact=session_slo_intact,
+                            remaining_turns=rem_turns,
                         )
                         if ar_res["status"] == "oom":
                             src_ctx_alive = False
@@ -1649,7 +1953,19 @@ class MorphServeClusterEngine:
                         ar_turn_has_image.append(turn_has_image)
                         ar_turn_num_images.append(turn_num_images)
                         ar_turn_image_res.append(turn_image_res)
-                        ar_texts.append(str(ar_res.get("text", "")))
+                        ar_text_out = str(ar_res.get("text", ""))
+                        ar_texts.append(ar_text_out)
+                        if not is_tight_mot:
+                            bridge_history.append([str(turn.prompt), ar_text_out])
+                        if session_slo_intact:
+                            ar_ttft_cap = eff_policy.ar_ttft_slo_for(
+                                has_image=turn_has_image,
+                                num_images=turn_num_images,
+                                image_res=(turn_image_res if turn_image_res > 0 else 512),
+                            )
+                            tpot_p95_cur = _percentile(turn_tpots, 95.0) if turn_tpots else 0.0
+                            if turn_ttft > ar_ttft_cap or tpot_p95_cur > float(eff_policy.ar_tpot_slo_ms):
+                                session_slo_intact = False
                         turn_records.append(
                             {
                                 "turn_idx": int(ti),
@@ -1706,6 +2022,9 @@ class MorphServeClusterEngine:
                             prepare_for_dit=True,
                             use_prev_image=turn_use_prev_image,
                             prev_image_path=eff_prev_img,
+                            vlm_history=eff_vlm_hist,
+                            session_slo_intact=session_slo_intact,
+                            remaining_turns=rem_turns,
                         )
                         if cot_res["status"] == "oom":
                             src_ctx_alive = False
@@ -1746,6 +2065,15 @@ class MorphServeClusterEngine:
                         ar_turn_num_images.append(turn_num_images)
                         ar_turn_image_res.append(turn_image_res)
                         cot_text_pending = str(cot_res.get("text", ""))
+                        if session_slo_intact:
+                            cot_ttft_cap = eff_policy.ar_ttft_slo_for(
+                                has_image=turn_has_image,
+                                num_images=turn_num_images,
+                                image_res=(turn_image_res if turn_image_res > 0 else 512),
+                            )
+                            cot_tpot_p95 = _percentile(turn_ar_tpots, 95.0) if turn_ar_tpots else 0.0
+                            if turn_ar_ttft > cot_ttft_cap or cot_tpot_p95 > float(eff_policy.ar_tpot_slo_ms):
+                                session_slo_intact = False
                         t_dit0 = time.perf_counter()
                     else:
                         est_prep_ms = default_operator_profile().prep_overhead_ms
@@ -1759,25 +2087,27 @@ class MorphServeClusterEngine:
                                 est_exec_ms=est_prep_ms,
                                 slo_deadline_ms=prep_dl_ms,
                                 op_priority=1,
+                                session_slo_intact=session_slo_intact,
+                                remaining_turns=rem_turns,
                             )
                             holding_src_lock = True
                             held_src_gpu = resident_gpu
                             turn_q_ms += max(0.0, (time.perf_counter() - t_pq0) * 1000.0)
                             try:
-                                prep_res = await self._rpc(
-                                    resident_gpu,
-                                    {
-                                        "op": "PREP_DIT",
-                                        "ctx_id": ctx_id,
-                                        "prompt": turn.prompt,
-                                        "height": turn.height,
-                                        "width": turn.width,
-                                        "image_paths": eff_prep_img_paths,
-                                        "use_prev_image": turn_use_prev_image,
-                                        "prev_image_path": eff_prev_img,
-                                        "prepare_for_dit": True,
-                                    },
-                                )
+                                prep_cmd: dict[str, Any] = {
+                                    "op": "PREP_DIT",
+                                    "ctx_id": ctx_id,
+                                    "prompt": turn.prompt,
+                                    "height": turn.height,
+                                    "width": turn.width,
+                                    "image_paths": eff_prep_img_paths,
+                                    "use_prev_image": turn_use_prev_image,
+                                    "prev_image_path": eff_prev_img,
+                                    "prepare_for_dit": True,
+                                }
+                                if eff_vlm_hist:
+                                    prep_cmd["vlm_history"] = eff_vlm_hist
+                                prep_res = await self._rpc(resident_gpu, prep_cmd)
                             except BaseException:
                                 holding_src_lock = False
                                 self._gpu_locks[held_src_gpu].release()
@@ -1859,7 +2189,10 @@ class MorphServeClusterEngine:
                     elif (
                         has_future_prev_image
                         and (not is_tight_mot)
-                        and eff_policy.routing_mode in ("twostage_shm", "static_nccl_fission")
+                        and (
+                            eff_policy.routing_mode in ("twostage_shm", "static_nccl_fission")
+                            or (is_quota_constrained and eff_policy.routing_mode == "dual_path")
+                        )
                     ):
                         save_tmp = str(self.tmp_root / f"{sess.session_id}_t{ti}.png")
                         owned_tmp_imgs.append(save_tmp)
@@ -1881,10 +2214,13 @@ class MorphServeClusterEngine:
                                 release_src_ctx=release_src_on_fwd,
                                 defer_src_release=(ship_mode == "nccl_dual"),
                                 src_lock_held=pass_src_lock,
+                                est_state_bytes=kv_bytes,
                                 dst_est_mem_bytes=est_dit_mem_b,
                                 dst_est_exec_ms=est_dit_ms,
                                 dst_slo_deadline_ms=dit_dl_ms,
                                 dst_op_priority=1,
+                                dst_session_slo_intact=session_slo_intact,
+                                dst_remaining_turns=rem_turns,
                             ) as ship:
                                 if release_src_on_fwd and ship.get("src_ctx_released", ship.get("packed_ok")):
                                     src_ctx_alive = False
@@ -1942,6 +2278,8 @@ class MorphServeClusterEngine:
                                     est_exec_ms=est_dit_ms,
                                     slo_deadline_ms=dit_dl_ms,
                                     op_priority=1,
+                                    session_slo_intact=session_slo_intact,
+                                    remaining_turns=rem_turns,
                                 )
                                 turn_q_ms += max(0.0, (time.perf_counter() - t_dq_fb) * 1000.0)
                                 try:
@@ -2009,6 +2347,7 @@ class MorphServeClusterEngine:
                                         and (
                                             turn.height >= 1024
                                             or is_expired_turn
+                                            or (not session_slo_intact)
                                             or est_dit_mem_b > self._free_mem_bytes_for_gpu(dst_gpu)
                                         )
                                     )
@@ -2030,6 +2369,8 @@ class MorphServeClusterEngine:
                                         est_exec_ms=est_dit_ms,
                                         slo_deadline_ms=dit_dl_ms,
                                         op_priority=1,
+                                        session_slo_intact=session_slo_intact,
+                                        remaining_turns=rem_turns,
                                     )
                                     turn_q_ms += max(0.0, (time.perf_counter() - t_dq_dit) * 1000.0)
                                 try:
@@ -2066,6 +2407,7 @@ class MorphServeClusterEngine:
                                     ctx_id,
                                     include_cfg_dup=False,
                                     release_src_ctx=True,
+                                    est_state_bytes=ret_kv_b,
                                 ) as rs:
                                     ret_ship = dict(rs)
                             else:
@@ -2138,6 +2480,8 @@ class MorphServeClusterEngine:
 
                     if cot_text_pending is not None:
                         ar_texts.append(cot_text_pending)
+                        if not is_tight_mot:
+                            bridge_history.append([str(turn.prompt), cot_text_pending])
                     self._sync_worker_telemetry(dst_gpu, dit_res)
                     total_yields += int(dit_res.get("yield_count", 0))
                     if not needs_return_ship:
@@ -2160,6 +2504,8 @@ class MorphServeClusterEngine:
 
                     last_generated_res = max(int(turn.height), int(turn.width))
                     dit_ms = (time.perf_counter() - t_dit0) * 1000.0
+                    if session_slo_intact and dit_ms > eff_policy.dit_turn_slo_for(turn.height, turn.dit_steps):
+                        session_slo_intact = False
                     dit_turns.append(dit_ms)
                     dit_heights.append(int(turn.height))
                     dit_steps_list.append(int(turn.dit_steps))

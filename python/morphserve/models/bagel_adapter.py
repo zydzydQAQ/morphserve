@@ -264,8 +264,18 @@ def pack_bagel_kv_context(
         if any_cuda and cuda_dev is not None:
             torch.cuda.current_stream(cuda_dev).synchronize()
     else:
-        chunks = [t.to(device).contiguous().view(torch.uint8).reshape(-1) for t in tensors]
-        flat = torch.cat(chunks, dim=0) if chunks else torch.empty((0,), dtype=torch.uint8, device=device)
+        target_dev = torch.device(device)
+        flat = torch.empty((total_bytes,), dtype=torch.uint8, device=target_dev)
+        cursor = 0
+        for t in tensors:
+            src = t.detach()
+            if src.device != target_dev:
+                src = src.to(target_dev)
+            src_u8 = src.contiguous().view(torch.uint8).reshape(-1)
+            nb = int(src_u8.numel())
+            if nb > 0:
+                flat[cursor : cursor + nb].copy_(src_u8)
+                cursor += nb
 
     meta = {
         "num_layers": num_layers,
@@ -289,6 +299,7 @@ def unpack_bagel_kv_context(
 
     num_layers = int(meta["num_layers"])
     pkv = cache_factory(num_layers)
+    is_vmm_cache = getattr(pkv, "vmm", None) is not None
     dst_device = device if device is not None else flat_u8.device
     need_copy_to_dst = str(dst_device) != str(flat_u8.device)
     is_cuda_dst = str(dst_device).startswith("cuda") and torch.cuda.is_available()
@@ -312,6 +323,12 @@ def unpack_bagel_kv_context(
             off += v_bytes
             pkv.key_cache[lidx] = k_dst
             pkv.value_cache[lidx] = v_dst
+        elif is_vmm_cache:
+            # VmmNaiveCache.__setitem__ copies straight into TriPoolVMM Arena-1 (no wasted .clone() alloc).
+            pkv.key_cache[lidx] = flat_u8[off : off + k_bytes].view(dtype).reshape(k_shape)
+            off += k_bytes
+            pkv.value_cache[lidx] = flat_u8[off : off + v_bytes].view(dtype).reshape(v_shape)
+            off += v_bytes
         else:
             pkv.key_cache[lidx] = flat_u8[off : off + k_bytes].view(dtype).reshape(k_shape).clone()
             off += k_bytes
@@ -670,16 +687,107 @@ class BagelSessionContext:
         return released_host_b
 
 
-def pack_bagel_multi_context(
+def copy_views_to_chunk(views: Sequence[Any], byte_offset: int, dst_chunk: Any) -> int:
+    """Copy `dst_chunk.numel()` bytes starting at `byte_offset` across ordered flat uint8 `views` into `dst_chunk`."""
+    need = int(dst_chunk.numel())
+    if need <= 0:
+        return 0
+    cur_pos = 0
+    written = 0
+    end_off = int(byte_offset) + need
+    for v in views:
+        v_len = int(v.numel())
+        v_end = cur_pos + v_len
+        if v_end > byte_offset and cur_pos < end_off:
+            src_lo = max(0, int(byte_offset) - cur_pos)
+            src_hi = min(v_len, end_off - cur_pos)
+            take = src_hi - src_lo
+            dst_chunk[written : written + take].copy_(v[src_lo:src_hi])
+            written += take
+        cur_pos = v_end
+        if cur_pos >= end_off:
+            break
+    return written
+
+
+def copy_chunk_to_views(views: Sequence[Any], byte_offset: int, src_chunk: Any) -> int:
+    """Scatter `src_chunk.numel()` bytes from `src_chunk` into ordered flat uint8 `views` starting at `byte_offset`."""
+    avail = int(src_chunk.numel())
+    if avail <= 0:
+        return 0
+    cur_pos = 0
+    copied = 0
+    end_off = int(byte_offset) + avail
+    for v in views:
+        v_len = int(v.numel())
+        v_end = cur_pos + v_len
+        if v_end > byte_offset and cur_pos < end_off:
+            dst_lo = max(0, int(byte_offset) - cur_pos)
+            dst_hi = min(v_len, end_off - cur_pos)
+            take = dst_hi - dst_lo
+            v[dst_lo:dst_hi].copy_(src_chunk[copied : copied + take])
+            copied += take
+        cur_pos = v_end
+        if cur_pos >= end_off:
+            break
+    return copied
+
+
+def _collect_kv_context_views(ctx: dict[str, Any], target_dev: Any) -> tuple[dict[str, Any], list[Any]]:
+    """Collect zero-copy flat uint8 views & metadata for a single BAGEL KV context."""
+    import torch
+
+    pkv = ctx["past_key_values"]
+    if callable(getattr(pkv, "flush_fast_ar_if_dirty", None)):
+        pkv.flush_fast_ar_if_dirty()
+    if getattr(pkv, "is_swapped", False) and callable(getattr(pkv, "ensure_resident", None)):
+        pkv.ensure_resident()
+    num_layers = int(getattr(pkv, "num_layers", len(pkv.key_cache)))
+    use_raw_dict = isinstance(pkv.key_cache, dict)
+    get_k = (lambda i: dict.get(pkv.key_cache, i)) if use_raw_dict else (lambda i: pkv.key_cache[i])
+    get_v = (lambda i: dict.get(pkv.value_cache, i)) if use_raw_dict else (lambda i: pkv.value_cache[i])
+
+    layer_specs: list[list[Any] | None] = []
+    views: list[Any] = []
+    total_bytes = 0
+    for lidx in range(num_layers):
+        k = get_k(lidx)
+        v = get_v(lidx)
+        if k is None or v is None:
+            layer_specs.append(None)
+            continue
+        layer_specs.append([list(k.shape), list(v.shape), str(k.dtype).replace("torch.", "")])
+        for t in (k, v):
+            src = t.detach()
+            if src.device != target_dev:
+                src = src.to(target_dev)
+            if not src.is_contiguous():
+                src = src.contiguous()
+            u8 = src.view(torch.uint8).reshape(-1)
+            views.append(u8)
+            total_bytes += int(u8.numel())
+
+    meta = {
+        "num_layers": num_layers,
+        "kv_lens": list(ctx["kv_lens"]),
+        "ropes": list(ctx["ropes"]),
+        "total_bytes": int(total_bytes),
+        "layers": layer_specs,
+    }
+    return meta, views
+
+
+def collect_bagel_stream_views(
     session: BagelSessionContext,
     include_cfg_text_dup: bool,
     device: Any,
-) -> PackedTransferState:
-    """Pack multi-turn `BagelSessionContext` (`main_ctx`, CFG branches/metadata, and loopback image state)."""
+) -> tuple[dict[str, Any], list[Any]]:
+    """Collect ordered flat uint8 views & wire metadata for `BagelSessionContext` with zero KV staging copies."""
     import numpy as np
     import torch
 
     assert session.main_ctx is not None
+    target_dev = torch.device(device)
     main_ctx = session.main_ctx
     cfg_text_ctx = session.cfg_text_ctx
     cfg_img_ctx = session.cfg_img_ctx
@@ -701,21 +809,23 @@ def pack_bagel_multi_context(
         named_items.append(("cfg_img", cfg_img_ctx))
 
     sections: dict[str, Any] = {}
-    flat_chunks: list[Any] = []
+    all_views: list[Any] = []
     offset_bytes = 0
     for name, c in named_items:
-        m, fl = pack_bagel_kv_context(c, device=device)
-        nbytes = int(fl.numel())
+        m, vs = _collect_kv_context_views(c, target_dev)
+        nbytes = int(m["total_bytes"])
         sections[name] = {"meta": m, "offset": offset_bytes, "nbytes": nbytes}
         if nbytes > 0:
-            flat_chunks.append(fl)
+            all_views.extend(vs)
             offset_bytes += nbytes
 
     image_sections: dict[str, Any] = {}
     last_u8 = session.last_img_u8
     last_pil = session.last_img_pil
     if last_u8 is not None and torch.is_tensor(last_u8):
-        u8_c = last_u8.to(device=device, dtype=torch.uint8).contiguous()
+        u8_c = last_u8.detach()
+        if u8_c.device != target_dev or u8_c.dtype != torch.uint8 or not u8_c.is_contiguous():
+            u8_c = u8_c.to(device=target_dev, dtype=torch.uint8).contiguous()
         nb = int(u8_c.numel())
         image_sections["last_img_u8"] = {
             "shape": list(u8_c.shape),
@@ -723,11 +833,11 @@ def pack_bagel_multi_context(
             "nbytes": nb,
         }
         if nb > 0:
-            flat_chunks.append(u8_c.reshape(-1))
+            all_views.append(u8_c.reshape(-1))
             offset_bytes += nb
     elif last_pil is not None:
         arr = np.array(last_pil.convert("RGB"), dtype=np.uint8, copy=True)
-        pil_u8 = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device=device, dtype=torch.uint8)
+        pil_u8 = torch.from_numpy(arr).permute(2, 0, 1).contiguous().to(device=target_dev, dtype=torch.uint8)
         nb = int(pil_u8.numel())
         image_sections["last_img_pil_u8"] = {
             "shape": list(pil_u8.shape),
@@ -735,14 +845,12 @@ def pack_bagel_multi_context(
             "nbytes": nb,
         }
         if nb > 0:
-            flat_chunks.append(pil_u8.reshape(-1))
+            all_views.append(pil_u8.reshape(-1))
             offset_bytes += nb
 
-    flat = torch.cat(flat_chunks, dim=0) if flat_chunks else torch.empty((0,), dtype=torch.uint8, device=device)
-    total_b = int(flat.numel())
     meta = {
-        "total_bytes": total_b,
-        "logical_bytes": total_b,
+        "total_bytes": int(offset_bytes),
+        "logical_bytes": int(offset_bytes),
         "cfg_text_prefix_len": cfg_text_prefix_len,
         "cfg_text_ropes": cfg_text_ropes,
         "cfg_text_kv_lens": cfg_text_kv_lens,
@@ -752,7 +860,158 @@ def pack_bagel_multi_context(
         "sections": sections,
         "image_sections": image_sections,
     }
+    return meta, all_views
+
+
+def pack_bagel_multi_context(
+    session: BagelSessionContext,
+    include_cfg_text_dup: bool,
+    device: Any,
+) -> PackedTransferState:
+    """Pack multi-turn `BagelSessionContext` into a single contiguous tensor (1x peak alloc, zero redundant torch.cat)."""
+    import torch
+
+    meta, views = collect_bagel_stream_views(session, include_cfg_text_dup=include_cfg_text_dup, device=device)
+    total_b = int(meta["total_bytes"])
+    flat = torch.empty((total_b,), dtype=torch.uint8, device=torch.device(device))
+    if total_b > 0:
+        copy_views_to_chunk(views, 0, flat)
     return PackedTransferState(meta=meta, payload=flat, logical_bytes=total_b)
+
+
+def _prealloc_kv_context_views(
+    meta: dict[str, Any],
+    cache_factory: Callable[[int], Any],
+    device: Any,
+) -> tuple[dict[str, Any], list[Any]]:
+    """Pre-allocate destination K/V tensors (directly inside VMM Arena-1 when available) for chunked streaming recv."""
+    import torch
+
+    num_layers = int(meta["num_layers"])
+    pkv = cache_factory(num_layers)
+    has_prealloc = callable(getattr(pkv, "prealloc_layer_tensor", None))
+    target_dev = torch.device(device)
+    views: list[Any] = []
+    try:
+        for lidx, spec in enumerate(meta["layers"]):
+            if spec is None:
+                continue
+            k_shape, v_shape, dt_name = spec
+            dtype = getattr(torch, dt_name)
+            if has_prealloc:
+                k_t = pkv.prealloc_layer_tensor("k", lidx, tuple(int(d) for d in k_shape), dtype)
+                v_t = pkv.prealloc_layer_tensor("v", lidx, tuple(int(d) for d in v_shape), dtype)
+            else:
+                k_t = torch.empty(tuple(int(d) for d in k_shape), dtype=dtype, device=target_dev)
+                v_t = torch.empty(tuple(int(d) for d in v_shape), dtype=dtype, device=target_dev)
+                pkv.key_cache[lidx] = k_t
+                pkv.value_cache[lidx] = v_t
+            views.append(k_t.view(torch.uint8).reshape(-1))
+            views.append(v_t.view(torch.uint8).reshape(-1))
+    except BaseException:
+        if callable(getattr(pkv, "close", None)):
+            pkv.close()
+        raise
+    return {"kv_lens": list(meta["kv_lens"]), "ropes": list(meta["ropes"]), "past_key_values": pkv}, views
+
+
+def prealloc_bagel_stream_recv(
+    meta: dict[str, Any],
+    main_cache_factory: Callable[[int], Any],
+    aux_cache_factory: Callable[[int], Any],
+    device: Any,
+) -> tuple[dict[str, Any], list[Any]]:
+    """Pre-map all destination KV & image tensors before chunked NCCL receive (zero allocations inside NCCL loop)."""
+    import torch
+
+    target_dev = torch.device(device)
+    sections = meta["sections"]
+    main_ctx: dict[str, Any] | None = None
+    cfg_text_ctx: dict[str, Any] | None = None
+    cfg_img_ctx: dict[str, Any] | None = None
+    all_views: list[Any] = []
+    try:
+        main_ctx, m_views = _prealloc_kv_context_views(sections["main"]["meta"], main_cache_factory, target_dev)
+        all_views.extend(m_views)
+        if "cfg_text" in sections:
+            cfg_text_ctx, ct_views = _prealloc_kv_context_views(sections["cfg_text"]["meta"], aux_cache_factory, target_dev)
+            all_views.extend(ct_views)
+        if "cfg_img" in sections:
+            cfg_img_ctx, ci_views = _prealloc_kv_context_views(sections["cfg_img"]["meta"], aux_cache_factory, target_dev)
+            all_views.extend(ci_views)
+
+        last_img_u8 = None
+        last_img_pil_u8 = None
+        img_secs = meta.get("image_sections") or {}
+        if "last_img_u8" in img_secs:
+            isec = img_secs["last_img_u8"]
+            last_img_u8 = torch.empty(tuple(int(d) for d in isec["shape"]), dtype=torch.uint8, device=target_dev)
+            if int(last_img_u8.numel()) > 0:
+                all_views.append(last_img_u8.reshape(-1))
+        elif "last_img_pil_u8" in img_secs:
+            isec = img_secs["last_img_pil_u8"]
+            last_img_pil_u8 = torch.empty(tuple(int(d) for d in isec["shape"]), dtype=torch.uint8, device=target_dev)
+            if int(last_img_pil_u8.numel()) > 0:
+                all_views.append(last_img_pil_u8.reshape(-1))
+    except BaseException:
+        _close_ctx_vmm_if_any(main_ctx)
+        _close_ctx_vmm_if_any(cfg_text_ctx)
+        _close_ctx_vmm_if_any(cfg_img_ctx)
+        raise
+
+    partial = {
+        "main_ctx": main_ctx,
+        "cfg_text_ctx": cfg_text_ctx,
+        "cfg_img_ctx": cfg_img_ctx,
+        "last_img_u8": last_img_u8,
+        "last_img_pil_u8": last_img_pil_u8,
+    }
+    return partial, all_views
+
+
+def finalize_bagel_stream_recv(
+    partial: dict[str, Any],
+    meta: dict[str, Any],
+    aux_cache_factory: Callable[[int], Any],
+    use_cow_rebind: bool,
+) -> BagelSessionContext:
+    """Finalize pre-allocated streamed tensors into a live `BagelSessionContext` restoring CoW branches & PIL state."""
+    main_ctx = partial["main_ctx"]
+    cfg_text_ctx = partial.get("cfg_text_ctx")
+    cfg_img_ctx = partial.get("cfg_img_ctx")
+    prefix_len = int(meta.get("cfg_text_prefix_len", 0))
+    if cfg_text_ctx is not None:
+        if use_cow_rebind:
+            rebind_cow_prefix(main_ctx["past_key_values"], cfg_text_ctx["past_key_values"])
+    elif prefix_len > 0:
+        cfg_text_ctx = cow_fork_context(
+            main_ctx,
+            prefix_len=prefix_len,
+            cache_factory=aux_cache_factory,
+            ropes=meta.get("cfg_text_ropes"),
+            kv_lens=meta.get("cfg_text_kv_lens"),
+            clone_slices=(not use_cow_rebind),
+        )
+
+    last_img_u8 = partial.get("last_img_u8")
+    last_img_pil = None
+    pil_u8 = partial.get("last_img_pil_u8")
+    if pil_u8 is not None:
+        from PIL import Image
+
+        chw = pil_u8.detach().cpu().numpy()
+        last_img_pil = Image.fromarray(chw.transpose(1, 2, 0))
+
+    return BagelSessionContext(
+        main_ctx=main_ctx,
+        cfg_text_ctx=cfg_text_ctx,
+        cfg_img_ctx=cfg_img_ctx,
+        cfg_text_prefix_len=prefix_len,
+        pending_deferral=PendingDitDeferral.from_meta(meta),
+        pending_vae_only_paths=[str(p) for p in (meta.get("pending_vae_only_paths") or [])],
+        last_img_u8=last_img_u8,
+        last_img_pil=last_img_pil,
+    )
 
 
 def unpack_bagel_multi_context(
@@ -1076,39 +1335,66 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             return 0
         return int(fn(int(max(0, target_bytes))))
 
+    def _reclaim_for_oom(self, exclude_ctx_ids: Iterable[str] = ()) -> bool:
+        """Full OOM recovery: evict idle KV, flush VMM swaps, trim overflow to driver, and defragment PyTorch cache."""
+        import torch
+
+        is_cuda = torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"
+        self._update_hwm()
+        free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
+        freed = 0
+        if self._auto_idle_kv_swap_enabled():
+            freed = int(self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=exclude_ctx_ids, for_dit=False))
+        vmm_trimmed = 0
+        if self.vmm is not None:
+            flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
+            if callable(flush_fn):
+                flush_fn()
+            vmm_trimmed = int(self._release_vmm_overflow_to_driver(0))
+        if is_cuda:
+            gc.collect()
+            torch.cuda.empty_cache()
+        free_after = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
+        return bool(freed > 0 or vmm_trimmed > 0 or (free_after - free_before) >= 64 * MIB)
+
     def _ensure_cuda_driver_headroom_for_dit(
         self,
         needed_driver_bytes: int,
         *,
         exclude_ctx_ids: Iterable[str] = (),
     ) -> int:
-        """Ensure CUDA driver + PyTorch caching allocator has sufficient headroom before DiT/VAE spikes."""
+        """Ensure CUDA driver has real contiguous headroom before DiT/VAE/NCCL spikes."""
         import torch
 
         if self.vmm is None or not (torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda"):
             return 0
+        needed = int(needed_driver_bytes)
         free_drv, _ = torch.cuda.mem_get_info(self.device)
         unused_pt = max(
             0,
             int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
         )
-        free_est = int(free_drv) + unused_pt
-        trimmed = 0
-        if free_est < int(needed_driver_bytes):
-            deficit = int(needed_driver_bytes) - free_est
-            trimmed += self._release_vmm_overflow_to_driver(deficit)
+        # Defragment PyTorch's caching allocator FIRST when raw driver free is short so we measure
+        # real driver free (fragmented unused_pt that survives empty_cache() cannot satisfy large allocs).
+        if int(free_drv) < needed and unused_pt >= 256 * MIB:
+            self._update_hwm()
+            torch.cuda.empty_cache()
             free_drv, _ = torch.cuda.mem_get_info(self.device)
             unused_pt = max(
                 0,
                 int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
             )
-            free_est = int(free_drv) + unused_pt
-            if free_est < int(needed_driver_bytes) and self._auto_idle_kv_swap_enabled():
+        trimmed = 0
+        if int(free_drv) < needed:
+            deficit = needed - int(free_drv)
+            trimmed += self._release_vmm_overflow_to_driver(deficit)
+            free_drv, _ = torch.cuda.mem_get_info(self.device)
+            if int(free_drv) < needed and self._auto_idle_kv_swap_enabled():
                 vmm_pool_b = int(self.vmm.stats_dict().get("pool_total_bytes", 0))
                 init_pool_b = int(round(float(getattr(self, "_vmm_initial_pool_mib", 0.0)) * MIB))
                 vmm_excess_b = max(0, vmm_pool_b - init_pool_b)
                 if vmm_excess_b > 0:
-                    rem_deficit = min(int(needed_driver_bytes) - free_est, vmm_excess_b)
+                    rem_deficit = min(needed - int(free_drv), vmm_excess_b)
                     target_avail = self.available_kv_bytes(for_dit=True) + rem_deficit
                     reclaimed = self.evict_idle_kv_to_host(
                         target_avail,
@@ -1121,13 +1407,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             flush_fn()
                         trimmed += self._release_vmm_overflow_to_driver(rem_deficit)
                         free_drv, _ = torch.cuda.mem_get_info(self.device)
-                        unused_pt = max(
-                            0,
-                            int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
-                        )
-        # Defragment PyTorch's caching allocator when raw driver free is tight so large contiguous
-        # DiT/VAE/FlashAttn/NCCL allocations (1.0-1.9 GiB) never fail with fragmented CUDACachingAllocator OOM.
-        if int(free_drv) < min(int(needed_driver_bytes), 4096 * MIB) and unused_pt >= 512 * MIB:
+        unused_pt = max(
+            0,
+            int(torch.cuda.memory_reserved(self.device)) - int(torch.cuda.memory_allocated(self.device)),
+        )
+        if int(free_drv) < min(needed, 3072 * MIB) and unused_pt >= 512 * MIB:
             self._update_hwm()
             torch.cuda.empty_cache()
         return trimmed
@@ -1180,11 +1464,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     vmm=self.vmm,
                 )
             except BaseException as exc:
-                if (
-                    allow_auto_swap
-                    and is_oom_exception(exc)
-                    and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,)) > 0
-                ):
+                if is_oom_exception(exc) and self._reclaim_for_oom(exclude_ctx_ids=(ctx_id,)):
                     restored_b, from_bundle = session.ensure_resident(
                         device=self.device,
                         main_cache_factory=self._main_cache_factory(),
@@ -1239,7 +1519,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         )
                         else 0
                     )
-                    headroom_b = (nccl_reserve_mib + 6144) * MIB
+                    headroom_b = (nccl_reserve_mib + 4096) * MIB
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
             self.vmm = TriPoolVMM(
                 device=self.rank,
@@ -1674,10 +1954,8 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     partial = self._ctx_store.pop(ctx_id, None)
                     if partial is not None:
                         partial.close()
-                if self._auto_idle_kv_swap_enabled() and is_oom_exception(exc):
-                    freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,))
-                    if freed > 0:
-                        return self._prepare_turn_inner(ctx_id, cmd)
+                if is_oom_exception(exc) and self._reclaim_for_oom(exclude_ctx_ids=(ctx_id,)):
+                    return self._prepare_turn_inner(ctx_id, cmd)
                 raise
 
     def decode_ar(self, ctx_id: str, max_tokens: int) -> dict[str, Any]:
@@ -1753,11 +2031,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         except BaseException as exc:
                             for st, plen in zip(active, prev_ar_lens):
                                 st["session"].rollback_main_kv(plen)
-                            if (
-                                self._auto_idle_kv_swap_enabled()
-                                and is_oom_exception(exc)
-                                and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=cids) > 0
-                            ):
+                            if is_oom_exception(exc) and self._reclaim_for_oom(exclude_ctx_ids=cids):
                                 for st in active:
                                     pkv_re = st["ctx"]["past_key_values"]
                                     if callable(getattr(pkv_re, "set_fast_ar_mode", None)):
@@ -2399,10 +2673,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             # stream back any evicted tail expert layers that fit directly in those free handles
             # (async on `h2d_stream_`, zero KV eviction, zero compute-stream stall) so `resident_alpha`
             # recovers during think-time/AR instead of causing H2D pacer stalls on the next DiT turn.
+            queued_restore = 0
             if self.pager is not None and self.vmm is not None and self.policy.use_scoped_vae:
                 restore_fn = getattr(self.pager, "restore_free_super_layers_async", None)
                 if callable(restore_fn):
-                    restore_fn()
+                    queued_restore = int(restore_fn())
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             if vae_decode_ev_pair is not None:
@@ -2427,6 +2702,9 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 h2d_weight_ms += (d_map_us + d_sub_us + d_wait_us) / 1000.0
 
             self._update_hwm()
+            eff_alpha = self.resident_alpha()
+            if queued_restore > 0 and self.pager is not None and self.pager.num_layers > 0:
+                eff_alpha = min(1.0, eff_alpha + float(queued_restore) / float(self.pager.num_layers))
             return {
                 "status": "ok",
                 "ctx_id": ctx_id,
@@ -2435,10 +2713,83 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 "vae_ms": round(vae_ms, 2),
                 "preempt_yield_ms": round(preempt_yield_ms, 2),
                 "kv_bytes": session.logical_bytes(),
-                "resident_alpha": self.resident_alpha(),
+                "resident_alpha": eff_alpha,
                 "kv_free_bytes": self.available_kv_bytes(),
                 "yield_count": total_yield_count,
             }
+
+    def prepare_stream_send(
+        self,
+        ctx_id: str,
+        include_cfg_dup: bool = False,
+    ) -> tuple[dict[str, Any], list[Any]]:
+        """Pin `ctx_id` in VMM and return zero-copy flat uint8 views & metadata for bounded-chunk NCCL streaming."""
+        self._pin_ctx_id(ctx_id)
+        try:
+            session = self._ensure_ctx_resident(ctx_id)
+            return collect_bagel_stream_views(session, include_cfg_text_dup=include_cfg_dup, device=self.device)
+        except BaseException:
+            self._unpin_ctx_id(ctx_id)
+            raise
+
+    def finish_stream_send(self, ctx_id: str, *, release_ctx: bool = False) -> None:
+        """Unpin (and optionally release) `ctx_id` after chunked NCCL send completes or aborts."""
+        self._unpin_ctx_id(ctx_id)
+        if release_ctx:
+            self.release_context(ctx_id)
+
+    def prepare_stream_recv(
+        self,
+        new_ctx_id: str,
+        meta: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[Any]]:
+        """Pre-map destination VMM Arena-1 & auxiliary tensors before chunked NCCL receive (0 allocs inside loop)."""
+        self.release_context(new_ctx_id)
+        allow_auto_swap = self._auto_idle_kv_swap_enabled()
+        self._pin_ctx_id(new_ctx_id)
+        try:
+            est_b = int(meta.get("logical_bytes", meta.get("total_bytes", 0)))
+            if allow_auto_swap and est_b > 0 and self.available_kv_bytes() < est_b + 512 * MIB:
+                self.evict_idle_kv_to_host(est_b + 512 * MIB, exclude_ctx_ids=(new_ctx_id,))
+            main_factory = self._main_cache_factory()
+            aux_factory = self._aux_cache_factory()
+            try:
+                return prealloc_bagel_stream_recv(meta, main_factory, aux_factory, self.device)
+            except BaseException as exc:
+                if is_oom_exception(exc) and self._reclaim_for_oom(exclude_ctx_ids=(new_ctx_id,)):
+                    return prealloc_bagel_stream_recv(meta, main_factory, aux_factory, self.device)
+                raise
+        except BaseException:
+            self._unpin_ctx_id(new_ctx_id)
+            raise
+
+    def commit_stream_recv(
+        self,
+        new_ctx_id: str,
+        partial: dict[str, Any],
+        meta: dict[str, Any],
+    ) -> int:
+        """Finalize streamed tensors into `self._ctx_store[new_ctx_id]` and release the temporary recv pin."""
+        try:
+            session = finalize_bagel_stream_recv(
+                partial,
+                meta,
+                aux_cache_factory=self._aux_cache_factory(),
+                use_cow_rebind=self.policy.use_module3_cow_loopback,
+            )
+            self._ctx_store[new_ctx_id] = session
+            self._update_hwm()
+            return session.logical_bytes()
+        finally:
+            self._unpin_ctx_id(new_ctx_id)
+
+    def abort_stream_recv(self, new_ctx_id: str, partial: dict[str, Any] | None) -> None:
+        """Cleanly close pre-allocated destination buffers on chunked NCCL receive failure."""
+        if partial is not None:
+            _close_ctx_vmm_if_any(partial.get("main_ctx"))
+            _close_ctx_vmm_if_any(partial.get("cfg_text_ctx"))
+            _close_ctx_vmm_if_any(partial.get("cfg_img_ctx"))
+        self._unpin_ctx_id(new_ctx_id)
 
     def pack_state(self, ctx_id: str, include_cfg_dup: bool = False) -> PackedTransferState:
         with self._pinned_ctx(ctx_id):
@@ -2470,11 +2821,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                     use_cow_rebind=self.policy.use_module3_cow_loopback,
                 )
             except BaseException as exc:
-                if (
-                    allow_auto_swap
-                    and is_oom_exception(exc)
-                    and self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(new_ctx_id,)) > 0
-                ):
+                if is_oom_exception(exc) and self._reclaim_for_oom(exclude_ctx_ids=(new_ctx_id,)):
                     session = unpack_bagel_multi_context(
                         meta,
                         raw_payload,

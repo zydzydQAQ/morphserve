@@ -18,6 +18,8 @@ struct GpuQueueWaiter {
     double slo_deadline_ms = 0.0;  // absolute deadline in ms (<= 0 means unprioritized/infinite)
     int op_priority = 1;           // 0 = control/prep/pack, 1 = DiT/heavy compute
     int bypass_count = 0;
+    bool session_slo_intact = true;  // true iff all prior turns in this session met SLO
+    int remaining_turns = 1;         // remaining turns in session including this turn (>= 1)
 
     nlohmann::json to_json() const;
     static GpuQueueWaiter from_json(const nlohmann::json& j);

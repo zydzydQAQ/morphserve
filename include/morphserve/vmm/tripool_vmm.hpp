@@ -332,12 +332,14 @@ private:
         void* stream,
         std::unique_lock<std::mutex>* opt_lock = nullptr,
         int32_t exclude_region_id = -1);
+    size_t missing_expert_handles_locked() const noexcept;
     SuperSlot pop_fine_bundle_locked();
     SuperSlot acquire_super_slot_locked(
         void* stream,
         bool for_kv,
         int exclude_expert_id = -1,
-        std::unique_lock<std::mutex>* opt_lock = nullptr);
+        std::unique_lock<std::mutex>* opt_lock = nullptr,
+        bool for_transient = false);
     void release_super_slot_to_pool_locked(SuperSlot& slot);
     size_t try_coalesce_fine_to_super_locked(size_t max_super = SIZE_MAX);
     void map_super_slot_locked(uint64_t slot_va, const SuperSlot& slot, bool host_access);

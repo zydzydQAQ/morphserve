@@ -558,3 +558,80 @@ def test_layer_chunk_non_poisoned_ema_and_bounded_post_admit_recheck() -> None:
     # T1 ran in the primary yield and T2 got exactly 1 bounded post-admit step (not infinite loop to completion).
     assert served_steps == ["t1", "t2"]
     assert len(sched.active_ar_tasks) == 1 and sched.active_ar_tasks[0].req_id == "t2"
+
+
+def test_preemption_session_single_light_admit_and_heavy_starvation_barrier() -> None:
+    """Verify at most 1 light AR admits per yield when active, and aged heavy AR blocks new light bypasses."""
+    pipe = _make_stub_pipeline(num_layers=4)
+    sched = UnifiedPreemptiveScheduler(
+        pipe,
+        mode="layer_chunk",
+        tpot_slo_ms=100.0,
+        guard_ms=20.0,
+        init_layer_ms=10.0,
+        init_ar_step_ms=30.0,
+    )
+    inbox: list[dict[str, Any]] = []
+    admitted: list[str] = []
+
+    def _poll() -> list[dict[str, Any]]:
+        out = list(inbox)
+        inbox.clear()
+        return out
+
+    def _admit(cmd: dict[str, Any], now_s: float) -> tuple[ArDecodeTask, str]:
+        admitted.append(str(cmd["cmd_id"]))
+        task = ArDecodeTask(
+            req_id=str(cmd["cmd_id"]),
+            kv_cache=None,
+            curr_tokens=None,
+            pos_ids=None,
+            max_tokens=int(cmd.get("max_ar_tokens", 2)),
+            end_token_id=None,
+            tpot_slo_ms=100.0,
+            arrival_time_s=now_s,
+            last_step_time_s=now_s,
+        )
+        return task, str(cmd["cmd_id"])
+
+    with PreemptionSession(sched, poll_cmds=_poll, admit_cmd=_admit) as ps:
+        t0 = sched.begin_session_clock()
+        # Seed 1 active task with full 100ms slack.
+        active0 = ArDecodeTask(
+            req_id="a0",
+            kv_cache=None,
+            curr_tokens=None,
+            pos_ids=None,
+            max_tokens=2,
+            end_token_id=None,
+            tpot_slo_ms=100.0,
+            arrival_time_s=t0,
+            last_step_time_s=t0,
+        )
+        sched.active_ar_tasks.append(active0)
+
+        # Two light arrivals + one heavy arrival arrive simultaneously while a0 is live:
+        # at most 1 light arrival (`l1`) may admit in this yield boundary; `l2` and `h1` defer.
+        heavy_cmd = {"cmd_id": "h1", "image_paths": ["x.png"], "max_ar_tokens": 1}
+        inbox.extend(
+            [
+                {"cmd_id": "l1", "max_ar_tokens": 1},
+                {"cmd_id": "l2", "max_ar_tokens": 1},
+                heavy_cmd,
+            ]
+        )
+        sched.admit_due_arrivals(t0)
+        assert admitted == ["l1"]
+        assert [c["cmd_id"] for c in ps._deferred_cmds] == ["l2", "h1"]
+
+        # Once `h1` has waited >= 400 ms, new/deferred light arrivals MUST NOT bypass `h1` while active AR runs!
+        sched.admit_due_arrivals(t0 + 0.50)
+        assert admitted == ["l1"]
+        assert [c["cmd_id"] for c in ps._deferred_cmds] == ["l2", "h1"]
+
+        # Once active tasks finish, `h1` admits cleanly instead of starving behind infinite light arrivals.
+        sched.active_ar_tasks.clear()
+        sched.admit_due_arrivals(t0 + 0.51)
+        assert "h1" in admitted
+        sched.active_ar_tasks.clear()
+        ps._deferred_cmds.clear()

@@ -431,9 +431,11 @@ PolicyConfig PolicyConfig::from_preset(
             (fam == "internvl_u") ? (is_ivlu_capped ? "non_preemptive" : "step_preemptive") : "layer_chunk";
         cfg.cost_model_mode = "atlas_3d";
         cfg.gpu_queue_mode = "memory_slack";
+        cfg.gpu_queue_max_aging_ms = 120000.0;
+        cfg.gpu_queue_max_bypasses = 16;
         cfg.kv_eviction_mode = "swap";
         cfg.super_pool_mib = (fam == "internvl_u") ? ivlu_super_mib : 14336;
-        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 256;
+        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 2048;
         cfg.transient_va_gib = 16;
         cfg.kv_va_gib = (fam == "internvl_u") ? 8 : 16;
         cfg.allow_vmm_overflow = !is_ivlu_capped;

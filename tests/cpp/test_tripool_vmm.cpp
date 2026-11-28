@@ -885,7 +885,7 @@ void test_transient_bundles_before_expert_evict_and_expert_super_reserve() {
         cfg.materialize_sim_va = false;
 
         auto vmm = TriPoolVMM::create(cfg);
-        const int eid = vmm->expert_register(2, 64 * kMiB, nullptr, 0);
+        const int eid = vmm->expert_register(2, 64, nullptr, 0);
         MS_EXPECT(eid >= 0);
         MS_EXPECT(vmm->expert_load_layers_sync(eid, 0, 2) == 0);
         MS_EXPECT(vmm->expert_resident_count(eid) == 2);
@@ -928,7 +928,7 @@ void test_transient_bundles_before_expert_evict_and_expert_super_reserve() {
         cfg.materialize_sim_va = false;
 
         auto vmm = TriPoolVMM::create(cfg);
-        const int eid = vmm->expert_register(2, 64 * kMiB, nullptr, 0);
+        const int eid = vmm->expert_register(2, 64, nullptr, 0);
         MS_EXPECT(eid >= 0);
         MS_EXPECT(vmm->expert_load_layers_sync(eid, 0, 2) == 0);
         // Evict layer 1 -> 1 free super handle, 1 missing expert layer (reserved_super == 1).

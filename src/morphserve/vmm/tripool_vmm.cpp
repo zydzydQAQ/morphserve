@@ -595,14 +595,11 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
         const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
         const bool can_grow_fine =
             cfg_.allow_overflow && cfg_.max_pool_bytes > 0 && (cur_pool_b + min_gran_) <= cfg_.max_pool_bytes;
-        // Protect initial super handles (Arena-0 experts + Arena-2 Scoped-VAE reserve) when safe
-        // fine-pool overflow headroom is available, eliminating carve<->overflow driver ioctl thrashing.
-        // Under tight pools (`!can_grow_fine`, e.g., `allow_overflow=0` or at `max_pool_bytes` cap),
-        // freely carve idle super handles into 2 MiB fine KV pages for full cross-arena elasticity.
-        const size_t active_super_mapped = expert_mapped_handles_ + transient_mapped_slots_.size();
-        const size_t init_super_free_reserve =
-            (init_super_handles_ > active_super_mapped) ? (init_super_handles_ - active_super_mapped) : 0;
-        const size_t reserved_super = std::max(missing_expert_handles_locked(), init_super_free_reserve);
+        // Preserve free super handles reserved for evicted Arena-0 expert layers when fine-pool
+        // overflow headroom is available, avoiding carve<->coalesce driver ioctl thrashing on reload.
+        // Under tight pools (`!can_grow_fine`, e.g., `allow_overflow=0` or at `max_pool_bytes` cap)
+        // or when no missing expert layers need those handles, carve idle super handles first.
+        const size_t reserved_super = missing_expert_handles_locked();
         if (!free_super_handles_.empty() && (free_super_handles_.size() > reserved_super || !can_grow_fine)) {
             const uint64_t super_h = free_super_handles_.back();
             free_super_handles_.pop_back();

@@ -226,12 +226,15 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
             if (all_edf_feasible) {
                 chosen = edf_order.front();
             } else {
+                // Under true overload, prioritize minimum `remaining_turns` FIRST (never let a
+                // 4-turn session whose current turn happens to be short starve a 1-turn session
+                // about to bank Joint SLO), then shortest current turn `exec_ms` (512px before
+                // 1024px), then tightest feasible slack.
                 auto srpt_key = [&](const GpuQueueWaiter& w) noexcept {
                     const int rem = std::max(1, w.remaining_turns);
                     const double exec_ms = std::max(1.0, w.est_exec_ms);
-                    const double rem_work = static_cast<double>(rem) * exec_ms;
                     const double slack = effective_slack_ms(w, now_ms);
-                    return std::make_tuple(rem_work, rem, slack, exec_ms, w.enqueue_ms, w.waiter_id);
+                    return std::make_tuple(rem, exec_ms, slack, w.enqueue_ms, w.waiter_id);
                 };
                 size_t best_srpt = top_group.front();
                 for (size_t idx : top_group) {

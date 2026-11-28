@@ -154,19 +154,76 @@ class WorkerRuntime:
         except queue.Empty:
             return None
 
+    @staticmethod
+    def _is_serial_ar_cmd(cmd: dict[str, Any]) -> bool:
+        """True if `EXEC_AR` requires multimodal vision encoding or CoT bridge extraction (unbatchable)."""
+        return bool(cmd.get("prepare_for_dit") or cmd.get("image_paths") or cmd.get("use_prev_image"))
+
     def _collect_ar_batch(self, first_cmd: dict[str, Any]) -> list[dict[str, Any]]:
-        """Opportunistically coalesce queued `EXEC_AR` commands into one continuous-batch execution."""
-        batch = [first_cmd]
-        while len(batch) < self.max_ar_batch_size:
-            try:
-                nxt = self.main_cmd_q.get_nowait()
-            except queue.Empty:
-                break
-            if nxt.get("op") == "EXEC_AR":
-                batch.append(nxt)
-            else:
-                self._deferred_main_cmds.append(nxt)
-                break
+        """Coalesce queued `EXEC_AR` commands with Session-SRPT ordering & clean text/multimodal separation.
+
+        Never crosses a non-`EXEC_AR` barrier command (`EXEC_DIT`, `PREP_DIT`, `RESET_SUITE`, `SHUTDOWN`),
+        preventing barrier starvation while ensuring:
+          1. Under `memory_slack`, intact `rem_turns = 1` AR sessions jump ahead of expired or
+             multi-turn sessions inside `main_cmd_q` (clock-skew-free via relative `_slo_budget_ms`).
+          2. Text-only AR requests batch into `[B, L]` without being poisoned into serial execution by
+             one multimodal/CoT request, and multimodal/CoT requests emit their ACK immediately.
+        """
+        ready_ars: list[dict[str, Any]] = [first_cmd]
+        has_barrier = False
+        while self._deferred_main_cmds and self._deferred_main_cmds[0].get("op") == "EXEC_AR":
+            ready_ars.append(self._deferred_main_cmds.pop(0))
+        if self._deferred_main_cmds:
+            has_barrier = True
+        if not has_barrier:
+            while True:
+                try:
+                    nxt = self.main_cmd_q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt.get("op") == "EXEC_AR":
+                    ready_ars.append(nxt)
+                else:
+                    self._deferred_main_cmds.append(nxt)
+                    break
+
+        if len(ready_ars) <= 1:
+            return ready_ars
+
+        has_slo_meta = any("_slo_intact" in c for c in ready_ars)
+        buckets: dict[int, int] = {}
+        if has_slo_meta:
+            now_s = time.perf_counter()
+
+            def _ar_prio_key(c: dict[str, Any]) -> tuple[int, int, float, float]:
+                intact = bool(c.get("_slo_intact", True))
+                rem = max(1, int(c.get("_rem_turns", 1)))
+                recv_s = float(c.get("_worker_recv_s", now_s))
+                budget_ms = float(c.get("_slo_budget_ms", 1e9))
+                slack_ms = budget_ms - max(0.0, (now_s - recv_s) * 1000.0)
+                feasible = slack_ms >= 0.0
+                bucket = 0 if (feasible and intact) else (1 if feasible else 2)
+                buckets[id(c)] = bucket
+                return (bucket, rem, slack_ms if feasible else -slack_ms, recv_s)
+
+            ready_ars.sort(key=_ar_prio_key)
+
+        if self._is_serial_ar_cmd(ready_ars[0]):
+            batch = [ready_ars[0]]
+            leftover = ready_ars[1:]
+        else:
+            first_bucket = buckets.get(id(ready_ars[0]), 0)
+            batch = [ready_ars[0]]
+            leftover: list[dict[str, Any]] = []
+            for c in ready_ars[1:]:
+                same_tier_ok = (not has_slo_meta) or (first_bucket > 0) or (buckets.get(id(c), 0) == 0)
+                if len(batch) < self.max_ar_batch_size and (not self._is_serial_ar_cmd(c)) and same_tier_ok:
+                    batch.append(c)
+                else:
+                    leftover.append(c)
+
+        if leftover:
+            self._deferred_main_cmds = leftover + self._deferred_main_cmds
         return batch
 
     def _execute_ar_cmds_and_ack(

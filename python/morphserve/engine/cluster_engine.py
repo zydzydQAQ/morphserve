@@ -953,27 +953,18 @@ class MorphServeClusterEngine:
             # ARs never livelock and batch concurrently into `WorkerRuntime.decode_ar_batch`.
             ar_has_img = bool(turn.image_paths or use_prev_image)
             ar_num_img = len(turn.image_paths) + (1 if use_prev_image else 0)
-            ar_dl_ms = t_enq * 1000.0 + eff_policy.ar_ttft_slo_for(
+            ar_budget_ms = eff_policy.ar_ttft_slo_for(
                 has_image=ar_has_img,
                 num_images=ar_num_img,
                 image_res=max(turn.height, turn.width),
             )
+            ar_dl_ms = t_enq * 1000.0 + ar_budget_ms
             if self._gpu_locks[resident_gpu].locked():
-                ar_op_priority = (
-                    1
-                    if (
-                        eff_policy.cptg_architecture == "bridge_mllm_dit"
-                        and (not self._supports_mid_dit_preemption(eff_policy))
-                        and eff_policy.routing_mode == "dual_path"
-                        and self.router.get_worker_state(resident_gpu).expert_alpha > 0.01
-                    )
-                    else 0
-                )
                 await self._gpu_locks[resident_gpu].acquire(
                     est_mem_bytes=0,
                     est_exec_ms=est_ar_ms,
                     slo_deadline_ms=ar_dl_ms,
-                    op_priority=ar_op_priority,
+                    op_priority=0,
                     session_slo_intact=session_slo_intact,
                     remaining_turns=remaining_turns,
                 )
@@ -998,6 +989,10 @@ class MorphServeClusterEngine:
                     "max_ar_tokens": turn.max_ar_tokens,
                     "prepare_for_dit": prepare_for_dit,
                 }
+                if eff_policy.gpu_queue_mode != "fcfs":
+                    ar_cmd["_slo_intact"] = bool(session_slo_intact)
+                    ar_cmd["_rem_turns"] = int(max(1, remaining_turns))
+                    ar_cmd["_slo_budget_ms"] = max(0.0, float(ar_budget_ms) - coord_queue_wait_ms)
                 if vlm_history:
                     ar_cmd["vlm_history"] = vlm_history
                 ar_res = await self._rpc(resident_gpu, ar_cmd)

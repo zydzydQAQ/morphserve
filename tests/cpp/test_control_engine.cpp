@@ -1186,6 +1186,17 @@ void test_gpu_wait_queue_scheduler() {
     const auto sc0 = sess_sched.select_and_pop(q_chase, 5000.0, 8LL * kGiB);
     MS_CHECK(sc0.has_value() && sc0->waiter_id == 53);
 
+    // Under overload, minimum `remaining_turns` runs BEFORE `rem_turns * current_exec_ms`:
+    // a 1-turn 1024px session (18s) must not be starved behind a 4-turn session whose current
+    // turn happens to be a cheap 512px turn (4s * 4 = 16s < 18s)!
+    std::vector<GpuQueueWaiter> q_rem_first = {
+        {61, 100.0, 1LL * kGiB, 4000.0, 10000.0, 1, 0, true, 4},   // 4 turns left, short current turn
+        {62, 110.0, 1LL * kGiB, 4000.0, 10500.0, 1, 0, true, 4},   // EDF: 5000+4000+4000=13000 > 10500 (OVERLOAD!)
+        {63, 120.0, 1LL * kGiB, 18000.0, 40000.0, 1, 0, true, 1},  // 1 turn left, heavy 1024px -> MUST win!
+    };
+    const auto sr0 = sess_sched.select_and_pop(q_rem_first, 5000.0, 8LL * kGiB);
+    MS_CHECK(sr0.has_value() && sr0->waiter_id == 63);
+
     // JSON roundtrip & backward-compatible defaults for session_slo_intact / remaining_turns.
     const GpuQueueWaiter w_rt = GpuQueueWaiter::from_json(
         GpuQueueWaiter{99, 10.0, 2LL * kGiB, 100.0, 500.0, 1, 0, false, 3}.to_json());

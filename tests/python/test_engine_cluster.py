@@ -1367,3 +1367,45 @@ def test_chunked_nccl_stream_acquires_dst_lock_before_pinning_src_ctx(tmp_path: 
 
     assert res.get("status") == "ok"
     assert pin_seen_with_dst_locked == [True]
+
+
+def test_worker_collect_ar_batch_session_srpt_and_barrier_isolation() -> None:
+    """`WorkerRuntime._collect_ar_batch` prioritizes intact low-rem ARs, separates text/image batches, and respects barriers."""
+    from morphserve.engine.worker_runtime import WorkerRuntime
+    from morphserve.models.synthetic_adapter import SyntheticCPTGAdapter
+
+    pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic")
+    rt = WorkerRuntime(rank=0, adapter=SyntheticCPTGAdapter(0, pol), ack_sink=lambda _a: None, max_ar_batch_size=4)
+    now_s = time.perf_counter()
+
+    # Enqueue: dead 4-turn text -> intact 3-turn image -> intact 1-turn text -> intact 1-turn text -> EXEC_DIT barrier -> post-barrier AR.
+    rt.main_cmd_q.put({"op": "EXEC_AR", "ctx_id": "dead4", "_slo_intact": False, "_rem_turns": 4, "_slo_budget_ms": 5000.0, "_worker_recv_s": now_s})
+    rt.main_cmd_q.put({"op": "EXEC_AR", "ctx_id": "img3", "image_paths": ["a.png"], "_slo_intact": True, "_rem_turns": 3, "_slo_budget_ms": 5000.0, "_worker_recv_s": now_s})
+    rt.main_cmd_q.put({"op": "EXEC_AR", "ctx_id": "txt1a", "_slo_intact": True, "_rem_turns": 1, "_slo_budget_ms": 5000.0, "_worker_recv_s": now_s})
+    rt.main_cmd_q.put({"op": "EXEC_AR", "ctx_id": "txt1b", "_slo_intact": True, "_rem_turns": 1, "_slo_budget_ms": 5000.0, "_worker_recv_s": now_s})
+    rt.main_cmd_q.put({"op": "EXEC_DIT", "ctx_id": "dit_barrier"})
+    rt.main_cmd_q.put({"op": "EXEC_AR", "ctx_id": "after_dit", "_slo_intact": True, "_rem_turns": 1, "_slo_budget_ms": 5000.0, "_worker_recv_s": now_s})
+
+    # Wave 1: ONLY intact rem=1 text ARs batch together (no img3 poisoning, no dead4 hitchhiking!).
+    first = rt._pop_next_main_cmd(timeout=0.01)
+    assert first is not None and first["op"] == "EXEC_AR"
+    b1 = rt._collect_ar_batch(first)
+    assert [c["ctx_id"] for c in b1] == ["txt1a", "txt1b"]
+
+    # Wave 2: img3 (intact) runs alone BEFORE dead4 and BEFORE dit_barrier!
+    second = rt._pop_next_main_cmd(timeout=0.01)
+    assert second is not None and second["ctx_id"] == "img3"
+    b2 = rt._collect_ar_batch(second)
+    assert [c["ctx_id"] for c in b2] == ["img3"]
+
+    # Wave 3: dead4 runs before EXEC_DIT barrier.
+    third = rt._pop_next_main_cmd(timeout=0.01)
+    assert third is not None and third["ctx_id"] == "dead4"
+    b3 = rt._collect_ar_batch(third)
+    assert [c["ctx_id"] for c in b3] == ["dead4"]
+
+    # Next popped command MUST be the EXEC_DIT barrier (after_dit NEVER crossed it!).
+    fourth = rt._pop_next_main_cmd(timeout=0.01)
+    assert fourth is not None and fourth["op"] == "EXEC_DIT" and fourth["ctx_id"] == "dit_barrier"
+    fifth = rt._pop_next_main_cmd(timeout=0.01)
+    assert fifth is not None and fifth["ctx_id"] == "after_dit"

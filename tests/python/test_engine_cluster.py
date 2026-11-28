@@ -1372,10 +1372,9 @@ def test_chunked_nccl_stream_acquires_dst_lock_before_pinning_src_ctx(tmp_path: 
 def test_worker_collect_ar_batch_session_srpt_and_barrier_isolation() -> None:
     """`WorkerRuntime._collect_ar_batch` prioritizes intact low-rem ARs, separates text/image batches, and respects barriers."""
     from morphserve.engine.worker_runtime import WorkerRuntime
-    from morphserve.models.synthetic_adapter import SyntheticCPTGAdapter
 
     pol = EnginePolicyConfig.from_preset("morphserve", num_gpus=1, model_family="synthetic")
-    rt = WorkerRuntime(rank=0, adapter=SyntheticCPTGAdapter(0, pol), ack_sink=lambda _a: None, max_ar_batch_size=4)
+    rt = WorkerRuntime(rank=0, adapter=SyntheticCPTGAdapter(rank=0, policy=pol), ack_sink=lambda _a: None, max_ar_batch_size=4)
     now_s = time.perf_counter()
 
     # Enqueue: dead 4-turn text -> intact 3-turn image -> intact 1-turn text -> intact 1-turn text -> EXEC_DIT barrier -> post-barrier AR.

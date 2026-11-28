@@ -1512,8 +1512,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             if is_cuda:
                 self._update_hwm()
                 torch.cuda.empty_cache()
-            init_pool_mib = int(self.policy.super_pool_mib + self.policy.fine_kv_pool_mib)
-            self._vmm_initial_pool_mib = float(init_pool_mib)
+            eff_fine_mib = int(self.policy.fine_kv_pool_mib)
             max_pool_b = 0
             if (
                 (self.pager is not None or bool(getattr(self.policy, "kv_vmm_only", False)))
@@ -1533,11 +1532,22 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                         else 0
                     )
                     headroom_b = (nccl_reserve_mib + 3072) * MIB
+                    safe_pool_mib = max(
+                        int(self.policy.super_pool_mib) + 256,
+                        int(max(0, int(free_drv) - headroom_b) // MIB),
+                    )
+                    eff_fine_mib = min(eff_fine_mib, max(256, safe_pool_mib - int(self.policy.super_pool_mib)))
+                    init_pool_mib = int(self.policy.super_pool_mib) + eff_fine_mib
                     max_pool_b = max(init_pool_mib * MIB, int(free_drv) - headroom_b)
+                else:
+                    init_pool_mib = int(self.policy.super_pool_mib) + eff_fine_mib
+            else:
+                init_pool_mib = int(self.policy.super_pool_mib) + eff_fine_mib
+            self._vmm_initial_pool_mib = float(init_pool_mib)
             self.vmm = TriPoolVMM(
                 device=self.rank,
                 super_pool_mib=self.policy.super_pool_mib,
-                fine_kv_pool_mib=self.policy.fine_kv_pool_mib,
+                fine_kv_pool_mib=eff_fine_mib,
                 super_handle_mib=self.policy.super_handle_mib,
                 transient_va_gib=self.policy.transient_va_gib,
                 kv_va_gib=self.policy.kv_va_gib,

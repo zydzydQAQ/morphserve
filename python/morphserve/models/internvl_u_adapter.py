@@ -548,14 +548,11 @@ class InternVLUCPTGAdapter(GpuCPTGAdapterMixin):
                     # Regime A (40 GiB unconstrained): keep Decoder 100% resident (`alpha=1.0`) alongside VLM.
                     init_alpha = 1.0
                 elif use_elastic_split:
-                    # Regime B (12 GiB constrained, >=2 GPUs): match the ~1:3 VLM:Decoder compute demand
-                    # ratio on >=4 GPUs (1 VLM-hot rank per 4-GPU PCIe half-node: ranks 0, 4, ... at
-                    # alpha=0.0; remaining 75% ranks Decoder-hot at alpha=1.0) so dual-path ships compact
-                    # ~2-8 MiB bridges across intra-half warm ranks while retaining full elastic morphing.
-                    if int(self.policy.num_gpus) >= 4:
-                        init_alpha = 0.0 if (self.rank % 4 == 0) else 1.0
-                    else:
-                        init_alpha = 1.0 if (self.rank % 2 == 1) else 0.0
+                    # Regime B (12 GiB constrained, >=2 GPUs): start at balanced 50:50 VLM:Decoder
+                    # per 4-GPU PCIe half-node (even ranks VLM-hot at alpha=0.0, odd ranks Decoder-hot
+                    # at alpha=1.0) matching steady-state mixed-workload demand while retaining full
+                    # elastic morphing and intra-half ~2-8 MiB Path-A bridge shipping.
+                    init_alpha = 1.0 if (self.rank % 2 == 1) else 0.0
                     if not bool(plan["allow_overflow"]):
                         max_fit_layers = int(plan["super_pool_mib"]) // max(1, self.pager.layer_stride_mib)
                         max_fit_alpha = min(1.0, float(max_fit_layers) / float(max(1, self.pager.num_layers)))

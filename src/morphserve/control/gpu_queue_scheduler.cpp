@@ -194,35 +194,53 @@ std::optional<GpuQueueSelection> GpuWaitQueueScheduler::peek_next(
         }
 
         if (best_bucket == 0) {
-            auto srpt_key = [&](const GpuQueueWaiter& w) noexcept {
-                const int rem = std::max(1, w.remaining_turns);
-                const double exec_ms = std::max(1.0, w.est_exec_ms);
-                const double rem_work = static_cast<double>(rem) * exec_ms;
-                const double slack = effective_slack_ms(w, now_ms);
-                return std::make_tuple(rem_work, rem, slack, exec_ms, w.enqueue_ms, w.waiter_id);
+            // Exact Moore-Hodgson Joint EDF-Feasibility Admission + Multi-Turn Session-SRPT:
+            //   1. Test whether ALL Bucket-0 waiters can finish within their SLO deadlines in EDF
+            //      order (Jackson / Liu-Layland theorem). Under non-overload (e.g., q <= 0.30),
+            //      `all_edf_feasible == true` so EDF dispatches the tightest-deadline waiter and
+            //      banks 100% of Bucket-0 sessions on time.
+            //   2. Under true overload (`all_edf_feasible == false`), pairwise EDF interchange would
+            //      chase tight deadlines across multi-turn jobs and collapse Joint SLO; instead,
+            //      dispatch pure Session-SRPT (`rem_work = rem_turns * max(1, est_exec_ms)`) to
+            //      maximize completed multi-turn sessions per GPU-second (Moore-Hodgson / Autellix).
+            auto edf_key = [&](size_t idx) noexcept {
+                const auto& w = waiters[idx];
+                const double dl =
+                    (w.slo_deadline_ms > 0.0) ? w.slo_deadline_ms : std::numeric_limits<double>::infinity();
+                return std::make_tuple(dl, effective_slack_ms(w, now_ms), std::max(0.0, w.est_exec_ms), w.enqueue_ms, w.waiter_id);
             };
-            size_t best_srpt = top_group.front();
-            for (size_t idx : top_group) {
-                if (srpt_key(waiters[idx]) < srpt_key(waiters[best_srpt])) {
-                    best_srpt = idx;
+            std::vector<size_t> edf_order = top_group;
+            std::sort(edf_order.begin(), edf_order.end(), [&](size_t a, size_t b) {
+                return edf_key(a) < edf_key(b);
+            });
+            double t_cursor = now_ms;
+            bool all_edf_feasible = true;
+            for (size_t idx : edf_order) {
+                const auto& w = waiters[idx];
+                t_cursor += std::max(0.0, w.est_exec_ms);
+                if (w.slo_deadline_ms > 0.0 && t_cursor > w.slo_deadline_ms) {
+                    all_edf_feasible = false;
+                    break;
                 }
             }
-            chosen = best_srpt;
-            const double best_slack = effective_slack_ms(waiters[best_srpt], now_ms);
-            const double safety = (top_group.size() <= 2) ? 1.0 : 1.5;
-            size_t best_edf = best_srpt;
-            double best_edf_slack = best_slack;
-            for (size_t idx : top_group) {
-                if (idx == best_srpt) continue;
-                const auto& u = waiters[idx];
-                const double u_slack = effective_slack_ms(u, now_ms);
-                const double u_exec = std::max(0.0, u.est_exec_ms);
-                if (u_slack < best_edf_slack && best_slack >= safety * u_exec) {
-                    best_edf = idx;
-                    best_edf_slack = u_slack;
+            if (all_edf_feasible) {
+                chosen = edf_order.front();
+            } else {
+                auto srpt_key = [&](const GpuQueueWaiter& w) noexcept {
+                    const int rem = std::max(1, w.remaining_turns);
+                    const double exec_ms = std::max(1.0, w.est_exec_ms);
+                    const double rem_work = static_cast<double>(rem) * exec_ms;
+                    const double slack = effective_slack_ms(w, now_ms);
+                    return std::make_tuple(rem_work, rem, slack, exec_ms, w.enqueue_ms, w.waiter_id);
+                };
+                size_t best_srpt = top_group.front();
+                for (size_t idx : top_group) {
+                    if (srpt_key(waiters[idx]) < srpt_key(waiters[best_srpt])) {
+                        best_srpt = idx;
+                    }
                 }
+                chosen = best_srpt;
             }
-            chosen = best_edf;
         } else {
             auto fallback_key = [&](const GpuQueueWaiter& w) noexcept {
                 const double slack = effective_slack_ms(w, now_ms);

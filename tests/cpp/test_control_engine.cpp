@@ -1175,6 +1175,17 @@ void test_gpu_wait_queue_scheduler() {
     const auto s4 = sess_sched.select_and_pop(q_overload, 5000.0, 8LL * kGiB);
     MS_CHECK(s4.has_value() && s4->waiter_id == 43);
 
+    // 3-waiter overload anti-chasing: two tight-slack 3-turn jobs (51, 52) cannot both meet their
+    // deadlines -> EDF is jointly infeasible -> pure Session-SRPT banks 1-turn job 53 immediately
+    // even though 53 alone could tolerate one interchange!
+    std::vector<GpuQueueWaiter> q_chase = {
+        {51, 100.0, 1LL * kGiB, 5000.0, 11000.0, 1, 0, true, 3},   // EDF: 5000+5000=10000 <= 11000
+        {52, 110.0, 1LL * kGiB, 5000.0, 12000.0, 1, 0, true, 3},   // EDF: 10000+5000=15000 > 12000 (OVERLOAD!)
+        {53, 120.0, 1LL * kGiB, 5000.0, 22000.0, 1, 0, true, 1},   // best_srpt (rem_work=5000)
+    };
+    const auto sc0 = sess_sched.select_and_pop(q_chase, 5000.0, 8LL * kGiB);
+    MS_CHECK(sc0.has_value() && sc0->waiter_id == 53);
+
     // JSON roundtrip & backward-compatible defaults for session_slo_intact / remaining_turns.
     const GpuQueueWaiter w_rt = GpuQueueWaiter::from_json(
         GpuQueueWaiter{99, 10.0, 2LL * kGiB, 100.0, 500.0, 1, 0, false, 3}.to_json());

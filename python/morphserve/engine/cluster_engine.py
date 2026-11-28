@@ -959,11 +959,21 @@ class MorphServeClusterEngine:
                 image_res=max(turn.height, turn.width),
             )
             if self._gpu_locks[resident_gpu].locked():
+                ar_op_priority = (
+                    1
+                    if (
+                        eff_policy.cptg_architecture == "bridge_mllm_dit"
+                        and (not self._supports_mid_dit_preemption(eff_policy))
+                        and eff_policy.routing_mode == "dual_path"
+                        and self.router.get_worker_state(resident_gpu).expert_alpha > 0.01
+                    )
+                    else 0
+                )
                 await self._gpu_locks[resident_gpu].acquire(
                     est_mem_bytes=0,
                     est_exec_ms=est_ar_ms,
                     slo_deadline_ms=ar_dl_ms,
-                    op_priority=0,
+                    op_priority=ar_op_priority,
                     session_slo_intact=session_slo_intact,
                     remaining_turns=remaining_turns,
                 )
@@ -2068,7 +2078,15 @@ class MorphServeClusterEngine:
                                 est_mem_bytes=(512 if turn.height >= 1024 else 256) * MIB if is_tight_mot else 0,
                                 est_exec_ms=est_prep_ms,
                                 slo_deadline_ms=prep_dl_ms,
-                                op_priority=0 if ((not is_tight_mot) and is_quota_constrained) else 1,
+                                op_priority=(
+                                    0
+                                    if (
+                                        (not is_tight_mot)
+                                        and is_quota_constrained
+                                        and self.router.get_worker_state(resident_gpu).expert_alpha <= 0.01
+                                    )
+                                    else 1
+                                ),
                                 session_slo_intact=session_slo_intact,
                                 remaining_turns=rem_turns,
                             )

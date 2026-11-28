@@ -1167,6 +1167,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         self._pending_vae_encode_ms: dict[str, float] = {}
 
         if getattr(self.pipeline.bagel, "language_model", None) is not None:
+            is_static_fission = policy.routing_mode in ("static_nccl_fission", "twostage_shm")
             gen_spec = ExpertPartitionSpec.for_bagel(
                 self.pipeline,
                 role="generation",
@@ -1174,13 +1175,58 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 wrap_vae=policy.use_scoped_vae,
                 vae_encode_restore="sync",
             )
-            pager = self.bind_expert_partition(gen_spec, drop_for_fission=(self.role == "und"))
+            pager = self.bind_expert_partition(gen_spec, drop_for_fission=(is_static_fission and self.role == "und"))
             if pager is not None:
                 self.interceptor.bind_pager(pager)
+            if is_static_fission and self.role == "gen":
+                self._drop_unused_gen_rank_modules()
 
     @property
     def total_mirror_bytes(self) -> int:
         return self.pager.total_mirror_bytes if self.pager is not None else 0
+
+    def _drop_unused_gen_rank_modules(self) -> int:
+        """Free AR/ViT-only weights (`vit_model`, `connector`, untied `lm_head`) on static-fission `gen` ranks.
+
+        Note: BAGEL's tight-MoT `mode="gen"` routes `<start_of_image>`/`<end_of_image>` delimiter tokens through
+        `embed_tokens` and the understanding transformer layers, so those layers are architecturally required
+        even on `gen`-only ranks; only ViT, connector, and untied `lm_head` (~1.9 GiB) can be safely dropped.
+        """
+        import torch
+
+        bagel = getattr(self.pipeline, "bagel", None)
+        if bagel is None:
+            return 0
+        embed_ptr = None
+        lm = getattr(bagel, "language_model", None)
+        lm_model = getattr(lm, "model", None) if lm is not None else None
+        embed_mod = getattr(lm_model, "embed_tokens", None) if lm_model is not None else None
+        embed_w = getattr(embed_mod, "weight", None) if embed_mod is not None else None
+        if embed_w is not None and hasattr(embed_w, "data_ptr"):
+            embed_ptr = int(embed_w.data_ptr())
+
+        dropped_bytes = 0
+        seen: set[int] = set()
+        drop_mods = [
+            getattr(bagel, "vit_model", None),
+            getattr(bagel, "connector", None),
+            getattr(lm, "lm_head", None) if lm is not None else None,
+        ]
+        for mod in drop_mods:
+            if mod is None or not hasattr(mod, "parameters"):
+                continue
+            for p in mod.parameters():
+                if id(p) in seen or p.numel() == 0:
+                    continue
+                if embed_ptr is not None and int(p.data_ptr()) == embed_ptr:
+                    continue
+                seen.add(id(p))
+                dropped_bytes += int(p.numel() * p.element_size())
+                p.data = torch.empty((0,), dtype=p.dtype, device=p.device)
+        if dropped_bytes > 0 and torch.cuda.is_available() and getattr(self.device, "type", "cuda") == "cuda":
+            gc.collect()
+            torch.cuda.empty_cache()
+        return dropped_bytes
 
     def attach_expert_mirror(self, shared_mirror: NumaMemfdMirror | None, populate: bool = True) -> None:
         if self.pager is None:
@@ -2514,7 +2560,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
             latents = None
             img_shape = (height, width)
             excl_sids = (session.main_session_id,) if session.main_session_id > 0 else ()
-            max_dit_oom_retries = 2 if (use_idle_kv_swap or (self.pager is not None and self.vmm is not None)) else 0
+            # Fair symmetric worker OOM retry budget across ALL policies (non-swap policies still perform
+            # bounded `gc.collect() + torch.cuda.empty_cache()` defragmentation; idle KV swap is strictly
+            # gated by `use_idle_kv_swap`).
+            max_dit_oom_retries = 2
             total_yield_count = 0
             preempt_yield_ms = 0.0
             vae_decode_ev_pair: tuple[Any, Any] | None = None
@@ -2592,14 +2641,16 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             if dit_attempt < max_dit_oom_retries and is_oom_exception(exc):
                                 self._update_hwm()
                                 free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
-                                target_reclaim = (
-                                    (self.available_kv_bytes(for_dit=False) + 2048 * MIB)
-                                    if dit_attempt == 0
-                                    else (1 << 50)
-                                )
-                                freed = self.evict_idle_kv_to_host(target_reclaim, exclude_ctx_ids=(ctx_id,), for_dit=False)
-                                if freed == 0 and dit_attempt == 0:
-                                    freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                freed = 0
+                                if use_idle_kv_swap:
+                                    target_reclaim = (
+                                        (self.available_kv_bytes(for_dit=False) + 2048 * MIB)
+                                        if dit_attempt == 0
+                                        else (1 << 50)
+                                    )
+                                    freed = self.evict_idle_kv_to_host(target_reclaim, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                    if freed == 0 and dit_attempt == 0:
+                                        freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
                                 vmm_trimmed = 0
                                 if self.vmm is not None:
                                     flush_fn = getattr(self.vmm, "flush_kv_swaps", None)
@@ -2679,7 +2730,11 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                             if vae_attempt < max_dit_oom_retries and is_oom_exception(exc):
                                 self._update_hwm()
                                 free_before = int(torch.cuda.mem_get_info(self.device)[0]) if is_cuda else 0
-                                freed = self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                freed = (
+                                    self.evict_idle_kv_to_host(1 << 50, exclude_ctx_ids=(ctx_id,), for_dit=False)
+                                    if use_idle_kv_swap
+                                    else 0
+                                )
                                 vmm_trimmed = 0
                                 if self.vmm is not None:
                                     flush_fn = getattr(self.vmm, "flush_kv_swaps", None)

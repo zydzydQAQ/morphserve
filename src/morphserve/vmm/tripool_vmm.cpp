@@ -595,9 +595,10 @@ uint64_t TriPoolVMM::pop_fine_handle_locked(
         const uint64_t cur_pool_b = super_pool_total_ * super_bytes_ + fine_pool_total_ * min_gran_;
         const bool can_grow_fine =
             cfg_.allow_overflow && cfg_.max_pool_bytes > 0 && (cur_pool_b + min_gran_) <= cfg_.max_pool_bytes;
-        // Protect free 64 MiB super handles needed to restore evicted Arena-0 expert layers when safe
-        // fine-pool overflow headroom is available, avoiding Arena-0 super-handle theft & carve thrashing
-        // (while still carving genuinely idle super handles first when no expert layers are missing).
+        // Preserve free super handles reserved for evicted Arena-0 expert layers when fine-pool
+        // overflow headroom is available, avoiding carve<->coalesce driver ioctl thrashing on reload.
+        // Under tight pools (`!can_grow_fine`, e.g., `allow_overflow=0` or at `max_pool_bytes` cap)
+        // or when no missing expert layers need those handles, carve idle super handles first.
         const size_t reserved_super = missing_expert_handles_locked();
         if (!free_super_handles_.empty() && (free_super_handles_.size() > reserved_super || !can_grow_fine)) {
             const uint64_t super_h = free_super_handles_.back();
@@ -800,7 +801,7 @@ int TriPoolVMM::kv_session_mark_active(uint64_t session_id, void* stream) {
         backend_->ensure_context();
         const size_t wm_target = compute_watermark_reclaim_target_locked(/*for_dit=*/false, needed_restore_bytes);
         if (wm_target > 0) {
-            reclaim_thinking_kv_locked(wm_target, /*sync=*/true, &session_id, 1, stream, lock);
+            reclaim_thinking_kv_locked(wm_target, /*sync=*/false, &session_id, 1, stream, lock);
         }
 
         std::sort(swapped_rids.begin(), swapped_rids.end());

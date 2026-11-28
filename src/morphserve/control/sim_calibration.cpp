@@ -8,6 +8,9 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -221,6 +224,30 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
     const bool within_8 = has_points && (mgp < 8.0) && (tp_errs.empty() || mtp < 8.0) && (dt_errs.empty() || mdt < 8.0);
     const bool within_5 = has_points && (mgp < 5.0) && (tp_errs.empty() || mtp < 5.0) && (dt_errs.empty() || mdt < 5.0);
 
+    // Per-GPU-scale breakdown (e.g. 8-GPU single-node vs 16-GPU 2x8 multi-node) across ALL points.
+    std::map<int, std::tuple<int, std::vector<double>, std::vector<double>, std::vector<double>>> scale_acc;
+    for (const auto& pt : per_pt) {
+        const int ng = pt.value("num_gpus", 8);
+        auto& entry = scale_acc[ng];
+        ++std::get<0>(entry);
+        std::get<1>(entry).push_back(pt.value("goodput_err_pct", 0.0));
+        if (pt.contains("ar_tpot_p95_err_pct") && pt["ar_tpot_p95_err_pct"].is_number()) {
+            std::get<2>(entry).push_back(pt["ar_tpot_p95_err_pct"].get<double>());
+        }
+        if (pt.contains("dit_p95_err_pct") && pt["dit_p95_err_pct"].is_number()) {
+            std::get<3>(entry).push_back(pt["dit_p95_err_pct"].get<double>());
+        }
+    }
+    nlohmann::json by_num_gpus = nlohmann::json::object();
+    for (const auto& [ng, entry] : scale_acc) {
+        by_num_gpus[std::to_string(ng)] = {
+            {"points_checked", std::get<0>(entry)},
+            {"goodput_mape_pct", round_2(mean_raw(std::get<1>(entry)))},
+            {"ar_tpot_p95_mape_pct", round_2(mean_raw(std::get<2>(entry)))},
+            {"dit_p95_mape_pct", round_2(mean_raw(std::get<3>(entry)))},
+        };
+    }
+
     return {
         {"reference_source", "live_cluster_out_of_sample"},
         {"zero_parameter_fitting", true},
@@ -231,6 +258,7 @@ nlohmann::json ClusterSimulator::evaluate_against_real_runs(
         {"max_point_error_pct", round_2(max_err)},
         {"within_8pct_oos_gate", within_8},
         {"within_5pct_gate", within_5},
+        {"by_num_gpus", by_num_gpus},
         {"per_point", per_pt},
     };
 }
@@ -297,20 +325,74 @@ nlohmann::json ClusterSimulator::run_scale_and_interconnect_sweep(
 
     nlohmann::json real_runs = nlohmann::json::array();
     if (!real_report_path.empty()) {
-        std::error_code ec;
-        if (std::filesystem::is_regular_file(real_report_path, ec)) {
-            std::ifstream in(real_report_path, std::ios::binary);
-            if (in) {
-                const auto raw = nlohmann::json::parse(in);
-                if (raw.contains("qps_sweep") && raw["qps_sweep"].is_array()) {
-                    for (const auto& x : raw["qps_sweep"]) real_runs.push_back(x);
+        std::set<std::tuple<std::string, int, int, std::string>> seen_pts;
+        auto append_run = [&](nlohmann::json item, const nlohmann::json& parent) {
+            if (!item.is_object()) return;
+            const std::string pol = item.value("policy_name", "");
+            if (!is_valid_policy_name(pol)) return;
+            // Propagate top-level suite window & think-time metadata when not duplicated on individual rows.
+            if (!item.contains("num_gpus") && parent.contains("world_size") && parent["world_size"].is_number_integer()) {
+                item["num_gpus"] = parent["world_size"];
+            } else if (!item.contains("num_gpus") && parent.contains("num_gpus") && parent["num_gpus"].is_number_integer()) {
+                item["num_gpus"] = parent["num_gpus"];
+            }
+            if (!item.contains("steady_window_mode") && parent.contains("steady_window_mode")) {
+                item["steady_window_mode"] = parent["steady_window_mode"];
+            }
+            if (!item.contains("warmup_window_s") && parent.contains("warmup_s")) {
+                item["warmup_window_s"] = parent["warmup_s"];
+            }
+            if (!item.contains("steady_window_s") && parent.contains("steady_s")) {
+                item["steady_window_s"] = parent["steady_s"];
+            }
+            if (!item.contains("cooldown_s") && parent.contains("cooldown_s")) {
+                item["cooldown_s"] = parent["cooldown_s"];
+            }
+            if (parent.contains("think_time_config") && parent["think_time_config"].is_object()) {
+                const auto& tc = parent["think_time_config"];
+                if (!item.contains("think_time_dist") && tc.contains("dist")) item["think_time_dist"] = tc["dist"];
+                if (!item.contains("inter_turn_think_s_range") && tc.contains("range_s")) {
+                    item["inter_turn_think_s_range"] = tc["range_s"];
                 }
-                if (raw.contains("skew_sweep") && raw["skew_sweep"].is_array()) {
-                    for (const auto& x : raw["skew_sweep"]) real_runs.push_back(x);
+                if (!item.contains("think_time_median_s") && tc.contains("median_s")) {
+                    item["think_time_median_s"] = tc["median_s"];
                 }
-                if (raw.contains("results") && raw["results"].is_array() && !raw.contains("qps_sweep")) {
-                    for (const auto& x : raw["results"]) real_runs.push_back(x);
-                }
+                if (!item.contains("think_time_sigma") && tc.contains("sigma")) item["think_time_sigma"] = tc["sigma"];
+            }
+            const int ng = item.value("num_gpus", 8);
+            const int qps_milli = static_cast<int>(std::llround(item.value("offered_qps", 0.8) * 1000.0));
+            const std::string sk_tag =
+                (item.contains("skew_tag") && item["skew_tag"].is_string()) ? item["skew_tag"].get<std::string>() : "";
+            const auto key = std::make_tuple(pol, ng, qps_milli, sk_tag);
+            if (seen_pts.insert(key).second) {
+                real_runs.push_back(std::move(item));
+            }
+        };
+
+        std::stringstream ss(real_report_path);
+        std::string part;
+        while (std::getline(ss, part, ',')) {
+            const size_t first = part.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) continue;
+            const size_t last = part.find_last_not_of(" \t\r\n");
+            const std::string path_str = part.substr(first, last - first + 1);
+            std::error_code ec;
+            if (!std::filesystem::is_regular_file(path_str, ec)) continue;
+            std::ifstream in(path_str, std::ios::binary);
+            if (!in) continue;
+            const auto raw = nlohmann::json::parse(in);
+            if (raw.contains("qps_sweep") && raw["qps_sweep"].is_array()) {
+                for (const auto& x : raw["qps_sweep"]) append_run(x, raw);
+            }
+            if (raw.contains("skew_sweep") && raw["skew_sweep"].is_array()) {
+                for (const auto& x : raw["skew_sweep"]) append_run(x, raw);
+            }
+            if (raw.contains("e2e_results") && raw["e2e_results"].is_array()) {
+                for (const auto& x : raw["e2e_results"]) append_run(x, raw);
+            }
+            if (raw.contains("results") && raw["results"].is_array() && !raw.contains("qps_sweep") &&
+                !raw.contains("e2e_results")) {
+                for (const auto& x : raw["results"]) append_run(x, raw);
             }
         }
     }

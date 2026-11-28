@@ -49,7 +49,7 @@ struct PolicyConfig {
     bool kv_vmm_only = false;
     bool use_idle_kv_swap = false;
     std::string preemption_mode = "layer_chunk";
-    std::string cost_model_mode = "atlas_3d";     // "atlas_3d" | "pipeline_analytical" | "legacy_analytical"
+    std::string cost_model_mode = "pipeline_analytical";  // "pipeline_analytical" | "atlas_3d" | "legacy_analytical"
     std::string gpu_queue_mode = "memory_slack";  // "memory_slack" | "fcfs"
     double gpu_queue_max_aging_ms = 45000.0;
     int gpu_queue_max_bypasses = 5;

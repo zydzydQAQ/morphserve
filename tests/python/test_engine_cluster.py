@@ -170,6 +170,7 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
         "no_m2_pacer_numa",
         "no_m3_cow_loopback",
         "no_m4_layer_chunk",
+        "no_queue_sched",
     }
     assert ablations["full_morphserve"].use_tripool_vmm is True
     assert ablations["no_m1_tripool_vmm"].use_tripool_vmm is False
@@ -184,6 +185,7 @@ def test_policy_config_presets_serialization_ablations_and_run_window_options(tm
     assert ablations["no_m2_pacer_numa"].use_shared_numa_mirror is False
     assert ablations["no_m3_cow_loopback"].use_module3_cow_loopback is False
     assert ablations["no_m4_layer_chunk"].preemption_mode != "layer_chunk"
+    assert ablations["no_queue_sched"].gpu_queue_mode == "fcfs"
 
     splits = dict(build_static_split_configs(num_gpus=8))
     assert len(splits["static_2und_6gen"].static_und_ranks) == 2
@@ -386,6 +388,33 @@ def test_topology_defaults_and_router_operator_profile_readonly_and_telemetry_se
         )
         assert chosen_gen in p_shm.static_gen_ranks
         assert chosen_gen != p_shm.static_gen_ranks[0]
+
+        # Fair 2x8 multi-node `static_nccl_fission` must prefer same-node gen rank over remote-node gen rank.
+        r16 = DualPathMorphRouter(topo_16, operator_profile=op_default)
+        try:
+            p_fis16 = EnginePolicyConfig.from_preset("static_nccl_fission", num_gpus=16)
+            w16 = {
+                g: WorkerState(
+                    gpu_id=g,
+                    role=p_fis16.role_of(g),
+                    expert_alpha=1.0 if g in p_fis16.static_gen_ranks else 0.0,
+                    queue_wait_ms=1500.0 if topo_16.same_node(0, g) else 0.0,
+                    kv_free_bytes=16 * (1024**3),
+                )
+                for g in range(16)
+            }
+            chosen_fis16 = r16.select_static_gen_gpu(
+                routing_mode="static_nccl_fission",
+                static_und_ranks=p_fis16.static_und_ranks,
+                static_gen_ranks=p_fis16.static_gen_ranks,
+                src_und_gpu=0,
+                workers=w16,
+                gpu_busy={},
+            )
+            assert chosen_fis16 in p_fis16.static_gen_ranks
+            assert topo_16.same_node(0, chosen_fis16) is True
+        finally:
+            r16.close()
     finally:
         r_default.close()
         r_heavy.close()

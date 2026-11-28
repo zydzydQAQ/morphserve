@@ -415,7 +415,7 @@ PolicyConfig PolicyConfig::from_preset(
             ((has_mem_frac && overrides["gpu_memory_fraction"].get<double>() <= 0.5) ||
              (has_quota_mib && overrides["gpu_memory_quota_mib"].get<double>() > 0.0 &&
               overrides["gpu_memory_quota_mib"].get<double>() <= 20480.0));
-        const int ivlu_super_mib = is_ivlu_capped ? 4864 : 12288;
+        const int ivlu_super_mib = is_ivlu_capped ? 4864 : 2560;
 
         cfg.routing_mode = (num_gpus >= 2) ? "dual_path" : "sticky_least_loaded";
         cfg.use_tripool_vmm = true;
@@ -429,13 +429,13 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_idle_kv_swap = true;
         cfg.preemption_mode =
             (fam == "internvl_u") ? (is_ivlu_capped ? "non_preemptive" : "step_preemptive") : "layer_chunk";
-        cfg.cost_model_mode = "atlas_3d";
+        cfg.cost_model_mode = "pipeline_analytical";
         cfg.gpu_queue_mode = "memory_slack";
-        cfg.gpu_queue_max_aging_ms = 120000.0;
-        cfg.gpu_queue_max_bypasses = 16;
+        cfg.gpu_queue_max_aging_ms = 45000.0;
+        cfg.gpu_queue_max_bypasses = 5;
         cfg.kv_eviction_mode = "swap";
         cfg.super_pool_mib = (fam == "internvl_u") ? ivlu_super_mib : 14336;
-        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? 512 : 256;
+        cfg.fine_kv_pool_mib = (fam == "internvl_u") ? (is_ivlu_capped ? 64 : 128) : 256;
         cfg.transient_va_gib = 16;
         cfg.kv_va_gib = (fam == "internvl_u") ? 8 : 16;
         cfg.allow_vmm_overflow = !is_ivlu_capped;
@@ -498,13 +498,15 @@ PolicyConfig PolicyConfig::from_preset(
         cfg.use_idle_kv_swap = true;
         cfg.preemption_mode = (fam == "internvl_u") ? "non_preemptive" : "step_preemptive";
         cfg.cost_model_mode = "legacy_analytical";
-        cfg.gpu_queue_mode = "fcfs";
+        cfg.gpu_queue_mode = "memory_slack";
+        cfg.gpu_queue_max_aging_ms = 45000.0;
+        cfg.gpu_queue_max_bypasses = 5;
         cfg.kv_eviction_mode = "swap";
         for (int g = 0; g < num_gpus; ++g) {
             cfg.initial_alphas[g] = 1.0;
         }
-        cfg.super_pool_mib = 128;
-        cfg.fine_kv_pool_mib = 2048;
+        cfg.super_pool_mib = 0;
+        cfg.fine_kv_pool_mib = 64;
         cfg.kv_va_gib = 16;
         cfg.allow_vmm_overflow = true;
     } else {
@@ -563,6 +565,10 @@ std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(
     no_m4.policy_name = "no_m4_layer_chunk";
     no_m4.preemption_mode = "non_preemptive";
 
+    PolicyConfig no_queue = full;
+    no_queue.policy_name = "no_queue_sched";
+    no_queue.gpu_queue_mode = "fcfs";
+
     return {
         {"full_morphserve", full},
         {"no_m1_tripool_vmm", no_m1_vmm},
@@ -571,6 +577,7 @@ std::vector<std::pair<std::string, PolicyConfig>> build_ablation_configs(
         {"no_m2_pacer_numa", no_m2_pacer},
         {"no_m3_cow_loopback", no_m3},
         {"no_m4_layer_chunk", no_m4},
+        {"no_queue_sched", no_queue},
     };
 }
 

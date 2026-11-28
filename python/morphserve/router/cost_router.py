@@ -254,7 +254,7 @@ class DualPathMorphRouter:
         allow_cross_half_state_ship: bool = True,
         allow_inter_node_state_ship: bool = True,
         max_inter_node_state_bytes: int = 128 * MIB,
-        cost_model_mode: str = "atlas_3d",
+        cost_model_mode: str = "pipeline_analytical",
         performance_atlas: Mapping[str, Any] | None = None,
     ) -> None:
         self.topology = topology

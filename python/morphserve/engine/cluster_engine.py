@@ -262,7 +262,7 @@ class ClusterRunReport:
     all_session_active_jct_p99_ms: float | None = None
     all_session_e2e_p99_ms: float | None = None
     all_session_dit_p99_ms: float | None = None
-    cost_model_mode: str = "atlas_3d"
+    cost_model_mode: str = "pipeline_analytical"
     gpu_queue_mode: str = "memory_slack"
     kv_eviction_mode: str = "swap"
     queue_reorders_total: int = 0
@@ -2242,7 +2242,12 @@ class MorphServeClusterEngine:
                                 )
                                 kv_res_released = True
                                 if ship.get("status") != "ok":
-                                    if ship_mode == "nccl_dual" and ship.get("src_ctx_preserved"):
+                                    if (
+                                        ship_mode == "nccl_dual"
+                                        and ship.get("src_ctx_preserved")
+                                        and oom_retries < eff_policy.max_oom_retries
+                                    ):
+                                        oom_retries += 1
                                         fallback_in_place = True
                                     else:
                                         dit_res = {"status": "oom", "error": ship.get("error", f"{ship_mode}_oom")}

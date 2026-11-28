@@ -86,7 +86,7 @@ class EnginePolicyConfig:
     use_idle_kv_swap: bool = False
     kv_vmm_only: bool = False
     preemption_mode: str = "layer_chunk"  # "non_preemptive" | "step_preemptive" | "layer_chunk"
-    cost_model_mode: str = "atlas_3d"  # "atlas_3d" | "pipeline_analytical" | "legacy_analytical"
+    cost_model_mode: str = "pipeline_analytical"  # "pipeline_analytical" | "atlas_3d" | "legacy_analytical"
     gpu_queue_mode: str = "memory_slack"  # "memory_slack" | "fcfs"
     gpu_queue_max_aging_ms: float = 45000.0
     gpu_queue_max_bypasses: int = 5

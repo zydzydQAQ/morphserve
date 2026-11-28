@@ -83,7 +83,7 @@ public:
         bool allow_cross_half_state_ship = true,
         bool allow_inter_node_state_ship = true,
         int64_t max_inter_node_state_bytes = 128LL * kMiB,
-        std::string cost_model_mode = "atlas_3d",
+        std::string cost_model_mode = "pipeline_analytical",
         PerformanceAtlas performance_atlas = PerformanceAtlas::a100_default());
 
     const ClusterTopologyProfile& topology() const noexcept { return topology_; }
@@ -230,7 +230,7 @@ private:
     bool allow_cross_half_state_ship_ = true;
     bool allow_inter_node_state_ship_ = true;
     int64_t max_inter_node_state_bytes_ = 128LL * kMiB;
-    std::string cost_model_mode_ = "atlas_3d";
+    std::string cost_model_mode_ = "pipeline_analytical";
     PerformanceAtlas atlas_ = PerformanceAtlas::a100_default();
 
     mutable std::mutex mu_;

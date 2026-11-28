@@ -1167,6 +1167,7 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
         self._pending_vae_encode_ms: dict[str, float] = {}
 
         if getattr(self.pipeline.bagel, "language_model", None) is not None:
+            is_static_fission = policy.routing_mode in ("static_nccl_fission", "twostage_shm")
             gen_spec = ExpertPartitionSpec.for_bagel(
                 self.pipeline,
                 role="generation",
@@ -1174,10 +1175,10 @@ class BagelCPTGAdapter(GpuCPTGAdapterMixin):
                 wrap_vae=policy.use_scoped_vae,
                 vae_encode_restore="sync",
             )
-            pager = self.bind_expert_partition(gen_spec, drop_for_fission=(self.role == "und"))
+            pager = self.bind_expert_partition(gen_spec, drop_for_fission=(is_static_fission and self.role == "und"))
             if pager is not None:
                 self.interceptor.bind_pager(pager)
-            if self.role == "gen":
+            if is_static_fission and self.role == "gen":
                 self._drop_unused_gen_rank_modules()
 
     @property

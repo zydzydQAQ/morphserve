@@ -1153,24 +1153,34 @@ def test_bagel_static_fission_gen_rank_drops_unused_ar_vit_and_uniform_oom_retry
     finally:
         ad_gen.close()
 
-    # Verify uniform `max_dit_oom_retries = 2` on `monolithic_dp` never calls `evict_idle_kv_to_host`.
-    pipe_mono, cache_cls_m = _build_bagel_stub(torch, num_layers=2, hidden=8)
-    pol_mono = EnginePolicyConfig.from_preset("monolithic_dp", num_gpus=1)
-    ad_mono = BagelCPTGAdapter(
-        rank=0,
-        policy=pol_mono,
-        bench_root=tmp_path,
-        pipeline=pipe_mono,
-        naive_cache_cls=cache_cls_m,
-        device=torch.device("cpu"),
-    )
-    evict_calls: list[int] = []
-    ad_mono.evict_idle_kv_to_host = lambda *a, **kw: (evict_calls.append(1) or 0)  # type: ignore[method-assign]
-    pipe_mono.bagel.generate_image = lambda **kw: (_ for _ in ()).throw(MemoryError("injected dit oom"))
-    try:
-        ad_mono.prepare_turn("mono_s0", {"prompt": "draw a tree", "prepare_for_dit": True, "height": 512, "width": 512})
-        with pytest.raises(MemoryError, match="injected dit oom"):
-            ad_mono.generate_dit("mono_s0", {"height": 512, "width": 512, "dit_steps": 2, "prompt": "draw a tree"})
-        assert evict_calls == []
-    finally:
-        ad_mono.close()
+    # Verify colocated baselines (`monolithic_dp`, `monolithic_kv_swap`, `prism_tetriserve_coloc`) NEVER drop
+    # `vit_model`/`connector`/`lm_head` even though `policy.role_of(0) == "gen"` when `use_expert_pager=False`,
+    # and verify uniform `max_dit_oom_retries = 2` on `monolithic_dp` never calls `evict_idle_kv_to_host`.
+    for coloc_preset in ("monolithic_dp", "monolithic_kv_swap", "prism_tetriserve_coloc"):
+        pipe_c, cache_cls_c = _build_bagel_stub(torch, num_layers=2, hidden=8)
+        pipe_c.bagel.vit_model = torch.nn.Linear(8, 8, bias=False)
+        pipe_c.bagel.connector = torch.nn.Linear(8, 8, bias=False)
+        pipe_c.bagel.language_model.model.embed_tokens = torch.nn.Embedding(32, 8)
+        pol_c = EnginePolicyConfig.from_preset(coloc_preset, num_gpus=1, use_tripool_vmm=False)
+        ad_c = BagelCPTGAdapter(
+            rank=0,
+            policy=pol_c,
+            bench_root=tmp_path,
+            pipeline=pipe_c,
+            naive_cache_cls=cache_cls_c,
+            device=torch.device("cpu"),
+        )
+        try:
+            assert pipe_c.bagel.vit_model.weight.numel() == 64
+            assert pipe_c.bagel.connector.weight.numel() == 64
+            assert pipe_c.bagel.language_model.lm_head.weight.numel() == 256
+            if coloc_preset == "monolithic_dp":
+                evict_calls: list[int] = []
+                ad_c.evict_idle_kv_to_host = lambda *a, **kw: (evict_calls.append(1) or 0)  # type: ignore[method-assign]
+                pipe_c.bagel.generate_image = lambda **kw: (_ for _ in ()).throw(MemoryError("injected dit oom"))
+                ad_c.prepare_turn("mono_s0", {"prompt": "draw a tree", "prepare_for_dit": True, "height": 512, "width": 512})
+                with pytest.raises(MemoryError, match="injected dit oom"):
+                    ad_c.generate_dit("mono_s0", {"height": 512, "width": 512, "dit_steps": 2, "prompt": "draw a tree"})
+                assert evict_calls == []
+        finally:
+            ad_c.close()
